@@ -68,8 +68,9 @@ def canonicalize_stream(stream_id: str, execution_instrument: str) -> str:
 class EventProcessor:
     """Processes events and updates state manager."""
     
-    def __init__(self, state_manager: WatchdogStateManager):
+    def __init__(self, state_manager: WatchdogStateManager, session_flatten_tracker=None):
         self._state_manager = state_manager
+        self._session_flatten_tracker = session_flatten_tracker
         self._last_processed_seq: Dict[str, int] = {}  # run_id -> event_seq
     
     def _parse_timestamp(self, timestamp_str: str) -> Optional[datetime]:
@@ -117,6 +118,13 @@ class EventProcessor:
         data = event.get("data", {})
         if not isinstance(data, dict):
             data = {}
+
+        # Session / flatten visibility (engine events only; must not depend on timestamp parse)
+        if self._session_flatten_tracker is not None:
+            try:
+                self._session_flatten_tracker.ingest(event)
+            except Exception:
+                pass
         
         timestamp_utc = self._parse_timestamp(timestamp_utc_str)
         if not timestamp_utc:

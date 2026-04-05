@@ -36,6 +36,8 @@ ALERT_TYPE_LABELS = {
     "INCIDENT_EXECUTION_JOURNAL_CORRUPTION": "Execution Journal Corruption (Incident)",
     "INCIDENT_EXECUTION_JOURNAL_ERROR": "Execution Journal Error (Incident)",
     "TIMETABLE_DRIFT": "Timetable drift (robot vs system)",
+    "SESSION_FLATTEN_NOT_CONFIRMED_CRITICAL": "Session flatten not broker-confirmed after close",
+    "SESSION_FLATTEN_AT_RISK_WARNING": "Session flatten at risk (within 60s of close, not confirmed)",
 }
 
 # Severity tiers: critical, high, warning, info (enables sound/priority/escalation without redesign)
@@ -153,6 +155,57 @@ class NotificationService:
             })
         except asyncio.QueueFull:
             logger.warning("Notification queue full, dropping new alert")
+
+    def append_ledger_alert_always(
+        self,
+        alert_type: str,
+        severity: str,
+        context: Dict[str, Any],
+        dedupe_key: str,
+    ) -> bool:
+        """
+        Append to alert ledger even when Pushover is disabled. Returns False if dedupe_key already active.
+        Caller should call enqueue_ledger_alert_delivery() when notifications are enabled.
+        """
+        if self._ledger.is_alert_active(dedupe_key):
+            return False
+        alert_id = generate_alert_id()
+        self._ledger.append_alert(alert_id, alert_type, severity, context, dedupe_key)
+        return True
+
+    def enqueue_ledger_alert_delivery(
+        self,
+        alert_type: str,
+        severity: str,
+        context: Dict[str, Any],
+        dedupe_key: str,
+    ) -> None:
+        """Queue delivery for an alert already recorded (append_ledger_alert_always / shared ledger)."""
+        if not self._enabled:
+            return
+        active = self._ledger.get_active_alert(dedupe_key)
+        if not active:
+            return
+        rate_limits = self._config.get("rate_limits", {})
+        max_per_hour = rate_limits.get("max_alerts_per_hour", 20)
+        now = datetime.now(timezone.utc)
+        hour_ago = now - timedelta(hours=1)
+        recent = sum(1 for t in self._alerts_this_hour if t > hour_ago)
+        if recent >= max_per_hour:
+            logger.warning(f"Alert rate limit reached ({max_per_hour}/hour), dropping delivery for {alert_type}")
+            return
+        try:
+            self._queue.put_nowait({
+                "alert_id": active.get("alert_id"),
+                "alert_type": alert_type,
+                "severity": severity,
+                "context": context,
+                "dedupe_key": dedupe_key,
+                "first_seen_utc": active.get("first_seen_utc", now.isoformat()),
+                "last_seen_utc": now.isoformat(),
+            })
+        except asyncio.QueueFull:
+            logger.warning("Notification queue full, dropping delivery enqueue")
 
     def resolve_alert(self, dedupe_key: str) -> None:
         """Mark alert as resolved. Removes from active set, appends resolution record."""

@@ -125,13 +125,18 @@ public interface IExecutionAdapter
         DateTimeOffset utcNow);
     
     /// <summary>
-    /// Emergency flatten by instrument when IEA is blocked. Bypasses IEA queue — calls broker directly.
-    /// Used when EnqueueAndWait times out to prevent leaving position unprotected.
+    /// Emergency flatten by instrument when IEA is blocked. Prefer <see cref="TryEnqueueEmergencyFlattenProtective"/> from timer/worker threads (SIM).
     /// </summary>
     /// <param name="instrument">Execution instrument key (e.g. MYM, MNQ)</param>
     /// <param name="utcNow">Current UTC timestamp</param>
     /// <returns>Flatten result</returns>
     FlattenResult FlattenEmergency(string instrument, DateTimeOffset utcNow);
+
+    /// <summary>
+    /// Thread-safe: enqueue EMERGENCY <c>NtFlattenInstrumentCommand</c> for strategy-thread drain (SIM).
+    /// Returns false when not supported (e.g. LIVE stub).
+    /// </summary>
+    bool TryEnqueueEmergencyFlattenProtective(string instrument, DateTimeOffset utcNow);
 
     /// <summary>
     /// Get account snapshot (positions and working orders) for recovery reconciliation.
@@ -217,10 +222,9 @@ public interface IExecutionAdapter
     void PrepareOrderRegistryForMismatchAssembly(string instrument, AccountSnapshot snap, DateTimeOffset utcNow);
 
     /// <summary>
-    /// Session-close immediate flatten: enqueue cancel+flatten NtActions and drain in same cycle.
-    /// Guarantees same-cycle execution before session close. Use for forced flatten when next-bar delay is unacceptable.
-    /// Returns null if not supported (caller should use EmergencyFlatten fallback).
-    /// MUST be called from strategy thread.
+    /// Session-close flatten: enqueue cancel+flatten NtActions (no drain). Strategy thread drains the queue.
+    /// Caller must confirm broker flat (or time out) before persisting session-close journal state.
+    /// Returns null if not supported (caller should use Flatten fallback + broker wait).
     /// </summary>
     FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow);
 }

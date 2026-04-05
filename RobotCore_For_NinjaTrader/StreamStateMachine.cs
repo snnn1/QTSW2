@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.IO;
 using System.Globalization;
+using System.Threading;
 
 namespace QTSW2.Robot.Core;
 
@@ -248,6 +249,9 @@ public sealed class StreamStateMachine
     private bool _rangeIntentAssertEmitted = false; // RANGE_INTENT_ASSERT emitted
     private bool _firstBarAcceptedAssertEmitted = false; // RANGE_FIRST_BAR_ACCEPTED emitted
     private bool _rangeLockAssertEmitted = false; // RANGE_LOCK_ASSERT emitted
+
+    /// <summary>Once per (trading_date|stream|reason) SESSION_REENTRY_BLOCKED engine events (avoids tick spam).</summary>
+    private readonly HashSet<string> _sessionReentryBlockedLogKeys = new(StringComparer.Ordinal);
 
     private decimal? _lastCloseBeforeLock;
 
@@ -6808,6 +6812,127 @@ public sealed class StreamStateMachine
         
         return false;
     }
+
+    private static bool IsFlattenRequestAcceptedPendingBroker(FlattenResult? r)
+    {
+        if (r == null) return false;
+        if (r.Success) return true;
+        var msg = r.ErrorMessage ?? "";
+        return msg.IndexOf("Enqueued", StringComparison.OrdinalIgnoreCase) >= 0
+               || string.Equals(msg, "SESSION_CLOSE_FLATTEN_ENQUEUED", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool TryWaitBrokerFlatForExecutionInstrument(string executionInstrument, DateTimeOffset deadlineUtc, out int remainingSignedQty)
+    {
+        remainingSignedQty = 0;
+        while (DateTimeOffset.UtcNow <= deadlineUtc)
+        {
+            try
+            {
+                var snap = _executionAdapter?.GetAccountSnapshot(DateTimeOffset.UtcNow);
+                remainingSignedQty = snap?.Positions?
+                                         .Where(p => string.Equals(p.Instrument, executionInstrument, StringComparison.OrdinalIgnoreCase))
+                                         .Sum(p => p.Quantity)
+                                     ?? 0;
+                if (remainingSignedQty == 0)
+                    return true;
+            }
+            catch
+            {
+                /* poll until deadline */
+            }
+
+            Thread.Sleep(100);
+        }
+
+        try
+        {
+            var snap = _executionAdapter?.GetAccountSnapshot(DateTimeOffset.UtcNow);
+            remainingSignedQty = snap?.Positions?
+                                     .Where(p => string.Equals(p.Instrument, executionInstrument, StringComparison.OrdinalIgnoreCase))
+                                     .Sum(p => p.Quantity)
+                                 ?? 0;
+        }
+        catch
+        {
+            remainingSignedQty = int.MaxValue;
+        }
+
+        return remainingSignedQty == 0;
+    }
+
+    /// <summary>
+    /// Session-close forced flatten failure as ENGINE event (robot_ENGINE.jsonl / watchdog feed).
+    /// Supplements LogHealth; always includes session_close_forced_flatten for aggregator scoping.
+    /// </summary>
+    private void LogSessionCloseForcedFlattenFailed(DateTimeOffset utcNow, string failurePhase, string message, Dictionary<string, object?>? extra = null)
+    {
+        var payload = new Dictionary<string, object?>
+        {
+            ["trading_date"] = TradingDate,
+            ["session_class"] = Session,
+            ["stream"] = Stream,
+            ["instrument"] = ExecutionInstrument,
+            ["session_close_forced_flatten"] = true,
+            ["failure_phase"] = failurePhase,
+            ["message"] = message
+        };
+        if (extra != null)
+        {
+            foreach (var kv in extra)
+                payload[kv.Key] = kv.Value;
+        }
+        _engine?.LogEngineEvent(utcNow, "FORCED_FLATTEN_FAILED", payload);
+    }
+
+    private void LogSessionReentryBlocked(DateTimeOffset utcNow, string reasonCode, string detail)
+    {
+        var dedupeKey = $"{TradingDate}|{Stream}|{reasonCode}";
+        if (!_sessionReentryBlockedLogKeys.Add(dedupeKey))
+            return;
+        _engine?.LogEngineEvent(utcNow, "SESSION_REENTRY_BLOCKED", new Dictionary<string, object?>
+        {
+            ["trading_date"] = TradingDate,
+            ["session_class"] = Session,
+            ["instrument"] = ExecutionInstrument ?? Instrument ?? "",
+            ["stream"] = Stream,
+            ["reason"] = reasonCode,
+            ["detail"] = detail
+        });
+    }
+
+    /// <summary>
+    /// Post–broker-confirm exposure check: ENGINE jsonl + watchdog (supplements LogHealth).
+    /// </summary>
+    private void LogSessionCloseExposureRemainingEngine(DateTimeOffset utcNow, int signedQuantity)
+    {
+        _engine?.LogEngineEvent(utcNow, "FORCED_FLATTEN_EXPOSURE_REMAINING", new Dictionary<string, object?>
+        {
+            ["trading_date"] = TradingDate,
+            ["session_class"] = Session,
+            ["stream"] = Stream,
+            ["instrument"] = ExecutionInstrument,
+            ["original_intent_id"] = _journal.OriginalIntentId ?? "",
+            ["session_close_forced_flatten"] = true,
+            ["quantity"] = signedQuantity,
+            ["note"] = "Account snapshot still shows position after FLATTEN_BROKER_FLAT_CONFIRMED path"
+        });
+    }
+
+    private void LogSessionCloseManualFlattenRequiredEngine(DateTimeOffset utcNow, int signedQuantity)
+    {
+        _engine?.LogEngineEvent(utcNow, "MANUAL_FLATTEN_REQUIRED", new Dictionary<string, object?>
+        {
+            ["trading_date"] = TradingDate,
+            ["session_class"] = Session,
+            ["stream"] = Stream,
+            ["instrument"] = ExecutionInstrument,
+            ["original_intent_id"] = _journal.OriginalIntentId ?? "",
+            ["session_close_forced_flatten"] = true,
+            ["quantity"] = signedQuantity,
+            ["note"] = "Operator must manually flatten; automated session-close flatten did not clear exposure"
+        });
+    }
     
     /// <summary>
     /// Handle forced flatten at market close (true pre-close flatten + market-open reentry).
@@ -6890,33 +7015,102 @@ public sealed class StreamStateMachine
         {
             LogHealth("CRITICAL", "FORCED_FLATTEN_FAILED", $"Cannot flatten: OriginalIntentId not found for stream {Stream}",
                 new { stream = Stream, trading_date = TradingDate });
+            LogSessionCloseForcedFlattenFailed(utcNow, "NO_ORIGINAL_INTENT",
+                $"Cannot flatten: OriginalIntentId not found for stream {Stream}",
+                new Dictionary<string, object?> { ["stream"] = Stream });
+            _engine?.OnForcedFlattenFailed(ExecutionInstrument, "FORCED_FLATTEN_NO_ORIGINAL_INTENT", utcNow);
             return;
         }
         
-        // Phase 1: Flatten position immediately (retry on failure)
-        const int MAX_FLATTEN_RETRIES = 3;
-        FlattenResult? flattenResult = null;
-        for (var attempt = 1; attempt <= MAX_FLATTEN_RETRIES && _executionAdapter != null; attempt++)
+        // Phase 1: Request flatten (session-close queue when supported), then wait for broker flat — do not advance state on enqueue alone.
+        const int SESSION_FORCED_FLATTEN_BROKER_WAIT_SECONDS = 90;
+        if (_executionAdapter == null)
         {
-            flattenResult = _executionAdapter.Flatten(_journal.OriginalIntentId, ExecutionInstrument, utcNow);
-            if (flattenResult.Success)
-                break;
-            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                "FORCED_FLATTEN_RETRY", State.ToString(),
-                new { attempt, max_retries = MAX_FLATTEN_RETRIES, error = flattenResult.ErrorMessage }));
-        }
-        
-        if (flattenResult == null || !flattenResult.Success)
-        {
-            LogHealth("CRITICAL", "FORCED_FLATTEN_FAILED", $"Flatten failed after {MAX_FLATTEN_RETRIES} attempts: {flattenResult?.ErrorMessage ?? "Unknown"}",
+            LogHealth("CRITICAL", "FORCED_FLATTEN_FAILED", "No execution adapter for forced flatten",
                 new { original_intent_id = _journal.OriginalIntentId, instrument = ExecutionInstrument });
+            LogSessionCloseForcedFlattenFailed(utcNow, "NO_ADAPTER", "No execution adapter for forced flatten",
+                new Dictionary<string, object?>
+                {
+                    ["original_intent_id"] = _journal.OriginalIntentId ?? ""
+                });
             _engine?.OnForcedFlattenFailed(ExecutionInstrument, "FORCED_FLATTEN_FAILED", utcNow);
             return;
         }
-        
+
+        FlattenResult? sessionCloseRequest = null;
+        if (_executionAdapter is NinjaTraderSimAdapter simSession)
+            sessionCloseRequest = simSession.RequestSessionCloseFlattenImmediate(_journal.OriginalIntentId, ExecutionInstrument, utcNow);
+
+        if (sessionCloseRequest == null)
+        {
+            var legacyFlatten = _executionAdapter.Flatten(_journal.OriginalIntentId, ExecutionInstrument, utcNow);
+            if (!IsFlattenRequestAcceptedPendingBroker(legacyFlatten))
+            {
+                LogHealth("CRITICAL", "FORCED_FLATTEN_FAILED", $"Flatten request rejected: {legacyFlatten?.ErrorMessage ?? "Unknown"}",
+                    new { original_intent_id = _journal.OriginalIntentId, instrument = ExecutionInstrument });
+                LogSessionCloseForcedFlattenFailed(utcNow, "DELEGATE_REJECTED",
+                    $"Flatten request rejected: {legacyFlatten?.ErrorMessage ?? "Unknown"}",
+                    new Dictionary<string, object?>
+                    {
+                        ["original_intent_id"] = _journal.OriginalIntentId ?? "",
+                        ["error_message"] = legacyFlatten?.ErrorMessage ?? ""
+                    });
+                _engine?.OnForcedFlattenFailed(ExecutionInstrument, "FORCED_FLATTEN_FAILED", utcNow);
+                return;
+            }
+        }
+
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "FORCED_FLATTEN_REQUEST_SUBMITTED", State.ToString(),
+            new { original_intent_id = _journal.OriginalIntentId, path = sessionCloseRequest != null ? "session_close_enqueue" : "flatten_delegate" }));
+
+        _engine?.LogEngineEvent(utcNow, "FORCED_FLATTEN_REQUEST_SUBMITTED", new Dictionary<string, object?>
+        {
+            ["trading_date"] = TradingDate,
+            ["session_class"] = Session,
+            ["stream"] = Stream,
+            ["instrument"] = ExecutionInstrument,
+            ["original_intent_id"] = _journal.OriginalIntentId ?? "",
+            ["path"] = sessionCloseRequest != null ? "session_close_enqueue" : "flatten_delegate",
+            ["session_close_forced_flatten"] = true
+        });
+
+        var deadlineUtc = DateTimeOffset.UtcNow.AddSeconds(SESSION_FORCED_FLATTEN_BROKER_WAIT_SECONDS);
+        var brokerFlat = TryWaitBrokerFlatForExecutionInstrument(ExecutionInstrument, deadlineUtc, out var remainingQty);
+        if (!brokerFlat)
+        {
+            LogHealth("CRITICAL", "FORCED_FLATTEN_FAILED",
+                $"Broker flat not confirmed within {SESSION_FORCED_FLATTEN_BROKER_WAIT_SECONDS}s (remaining qty={remainingQty})",
+                new { original_intent_id = _journal.OriginalIntentId, instrument = ExecutionInstrument, remaining_qty = remainingQty });
+            _engine?.LogEngineEvent(DateTimeOffset.UtcNow, "FORCED_FLATTEN_BROKER_TIMEOUT", new Dictionary<string, object?>
+            {
+                ["trading_date"] = TradingDate,
+                ["session_class"] = Session,
+                ["stream"] = Stream,
+                ["instrument"] = ExecutionInstrument,
+                ["original_intent_id"] = _journal.OriginalIntentId ?? "",
+                ["remaining_qty"] = remainingQty,
+                ["wait_seconds"] = SESSION_FORCED_FLATTEN_BROKER_WAIT_SECONDS,
+                ["session_close_forced_flatten"] = true
+            });
+            _engine?.OnForcedFlattenFailed(ExecutionInstrument, "FORCED_FLATTEN_BROKER_TIMEOUT", utcNow);
+            return;
+        }
+
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
             "FORCED_FLATTEN_POSITION_CLOSED", State.ToString(),
-            new { original_intent_id = _journal.OriginalIntentId, note = "Position closed before market close" }));
+            new { original_intent_id = _journal.OriginalIntentId, note = "Broker flat confirmed before market close" }));
+
+        _engine?.LogEngineEvent(utcNow, "FLATTEN_BROKER_FLAT_CONFIRMED", new Dictionary<string, object?>
+        {
+            ["trading_date"] = TradingDate,
+            ["session_class"] = Session,
+            ["stream"] = Stream,
+            ["instrument"] = ExecutionInstrument,
+            ["original_intent_id"] = _journal.OriginalIntentId ?? "",
+            ["note"] = "Session forced flatten — broker flat confirmed before market close",
+            ["session_close_forced_flatten"] = true
+        });
         
         // Phase 2: Cancel protective orders (stop and target)
         var ordersCancelled = false;
@@ -6955,9 +7149,11 @@ public sealed class StreamStateMachine
                 LogHealth("CRITICAL", "FORCED_FLATTEN_EXPOSURE_REMAINING",
                     $"Position still open after flatten: {ExecutionInstrument} qty={posQty}",
                     new { instrument = ExecutionInstrument, quantity = posQty, original_intent_id = _journal.OriginalIntentId });
+                LogSessionCloseExposureRemainingEngine(utcNow, posQty);
                 LogHealth("CRITICAL", "MANUAL_FLATTEN_REQUIRED",
                     $"Operator must manually flatten {ExecutionInstrument} — automated flatten did not close position",
                     new { instrument = ExecutionInstrument, quantity = posQty });
+                LogSessionCloseManualFlattenRequiredEngine(utcNow, posQty);
                 _engine?.OnForcedFlattenFailed(ExecutionInstrument, "FORCED_FLATTEN_EXPOSURE_REMAINING", utcNow);
             }
         }
@@ -7128,9 +7324,17 @@ public sealed class StreamStateMachine
         if (!string.IsNullOrEmpty(execInst))
         {
             if (_isInstrumentBlockedForReentry?.Invoke(execInst) == true)
-                return; // Instrument blocked for reentry (frozen, supervisor block, etc.)
+            {
+                LogSessionReentryBlocked(utcNow, "INSTRUMENT_BLOCKED",
+                    "Instrument blocked or frozen for reentry (reconciliation / flatten latch)");
+                return;
+            }
             if (_isIeaQueueHealthyForInstrument?.Invoke(execInst) == false)
-                return; // IEA queue poison / unhealthy - skip reentry
+            {
+                LogSessionReentryBlocked(utcNow, "IEA_QUEUE_UNHEALTHY",
+                    "IE execution adapter queue unhealthy or poison — reentry not allowed");
+                return;
+            }
         }
         
         // Load bracket levels from ExecutionJournalEntry via OriginalIntentId (canonical source)
@@ -7199,6 +7403,8 @@ public sealed class StreamStateMachine
                     });
             }
             Commit(utcNow, "REENTRY_FAILED_CANNOT_LOAD_ORIGINAL_ENTRY", "REENTRY_FAILED");
+            LogSessionReentryBlocked(utcNow, "CANNOT_LOAD_ORIGINAL_ENTRY",
+                $"Cannot load original ExecutionJournalEntry for intent {_journal.OriginalIntentId}");
             LogHealth("CRITICAL", "REENTRY_FAILED", $"Re-entry failed: Cannot load original ExecutionJournalEntry for intent {_journal.OriginalIntentId}",
                 new { original_intent_id = _journal.OriginalIntentId });
             return;
@@ -7235,15 +7441,27 @@ public sealed class StreamStateMachine
                     });
             }
             Commit(utcNow, "REENTRY_FAILED_INVALID_QUANTITY", "REENTRY_FAILED");
+            LogSessionReentryBlocked(utcNow, "INVALID_QUANTITY", $"Re-entry failed: invalid quantity {quantity}");
             LogHealth("CRITICAL", "REENTRY_FAILED", $"Re-entry failed: Invalid quantity {quantity}",
                 new { original_intent_id = _journal.OriginalIntentId, quantity });
             return;
         }
+
+        _engine?.LogEngineEvent(utcNow, "SESSION_REENTRY_ATTEMPT", new Dictionary<string, object?>
+        {
+            ["trading_date"] = TradingDate,
+            ["session_class"] = Session,
+            ["instrument"] = ExecutionInstrument ?? Instrument ?? "",
+            ["stream"] = Stream,
+            ["original_intent_id"] = _journal.OriginalIntentId ?? "",
+            ["reentry_intent_id"] = _journal.ReentryIntentId ?? "",
+            ["reason"] = "MARKET_OPEN_GATES_PASSED"
+        });
         
         // Mark re-entry as submitted (idempotency)
         _journal.ReentrySubmitted = true;
         _journals.Save(_journal);
-        
+
         // Enqueue SubmitMarketReentryCommand through IEA for actual order placement
         var cmd = new SubmitMarketReentryCommand
         {
@@ -7262,6 +7480,18 @@ public sealed class StreamStateMachine
             CallerContext = "CheckMarketOpenReentry"
         };
         _executionAdapter.EnqueueExecutionCommand(cmd);
+
+        _engine?.LogEngineEvent(utcNow, "SESSION_REENTRY_EXECUTED", new Dictionary<string, object?>
+        {
+            ["trading_date"] = TradingDate,
+            ["session_class"] = Session,
+            ["instrument"] = ExecutionInstrument ?? Instrument ?? "",
+            ["stream"] = Stream,
+            ["original_intent_id"] = _journal.OriginalIntentId ?? "",
+            ["reentry_intent_id"] = _journal.ReentryIntentId ?? "",
+            ["command_id"] = cmd.CommandId,
+            ["reason"] = "REENTRY_COMMAND_ENQUEUED"
+        });
         
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
             "REENTRY_SUBMITTED", State.ToString(),

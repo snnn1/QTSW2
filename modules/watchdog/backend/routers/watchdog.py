@@ -72,6 +72,21 @@ async def debug_watchdog():
     }
 
 
+@router.get("/session-flatten-state")
+async def get_session_flatten_state():
+    """
+    Aggregated session close + forced-flatten lifecycle (engine events only).
+    """
+    try:
+        aggregator = get_aggregator()
+        return aggregator.get_session_flatten_state()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting session-flatten-state: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/status")
 async def get_watchdog_status():
     """Get current WatchdogStatus (pre-computed by backend)."""

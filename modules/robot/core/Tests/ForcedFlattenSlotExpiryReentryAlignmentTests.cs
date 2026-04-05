@@ -176,4 +176,5 @@ internal sealed class CapturingExecutionAdapter : IExecutionAdapter
     public void CancelOrders(IEnumerable<string> orderIds, DateTimeOffset utcNow) { }
     public FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow)
         => FlattenResult.SuccessResult(utcNow);
+    public bool TryEnqueueEmergencyFlattenProtective(string instrument, DateTimeOffset utcNow) => true;
 }

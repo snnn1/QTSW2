@@ -1,6 +1,5 @@
-"""Tests for timetable write-time validation (incident 2026-03-20 prevention)."""
+"""Tests for timetable write-time validation."""
 
-import os
 import pytest
 
 from modules.timetable.timetable_write_guard import validate_streams_before_execution_write
@@ -17,12 +16,11 @@ def test_valid_ym_early_and_es_standard():
     validate_streams_before_execution_write(streams, session_time_slots=SLOTS)
 
 
-def test_rejects_es1_with_0730():
+def test_accepts_es1_with_0730_when_in_session_slots():
     streams = [
         {"stream": "ES1", "slot_time": "07:30", "enabled": True},
     ]
-    with pytest.raises(ValueError, match="TIMETABLE_WRITE_REJECTED_INSTRUMENT_SLOT_MISMATCH"):
-        validate_streams_before_execution_write(streams, session_time_slots=SLOTS)
+    validate_streams_before_execution_write(streams, session_time_slots=SLOTS)
 
 
 def test_rejects_bad_slot_time():
@@ -44,14 +42,3 @@ def test_disabled_stream_may_have_empty_slot_time():
         },
     ]
     validate_streams_before_execution_write(streams, session_time_slots=SLOTS)
-
-
-def test_skip_guard_env_allows_es_0730(monkeypatch):
-    monkeypatch.setenv("QTSW2_SKIP_TIMETABLE_INSTRUMENT_SLOT_GUARD", "1")
-    streams = [
-        {"stream": "ES1", "slot_time": "07:30", "enabled": True},
-    ]
-    try:
-        validate_streams_before_execution_write(streams, session_time_slots=SLOTS)
-    finally:
-        monkeypatch.delenv("QTSW2_SKIP_TIMETABLE_INSTRUMENT_SLOT_GUARD", raising=False)

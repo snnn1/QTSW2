@@ -137,6 +137,13 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
             new { instrument, note = "DRYRUN mode - emergency flatten not executed" }));
         return FlattenResult.SuccessResult(utcNow);
     }
+
+    public bool TryEnqueueEmergencyFlattenProtective(string instrument, DateTimeOffset utcNow)
+    {
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_EMERGENCY_ENQUEUE_DRYRUN", state: "ENGINE",
+            new { instrument, note = "DRYRUN — simulated protective emergency enqueue" }));
+        return true;
+    }
     
     public AccountSnapshot GetAccountSnapshot(DateTimeOffset utcNow)
     {

@@ -126,7 +126,10 @@ namespace NinjaTrader.NinjaScript.Strategies
         private const double BE_TICK_STALE_WARNING_SECONDS = 5;
         private const double BE_TICK_STALE_FAIL_CLOSED_SECONDS = 12;
         
-        // Lightweight heartbeat: BIP 0 only, every N bars. Decoupled from trade state; no secondary series.
+        /// <summary>Added series index for 1-second bars — drains NT action queue without relying on primary chart liquidity/ticks.</summary>
+        private const int VERIFY_SECONDARY_BARS_IN_PROGRESS = 1;
+
+        // Lightweight heartbeat: primary series (BIP 0), every N bars.
         private const int HEARTBEAT_BARS_INTERVAL = 1; // Every bar = ~1 min on 1-min chart; 30–60s is fine for liveness.
         
         // Per-bar profiling: log when sections exceed threshold (chart lag diagnosis)
@@ -218,7 +221,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (State == State.Configure)
             {
                 TraceLifecycle("Configure_ENTER", Instrument?.MasterInstrument?.Name, "Configure", _instanceId);
-                // BE detection moved to OnMarketData (tick-level) — no secondary series needed
+                AddDataSeries(BarsPeriodType.Second, 1);
                 TraceLifecycle("Configure_EXIT", Instrument?.MasterInstrument?.Name, "Configure", _instanceId);
             }
             else if (State == State.DataLoaded)
@@ -1321,6 +1324,30 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 // Dormant: init failed or engine not ready — skip all work immediately (Tier 2.1)
                 if (_initFailed || !_engineReady || _engine is null) return;
+
+                // 1-second series: deterministic NT queue drain when primary bar path stalls (low liquidity / no ticks).
+                if (BarsInProgress == VERIFY_SECONDARY_BARS_IN_PROGRESS)
+                {
+                    if ((State == State.Realtime || State == State.Transition) && _adapter is IIEAOrderExecutor ieaVerifySeries)
+                    {
+                        ieaVerifySeries.EnterStrategyThreadContext();
+                        try
+                        {
+                            var lockObjVerify = ieaVerifySeries.GetEntrySubmissionLock();
+                            if (lockObjVerify != null)
+                            {
+                                lock (lockObjVerify)
+                                    ieaVerifySeries.DrainNtActions();
+                            }
+                            _adapter.ProcessPendingUnresolvedExecutions();
+                        }
+                        finally
+                        {
+                            ieaVerifySeries.ExitStrategyThreadContext();
+                        }
+                    }
+                    return;
+                }
 
                 // Strict phase control: skip only when State.Historical AND config disabled. Do NOT use !isRealtime — Transition exists between Historical and Realtime.
                 var skipHistoricalDiagEarly = State == State.Historical && _engine != null && !IsDiagnosticLoggingDuringHistoricalEnabled(_engine);

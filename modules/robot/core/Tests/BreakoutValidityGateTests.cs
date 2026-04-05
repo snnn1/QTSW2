@@ -52,6 +52,8 @@ public static class BreakoutValidityGateTests
             => _base.EnqueueExecutionCommand(command);
         public FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow)
             => _base.RequestSessionCloseFlattenImmediate(intentId, instrument, utcNow);
+        public bool TryEnqueueEmergencyFlattenProtective(string instrument, DateTimeOffset utcNow)
+            => _base.TryEnqueueEmergencyFlattenProtective(instrument, utcNow);
     }
 
     public static (bool Pass, string? Error) RunBreakoutValidityGateTests()

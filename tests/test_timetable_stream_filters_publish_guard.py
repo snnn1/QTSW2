@@ -12,13 +12,14 @@ sys.path.insert(0, str(QTSW2_ROOT))
 
 from modules.timetable.timetable_engine import TimetableEngine
 from tests.stream_filters_fixtures import install_min_stream_filters
+from tests.timetable_matrix_test_utils import matrix_time_valid_for_execution
 
 
 def _minimal_matrix_df(eng: TimetableEngine, trade_ts: pd.Timestamp) -> pd.DataFrame:
     rows = []
     for sid in eng.streams:
         sess = "S1" if sid.endswith("1") else "S2"
-        slot0 = eng.session_time_slots[sess][0]
+        slot0 = matrix_time_valid_for_execution(eng, sid)
         rows.append(
             {
                 "Stream": sid,

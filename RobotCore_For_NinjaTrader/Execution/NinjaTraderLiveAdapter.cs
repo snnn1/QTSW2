@@ -161,6 +161,8 @@ public sealed partial class NinjaTraderLiveAdapter : IExecutionAdapter
     {
         return FlattenEmergencyReal(instrument, utcNow);
     }
+
+    public bool TryEnqueueEmergencyFlattenProtective(string instrument, DateTimeOffset utcNow) => false;
     
     public AccountSnapshot GetAccountSnapshot(DateTimeOffset utcNow)
     {

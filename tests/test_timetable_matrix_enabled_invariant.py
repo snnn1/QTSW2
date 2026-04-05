@@ -13,6 +13,7 @@ sys.path.insert(0, str(QTSW2_ROOT))
 from modules.matrix.config import SCF_THRESHOLD
 from modules.timetable.timetable_engine import TimetableEngine
 from tests.stream_filters_fixtures import install_min_stream_filters
+from tests.timetable_matrix_test_utils import matrix_time_valid_for_execution
 
 
 def _truthy_final_allowed(v) -> bool:
@@ -33,7 +34,7 @@ def test_timetable_execution_streams_matrix_final_allowed_full_write(tmp_path, m
     rows = []
     for i, sid in enumerate(eng.streams):
         sess = "S1" if sid.endswith("1") else "S2"
-        slot0 = eng.session_time_slots[sess][0]
+        slot0 = matrix_time_valid_for_execution(eng, sid)
         fa = i % 3 != 0
         rows.append(
             {
@@ -75,7 +76,7 @@ def test_build_streams_execution_mode_respects_final_allowed_per_row():
     rows = []
     for sid in eng.streams[:4]:
         sess = "S1" if sid.endswith("1") else "S2"
-        slot0 = eng.session_time_slots[sess][0]
+        slot0 = matrix_time_valid_for_execution(eng, sid)
         fa = sid.endswith("1")
         rows.append(
             {
@@ -116,7 +117,7 @@ def test_execution_mode_calendar_blocked_uses_session_trading_date_dow():
     rows = []
     for sid in eng.streams:
         sess = "S1" if sid.endswith("1") else "S2"
-        slot0 = eng.session_time_slots[sess][0]
+        slot0 = matrix_time_valid_for_execution(eng, sid)
         rows.append(
             {
                 "Stream": sid,
@@ -151,7 +152,7 @@ def test_execution_mode_final_allowed_from_max_trade_date_per_stream():
     rows = []
     for sid in eng.streams:
         sess = "S1" if sid.endswith("1") else "S2"
-        slot0 = eng.session_time_slots[sess][0]
+        slot0 = matrix_time_valid_for_execution(eng, sid)
         rows.append(
             {
                 "Stream": sid,
@@ -190,7 +191,7 @@ def test_execution_mode_friday_row_dow_only_does_not_veto_monday_session():
     rows = []
     for sid in eng.streams:
         sess = "S1" if sid.endswith("1") else "S2"
-        slot0 = eng.session_time_slots[sess][0]
+        slot0 = matrix_time_valid_for_execution(eng, sid)
         rows.append(
             {
                 "Stream": sid,
@@ -219,7 +220,7 @@ def test_execution_mode_friday_row_dom_only_does_not_veto_monday_session_dom():
     rows = []
     for sid in eng.streams:
         sess = "S1" if sid.endswith("1") else "S2"
-        slot0 = eng.session_time_slots[sess][0]
+        slot0 = matrix_time_valid_for_execution(eng, sid)
         rows.append(
             {
                 "Stream": sid,
@@ -247,7 +248,7 @@ def test_execution_mode_scf_matrix_block_still_blocks_on_future_session_day():
     rows = []
     for sid in eng.streams:
         sess = "S1" if sid.endswith("1") else "S2"
-        slot0 = eng.session_time_slots[sess][0]
+        slot0 = matrix_time_valid_for_execution(eng, sid)
         rows.append(
             {
                 "Stream": sid,
@@ -283,7 +284,7 @@ def test_execution_mode_non_calendar_matrix_block_precedes_monday_calendar_messa
     rows = []
     for sid in eng.streams:
         sess = "S1" if sid.endswith("1") else "S2"
-        slot0 = eng.session_time_slots[sess][0]
+        slot0 = matrix_time_valid_for_execution(eng, sid)
         rows.append(
             {
                 "Stream": sid,

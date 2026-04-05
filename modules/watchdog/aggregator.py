@@ -23,6 +23,7 @@ import pytz
 
 from .event_feed import EventFeedGenerator
 from .event_processor import EventProcessor
+from .aggregator.session_flatten_state import SessionFlattenStateTracker
 from .state_manager import WatchdogStateManager, CursorManager, _is_trading_date_within_max_age
 from .timetable_poller import TimetablePoller, compute_timetable_trading_date
 from .market_calendar import get_market_state
@@ -484,7 +485,8 @@ class WatchdogAggregator:
     def __init__(self):
         self._event_feed = EventFeedGenerator()
         self._state_manager = WatchdogStateManager()
-        self._event_processor = EventProcessor(self._state_manager)
+        self._session_flatten_tracker = SessionFlattenStateTracker()
+        self._event_processor = EventProcessor(self._state_manager, self._session_flatten_tracker)
         self._cursor_manager = CursorManager()
         self._timetable_poller = TimetablePoller()
         self._running = False
@@ -1153,6 +1155,12 @@ class WatchdogAggregator:
                 
                 # Phase 1: Check alert conditions (heartbeat, connection)
                 self._check_alert_conditions()
+
+                # Session / flatten visibility alerts (engine-sourced state only)
+                try:
+                    self._tick_session_flatten_alerts(utc_now)
+                except Exception as e:
+                    logger.debug(f"Session flatten alert tick failed: {e}")
 
                 # Sleep before next iteration
                 await asyncio.sleep(1)  # Process every second
@@ -2454,6 +2462,65 @@ class WatchdogAggregator:
         from .state.operator_snapshot import build_operator_snapshot
         events = self.get_events_for_slot_lifecycle(n_events)
         return build_operator_snapshot(events, self._state_manager)
+
+    def get_session_flatten_state(self) -> List[Dict[str, Any]]:
+        """Session close + flatten lifecycle rows from engine events only (see SessionFlattenStateTracker)."""
+        if getattr(self, "_session_flatten_tracker", None) is None:
+            return []
+        return self._session_flatten_tracker.list_rows_sorted(datetime.now(timezone.utc))
+
+    def _session_flatten_ledger_singleton(self):
+        """Shared ledger when NotificationService is unavailable (audit file still updated)."""
+        led = getattr(self, "_session_flatten_fallback_ledger", None)
+        if led is None:
+            from .alert_ledger import AlertLedger
+
+            self._session_flatten_fallback_ledger = AlertLedger()
+            led = self._session_flatten_fallback_ledger
+        return led
+
+    def _tick_session_flatten_alerts(self, now_utc: datetime) -> None:
+        tracker = getattr(self, "_session_flatten_tracker", None)
+        if tracker is None:
+            return
+        if self._watchdog_started_utc and (now_utc - self._watchdog_started_utc).total_seconds() < ALERT_STARTUP_GRACE_SECONDS:
+            return
+
+        ns = self._notification_service
+
+        def resolve_alert(dk: str) -> None:
+            if ns:
+                ns.resolve_alert(dk)
+            else:
+                self._session_flatten_ledger_singleton().resolve_alert(dk)
+
+        def append_ledger_alert(alert_type: str, severity: str, context: Dict[str, Any], dedupe_key: str) -> bool:
+            if ns:
+                return ns.append_ledger_alert_always(alert_type, severity, context, dedupe_key)
+            ledger = self._session_flatten_ledger_singleton()
+            if ledger.is_alert_active(dedupe_key):
+                return False
+            from .alert_ledger import generate_alert_id
+
+            ledger.append_alert(generate_alert_id(), alert_type, severity, context, dedupe_key)
+            return True
+
+        def enqueue_delivery(alert_type: str, severity: str, context: Dict[str, Any], dedupe_key: str) -> None:
+            if ns:
+                ns.enqueue_ledger_alert_delivery(alert_type, severity, context, dedupe_key)
+
+        def is_alert_active(dk: str) -> bool:
+            if ns:
+                return ns.is_alert_active(dk)
+            return self._session_flatten_ledger_singleton().is_alert_active(dk)
+
+        tracker.tick_alerts(
+            now_utc,
+            resolve_alert=resolve_alert,
+            append_ledger_alert=append_ledger_alert,
+            enqueue_delivery=enqueue_delivery,
+            is_alert_active=is_alert_active,
+        )
 
     def get_watchdog_status(self) -> Dict:
         """Get current watchdog status.

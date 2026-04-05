@@ -13,15 +13,16 @@ QTSW2_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(QTSW2_ROOT))
 
 from modules.timetable.cme_session import get_cme_trading_date, get_trading_date_cme
+from modules.timetable.eligibility_writer import write_eligibility_file
+from modules.timetable.eligibility_session_policy import EligibilityOverwriteBlockedAfterSessionStart
 from modules.timetable.timetable_engine import (
     TimetableEngine,
     TimetableWriteBlockedCmeMismatch,
     TimetableLivePublishBlocked,
     _parse_slot_time,
 )
-from modules.timetable.eligibility_writer import write_eligibility_file
-from modules.timetable.eligibility_session_policy import EligibilityOverwriteBlockedAfterSessionStart
 from tests.stream_filters_fixtures import install_min_stream_filters
+from tests.timetable_matrix_test_utils import matrix_time_valid_for_execution
 
 
 def test_1730_ct_same_trading_date():
@@ -225,7 +226,7 @@ def test_eligibility_overwrite_allowed_before_session_when_forced_window(tmp_pat
 
 
 def test_execution_mode_time_change_overrides_time_when_both_calendar_days_present(tmp_path):
-    """Previous-day row + current day in matrix: Time Change on previous row sets slot (execution_mode)."""
+    """Latest row wins: Time Change on newest row; older row does not set slot_time."""
     import pandas as pd
     from datetime import date as date_cls
 
@@ -255,7 +256,7 @@ def test_execution_mode_time_change_overrides_time_when_both_calendar_days_prese
         df, date_cls(2026, 3, 20), "2026-03-20", {}
     )
     by_stream = {s["stream"]: s for s in streams}
-    assert by_stream["RTY1"]["slot_time"] == "08:00"
+    assert by_stream["RTY1"]["slot_time"] == "09:00"
 
 
 def test_execution_mode_time_change_column_time_underscore_and_timestamp_rhs(tmp_path):
@@ -288,7 +289,7 @@ def test_execution_mode_time_change_column_time_underscore_and_timestamp_rhs(tmp
         df, date_cls(2026, 3, 20), "2026-03-20", {}
     )
     by_stream = {s["stream"]: s for s in streams}
-    assert by_stream["RTY1"]["slot_time"] == "08:00"
+    assert by_stream["RTY1"]["slot_time"] == "09:00"
 
 
 def test_execution_mode_arrow_form_time_change(tmp_path):
@@ -315,7 +316,7 @@ def test_execution_mode_arrow_form_time_change(tmp_path):
         df, date_cls(2026, 3, 20), "2026-03-20", {}
     )
     by_stream = {s["stream"]: s for s in streams}
-    assert by_stream["RTY1"]["slot_time"] == "09:00"
+    assert by_stream["RTY1"]["slot_time"] == "08:00"
 
 
 def test_execution_mode_time_change_when_only_previous_day_in_matrix(tmp_path):
@@ -355,7 +356,7 @@ def test_execution_mode_streams_sorted_by_slot_time_descending(tmp_path):
     rows = []
     for sid in eng.streams:
         sess = "S1" if sid.endswith("1") else "S2"
-        slot0 = eng.session_time_slots[sess][0]
+        slot0 = matrix_time_valid_for_execution(eng, sid)
         rows.append(
             {
                 "Stream": sid,
@@ -426,8 +427,8 @@ def test_execution_mode_ym_slot_unaffected_by_exclude_times(tmp_path):
     assert by_stream["YM1"]["slot_time"] == "08:00"
 
 
-def test_execution_mode_nq_matrix_early_time_remapped_for_write_guard(tmp_path):
-    """S1 07:30 in matrix for non-YM is remapped to the next instrument-allowed slot (08:00)."""
+def test_execution_mode_nq_matrix_early_time_accepted_from_matrix(tmp_path):
+    """S1 07:30 from the matrix is valid for any instrument when it is in session slots."""
     import pandas as pd
     from datetime import date as date_cls
 
@@ -449,7 +450,9 @@ def test_execution_mode_nq_matrix_early_time_remapped_for_write_guard(tmp_path):
         df, date_cls(2026, 3, 20), "2026-03-20", {}
     )
     by_stream = {s["stream"]: s for s in streams}
-    assert by_stream["NQ1"]["slot_time"] == "08:00"
+    assert by_stream["NQ1"]["enabled"] is True
+    assert by_stream["NQ1"].get("block_reason") is None
+    assert by_stream["NQ1"].get("slot_time") == "07:30"
 
 
 def test_execution_mode_matrix_time_unchanged_when_not_excluded_in_timetable(tmp_path):

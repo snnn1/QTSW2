@@ -12,6 +12,7 @@ sys.path.insert(0, str(QTSW2_ROOT))
 from modules.timetable.timetable_engine import TimetableEngine
 from modules.timetable.timetable_content_hash import compute_content_hash_from_document
 from tests.stream_filters_fixtures import install_min_stream_filters
+from tests.timetable_matrix_test_utils import matrix_time_valid_for_execution
 from modules.watchdog.timetable_poller import _compute_content_hash as poller_content_hash
 
 
@@ -58,7 +59,7 @@ def test_live_publish_final_allowed_false_disables_all_streams(tmp_path, monkeyp
     rows = []
     for sid in eng.streams:
         sess = "S1" if sid.endswith("1") else "S2"
-        slot0 = eng.session_time_slots[sess][0]
+        slot0 = matrix_time_valid_for_execution(eng, sid)
         rows.append(
             {
                 "Stream": sid,

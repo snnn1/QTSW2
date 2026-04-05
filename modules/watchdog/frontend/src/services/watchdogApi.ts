@@ -48,6 +48,39 @@ async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutM
 /**
  * Fetch watchdog status
  */
+export type SessionFlattenRow = {
+  trading_date: string
+  session_class: string
+  instrument: string
+  has_session: boolean | null
+  session_close_chicago: string
+  flatten_trigger_chicago: string
+  source: string
+  flatten_status: string
+}
+
+export async function fetchSessionFlattenState(): Promise<ApiResponse<SessionFlattenRow[]>> {
+  try {
+    const response = await fetchWithTimeout(`${API_BASE}/session-flatten-state`)
+    if (!response.ok) {
+      let errorDetail = response.statusText
+      try {
+        const errorData = await response.json()
+        if (errorData.detail) {
+          errorDetail = errorData.detail
+        }
+      } catch {
+        /* ignore */
+      }
+      return { data: null, error: `HTTP ${response.status}: ${errorDetail}` }
+    }
+    const data = await response.json()
+    return { data, error: null }
+  } catch (error) {
+    return { data: null, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+}
+
 export async function fetchWatchdogStatus(): Promise<ApiResponse<WatchdogStatus>> {
   try {
     const response = await fetchWithTimeout(`${API_BASE}/status`)

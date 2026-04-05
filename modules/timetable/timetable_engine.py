@@ -1,8 +1,9 @@
 """
 Timetable Engine - "What trades to take today"
 
-This module generates a timetable showing which trades should be taken today
-based on RS/time selection rules and filters.
+Builds execution timetables from the master matrix. Live robot arms only from
+``data/timetable/timetable_current.json``; ``eligibility_*`` writers and session
+policy helpers are legacy operations tooling, not execution authority.
 
 Author: Quantitative Trading System
 Date: 2025
@@ -24,8 +25,6 @@ import pytz
 try:
     from modules.matrix.config import (
         DOM_BLOCKED_DAYS,
-        S1_EARLY_OPEN_SLOT_TIME,
-        S1_INSTRUMENTS_ALLOWED_EARLY_OPEN_SLOT,
         SCF_THRESHOLD,
         SLOT_ENDS,
     )
@@ -34,8 +33,6 @@ except ImportError:
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
     from modules.matrix.config import (  # type: ignore
         DOM_BLOCKED_DAYS,
-        S1_EARLY_OPEN_SLOT_TIME,
-        S1_INSTRUMENTS_ALLOWED_EARLY_OPEN_SLOT,
         SCF_THRESHOLD,
         SLOT_ENDS,
     )
@@ -65,7 +62,8 @@ logger = logging.getLogger(__name__)
 def eligibility_trade_date_ymd_from_matrix_df(master_matrix_df: pd.DataFrame) -> Optional[str]:
     """
     Latest ``trade_date`` in the master matrix (YYYY-MM-DD): written as ``eligibility_trade_date``
-    on execution documents for operator alignment (not used for stream enablement in execution mode).
+    on execution documents for operator alignment only — **not** used for stream enablement or robot
+    arming (robot uses ``timetable_current.json`` only).
     """
     if master_matrix_df is None or master_matrix_df.empty or "trade_date" not in master_matrix_df.columns:
         return None
@@ -302,7 +300,7 @@ def _merge_stream_filters_for_execution(
 
 
 def _log_execution_filter_audit_for_publish(stream_filters: Dict[str, Any]) -> None:
-    """One-shot stdout + logger audit of merged stream_filters config (debug only; does not gate enabled)."""
+    """Logger-only snapshot of merged stream_filters (does not gate enabled)."""
     try:
         merged_repr = json.dumps(stream_filters, sort_keys=True, default=str)
     except TypeError:
@@ -312,7 +310,6 @@ def _log_execution_filter_audit_for_publish(stream_filters: Dict[str, Any]) -> N
         f"merged_stream_filters_snapshot={merged_repr}"
     )
     logger.info(hdr)
-    print(hdr, flush=True)
     master_audit = stream_filters.get("master")
     if not isinstance(master_audit, dict):
         master_audit = {}
@@ -331,7 +328,6 @@ def _log_execution_filter_audit_for_publish(stream_filters: Dict[str, Any]) -> N
             f"stream_filter_config={sjson} master_filter_config={mjson}"
         )
         logger.info(line)
-        print(line, flush=True)
 
 
 def _execution_session_calendar_filters_eval(
@@ -475,146 +471,151 @@ def _execution_session_calendar_filters_eval(
     }
 
 
-def _log_cursor_execution_filter_audit(
-    project_root: Path,
-    merged_stream_filters: Dict[str, Any],
-    session_trading_date: str,
+def get_execution_slot_from_latest_row(
+    r: Optional[pd.Series],
+    stream_id: str,
+    session: str,
+    session_time_slots: Dict[str, List[str]],
+) -> Tuple[str, bool]:
+    """
+    Latest matrix row -> ``slot_time`` display string and whether it is valid for execution.
+
+    **Time Change** (if non-empty and coercible) overrides **Time** when both are valid session times.
+    Valid means normalized HH:MM is in ``session_time_slots[session]``. Every slot listed for the
+    session is allowed for every instrument (matrix is the time authority; no hidden per-instrument lists).
+    """
+    from modules.matrix.utils import normalize_time as _norm_slot
+
+    session_slot_list = session_time_slots.get(session, [])
+    full_order_norm, norm_to_display = _execution_slot_order_and_display_map(session_slot_list)
+    instrument = stream_id[:-1] if len(stream_id) > 1 else ""
+
+    if r is None:
+        return "", False
+
+    available_norm = [_norm_slot(str(t)) for t in session_slot_list]
+
+    def _in_session_slots(hhmm: Optional[str]) -> bool:
+        if not hhmm:
+            return False
+        return _norm_slot(str(hhmm)) in available_norm
+
+    time_raw = _execution_mode_row_get_time(r)
+    tc_raw = _execution_mode_row_get_time_change(r)
+    tc_parsed = _coerce_matrix_cell_to_slot_hhmm(tc_raw)
+    t_parsed = _coerce_matrix_cell_to_slot_hhmm(time_raw)
+    time_from_matrix = ""
+    if _execution_mode_matrix_cell_is_nonempty(tc_raw):
+        if tc_parsed and _in_session_slots(tc_parsed):
+            time_from_matrix = tc_parsed
+            logger.info(
+                "TIME_CHANGE_APPLIED stream=%s matrix_row=latest new_time=%s",
+                stream_id,
+                tc_parsed,
+            )
+        else:
+            logger.warning(
+                "TIME_CHANGE_INVALID stream=%s session=%s raw=%r coerced=%r allowed=%s",
+                stream_id,
+                session,
+                tc_raw,
+                tc_parsed,
+                available_norm,
+            )
+    if not time_from_matrix and t_parsed and _in_session_slots(t_parsed):
+        time_from_matrix = t_parsed
+
+    matrix_pref_norm = _norm_slot(str(time_from_matrix)) if time_from_matrix else ""
+    picked_norm: Optional[str] = None
+    if matrix_pref_norm and matrix_pref_norm in full_order_norm:
+        picked_norm = matrix_pref_norm
+    else:
+        if matrix_pref_norm:
+            logger.error(
+                "EXECUTION_MATRIX_SLOT_REJECTED stream=%s session=%s instrument=%s "
+                "matrix_time=%s session_slots_norm=%s",
+                stream_id,
+                session,
+                instrument,
+                matrix_pref_norm,
+                full_order_norm,
+            )
+        elif r is not None:
+            logger.error(
+                "NO_VALID_MATRIX_TIME stream=%s session=%s (latest row present; "
+                "Time/Time Change missing or not in session slots)",
+                stream_id,
+                session,
+            )
+
+    if picked_norm is None:
+        if matrix_pref_norm and matrix_pref_norm in full_order_norm:
+            raise AssertionError(
+                "EXECUTION_SLOT_INVARIANT: matrix time "
+                f"{matrix_pref_norm!r} is in session slots for stream={stream_id} "
+                "but slot was rejected (unexpected hidden filter)."
+            )
+        return "", False
+    return norm_to_display[picked_norm], True
+
+
+def get_execution_stream_enablement(
+    master_matrix_df: pd.DataFrame,
+    stream_id: str,
+    has_valid_slot: bool,
+    slot_time: str,
+    stream_filters: Dict[str, Any],
     filter_dow_name: str,
     filter_dow: int,
     filter_dom: int,
-    stream_order: List[str],
-    streams_by_id: Dict[str, Dict[str, Any]],
-) -> None:
+) -> Tuple[bool, Optional[str], Dict[str, Any]]:
     """
-    Operator / Cursor audit: raw filter file, calendar-rule semantics, per-stream trace.
+    Latest-row matrix (non-calendar) gate + session calendar (DOW/DOM) and ``block_reason``.
 
-    **Enablement** uses latest matrix row per stream (``final_allowed``), a valid slot, and DOW/DOM from
-    merged **stream_filters** on **session_trading_date**. This trace evaluates full calendar eval (including
-    **time_match** vs published slot) for diagnostics; **time_match** does not gate ``enabled``.
-
-    Rule lookup is **stream_id**-keyed (plus **master**). DOW/DOM exclusions use session calendar only.
+    ``enabled`` requires ``has_valid_slot``, non-calendar matrix OK, and DOW/DOM pass.
+    ``exclude_times`` affects only the returned ``calendar_eval`` (diagnostic); it does not gate ``enabled``.
     """
-    from modules.timetable.stream_id_derived import (
-        instrument_from_stream_id,
-        session_from_stream_id,
+    (
+        m_raw,
+        m_nc_ok,
+        m_fr,
+        m_suf,
+    ) = _matrix_latest_row_execution_non_calendar_split(master_matrix_df, stream_id)
+
+    calendar_eval = _execution_session_calendar_filters_eval(
+        stream_id,
+        stream_filters,
+        filter_dow_name,
+        filter_dow,
+        filter_dom,
+        slot_time,
     )
+    dow_pass = bool(calendar_eval["dow_pass"])
+    dom_pass = bool(calendar_eval["dom_pass"])
+    calendar_ok = dow_pass and dom_pass
 
-    cfg = (Path(project_root) / "configs" / "stream_filters.json").resolve()
-    cfg_exists = cfg.is_file()
-    if cfg_exists:
-        try:
-            raw_file = cfg.read_text(encoding="utf-8")
-        except OSError as e:
-            raw_file = f"<READ_ERROR {e}>"
+    enabled = bool(has_valid_slot and m_nc_ok and calendar_ok)
+    cal_block = f"calendar_filter_blocked:{filter_dow_name}:{filter_dom}"
+
+    if not has_valid_slot:
+        block_reason: Optional[str] = "no_valid_execution_slot"
+    elif not m_nc_ok:
+        block_reason = "matrix_filter_blocked:" + (m_suf or "matrix_row_final_allowed_false")
+    elif not calendar_ok:
+        block_reason = cal_block
     else:
-        raw_file = "<FILE_MISSING>"
+        block_reason = None
 
-    sep = "=" * 72
-    print(f"{sep}\nEXECUTION_FILTER_AUDIT_CURSOR — SECTION 1: FILTER INPUT (GROUND TRUTH)\n{sep}", flush=True)
-    print(f"configs/stream_filters.json path={cfg}", flush=True)
-    print(f"configs/stream_filters.json exists={cfg_exists}", flush=True)
-    print("stream_filters.json (raw) BEGIN", flush=True)
-    print(raw_file, flush=True)
-    print("stream_filters.json (raw) END", flush=True)
-
-    print(f"\n{sep}\nEXECUTION_FILTER_AUDIT_CURSOR — SECTION 2: CALENDAR vs SESSION TRADING DATE\n{sep}", flush=True)
-    print(
-        "``enabled`` combines: valid slot + latest-matrix ``final_allowed`` + **DOW/DOM** from **stream_filters** "
-        "using calendar derived **only** from ``session_trading_date`` (below).\n"
-        "- Identity: each rule set is looked up by **stream_id** (and a shared **master** dict).\n"
-        "- **dow_match** / **dom_match**: exclude_days_of_week / exclude_days_of_month vs session day; "
-        "both required for enablement; failure → ``calendar_filter_blocked:<weekday>:<dom>``.\n"
-        "- **time_match** in the trace: published **slot_time** vs exclude_times — **diagnostic only**, "
-        "not an enablement input.\n"
-        "- Default when a list is missing or empty: that calendar dimension does not block.\n"
-        "- **instrument_match** / **session_match** in the trace: always **true** — JSON is stream-keyed only.\n"
-        f"Session trading date evaluated: {session_trading_date!r} "
-        f"(filter_dow_name={filter_dow_name!r} filter_dow_mon0={filter_dow} filter_dom={filter_dom}).",
-        flush=True,
-    )
-
-    print(f"\n{sep}\nEXECUTION_FILTER_AUDIT_CURSOR — SECTION 3: RUNTIME EVALUATION TRACE\n{sep}", flush=True)
-    print(
-        "merged_stream_filters (runtime dict after merge with API overrides, if any) = "
-        + json.dumps(merged_stream_filters, sort_keys=True, default=str),
-        flush=True,
-    )
-
-    trace_rows: List[Dict[str, Any]] = []
-    for sid in stream_order:
-        rec = streams_by_id.get(sid) or {}
-        slot = (rec.get("slot_time") or "").strip()
-        derived_i = instrument_from_stream_id(sid)
-        derived_s = session_from_stream_id(sid)
-        ev = _execution_session_calendar_filters_eval(
-            sid,
-            merged_stream_filters,
-            filter_dow_name,
-            filter_dow,
-            filter_dom,
-            slot,
-        )
-        sf = ev["filter_config"]["stream"]
-        mf = ev["filter_config"]["master"]
-        ex_t_stream = sf.get("exclude_times") if isinstance(sf, dict) else None
-        ex_t_master = mf.get("exclude_times") if isinstance(mf, dict) else None
-        ex_d_stream = sf.get("exclude_days_of_week") if isinstance(sf, dict) else None
-        ex_d_master = mf.get("exclude_days_of_week") if isinstance(mf, dict) else None
-
-        br = rec.get("block_reason")
-        if br == "no_valid_execution_slot":
-            final_decision = "DISABLED:no_valid_execution_slot"
-        elif isinstance(br, str) and br.startswith("matrix_filter_blocked:"):
-            final_decision = f"DISABLED:{br}"
-        elif isinstance(br, str) and br.startswith("calendar_filter_blocked:"):
-            final_decision = f"DISABLED:{br}"
-        elif br == "session_filter_blocked":
-            final_decision = (
-                f"DISABLED:session_filter_blocked:{ev.get('session_block_reason') or 'unknown'}"
-            )
-        elif rec.get("enabled"):
-            final_decision = "ENABLED"
-        else:
-            final_decision = f"DISABLED:{br or 'unknown'}"
-
-        trace_rows.append(
-            {
-                "stream_id": sid,
-                "derived_instrument": derived_i,
-                "derived_session": derived_s,
-                "slot_time": slot,
-                "filter_instrument": "__N_A_JSON_HAS_NO_INSTRUMENT_FIELD_STREAM_KEYED__",
-                "filter_session": "__N_A_JSON_HAS_NO_SESSION_FIELD_STREAM_KEYED__",
-                "filter_slot_time_exclude_lists": {
-                    "stream_entry": ex_t_stream,
-                    "master": ex_t_master,
-                },
-                "filter_dow_context": {
-                    "session_day_dow_name": filter_dow_name,
-                    "stream_exclude_days_of_week": ex_d_stream,
-                    "master_exclude_days_of_week": ex_d_master,
-                },
-                "instrument_match": True,
-                "session_match": True,
-                "time_match": bool(ev["time_pass"]),
-                "dow_match": bool(ev["dow_pass"]),
-                "dom_match": bool(ev["dom_pass"]),
-                "FINAL_DECISION": final_decision,
-            }
-        )
-
-    try:
-        trace_json = json.dumps(trace_rows, indent=2, sort_keys=False, default=str)
-    except TypeError:
-        trace_json = str(trace_rows)
-    print(trace_json, flush=True)
-    print(f"{sep}\nEXECUTION_FILTER_AUDIT_CURSOR — END\n{sep}\n", flush=True)
-
-    logger.info(
-        "EXECUTION_FILTER_AUDIT_CURSOR completed streams=%s session=%s",
-        len(trace_rows),
-        session_trading_date,
-    )
+    detail: Dict[str, Any] = {
+        "matrix_row_final_allowed_raw": m_raw,
+        "matrix_non_calendar_ok": m_nc_ok,
+        "matrix_filter_reasons": m_fr,
+        "matrix_non_calendar_block_suffix": m_suf,
+        "calendar_eval": calendar_eval,
+        "dow_pass": dow_pass,
+        "dom_pass": dom_pass,
+    }
+    return enabled, block_reason, detail
 
 
 def _matrix_row_series_to_final_allowed(r0: pd.Series) -> Tuple[bool, str]:
@@ -718,6 +719,24 @@ def _matrix_latest_row_final_allowed_for_stream(
     return _matrix_row_series_to_final_allowed(latest)
 
 
+def _matrix_latest_row_series_for_stream(
+    master_matrix_df: pd.DataFrame,
+    stream_id: str,
+) -> Optional[pd.Series]:
+    """Row with max ``trade_date`` for ``stream_id`` (same row as execution enablement)."""
+    if master_matrix_df.empty or "Stream" not in master_matrix_df.columns:
+        return None
+    sub = master_matrix_df[master_matrix_df["Stream"] == stream_id]
+    if sub.empty:
+        return None
+    if "trade_date" not in master_matrix_df.columns:
+        return sub.iloc[0]
+    sub_td = sub.dropna(subset=["trade_date"])
+    if sub_td.empty:
+        return None
+    return sub_td.sort_values("trade_date", ascending=False).iloc[0]
+
+
 def _matrix_row_final_allowed_for_session(
     latest_df: pd.DataFrame,
     stream_id: str,
@@ -733,30 +752,6 @@ def _matrix_row_final_allowed_for_session(
     if mrow.empty:
         return False, ""
     return _matrix_row_series_to_final_allowed(mrow.iloc[0])
-
-
-def _execution_session_calendar_filters_pass(
-    stream_id: str,
-    stream_filters: Dict[str, Any],
-    filter_dow_name: str,
-    filter_dow: int,
-    filter_dom: int,
-    slot_display_time: str,
-) -> Tuple[bool, Optional[str]]:
-    """
-    DOW/DOM/exclude_times from ``stream_filters`` evaluated for the **session trading day**
-    (not the matrix eligibility / ``allowed_df`` date).
-    ``slot_display_time`` is the published slot (HH:MM); when empty, time exclusions are skipped.
-    """
-    ev = _execution_session_calendar_filters_eval(
-        stream_id,
-        stream_filters,
-        filter_dow_name,
-        filter_dow,
-        filter_dom,
-        slot_display_time,
-    )
-    return ev["overall_pass"], ev["session_block_reason"]
 
 
 def _parse_slot_time(t: Any) -> datetime:
@@ -783,61 +778,6 @@ def _execution_slot_order_and_display_map(
         order.append(n)
         display.setdefault(n, str(raw).strip())
     return order, display
-
-
-def _execution_instrument_slots_ordered(
-    session: str,
-    instrument: str,
-    session_time_slots: Dict[str, List[str]],
-) -> List[str]:
-    """Session slots in order, minus S1 early open when instrument is not allowed (timetable write guard parity)."""
-    from modules.matrix.utils import normalize_time
-
-    slots = session_time_slots.get(session, [])
-    full_order, _ = _execution_slot_order_and_display_map(slots)
-    early_norm = normalize_time(S1_EARLY_OPEN_SLOT_TIME)
-    inst_up = (instrument or "").strip().upper()
-    out: List[str] = []
-    for n in full_order:
-        if (
-            session == "S1"
-            and n == early_norm
-            and inst_up not in S1_INSTRUMENTS_ALLOWED_EARLY_OPEN_SLOT
-        ):
-            continue
-        out.append(n)
-    return out
-
-
-def _pick_slot_from_preference(
-    full_order_norm: List[str],
-    candidates_norm: List[str],
-    preferred_norm: Optional[str],
-) -> Optional[str]:
-    """
-    Choose normalized slot from candidates_norm using matrix preference as anchor in full_order_norm.
-
-    If preferred is missing or not in full_order_norm, first candidate in session order.
-    If preferred is not in candidates, scan forward in full order then backward for the nearest candidate.
-    """
-    if not candidates_norm:
-        return None
-    cand_set = set(candidates_norm)
-    if not preferred_norm or preferred_norm not in full_order_norm:
-        return candidates_norm[0]
-    if preferred_norm in cand_set:
-        return preferred_norm
-    try:
-        idx = full_order_norm.index(preferred_norm)
-    except ValueError:
-        return candidates_norm[0]
-    for j in range(idx + 1, len(full_order_norm)):
-        if full_order_norm[j] in cand_set:
-            return full_order_norm[j]
-    for j in range(idx - 1, -1, -1):
-        if full_order_norm[j] in cand_set:
-            return full_order_norm[j]
-    return None
 
 
 class TimetableLivePublishBlocked(RuntimeError):
@@ -1893,55 +1833,34 @@ class TimetableEngine:
         stream_filters: Dict,
     ) -> List[Dict]:
         """
-        Live execution: ``slot_time`` from matrix Time / Time Change using ``slot_date_obj`` parsed from
-        **session_trading_date** (calendar DOW/DOM from this date only, not wall-clock).
+        Live execution: **slot_time** and **non-calendar enablement** both come from the **same** matrix row:
+        the latest row (max ``trade_date``) per ``stream_id``. There is no session-day vs previous-day slice and
+        no default first-slot fallback — invalid or missing matrix time → ``no_valid_execution_slot``.
 
-        **Matrix (non-calendar):** Latest row (max ``trade_date``) supplies ``final_allowed`` and ``filter_reasons``,
-        but **row-date** ``dow_filter`` / ``dom_filter`` tokens are stripped for gating — DOW/DOM are **only**
-        evaluated for ``session_trading_date`` via ``_execution_session_calendar_filters_*``.
+        **Calendar gate (session_trading_date):** merged ``stream_filters`` DOW/DOM only (exclude_times is
+        diagnostic via ``get_execution_stream_enablement`` / ``calendar_eval``, not an enablement input).
 
-        **Calendar gate:** ``_execution_session_calendar_filters_eval`` with empty slot time → **dow_pass** and
-        **dom_pass** only (exclude_times does not gate ``enabled``).
+        **Slot:** ``get_execution_slot_from_latest_row`` — any time in ``SLOT_ENDS[session]`` is valid for every
+        instrument (matrix is the only time authority).
 
-        **Enablement:** ``has_valid_slot AND matrix_non_calendar_ok AND calendar_ok``.
+        **Enablement:** ``get_execution_stream_enablement`` → ``has_valid_slot AND matrix_non_calendar_ok AND
+        dow_pass AND dom_pass``.
 
-        ``block_reason``: ``no_valid_execution_slot``, ``matrix_filter_blocked:`` + non-calendar reasons only,
-        ``calendar_filter_blocked:{dow}:{dom}``, or ``None``.
-
-        Top-level ``eligibility_trade_date`` remains the latest matrix ``trade_date`` (operators only).
-        ``trade_date_obj`` is retained for callers but ignored for slot structure; a warning is logged if
-        it differs from ``slot_date_obj``.
+        ``trade_date_obj`` is ignored for slot/enabled structure; a warning is logged if it differs from
+        ``slot_date_obj`` parsed from ``session_trading_date``.
         """
-        from datetime import timedelta
-
         raw_session = (session_trading_date or "").strip()
         if not raw_session:
             raise ValueError(
                 "_build_streams_execution_mode requires session_trading_date (YYYY-MM-DD from live session)"
             )
-        # Compare with UI: full merged input here + on-disk configs/stream_filters.json (source of merge).
         _cfg_path = (Path(self._project_root) / "configs" / "stream_filters.json").resolve()
-        _cfg_exists = _cfg_path.is_file()
-        if _cfg_exists:
-            try:
-                _cfg_raw = _cfg_path.read_text(encoding="utf-8")
-            except OSError as _e:
-                _cfg_raw = f"<read_error {_e}>"
-        else:
-            _cfg_raw = ""
-        try:
-            _merged_repr = json.dumps(stream_filters, sort_keys=True, default=str)
-        except TypeError:
-            _merged_repr = str(stream_filters)
-        _cmp1 = (
-            f"BACKEND_TIMETABLE_FILTER_COMPARE path={_cfg_path} exists={_cfg_exists} "
-            f"merged_stream_filters={_merged_repr}"
+        logger.info(
+            "EXECUTION_STREAM_FILTERS snapshot path=%s exists=%s filter_top_level_keys=%s",
+            _cfg_path,
+            _cfg_path.is_file(),
+            sorted(stream_filters.keys()) if isinstance(stream_filters, dict) else type(stream_filters).__name__,
         )
-        logger.info(_cmp1)
-        print(_cmp1, flush=True)
-        _cmp2 = f"BACKEND_TIMETABLE_FILTER_COMPARE config_file_contents={_cfg_raw}"
-        logger.info(_cmp2)
-        print(_cmp2, flush=True)
 
         slot_date_obj = pd.to_datetime(raw_session).date()
         filter_date_obj = slot_date_obj
@@ -1966,264 +1885,55 @@ class TimetableEngine:
                 slot_date_obj.isoformat(),
             )
 
-        # Weekend publish audit: unambiguous stdout (logger may not surface in dashboard terminals)
-        print(
-            "AUDIT_CHECK >>> session:",
-            session_trading_date,
-            "| filter:",
-            filter_dow_name,
-            "| filter_dow_idx:",
-            filter_dow,
-            "| slot_date:",
-            slot_date_obj.isoformat(),
-            "| legacy_trade_date_param:",
-            trade_date_obj.isoformat(),
-            flush=True,
-        )
-
-        streams_dict = {}
-        previous_date_obj = slot_date_obj - timedelta(days=1)
-        if not master_matrix_df.empty and 'trade_date' in master_matrix_df.columns:
-            previous_df = master_matrix_df[master_matrix_df['trade_date'].dt.date == previous_date_obj].copy()
-            latest_df = master_matrix_df[master_matrix_df['trade_date'].dt.date == slot_date_obj].copy()
-        else:
-            previous_df = pd.DataFrame()
-            latest_df = pd.DataFrame()
-        source_df = previous_df if not previous_df.empty else latest_df
-        use_previous_day_logic = not previous_df.empty and source_df is previous_df
+        streams_dict: Dict[str, Dict[str, Any]] = {}
 
         for stream_id in self.streams:
-            instrument = stream_id[:-1] if len(stream_id) > 1 else ''
-            session = 'S1' if stream_id.endswith('1') else 'S2'
-
-            # Matrix preference (Time Change > Time); must still be a valid session slot.
-            time_from_matrix = ""
-            if not source_df.empty:
-                row = source_df[source_df['Stream'] == stream_id]
-                if not row.empty:
-                    r = row.iloc[0]
-                    from modules.matrix.utils import normalize_time
-
-                    available_norm = [
-                        normalize_time(str(t)) for t in self.session_time_slots.get(session, [])
-                    ]
-
-                    def _in_session_slots(hhmm: Optional[str]) -> bool:
-                        if not hhmm:
-                            return False
-                        return normalize_time(str(hhmm)) in available_norm
-
-                    time_raw = _execution_mode_row_get_time(r)
-                    time_from_matrix = ""
-
-                    if use_previous_day_logic:
-                        # Previous day's row: Time Change (next session slot) wins over Time when valid.
-                        tc_raw = _execution_mode_row_get_time_change(r)
-                        original_display = _coerce_matrix_cell_to_slot_hhmm(time_raw) or ""
-
-                        if _execution_mode_matrix_cell_is_nonempty(tc_raw):
-                            tc_parsed = _coerce_matrix_cell_to_slot_hhmm(tc_raw)
-                            if tc_parsed and _in_session_slots(tc_parsed):
-                                time_from_matrix = tc_parsed
-                                logger.info(
-                                    "TIME_CHANGE_APPLIED stream=%s original_time=%s new_time=%s",
-                                    stream_id,
-                                    original_display if original_display else "(none)",
-                                    tc_parsed,
-                                )
-                            else:
-                                logger.warning(
-                                    "TIME_CHANGE_INVALID stream=%s session=%s raw=%r coerced=%r "
-                                    "allowed=%s",
-                                    stream_id,
-                                    session,
-                                    tc_raw,
-                                    tc_parsed,
-                                    available_norm,
-                                )
-
-                        if not time_from_matrix:
-                            t_parsed = _coerce_matrix_cell_to_slot_hhmm(time_raw)
-                            if t_parsed and _in_session_slots(t_parsed):
-                                time_from_matrix = t_parsed
-                    else:
-                        t_parsed = _coerce_matrix_cell_to_slot_hhmm(time_raw)
-                        if t_parsed and _in_session_slots(t_parsed):
-                            time_from_matrix = t_parsed
-
-            from modules.matrix.utils import normalize_time as _norm_slot
-
-            session_slots = self.session_time_slots.get(session, [])
-            full_order_norm, norm_to_display = _execution_slot_order_and_display_map(session_slots)
-            instrument_slots_norm = _execution_instrument_slots_ordered(
-                session, instrument, self.session_time_slots
-            )
-            # Slot picking follows matrix Time + session instrument allow-list only; exclude_times does not remap slot.
-            candidates_norm = list(instrument_slots_norm)
-            matrix_pref_norm = _norm_slot(str(time_from_matrix)) if time_from_matrix else ""
-
-            picked_norm: Optional[str] = None
-
-            if not matrix_pref_norm:
-                picked_norm = candidates_norm[0] if candidates_norm else None
-            elif matrix_pref_norm not in full_order_norm:
-                picked_norm = candidates_norm[0] if candidates_norm else None
-            elif matrix_pref_norm not in candidates_norm:
-                picked_norm = _pick_slot_from_preference(
-                    full_order_norm, candidates_norm, matrix_pref_norm
-                )
-            else:
-                picked_norm = matrix_pref_norm
-
-            if picked_norm is None:
-                time = ""
-                logger.error(
-                    "NO_VALID_EXECUTION_SLOTS stream=%s session=%s instrument=%s "
-                    "matrix_time=%s candidates=%s",
-                    stream_id,
-                    session,
-                    instrument,
-                    time_from_matrix or "(empty)",
-                    candidates_norm,
-                )
-                has_valid_slot = False
-            else:
-                time = norm_to_display[picked_norm]
-                if matrix_pref_norm and picked_norm != matrix_pref_norm:
-                    logger.info(
-                        "EXECUTION_INSTRUMENT_SLOT_REMAP stream=%s matrix_time=%s published_slot=%s",
-                        stream_id,
-                        matrix_pref_norm,
-                        picked_norm,
-                    )
-                has_valid_slot = True
-
-            (
-                _matrix_row_raw_ok,
-                matrix_non_calendar_ok,
-                matrix_filter_reasons_raw,
-                matrix_non_cal_block_suffix,
-            ) = _matrix_latest_row_execution_non_calendar_split(master_matrix_df, stream_id)
-
-            _ev_calendar_only = _execution_session_calendar_filters_eval(
+            session = "S1" if stream_id.endswith("1") else "S2"
+            r = _matrix_latest_row_series_for_stream(master_matrix_df, stream_id)
+            time, has_valid_slot = get_execution_slot_from_latest_row(
+                r,
                 stream_id,
+                session,
+                self.session_time_slots,
+            )
+            enabled, block_reason, en_detail = get_execution_stream_enablement(
+                master_matrix_df,
+                stream_id,
+                has_valid_slot,
+                time,
                 stream_filters,
                 filter_dow_name,
                 filter_dow,
                 filter_dom,
-                "",
             )
-            dow_pass = bool(_ev_calendar_only["dow_pass"])
-            dom_pass = bool(_ev_calendar_only["dom_pass"])
-            calendar_ok = dow_pass and dom_pass
-
-            passes_session_filters, _ = _execution_session_calendar_filters_pass(
+            logger.debug(
+                "STREAM_EXECUTION stream=%s slot_date=%s has_slot=%s m_final_allowed_raw=%s "
+                "m_nc_ok=%s dow=%s dom=%s enabled=%s",
                 stream_id,
-                stream_filters,
-                filter_dow_name,
-                filter_dow,
-                filter_dom,
-                time if has_valid_slot else "",
-            )
-
-            enabled = bool(has_valid_slot and matrix_non_calendar_ok and calendar_ok)
-            _cal_block = f"calendar_filter_blocked:{filter_dow_name}:{filter_dom}"
-
-            if not has_valid_slot:
-                block_reason = "no_valid_execution_slot"
-            elif not matrix_non_calendar_ok:
-                _mbs = matrix_non_cal_block_suffix or "matrix_row_final_allowed_false"
-                block_reason = "matrix_filter_blocked:" + _mbs
-            elif not calendar_ok:
-                block_reason = _cal_block
-            else:
-                block_reason = None
-
-            print(
-                f"STREAM_AUDIT >>> stream={stream_id} | slot_date={slot_date_obj} | "
-                f"has_valid_slot={has_valid_slot} | matrix_row_final_allowed_raw={_matrix_row_raw_ok} | "
-                f"matrix_non_calendar_ok={matrix_non_calendar_ok} | "
-                f"dow_pass={dow_pass} dom_pass={dom_pass} | "
-                f"filter_eval_overall_pass={passes_session_filters} (incl_time_diagnostic) | enabled={enabled}",
-                flush=True,
+                slot_date_obj.isoformat(),
+                has_valid_slot,
+                en_detail["matrix_row_final_allowed_raw"],
+                en_detail["matrix_non_calendar_ok"],
+                en_detail["dow_pass"],
+                en_detail["dom_pass"],
+                enabled,
             )
 
             entry: Dict[str, Any] = {
-                'stream': stream_id,
-                'slot_time': time,
-                'enabled': enabled,
+                "stream": stream_id,
+                "slot_time": time,
+                "enabled": enabled,
             }
             if block_reason is not None:
-                entry['block_reason'] = block_reason
+                entry["block_reason"] = block_reason
             streams_dict[stream_id] = entry
 
-        # One combined report: latest-matrix outcome + calendar eval + merged filter snapshot.
-        _pr_streams: List[Dict[str, Any]] = []
-        for _sid in self.streams:
-            _rec = streams_dict[_sid]
-            _slot = _rec.get("slot_time") or ""
-            _ev = _execution_session_calendar_filters_eval(
-                _sid,
-                stream_filters,
-                filter_dow_name,
-                filter_dow,
-                filter_dom,
-                _slot,
-            )
-            _m_raw, _m_nc_ok, _m_fr_raw, _m_nc_suf = _matrix_latest_row_execution_non_calendar_split(
-                master_matrix_df, _sid
-            )
-            _pr_streams.append(
-                {
-                    "stream": _sid,
-                    "slot_time": _slot,
-                    "matrix_row_final_allowed_raw": _m_raw,
-                    "matrix_non_calendar_ok": _m_nc_ok,
-                    "matrix_filter_reasons": _m_fr_raw,
-                    "matrix_non_calendar_block_suffix": _m_nc_suf,
-                    "filter_config": _ev["filter_config"],
-                    "dow_pass": _ev["dow_pass"],
-                    "time_pass": _ev["time_pass"],
-                    "overall_pass": _ev["overall_pass"],
-                    "session_block_reason_if_filters": _ev["session_block_reason"],
-                    "dom_pass": _ev["dom_pass"],
-                    "filter_eval_detail": _ev["detail"],
-                    "enabled": _rec["enabled"],
-                    "block_reason": _rec.get("block_reason"),
-                }
-            )
-        _pr_streams.sort(
-            key=lambda s: _parse_slot_time(s.get("slot_time")),
-            reverse=True,
-        )
-        _publish_report: Dict[str, Any] = {
-            "merged_stream_filters": stream_filters,
-            "session_trading_date": session_trading_date,
-            "filter_calendar": {
-                "dow_name": filter_dow_name,
-                "dow_mon0_sun6": filter_dow,
-                "day_of_month": filter_dom,
-            },
-            "streams": _pr_streams,
-        }
-        try:
-            _report_line = "EXECUTION_FILTER_PUBLISH_REPORT " + json.dumps(
-                _publish_report, sort_keys=True, default=str
-            )
-        except TypeError:
-            _report_line = f"EXECUTION_FILTER_PUBLISH_REPORT {_publish_report!r}"
-        logger.info(_report_line)
-        print(_report_line, flush=True)
-
-        _log_cursor_execution_filter_audit(
-            self._project_root,
-            stream_filters,
+        enabled_n = sum(1 for s in streams_dict.values() if s.get("enabled"))
+        logger.info(
+            "EXECUTION_TIMETABLE_BUILT session=%s streams=%d enabled=%d",
             session_trading_date,
-            filter_dow_name,
-            filter_dow,
-            filter_dom,
-            self.streams,
-            streams_dict,
+            len(streams_dict),
+            enabled_n,
         )
 
         streams_out: List[Dict[str, Any]] = list(streams_dict.values())
@@ -2267,7 +1977,6 @@ class TimetableEngine:
         eligibility_trade_date: Optional[str] = None,
     ) -> TimetablePublishResult:
         """Write data/timetable/timetable_current.json with history/, skip if content unchanged."""
-        from modules.timetable.timetable_write_guard import validate_streams_before_execution_write
         from modules.timetable.timetable_content_hash import (
             compute_timetable_hash_sorted,
             timetable_hash_from_document,
@@ -2281,8 +1990,6 @@ class TimetableEngine:
         )
 
         streams_copy: List[Dict[str, Any]] = [dict(s) for s in streams]
-
-        validate_streams_before_execution_write(streams_copy, session_time_slots=self.session_time_slots)
 
         tz_label = "America/Chicago"
         timetable_hash = compute_timetable_hash_sorted(session_trading_date, tz_label, streams_copy)

@@ -12,6 +12,7 @@ using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using QTSW2.Robot.Contracts;
 using QTSW2.Robot.Core.Diagnostics;
 
@@ -33,6 +34,8 @@ namespace QTSW2.Robot.Core.Execution;
 /// </summary>
 public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrderExecutor, INtActionExecutor, IIntentRegistrationAdapter
 {
+    private readonly ConcurrentDictionary<string, byte> _criticalFlattenCoordinationRetryInflight = new(StringComparer.OrdinalIgnoreCase);
+
     private static int _adapterInstanceCounter;
     private readonly int _adapterInstanceId;
 
@@ -375,8 +378,23 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
                         host_chart_instrument = hostChart,
                         correlation_id = cmd.CorrelationId,
                         reason = cmd.IsVerifyRetryFlatten ? "verify_retry_non_owner_or_no_episode" : "flatten_enqueue_non_owner_active",
-                        metrics_flatten_secondary_skipped_total = m.FlattenSecondarySkippedTotal
+                        metrics_flatten_secondary_skipped_total = m.FlattenSecondarySkippedTotal,
+                        critical_flatten = IsCriticalFlattenCommand(cmd)
                     }));
+                if (IsCriticalFlattenCommand(cmd))
+                {
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_COORDINATION_SKIP_ESCALATION", state: "CRITICAL",
+                        new
+                        {
+                            account,
+                            canonical_broker_key = canonical,
+                            correlation_id = cmd.CorrelationId,
+                            instrument = cmd.Instrument,
+                            note = "Non-owner skipped critical flatten enqueue — escalating block"
+                        }));
+                    _blockInstrumentCallback?.Invoke(cmd.Instrument ?? "", utcNow, "FLATTEN_COORDINATION_NON_OWNER_CRITICAL");
+                    ScheduleCriticalFlattenCoordinationRetryIfNeeded(cmd, "flatten_enqueue_non_owner");
+                }
                 return false;
 
             case FlattenEnqueueGateOutcome.FailedPersistentBlocked:
@@ -1299,26 +1317,115 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     /// <summary>
     /// Enqueue execution command. Forwards to IEA when bound; no-op when IEA not enabled.
     /// Strategy layers should use this instead of calling adapter.Flatten/SubmitOrders/CancelOrders directly.
+    /// Enqueues cancel + flatten only; does not drain. Caller must wait for broker flat before advancing session-close state.
     /// </summary>
     public FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow)
     {
-        if (_ntActionQueue == null || !(this is INtActionExecutor executor)) return null;
+        if (_ntActionQueue == null || !(this is INtActionExecutor)) return null;
         var cidCancel = $"SESSION_CLOSE_CANCEL:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
         var cidFlatten = $"SESSION_CLOSE_FLATTEN:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
         _ntActionQueue.EnqueueNtAction(new NtCancelOrdersCommand(cidCancel, intentId, instrument, false, "FORCED_FLATTEN_CANCEL", utcNow), out _);
         EnqueueNtActionInternal(new NtFlattenInstrumentCommand(cidFlatten, intentId, instrument, "SESSION_FORCED_FLATTEN", utcNow,
             DestructiveActionSource.MANUAL, DestructiveTriggerReason.MANUAL));
-        var lockObj = _iea?.EntrySubmissionLock;
-        if (lockObj != null)
+        return FlattenResult.FailureResult("SESSION_CLOSE_FLATTEN_ENQUEUED", utcNow);
+    }
+
+    /// <summary>
+    /// Protective / timer-path emergency flatten: enqueue EMERGENCY NtFlattenInstrumentCommand (strategy thread drain). Safe from any thread.
+    /// </summary>
+    public void EnqueueEmergencyFlattenProtective(string instrument, DateTimeOffset utcNow)
+    {
+        var cmd = new NtFlattenInstrumentCommand(
+            $"FLATTEN:EMERGENCY:{utcNow:yyyyMMddHHmmssfff}",
+            "EMERGENCY_BLOCK",
+            instrument ?? "",
+            "IEA_BLOCK_EMERGENCY",
+            utcNow,
+            DestructiveActionSource.EMERGENCY,
+            DestructiveTriggerReason.IEA_ENQUEUE_FAILURE);
+        EnqueueNtActionInternal(cmd);
+    }
+
+    public bool TryEnqueueEmergencyFlattenProtective(string instrument, DateTimeOffset utcNow)
+    {
+        EnqueueEmergencyFlattenProtective(instrument, utcNow);
+        return true;
+    }
+
+    private void ScheduleCriticalFlattenCoordinationRetryIfNeeded(NtFlattenInstrumentCommand skippedCmd, string gateContext)
+    {
+        if (!IsCriticalFlattenCommand(skippedCmd)) return;
+        var account = GetCoordinationAccountName();
+        var canonical = BrokerPositionResolver.NormalizeCanonicalKey(skippedCmd.Instrument);
+        if (string.IsNullOrEmpty(canonical)) return;
+        var key = $"{account}|{canonical}";
+        if (!_criticalFlattenCoordinationRetryInflight.TryAdd(key, 0)) return;
+
+        var delay = FlattenCoordinationTracker.DefaultStaleOwnerTtl.Add(TimeSpan.FromSeconds(2));
+        _ = Task.Delay(delay).ContinueWith(_ =>
         {
-            lock (lockObj)
+            try
             {
-                _ntActionQueue.DrainNtActions(executor);
-                return FlattenResult.SuccessResult(utcNow);
+                var utc = DateTimeOffset.UtcNow;
+                var retryCid = $"{skippedCmd.CorrelationId}:COORD_RETRY:{utc:yyyyMMddHHmmssfff}";
+                var retry = new NtFlattenInstrumentCommand(
+                    retryCid,
+                    skippedCmd.IntentId,
+                    skippedCmd.Instrument ?? "",
+                    skippedCmd.Reason,
+                    utc,
+                    skippedCmd.DestructiveSource,
+                    skippedCmd.ExplicitPolicyTrigger,
+                    skippedCmd.AllowAccountWideCancelFallback,
+                    skippedCmd.HasRecoveryPolicySeal,
+                    skippedCmd.RecoveryPolicySealAllowInstrument,
+                    skippedCmd.RecoveryPolicySealCode,
+                    skippedCmd.RecoveryPolicySealAttributionScope,
+                    skippedCmd.ExplicitCancelBrokerOrderIds,
+                    isVerifyRetryFlatten: false);
+                EnqueueNtActionInternal(retry);
+                _log.Write(RobotEvents.EngineBase(utc, tradingDate: "", eventType: "FLATTEN_COORDINATION_CRITICAL_RETRY_ENQUEUED", state: "ENGINE",
+                    new
+                    {
+                        account,
+                        canonical_broker_key = canonical,
+                        original_correlation_id = skippedCmd.CorrelationId,
+                        gate = gateContext
+                    }));
             }
-        }
-        _ntActionQueue.DrainNtActions(executor);
-        return FlattenResult.SuccessResult(utcNow);
+            catch (Exception ex)
+            {
+                _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "FLATTEN_COORDINATION_CRITICAL_RETRY_ERROR", state: "ENGINE",
+                    new { error = ex.Message, gate = gateContext }));
+            }
+            finally
+            {
+                _criticalFlattenCoordinationRetryInflight.TryRemove(key, out _);
+            }
+        }, CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
+    }
+
+#if !NINJATRADER
+    /// <summary>Core/harness build (NT partial excluded): emergency flatten via enqueue-only path.</summary>
+    public FlattenResult FlattenEmergency(string instrument, DateTimeOffset utcNow)
+    {
+        EnqueueEmergencyFlattenProtective(instrument, utcNow);
+        return FlattenResult.FailureResult("Enqueued for strategy thread", utcNow);
+    }
+#endif
+
+    private static bool IsCriticalFlattenCommand(NtFlattenInstrumentCommand cmd)
+    {
+        if (cmd == null) return false;
+        if (string.Equals(cmd.Reason, "SESSION_FORCED_FLATTEN", StringComparison.OrdinalIgnoreCase))
+            return true;
+        return cmd.DestructiveSource switch
+        {
+            DestructiveActionSource.FAIL_CLOSED => true,
+            DestructiveActionSource.EMERGENCY => true,
+            DestructiveActionSource.RECOVERY => true,
+            _ => false
+        };
     }
 
     public void EnqueueExecutionCommand(ExecutionCommandBase command)

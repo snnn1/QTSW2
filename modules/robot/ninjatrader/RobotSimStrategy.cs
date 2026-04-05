@@ -128,6 +128,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         private const double BE_TICK_STALE_WARNING_SECONDS = 5;
         private const double BE_TICK_STALE_FAIL_CLOSED_SECONDS = 12;
         
+        /// <summary>Added series index for 1-second bars — drains NT action queue without relying on primary chart liquidity/ticks.</summary>
+        private const int VERIFY_SECONDARY_BARS_IN_PROGRESS = 1;
+
         // Lightweight heartbeat: every N bars. Decoupled from trade state.
         private const int HEARTBEAT_BARS_INTERVAL = 1; // Every bar = ~1 min on 1-min chart; 30–60s is fine for liveness.
         
@@ -250,6 +253,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             else if (State == State.Configure)
             {
                 TraceLifecycle("Configure_ENTER", Instrument?.MasterInstrument?.Name, "Configure", _instanceId);
+                AddDataSeries(BarsPeriodType.Second, 1);
                 TraceLifecycle("Configure_EXIT", Instrument?.MasterInstrument?.Name, "Configure", _instanceId);
             }
             else if (State == State.DataLoaded)
@@ -1369,8 +1373,32 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Dormant: init failed or engine not ready — skip all work immediately (Tier 2.1)
                 if (_initFailed || !_engineReady || _engine is null) return;
 
-                // NT THREADING FIX: Drain NT action queue on Realtime. All account.Change/Cancel/Flatten must run on strategy thread.
-                if (State == State.Realtime && _adapter is IIEAOrderExecutor ieaExecutorBar)
+                // 1-second series: deterministic drain cadence when primary series stalls (no ticks / thin liquidity).
+                if (BarsInProgress == VERIFY_SECONDARY_BARS_IN_PROGRESS)
+                {
+                    if ((State == State.Realtime || State == State.Transition) && _adapter is IIEAOrderExecutor ieaVerifySeries)
+                    {
+                        ieaVerifySeries.EnterStrategyThreadContext();
+                        try
+                        {
+                            var lockObjVerify = ieaVerifySeries.GetEntrySubmissionLock();
+                            if (lockObjVerify != null)
+                            {
+                                lock (lockObjVerify)
+                                    ieaVerifySeries.DrainNtActions();
+                            }
+                            _adapter.ProcessPendingUnresolvedExecutions();
+                        }
+                        finally
+                        {
+                            ieaVerifySeries.ExitStrategyThreadContext();
+                        }
+                    }
+                    return;
+                }
+
+                // NT THREADING FIX: Drain NT action queue on Realtime/Transition. All account.Change/Cancel/Flatten must run on strategy thread.
+                if ((State == State.Realtime || State == State.Transition) && _adapter is IIEAOrderExecutor ieaExecutorBar)
                 {
                     ieaExecutorBar.EnterStrategyThreadContext();
                     try
@@ -2025,7 +2053,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (hasExposure) TryEmitBeGateBlocked("ENGINE_NULL", instrumentName, accountPositionCount, executionInstrument);
                 return;
             }
-            if (State != State.Realtime)
+            if (State != State.Realtime && State != State.Transition)
             {
                 if (hasExposure) TryEmitBeGateBlocked("STATE_NOT_REALTIME", instrumentName, accountPositionCount, executionInstrument);
                 return;
@@ -2056,6 +2084,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                     ieaExecutorTick.ExitStrategyThreadContext();
                 }
             }
+
+            if (State != State.Realtime)
+                return;
 
             if (!hasExposure)
             {

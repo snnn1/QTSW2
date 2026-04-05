@@ -118,6 +118,12 @@ public interface IExecutionAdapter
         string intentId,
         string instrument,
         DateTimeOffset utcNow);
+
+    /// <summary>Emergency flatten by instrument. Prefer <see cref="TryEnqueueEmergencyFlattenProtective"/> from timer/worker threads (SIM).</summary>
+    FlattenResult FlattenEmergency(string instrument, DateTimeOffset utcNow);
+
+    /// <summary>Enqueue protective emergency flatten without blocking; returns false when unsupported (e.g. LIVE stub).</summary>
+    bool TryEnqueueEmergencyFlattenProtective(string instrument, DateTimeOffset utcNow);
     
     /// <summary>
     /// Get account snapshot (positions and working orders) for recovery reconciliation.

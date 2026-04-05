@@ -144,6 +144,15 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
 
         return FlattenResult.FailureResult("LIVE adapter not yet implemented", utcNow);
     }
+
+    public FlattenResult FlattenEmergency(string instrument, DateTimeOffset utcNow)
+    {
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_EMERGENCY_LIVE_STUB", state: "ENGINE",
+            new { instrument, note = "LIVE adapter FlattenEmergency not yet implemented" }));
+        return FlattenResult.FailureResult("LIVE adapter FlattenEmergency not yet implemented", utcNow);
+    }
+
+    public bool TryEnqueueEmergencyFlattenProtective(string instrument, DateTimeOffset utcNow) => false;
     
     public AccountSnapshot GetAccountSnapshot(DateTimeOffset utcNow)
     {

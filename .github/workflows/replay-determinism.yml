@@ -29,6 +29,23 @@ jobs:
           dotnet run --project modules/robot/replay/Robot.Replay.csproj -c Release --no-build -- \
             --determinism-test --file modules/robot/replay/sample_replay.jsonl
 
+  watchdog-session-flatten:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pytest + pytz
+        run: pip install pytest pytz
+
+      - name: Session flatten replay tests
+        run: |
+          python -m pytest modules/watchdog/tests/test_session_flatten_synthetic_replay.py modules/watchdog/tests/test_session_flatten_golden_day.py -v
+
   incident-packs:
     runs-on: windows-latest
     steps:

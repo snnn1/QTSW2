@@ -152,6 +152,8 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
             new { instrument, note = "LIVE adapter FlattenEmergency not yet implemented" }));
         return FlattenResult.FailureResult("LIVE adapter FlattenEmergency not yet implemented", utcNow);
     }
+
+    public bool TryEnqueueEmergencyFlattenProtective(string instrument, DateTimeOffset utcNow) => false;
     
     public AccountSnapshot GetAccountSnapshot(DateTimeOffset utcNow)
     {

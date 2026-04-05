@@ -387,6 +387,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private readonly HashSet<(string, string)> _sessionCloseCacheMissingEmittedKeys = new();
     private readonly HashSet<(string, string)> _sessionCloseFallbackFailedEmittedKeys = new();
 
+    /// <summary>Watchdog session/flatten visibility: highest source wins per (tradingDay, sessionClass) (NT_CACHE &gt; SPEC &gt; DEFAULT_1600).</summary>
+    private readonly Dictionary<(string tradingDay, string sessionClass), string> _sessionFlattenVisibilitySource = new();
+
+    /// <summary>SESSION_CLOSE_FALLBACK_WARNING: once per (tradingDay, sessionClass).</summary>
+    private readonly HashSet<(string, string)> _sessionCloseFallbackWarningEmitted = new();
+
     // Event-driven snapshot (strict 60s rate limit, independent of periodic)
     private DateTimeOffset? _lastEventDrivenSnapshotUtc = null;
     private const double EVENT_DRIVEN_SNAPSHOT_RATE_LIMIT_SECONDS = 60.0;
@@ -1163,13 +1169,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     blockInstrumentCallback: (instrument, now, reason) =>
                     {
                         _executionAdapter?.RequestSupervisoryActionForInstrument(instrument, SupervisoryTriggerReason.IEA_ENQUEUE_FAILURE, SupervisorySeverity.HIGH, new { reason }, now);
-                        // Flatten on block: prevent position with no protectives when IEA queue is blocked
-                        var flattenResult = _executionAdapter.FlattenEmergency(instrument, now);
-                        if (!flattenResult.Success)
+                        if (_executionAdapter?.TryEnqueueEmergencyFlattenProtective(instrument, now) != true)
                         {
                             LogEvent(RobotEvents.EngineBase(now, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "",
-                                eventType: "FLATTEN_EMERGENCY_ON_BLOCK_FAILED", state: "ENGINE",
-                                new { instrument, reason, error = flattenResult.ErrorMessage, note = "Flatten on block failed; position may be unprotected" }));
+                                eventType: "FLATTEN_EMERGENCY_ON_BLOCK_ENQUEUE_UNSUPPORTED", state: "ENGINE",
+                                new { instrument, reason, note = "Emergency flatten enqueue not supported for adapter; position may be unprotected until manual action" }));
                         }
                         StandDownStreamsForInstrument(instrument, now, reason);
                         _healthMonitor?.ReportCritical("IEA_ENQUEUE_FAILURE_INSTRUMENT_BLOCKED", new Dictionary<string, object>
@@ -1297,10 +1301,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 submitCorrective: TrySubmitCorrectiveStop,
                 emergencyFlatten: (instrument, utcNow) =>
                 {
-                    if (_executionAdapter is IIEAOrderExecutor iea)
-                        return iea.EmergencyFlatten(instrument, utcNow);
-                    return _executionAdapter?.FlattenEmergency(instrument, utcNow)
-                        ?? FlattenResult.FailureResult("No adapter", utcNow);
+                    if (_executionAdapter?.TryEnqueueEmergencyFlattenProtective(instrument, utcNow) == true)
+                        return FlattenResult.FailureResult("Enqueued for strategy thread", utcNow);
+                    return FlattenResult.FailureResult("Emergency flatten enqueue not supported for this adapter", utcNow);
                 },
                 eventWriter: _eventWriter,
                 getActiveIntentIdsForInstrument: inst => _executionAdapter.GetActiveIntentIdsForProtectiveAudit(inst),
@@ -2022,6 +2025,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                             {
                                 reason = "SESSION_CLOSE",
                                 session_class = sessionClass,
+                                instrument = _executionInstrument ?? "",
                                 source = usedFallback ? "FALLBACK_SPEC" : "LIVE_RESOLVER",
                                 resolved_session_close_utc = closeResult.ResolvedSessionCloseUtc?.ToString("o"),
                                 buffer_seconds = closeResult.BufferSeconds,
@@ -2723,6 +2727,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         var utcNow = DateTimeOffset.UtcNow;
         if (r.HasSession)
         {
+            TryEmitSessionFlattenVisibility(tradingDay, sessionClass, "NT_CACHE", true,
+                r.ResolvedSessionCloseUtc, r.FlattenTriggerUtc, r.BufferSeconds, utcNow);
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_RESOLVED", state: "ENGINE",
                 new
                 {
@@ -2739,6 +2745,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
         else
         {
+            TryEmitSessionFlattenVisibility(tradingDay, sessionClass, "NT_CACHE", false,
+                null, null, 0, utcNow, r.FailureReason);
             var eventType = r.FailureReason switch
             {
                 "HOLIDAY" => "SESSION_CLOSE_HOLIDAY",
@@ -2837,6 +2845,110 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         return false;
     }
 
+    private static int SessionFlattenSourcePriority(string source) => source switch
+    {
+        "NT_CACHE" => 3,
+        "OVERRIDE" => 4,
+        "SPEC" => 2,
+        "DEFAULT_1600" => 1,
+        _ => 0
+    };
+
+    /// <summary>
+    /// Emit SESSION_CLOSE_SOURCE_SELECTED, SESSION_RESOLVED, and FLATTEN_TRIGGER_SET for Watchdog aggregation.
+    /// Source priority allows SPEC/DEFAULT_1600 to be superseded later by NT_CACHE.
+    /// </summary>
+    private void TryEmitSessionFlattenVisibility(
+        string tradingDay,
+        string sessionClass,
+        string source,
+        bool hasSession,
+        DateTimeOffset? sessionCloseUtc,
+        DateTimeOffset? flattenTriggerUtc,
+        int bufferSeconds,
+        DateTimeOffset utcNow,
+        string? reason = null)
+    {
+        if (string.IsNullOrWhiteSpace(tradingDay) || string.IsNullOrWhiteSpace(sessionClass) || _time == null)
+            return;
+
+        var key = (tradingDay, sessionClass);
+        var pNew = SessionFlattenSourcePriority(source);
+        lock (_engineLock)
+        {
+            if (_sessionFlattenVisibilitySource.TryGetValue(key, out var oldSrc))
+            {
+                var pOld = SessionFlattenSourcePriority(oldSrc);
+                if (pNew < pOld)
+                    return;
+                if (pNew == pOld && string.Equals(oldSrc, source, StringComparison.Ordinal))
+                    return;
+            }
+            _sessionFlattenVisibilitySource[key] = source;
+        }
+
+        var inst = _executionInstrument ?? "";
+        var chicagoClose = "";
+        var chicagoTrigger = "";
+        if (sessionCloseUtc.HasValue)
+            chicagoClose = _time.ConvertUtcToChicago(sessionCloseUtc.Value).ToString("o");
+        if (flattenTriggerUtc.HasValue)
+            chicagoTrigger = _time.ConvertUtcToChicago(flattenTriggerUtc.Value).ToString("o");
+
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_SOURCE_SELECTED", state: "ENGINE",
+            new Dictionary<string, object?>
+            {
+                ["session_class"] = sessionClass,
+                ["instrument"] = inst,
+                ["source"] = source,
+                ["has_session"] = hasSession
+            }));
+
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_RESOLVED", state: "ENGINE",
+            new Dictionary<string, object?>
+            {
+                ["session_class"] = sessionClass,
+                ["instrument"] = inst,
+                ["session_close_utc"] = sessionCloseUtc?.ToString("o") ?? "",
+                ["session_close_chicago"] = chicagoClose,
+                ["has_session"] = hasSession,
+                ["reason"] = reason ?? ""
+            }));
+
+        if (hasSession && flattenTriggerUtc.HasValue)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "FLATTEN_TRIGGER_SET", state: "ENGINE",
+                new Dictionary<string, object?>
+                {
+                    ["session_class"] = sessionClass,
+                    ["instrument"] = inst,
+                    ["flatten_trigger_utc"] = flattenTriggerUtc.Value.ToString("o"),
+                    ["flatten_trigger_chicago"] = chicagoTrigger,
+                    ["buffer_seconds"] = bufferSeconds
+                }));
+        }
+    }
+
+    private void TryEmitSessionCloseFallbackWarning(string tradingDay, string sessionClass, DateTimeOffset utcNow)
+    {
+        var key = (tradingDay, sessionClass);
+        bool first;
+        lock (_engineLock)
+        {
+            first = _sessionCloseFallbackWarningEmitted.Add(key);
+        }
+        if (!first) return;
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_FALLBACK_WARNING", state: "ENGINE",
+            new Dictionary<string, object?>
+            {
+                ["session_class"] = sessionClass,
+                ["instrument"] = _executionInstrument ?? "",
+                ["source"] = "DEFAULT_1600",
+                ["reason"] = "Potential holiday or misconfigured session — using hard 16:00 CT fallback",
+                ["note"] = "Verify timetable, spec market_close_time, and NT TradingHours for this date"
+            }));
+    }
+
     private const int SESSION_CLOSE_FALLBACK_BUFFER_SECONDS = 300;
 
     /// <summary>
@@ -2859,7 +2971,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     {
         usedFallback = false;
         if (TryGetSessionCloseResult(tradingDay, sessionClass, out var cached) && cached != null)
+        {
+            TryEmitSessionFlattenVisibility(tradingDay, sessionClass, "NT_CACHE", cached.HasSession,
+                cached.ResolvedSessionCloseUtc, cached.FlattenTriggerUtc, cached.BufferSeconds, utcNow,
+                cached.HasSession ? null : cached.FailureReason);
             return cached;
+        }
 
         if (!DateOnly.TryParse(tradingDay, out var tradingDate))
             return null;
@@ -2872,7 +2989,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             {
                 var result = ComputeFallbackFromTime(tradingDate, marketCloseTime, tradingDay, sessionClass, utcNow, "SPEC", ref usedFallback);
                 if (result != null)
+                {
+                    TryEmitSessionFlattenVisibility(tradingDay, sessionClass, "SPEC", true,
+                        result.ResolvedSessionCloseUtc, result.FlattenTriggerUtc, result.BufferSeconds, utcNow);
                     return result;
+                }
             }
         }
 
@@ -2900,7 +3021,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
             var emergency = ComputeFallbackFromTime(tradingDate, EMERGENCY_MARKET_CLOSE_DEFAULT, tradingDay, sessionClass, utcNow, "EMERGENCY", ref usedFallback);
             if (emergency != null)
+            {
+                TryEmitSessionFlattenVisibility(tradingDay, sessionClass, "DEFAULT_1600", true,
+                    emergency.ResolvedSessionCloseUtc, emergency.FlattenTriggerUtc, emergency.BufferSeconds, utcNow);
+                TryEmitSessionCloseFallbackWarning(tradingDay, sessionClass, utcNow);
                 return emergency;
+            }
         }
 
         return null;
@@ -4580,9 +4706,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     isInstrumentBlockedForReentry: inst => IsInstrumentBlockedForReentry(inst),
                     emergencyFlatten: (inst, utcNow) =>
                     {
-                        if (_executionAdapter is IIEAOrderExecutor iea)
-                            return iea.EmergencyFlatten(inst, utcNow);
-                        return _executionAdapter?.FlattenEmergency(inst, utcNow) ?? FlattenResult.FailureResult("No adapter", utcNow);
+                        if (_executionAdapter?.TryEnqueueEmergencyFlattenProtective(inst, utcNow) == true)
+                            return FlattenResult.FailureResult("Enqueued for strategy thread", utcNow);
+                        return FlattenResult.FailureResult("Emergency flatten enqueue not supported for this adapter", utcNow);
                     },
                     isIeaQueueHealthyForInstrument: inst => IsIeaQueueHealthyForInstrument(inst),
                     eventWriter: _eventWriter);
@@ -6950,14 +7076,18 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                             run_id = _runId ?? ""
                         }));
 
-                    var flattenResult = _executionAdapter.FlattenEmergency(policyResult.Instrument, utcNow);
+                    var enq = _executionAdapter?.TryEnqueueEmergencyFlattenProtective(policyResult.Instrument, utcNow) == true;
+                    var flattenResult = enq
+                        ? FlattenResult.FailureResult("Enqueued for strategy thread", utcNow)
+                        : FlattenResult.FailureResult("Emergency flatten enqueue not supported", utcNow);
                     flattenedInstruments.Add(policyResult.Instrument);
                     LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "UNMATCHED_POSITION_FLATTEN_RESULT", state: "ENGINE",
                         new
                         {
                             instrument = policyResult.Instrument,
-                            flatten_success = flattenResult.Success,
+                            flatten_success = enq,
                             flatten_error = flattenResult.ErrorMessage,
+                            enqueue_only = true,
                             run_id = _runId ?? ""
                         }));
                 }

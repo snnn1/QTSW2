@@ -9,6 +9,7 @@ import { OperatorConsolePage } from './OperatorConsolePage'
 import { DailyJournalPage } from './DailyJournalPage'
 import { JournalPage } from './JournalPage'
 import { SummaryPage } from './SummaryPage'
+import { SessionFlattenPage } from './SessionFlattenPage'
 import './App.css'
 
 function App() {
@@ -22,6 +23,7 @@ function App() {
           <Route path="/daily" element={<DailyJournalPage />} />
           <Route path="/journal" element={<JournalPage />} />
           <Route path="/summary" element={<SummaryPage />} />
+          <Route path="/session-flatten" element={<SessionFlattenPage />} />
         </Routes>
       </BrowserRouter>
     </WebSocketProvider>

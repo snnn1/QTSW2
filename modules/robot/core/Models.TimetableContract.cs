@@ -77,8 +77,9 @@ public sealed class TimetableStream
     public bool? matrix_final_allowed { get; set; }
 
     /// <summary>
-    /// Reason why stream is blocked (if enabled = false). Execution contract:
-    /// <c>no_valid_execution_slot</c>, <c>session_filter_blocked</c>, or null when armed.
+    /// Reason why stream is blocked (if enabled = false). Execution contract (Python publisher):
+    /// <c>no_valid_execution_slot</c>, <c>matrix_filter_blocked:…</c>, <c>calendar_filter_blocked:…</c>,
+    /// or null when armed. (Legacy docs may say <c>session_filter_blocked</c>; align with Python strings above.)
     /// </summary>
     public string? block_reason { get; set; }
 

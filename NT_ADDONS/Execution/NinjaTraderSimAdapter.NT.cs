@@ -1089,8 +1089,24 @@ public sealed partial class NinjaTraderSimAdapter
                     episode_id = epi,
                     host_chart_instrument = GetHostChartInstrumentName(),
                     correlation_id = cmd.CorrelationId,
-                    reason = "execute_phase_not_coordination_owner"
+                    reason = "execute_phase_not_coordination_owner",
+                    critical_flatten = IsCriticalFlattenCommand(cmd)
                 }));
+            if (IsCriticalFlattenCommand(cmd))
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_COORDINATION_SKIP_ESCALATION", state: "CRITICAL",
+                    new
+                    {
+                        account = coordAcct,
+                        canonical_broker_key = canonicalKey,
+                        correlation_id = cmd.CorrelationId,
+                        instrument = cmd.Instrument,
+                        phase = "execute_flatten_instrument",
+                        note = "Non-owner skipped critical flatten execute — escalating block"
+                    }));
+                _blockInstrumentCallback?.Invoke(cmd.Instrument ?? "", utcNow, "FLATTEN_EXECUTE_NON_OWNER_CRITICAL");
+                ScheduleCriticalFlattenCoordinationRetryIfNeeded(cmd, "execute_flatten_instrument");
+            }
             return;
         }
 
@@ -6833,9 +6849,7 @@ public sealed partial class NinjaTraderSimAdapter
             new { instrument, note = "Flatten on block — enqueued via NtFlattenInstrumentCommand (policy funnel)" }));
         if (_useInstrumentExecutionAuthority && _iea != null)
         {
-            var cmd = new NtFlattenInstrumentCommand($"FLATTEN:EMERGENCY:{utcNow:yyyyMMddHHmmssfff}", "EMERGENCY_BLOCK", instrument, "IEA_BLOCK_EMERGENCY", utcNow,
-                DestructiveActionSource.EMERGENCY, DestructiveTriggerReason.IEA_ENQUEUE_FAILURE);
-            EnqueueNtActionInternal(cmd);
+            EnqueueEmergencyFlattenProtective(instrument, utcNow);
             return FlattenResult.FailureResult("Enqueued for strategy thread", utcNow);
         }
         return FlattenIntentReal("EMERGENCY_BLOCK", instrument, utcNow);
