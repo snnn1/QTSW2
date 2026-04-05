@@ -13,6 +13,10 @@ export interface ExecutionSeverityStatusInput {
   adoption_grace_expired_active?: boolean
   /** True when robot heartbeat timetable identity ≠ system timetable (Watchdog computed). */
   timetable_drift?: boolean
+  /** Watchdog GET /status — when false, execution is blocked for liveness reasons */
+  engine_alive?: boolean
+  enabled_streams_unknown?: boolean
+  timetable_unavailable?: boolean
 }
 
 export type OverallExecutionSeverity = 'SAFE' | 'WARNING' | 'CRITICAL' | 'UNKNOWN'
@@ -25,6 +29,12 @@ export type OverallExecutionReason =
   | 'DISCONNECT_FAIL_CLOSED'
   | 'ADOPTION_GRACE_EXPIRED'
   | 'RECONCILIATION_GATE_ENGAGED'
+  | 'ENGINE_NOT_ALIVE'
+  | 'TIMETABLE_NOT_READY'
+  | 'RECOVERY_NOT_CLEAR'
+  | 'SESSION_SLOT_TIME_INVALID'
+  | 'TRADING_DATE_NOT_SET'
+  | 'RISK_GATES_RECOVERY_BLOCKED'
   | 'EXECUTION_UNSAFE'
   | 'SAFE'
   | 'UNKNOWN'
@@ -34,6 +44,39 @@ export interface OverallExecutionDerived {
   overall_execution_reason: OverallExecutionReason
   /** True whenever trading must not be treated as allowed (includes UNKNOWN). */
   execution_blocked: boolean
+  /**
+   * When set, overrides EXECUTION_REASON_OPERATOR_MESSAGES for display (deterministic detail).
+   */
+  operator_message?: string
+}
+
+const RECOVERY_CLEARED_STATES = ['CONNECTED_OK', 'RECOVERY_COMPLETE'] as const
+
+function recoveryIsCleared(recoveryState: string): boolean {
+  return (RECOVERY_CLEARED_STATES as readonly string[]).includes(recoveryState)
+}
+
+/** Last-resort deterministic line when execution_safe is false but no single predicate matched earlier rules. */
+function buildMultifactorUnsafeDetail(
+  status: ExecutionSeverityStatusInput | null | undefined,
+  gates: RiskGateStatus | null | undefined,
+  recovery_state: string
+): string {
+  const parts: string[] = []
+  if (status?.engine_alive === false) parts.push('engine_alive=false')
+  if (gates?.timetable_validated === false) parts.push('timetable_validated=false')
+  if (status?.enabled_streams_unknown === true) parts.push('enabled_streams_unknown=true')
+  if (status?.timetable_unavailable === true) parts.push('timetable_unavailable=true')
+  if (!recoveryIsCleared(recovery_state) && recovery_state !== 'DISCONNECT_FAIL_CLOSED') {
+    parts.push(`recovery_state=${recovery_state}`)
+  }
+  if (gates && gates.session_slot_time_valid === false) parts.push('session_slot_time_valid=false')
+  if (gates && gates.trading_date_set === false) parts.push('trading_date_set=false')
+  if (gates && gates.recovery_state_allowed === false) parts.push('recovery_state_allowed=false')
+  if (parts.length > 0) {
+    return `Execution blocked — ${parts.join('; ')}`
+  }
+  return `Execution blocked — execution_safe=false; recovery_state=${recovery_state}; reconciliation_gate=${status?.reconciliation_gate_state ?? 'n/a'}`
 }
 
 function mergeExecutionFields(
@@ -157,10 +200,58 @@ export function deriveOverallExecutionStatus(
     }
   }
   if (execution_safe === false) {
+    if (status?.engine_alive === false) {
+      return {
+        overall_execution_severity: 'WARNING',
+        overall_execution_reason: 'ENGINE_NOT_ALIVE',
+        execution_blocked: true,
+      }
+    }
+    const timetableBlock =
+      gates?.timetable_validated === false ||
+      status?.enabled_streams_unknown === true ||
+      status?.timetable_unavailable === true
+    if (timetableBlock) {
+      return {
+        overall_execution_severity: 'WARNING',
+        overall_execution_reason: 'TIMETABLE_NOT_READY',
+        execution_blocked: true,
+      }
+    }
+    if (!recoveryIsCleared(recovery_state)) {
+      return {
+        overall_execution_severity: 'WARNING',
+        overall_execution_reason: 'RECOVERY_NOT_CLEAR',
+        execution_blocked: true,
+        operator_message: `Recovery state is ${recovery_state} — execution blocked until CONNECTED_OK or RECOVERY_COMPLETE`,
+      }
+    }
+    if (gates && gates.session_slot_time_valid === false) {
+      return {
+        overall_execution_severity: 'WARNING',
+        overall_execution_reason: 'SESSION_SLOT_TIME_INVALID',
+        execution_blocked: true,
+      }
+    }
+    if (gates && gates.trading_date_set === false) {
+      return {
+        overall_execution_severity: 'WARNING',
+        overall_execution_reason: 'TRADING_DATE_NOT_SET',
+        execution_blocked: true,
+      }
+    }
+    if (gates && gates.recovery_state_allowed === false) {
+      return {
+        overall_execution_severity: 'WARNING',
+        overall_execution_reason: 'RISK_GATES_RECOVERY_BLOCKED',
+        execution_blocked: true,
+      }
+    }
     return {
       overall_execution_severity: 'WARNING',
       overall_execution_reason: 'EXECUTION_UNSAFE',
       execution_blocked: true,
+      operator_message: buildMultifactorUnsafeDetail(status, gates, recovery_state),
     }
   }
 
@@ -179,13 +270,25 @@ export const EXECUTION_REASON_OPERATOR_MESSAGES: Record<OverallExecutionReason, 
   DISCONNECT_FAIL_CLOSED: 'Disconnect fail-closed — execution blocked',
   ADOPTION_GRACE_EXPIRED: 'Adoption grace expired — execution blocked',
   RECONCILIATION_GATE_ENGAGED: 'Reconciliation gate engaged — execution paused pending validation',
-  EXECUTION_UNSAFE: 'Execution not safe — trading blocked',
+  ENGINE_NOT_ALIVE: 'Engine not alive — stalled or missing heartbeat',
+  TIMETABLE_NOT_READY: 'Timetable not validated or stream enablement unknown — execution blocked',
+  RECOVERY_NOT_CLEAR: 'Recovery not complete — execution blocked until CONNECTED_OK or RECOVERY_COMPLETE',
+  SESSION_SLOT_TIME_INVALID: 'Session slot time is not valid for the stream session (see risk gates)',
+  TRADING_DATE_NOT_SET: 'Trading date is not set (see risk gates)',
+  RISK_GATES_RECOVERY_BLOCKED: 'Risk gates report recovery path not allowed',
+  EXECUTION_UNSAFE: 'Execution blocked — see risk gates (details unavailable)',
   SAFE: 'Execution safe',
   UNKNOWN: 'Execution state unknown',
 }
 
 export function executionReasonToOperatorMessage(reason: OverallExecutionReason): string {
   return EXECUTION_REASON_OPERATOR_MESSAGES[reason]
+}
+
+/** Prefer deterministic operator_message when deriveOverallExecutionStatus set it. */
+export function overallExecutionOperatorMessage(d: OverallExecutionDerived): string {
+  if (d.operator_message) return d.operator_message
+  return EXECUTION_REASON_OPERATOR_MESSAGES[d.overall_execution_reason]
 }
 
 /** Optional scroll target for watchdog page */
@@ -195,7 +298,7 @@ export function executionSeverityAlert(
   if (derived.overall_execution_severity === 'SAFE') return null
   return {
     type: derived.overall_execution_severity === 'CRITICAL' ? 'critical' : 'degraded',
-    message: executionReasonToOperatorMessage(derived.overall_execution_reason),
+    message: overallExecutionOperatorMessage(derived),
     scrollTo: 'risk-gates-panel',
   }
 }

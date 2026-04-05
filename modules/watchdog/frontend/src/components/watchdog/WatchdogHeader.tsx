@@ -5,7 +5,7 @@ import { useMemo, ReactNode } from 'react'
 import { CopyableText } from '../ui/CopyableText'
 import { formatChicagoTime } from '../../utils/timeUtils.ts'
 import type { OverallExecutionDerived } from '../../utils/executionSeverity'
-import { executionReasonToOperatorMessage } from '../../utils/executionSeverity'
+import { overallExecutionOperatorMessage } from '../../utils/executionSeverity'
 
 interface WatchdogHeaderProps {
   runId: string | null
@@ -120,7 +120,7 @@ export function WatchdogHeader({
   }
 
   const getExecutionSeverityBadge = () => {
-    const msg = executionReasonToOperatorMessage(overallExecution.overall_execution_reason)
+    const msg = overallExecutionOperatorMessage(overallExecution)
     const sev = overallExecution.overall_execution_severity
     if (sev === 'SAFE') {
       return (

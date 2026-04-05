@@ -127,7 +127,14 @@ Examples:
             )
             engine.scf_threshold = args.scf_threshold
             engine.write_execution_timetable_from_master_matrix(
-                master_df, trade_date=args.date, execution_mode=True
+                master_df,
+                trade_date=args.date,
+                execution_mode=True,
+                publish_context={
+                    "source": "cli",
+                    "reason": "run_matrix_and_timetable",
+                    "caller": "scripts/maintenance/run_matrix_and_timetable.py",
+                },
             )
             timetable_df = engine.build_timetable_dataframe_from_master_matrix(
                 master_df, trade_date=args.date, execution_mode=True

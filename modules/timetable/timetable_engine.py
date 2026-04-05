@@ -231,9 +231,18 @@ def _execution_mode_row_get_time(series: pd.Series) -> Any:
     return None
 
 
+def _execution_merged_stream_filters_nonempty(merged: Dict[str, Any]) -> bool:
+    """True when merged dict has at least one truthy entry (execution calendar must not run on empty config)."""
+    if not merged:
+        return False
+    return not all(not v for v in merged.values())
+
+
 def _merge_stream_filters_for_execution(
     project_root: Path,
     stream_filters: Optional[Dict],
+    *,
+    require_non_empty: bool = False,
 ) -> Dict:
     """
     Merge configs/stream_filters.json with caller-provided filters.
@@ -242,6 +251,10 @@ def _merge_stream_filters_for_execution(
     When ``stream_filters`` is None, the returned dict is exactly what is on disk (or empty if
     the file is missing). Execution mode always calls this so disk config is applied unless the
     caller passes explicit overrides.
+
+    When ``require_non_empty`` is True (execution publish with a non-empty matrix), missing or
+    all-falsy merge results raise RuntimeError so calendar evaluation cannot see an empty dict
+    (which would set dow_pass/dom_pass True for every stream).
     """
     merged: Dict[str, Any] = {}
     cfg = (Path(project_root) / "configs" / "stream_filters.json").resolve()
@@ -281,6 +294,10 @@ def _merge_stream_filters_for_execution(
     except TypeError:
         merged_repr = str(merged)
     logger.info("EXECUTION_STREAM_FILTERS_LOADED: filters=%s", merged_repr)
+    if require_non_empty and not _execution_merged_stream_filters_nonempty(merged):
+        raise RuntimeError(
+            "TIMETABLE_PUBLISH_BLOCKED: No valid stream_filters loaded. Refusing to publish timetable."
+        )
     return merged
 
 
@@ -622,6 +639,60 @@ def _matrix_row_series_to_final_allowed(r0: pd.Series) -> Tuple[bool, str]:
     return matrix_ok, fr_str
 
 
+def _strip_matrix_row_calendar_filter_reason_tokens(filter_reasons: str) -> str:
+    """
+    Remove ``dow_filter(...)`` and ``dom_filter(...)`` tokens from matrix ``filter_reasons``.
+
+    Those are evaluated in ``filter_engine`` using the **row's trade_date**. Execution timetable
+    uses ``session_trading_date`` for DOW/DOM via ``_execution_session_calendar_filters_*`` only;
+    stale row-date DOW/DOM text must not contribute to non-calendar matrix blocking.
+    """
+    if not filter_reasons or not str(filter_reasons).strip():
+        return ""
+    s = str(filter_reasons).strip()
+    prev = None
+    while prev != s:
+        prev = s
+        s = re.sub(r"(?i)\bdow_filter\([^)]*\)\s*", "", s)
+        s = re.sub(r"(?i)\bdom_filter\([^)]*\)\s*", "", s)
+    s = re.sub(r"\s*,\s*,+", ", ", s)
+    s = re.sub(r"^\s*,|,\s*$", "", s)
+    return s.strip().strip(",").strip()
+
+
+def _matrix_latest_row_execution_non_calendar_split(
+    master_matrix_df: pd.DataFrame,
+    stream_id: str,
+) -> Tuple[bool, bool, str, str]:
+    """
+    Latest row (max trade_date) split for execution gating.
+
+    Returns:
+        matrix_row_final_allowed_raw: latest row ``final_allowed`` is strictly True.
+        matrix_non_calendar_ok: False only when non-calendar matrix causes block the stream
+            (SCF, time_filter, unknown empty-reason false, etc.). Row-only DOW/DOM do not set this False.
+        filter_reasons_raw: verbatim ``filter_reasons`` from the row (audit).
+        matrix_non_calendar_block_suffix: text for ``matrix_filter_blocked:`` only;
+            stripped of dow_filter/dom_filter; empty when not blocked on non-calendar causes.
+    """
+    raw_ok, fr = _matrix_latest_row_final_allowed_for_stream(master_matrix_df, stream_id)
+    fr = fr or ""
+    fr_st = fr.strip()
+    ncal_only = _strip_matrix_row_calendar_filter_reason_tokens(fr)
+    ncal_st = ncal_only.strip()
+
+    if raw_ok:
+        return True, True, fr, ""
+
+    if not fr_st:
+        return False, False, fr, "matrix_row_final_allowed_false"
+
+    if not ncal_st:
+        return False, True, fr, ""
+
+    return False, False, fr, ncal_st
+
+
 def _matrix_latest_row_final_allowed_for_stream(
     master_matrix_df: pd.DataFrame,
     stream_id: str,
@@ -629,6 +700,9 @@ def _matrix_latest_row_final_allowed_for_stream(
     """
     Latest matrix state per stream: row with max ``trade_date`` for that ``stream_id``.
     Returns ``(final_allowed`` is strictly True, ``filter_reasons`` text).
+
+    Execution publish uses ``_matrix_latest_row_execution_non_calendar_split`` so row ``trade_date``
+    DOW/DOM do not veto a different ``session_trading_date``.
     """
     if master_matrix_df.empty or "Stream" not in master_matrix_df.columns:
         return False, ""
@@ -1329,6 +1403,20 @@ class TimetableEngine:
             )
             return None
 
+        pub_out: Dict[str, Any] = dict(publish_context or {})
+        if execution_mode:
+            _merged_for_audit = _merge_stream_filters_for_execution(
+                Path(self._project_root),
+                stream_filters,
+                require_non_empty=False,
+            )
+            pub_out["_filter_audit"] = {
+                "has_stream_filters": _execution_merged_stream_filters_nonempty(
+                    _merged_for_audit
+                ),
+                "filter_keys": list(_merged_for_audit.keys()),
+            }
+
         return self._publish_live_execution_timetable_versioned(
             streams,
             session_trading_date,
@@ -1336,7 +1424,7 @@ class TimetableEngine:
             ledger_writer="matrix",
             ledger_source="master_matrix",
             enforce_cme_live=execution_mode and not replay,
-            publish_context=publish_context,
+            publish_context=pub_out,
             eligibility_trade_date=eligibility_trade_date,
         )
 
@@ -1452,7 +1540,7 @@ class TimetableEngine:
                         get_cme_trading_date(datetime.now(timezone.utc))
                     ).date()
                 eff_empty = _merge_stream_filters_for_execution(
-                    self._project_root, stream_filters
+                    self._project_root, stream_filters, require_non_empty=False
                 )
                 _log_execution_filter_audit_for_publish(eff_empty)
                 return self._build_all_disabled_streams(
@@ -1478,7 +1566,7 @@ class TimetableEngine:
 
         if execution_mode:
             eff_stream_filters = _merge_stream_filters_for_execution(
-                self._project_root, stream_filters
+                self._project_root, stream_filters, require_non_empty=True
             )
             _log_execution_filter_audit_for_publish(eff_stream_filters)
             if execution_replay:
@@ -1807,14 +1895,17 @@ class TimetableEngine:
         Live execution: ``slot_time`` from matrix Time / Time Change using ``slot_date_obj`` parsed from
         **session_trading_date** (calendar DOW/DOM from this date only, not wall-clock).
 
-        **Matrix:** ``final_allowed`` / ``filter_reasons`` from **max(trade_date)** row per ``stream_id``.
+        **Matrix (non-calendar):** Latest row (max ``trade_date``) supplies ``final_allowed`` and ``filter_reasons``,
+        but **row-date** ``dow_filter`` / ``dom_filter`` tokens are stripped for gating — DOW/DOM are **only**
+        evaluated for ``session_trading_date`` via ``_execution_session_calendar_filters_*``.
 
         **Calendar gate:** ``_execution_session_calendar_filters_eval`` with empty slot time → **dow_pass** and
         **dom_pass** only (exclude_times does not gate ``enabled``).
 
-        **Enablement:** ``has_valid_slot AND latest_final_allowed AND dow_pass AND dom_pass``.
+        **Enablement:** ``has_valid_slot AND matrix_non_calendar_ok AND calendar_ok``.
 
-        ``block_reason``: ``no_valid_execution_slot``, ``matrix_filter_blocked:…``, ``calendar_filter_blocked:…``, or ``None``.
+        ``block_reason``: ``no_valid_execution_slot``, ``matrix_filter_blocked:`` + non-calendar reasons only,
+        ``calendar_filter_blocked:{dow}:{dom}``, or ``None``.
 
         Top-level ``eligibility_trade_date`` remains the latest matrix ``trade_date`` (operators only).
         ``trade_date_obj`` is retained for callers but ignored for slot structure; a warning is logged if
@@ -2006,9 +2097,12 @@ class TimetableEngine:
                     )
                 has_valid_slot = True
 
-            matrix_ok, matrix_filter_reasons = _matrix_latest_row_final_allowed_for_stream(
-                master_matrix_df, stream_id
-            )
+            (
+                _matrix_row_raw_ok,
+                matrix_non_calendar_ok,
+                matrix_filter_reasons_raw,
+                matrix_non_cal_block_suffix,
+            ) = _matrix_latest_row_execution_non_calendar_split(master_matrix_df, stream_id)
 
             _ev_calendar_only = _execution_session_calendar_filters_eval(
                 stream_id,
@@ -2031,13 +2125,14 @@ class TimetableEngine:
                 time if has_valid_slot else "",
             )
 
-            enabled = bool(has_valid_slot and matrix_ok and calendar_ok)
+            enabled = bool(has_valid_slot and matrix_non_calendar_ok and calendar_ok)
             _cal_block = f"calendar_filter_blocked:{filter_dow_name}:{filter_dom}"
 
             if not has_valid_slot:
                 block_reason = "no_valid_execution_slot"
-            elif not matrix_ok:
-                block_reason = "matrix_filter_blocked:" + matrix_filter_reasons
+            elif not matrix_non_calendar_ok:
+                _mbs = matrix_non_cal_block_suffix or "matrix_row_final_allowed_false"
+                block_reason = "matrix_filter_blocked:" + _mbs
             elif not calendar_ok:
                 block_reason = _cal_block
             else:
@@ -2045,7 +2140,8 @@ class TimetableEngine:
 
             print(
                 f"STREAM_AUDIT >>> stream={stream_id} | slot_date={slot_date_obj} | "
-                f"has_valid_slot={has_valid_slot} | matrix_final_allowed={matrix_ok} | "
+                f"has_valid_slot={has_valid_slot} | matrix_row_final_allowed_raw={_matrix_row_raw_ok} | "
+                f"matrix_non_calendar_ok={matrix_non_calendar_ok} | "
                 f"dow_pass={dow_pass} dom_pass={dom_pass} | "
                 f"filter_eval_overall_pass={passes_session_filters} (incl_time_diagnostic) | enabled={enabled}",
                 flush=True,
@@ -2073,15 +2169,17 @@ class TimetableEngine:
                 filter_dom,
                 _slot,
             )
-            _m_ok, _m_fr = _matrix_latest_row_final_allowed_for_stream(
+            _m_raw, _m_nc_ok, _m_fr_raw, _m_nc_suf = _matrix_latest_row_execution_non_calendar_split(
                 master_matrix_df, _sid
             )
             _pr_streams.append(
                 {
                     "stream": _sid,
                     "slot_time": _slot,
-                    "matrix_final_allowed": _m_ok,
-                    "matrix_filter_reasons": _m_fr,
+                    "matrix_row_final_allowed_raw": _m_raw,
+                    "matrix_non_calendar_ok": _m_nc_ok,
+                    "matrix_filter_reasons": _m_fr_raw,
+                    "matrix_non_calendar_block_suffix": _m_nc_suf,
                     "filter_config": _ev["filter_config"],
                     "dow_pass": _ev["dow_pass"],
                     "time_pass": _ev["time_pass"],
@@ -2177,6 +2275,9 @@ class TimetableEngine:
         ctx = publish_context or {}
         doc_source = (ctx.get("source") or execution_document_source or "master_matrix").strip()
         reason = (ctx.get("reason") or "publish").strip()
+        caller_label = (ctx.get("caller") or "").strip() or (
+            f"{ledger_writer}|{ledger_source or doc_source}|{reason}"
+        )
 
         streams_copy: List[Dict[str, Any]] = [dict(s) for s in streams]
 
@@ -2197,6 +2298,40 @@ class TimetableEngine:
                     previous_hash = timetable_hash_from_document(existing_doc)
             except Exception as ex:
                 logger.warning("TIMETABLE_PREVIOUS_READ: %s", ex)
+
+        _audit_ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        _first_two = [
+            {
+                "stream": s.get("stream"),
+                "enabled": s.get("enabled"),
+                "slot_time": s.get("slot_time"),
+            }
+            for s in streams_copy[:2]
+        ]
+        _will_skip = previous_hash is not None and timetable_hash == previous_hash
+        print(
+            f"TIMETABLE_CURRENT_PUBLISH_AUDIT ts_utc={_audit_ts} session_trading_date={session_trading_date} "
+            f"caller={caller_label!r} hash_prefix={timetable_hash[:16]}... "
+            f"outcome={'skip_no_change' if _will_skip else 'publish'} first_streams={_first_two!r}",
+            flush=True,
+        )
+        _fa = ctx.get("_filter_audit") or {}
+        _fa_keys = _fa.get("filter_keys")
+        if not isinstance(_fa_keys, list):
+            _fa_keys = []
+        print(
+            "TIMETABLE_CURRENT_PUBLISH_AUDIT",
+            json.dumps(
+                {
+                    "caller": ctx.get("caller"),
+                    "has_stream_filters": bool(_fa.get("has_stream_filters")),
+                    "filter_keys": _fa_keys,
+                },
+                sort_keys=True,
+                default=str,
+            ),
+            flush=True,
+        )
 
         if previous_hash is not None and timetable_hash == previous_hash:
             logger.info(

@@ -21,6 +21,7 @@ from modules.timetable.timetable_engine import (
 )
 from modules.timetable.eligibility_writer import write_eligibility_file
 from modules.timetable.eligibility_session_policy import EligibilityOverwriteBlockedAfterSessionStart
+from tests.stream_filters_fixtures import install_min_stream_filters
 
 
 def test_1730_ct_same_trading_date():
@@ -65,6 +66,7 @@ def test_publish_timetable_writes_without_eligibility_file(tmp_path, monkeypatch
         lambda _utc=None: "2026-04-01",
     )
     (tmp_path / "data" / "timetable").mkdir(parents=True)
+    install_min_stream_filters(tmp_path)
     eng = TimetableEngine(project_root=str(tmp_path))
     d = pd.Timestamp("2026-04-01")
     df = pd.DataFrame(
@@ -91,6 +93,7 @@ def test_publish_succeeds_live_cme(tmp_path, monkeypatch):
     )
     tdir = tmp_path / "data" / "timetable"
     tdir.mkdir(parents=True)
+    install_min_stream_filters(tmp_path)
     eng = TimetableEngine(project_root=str(tmp_path))
     d = pd.Timestamp("2026-04-02")
     df = pd.DataFrame(
@@ -149,6 +152,7 @@ def test_publish_session_date_not_cme_fails_before_write(tmp_path, monkeypatch):
     )
     tdir = tmp_path / "data" / "timetable"
     tdir.mkdir(parents=True)
+    install_min_stream_filters(tmp_path)
     eng = TimetableEngine(project_root=str(tmp_path))
     d = pd.Timestamp("2026-04-02")
     df = pd.DataFrame(

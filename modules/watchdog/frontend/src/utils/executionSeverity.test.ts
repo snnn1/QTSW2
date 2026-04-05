@@ -141,7 +141,7 @@ describe('deriveOverallExecutionStatus', () => {
     expect(d.overall_execution_reason).toBe('RECONCILIATION_GATE_ENGAGED')
   })
 
-  it('execution_safe false fallback → WARNING / EXECUTION_UNSAFE', () => {
+  it('execution_safe false + recovery running → WARNING / RECOVERY_NOT_CLEAR (deterministic)', () => {
     const d = deriveOverallExecutionStatus(
       {
         kill_switch_active: false,
@@ -149,11 +149,53 @@ describe('deriveOverallExecutionStatus', () => {
         reconciliation_gate_state: 'OK',
         recovery_state: 'RECOVERY_RUNNING',
         adoption_grace_expired_active: false,
+        engine_alive: true,
       },
       null
     )
     expect(d.overall_execution_severity).toBe('WARNING')
-    expect(d.overall_execution_reason).toBe('EXECUTION_UNSAFE')
+    expect(d.overall_execution_reason).toBe('RECOVERY_NOT_CLEAR')
+    expect(d.operator_message).toContain('RECOVERY_RUNNING')
+    expect(d.operator_message).toContain('CONNECTED_OK')
+  })
+
+  it('execution_safe false + engine not alive precedes recovery message', () => {
+    const d = deriveOverallExecutionStatus(
+      {
+        kill_switch_active: false,
+        execution_safe: false,
+        reconciliation_gate_state: 'OK',
+        recovery_state: 'RECOVERY_RUNNING',
+        adoption_grace_expired_active: false,
+        engine_alive: false,
+      },
+      null
+    )
+    expect(d.overall_execution_reason).toBe('ENGINE_NOT_ALIVE')
+  })
+
+  it('execution_safe false + timetable not validated → TIMETABLE_NOT_READY', () => {
+    const d = deriveOverallExecutionStatus(
+      {
+        kill_switch_active: false,
+        execution_safe: false,
+        reconciliation_gate_state: 'OK',
+        recovery_state: 'CONNECTED_OK',
+        adoption_grace_expired_active: false,
+        engine_alive: true,
+      },
+      {
+        timestamp_chicago: '',
+        recovery_state_allowed: true,
+        kill_switch_allowed: true,
+        execution_safe: false,
+        timetable_validated: false,
+        stream_armed: [],
+        session_slot_time_valid: true,
+        trading_date_set: true,
+      }
+    )
+    expect(d.overall_execution_reason).toBe('TIMETABLE_NOT_READY')
   })
 
   it('all clear → SAFE / SAFE', () => {
@@ -183,6 +225,23 @@ describe('deriveOverallExecutionStatus', () => {
     expect(d.overall_execution_severity).toBe('UNKNOWN')
     expect(d.overall_execution_reason).toBe('UNKNOWN')
     expect(d.execution_blocked).toBe(true)
+  })
+
+  it('execution_safe false with no gate payload → EXECUTION_UNSAFE with deterministic tail', () => {
+    const d = deriveOverallExecutionStatus(
+      {
+        kill_switch_active: false,
+        execution_safe: false,
+        reconciliation_gate_state: 'OK',
+        recovery_state: 'CONNECTED_OK',
+        adoption_grace_expired_active: false,
+        engine_alive: true,
+      },
+      null
+    )
+    expect(d.overall_execution_reason).toBe('EXECUTION_UNSAFE')
+    expect(d.operator_message).toContain('execution_safe=false')
+    expect(d.operator_message).toContain('CONNECTED_OK')
   })
 
   it('stable operator messages for reasons', () => {

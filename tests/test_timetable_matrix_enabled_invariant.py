@@ -10,7 +10,9 @@ import pandas as pd
 QTSW2_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(QTSW2_ROOT))
 
+from modules.matrix.config import SCF_THRESHOLD
 from modules.timetable.timetable_engine import TimetableEngine
+from tests.stream_filters_fixtures import install_min_stream_filters
 
 
 def _truthy_final_allowed(v) -> bool:
@@ -25,6 +27,7 @@ def test_timetable_execution_streams_matrix_final_allowed_full_write(tmp_path, m
         lambda _utc=None: "2026-04-02",
     )
     (tmp_path / "data" / "timetable").mkdir(parents=True)
+    install_min_stream_filters(tmp_path)
     eng = TimetableEngine(project_root=str(tmp_path))
     d = pd.Timestamp("2026-04-02")
     rows = []
@@ -40,7 +43,9 @@ def test_timetable_execution_streams_matrix_final_allowed_full_write(tmp_path, m
                 "Time": slot0,
                 "Time Change": "",
                 "final_allowed": fa,
-                "filter_reasons": "dow_filter(mon)" if not fa else "",
+                # Non-calendar reason: execution path strips dow_filter/dom_filter for gating; same-day
+                # calendar would still apply via stream_filters when present.
+                "filter_reasons": f"scf_s1_blocked(>={SCF_THRESHOLD})" if not fa else "",
             }
         )
     df = pd.DataFrame(rows)
@@ -176,3 +181,135 @@ def test_execution_mode_final_allowed_from_max_trade_date_per_stream():
     assert by_s["ES1"]["enabled"] is False
     assert (by_s["ES1"].get("block_reason") or "").startswith("matrix_filter_blocked:"), by_s["ES1"]
     assert by_s["NQ1"]["enabled"] is True, by_s["NQ1"]
+
+
+def test_execution_mode_friday_row_dow_only_does_not_veto_monday_session():
+    """Latest row is Friday with DOW-matrix block only; Monday session must not inherit that veto."""
+    eng = TimetableEngine(project_root=str(QTSW2_ROOT))
+    d_friday = pd.Timestamp("2026-04-03")
+    rows = []
+    for sid in eng.streams:
+        sess = "S1" if sid.endswith("1") else "S2"
+        slot0 = eng.session_time_slots[sess][0]
+        rows.append(
+            {
+                "Stream": sid,
+                "trade_date": d_friday,
+                "Session": sess,
+                "Time": slot0,
+                "Time Change": "",
+                "final_allowed": False,
+                "filter_reasons": "dow_filter(thursday,friday)",
+            }
+        )
+    df = pd.DataFrame(rows)
+    streams = eng._build_streams_execution_mode(
+        df, date_cls(2026, 4, 6), "2026-04-06", {}
+    )
+    by_s = {x["stream"]: x for x in streams}
+    for sid in eng.streams:
+        assert by_s[sid]["enabled"] is True, (sid, by_s[sid])
+        assert by_s[sid].get("block_reason") is None, (sid, by_s[sid])
+
+
+def test_execution_mode_friday_row_dom_only_does_not_veto_monday_session_dom():
+    """Row-date DOM filter text must not block when session_trading_date DOM is different and passes calendar."""
+    eng = TimetableEngine(project_root=str(QTSW2_ROOT))
+    d_row = pd.Timestamp("2026-04-10")
+    rows = []
+    for sid in eng.streams:
+        sess = "S1" if sid.endswith("1") else "S2"
+        slot0 = eng.session_time_slots[sess][0]
+        rows.append(
+            {
+                "Stream": sid,
+                "trade_date": d_row,
+                "Session": sess,
+                "Time": slot0,
+                "Time Change": "",
+                "final_allowed": False,
+                "filter_reasons": "dom_filter(10,15)",
+            }
+        )
+    df = pd.DataFrame(rows)
+    streams = eng._build_streams_execution_mode(
+        df, date_cls(2026, 4, 6), "2026-04-06", {}
+    )
+    by_s = {x["stream"]: x for x in streams}
+    for sid in eng.streams:
+        assert by_s[sid]["enabled"] is True, (sid, by_s[sid])
+
+
+def test_execution_mode_scf_matrix_block_still_blocks_on_future_session_day():
+    eng = TimetableEngine(project_root=str(QTSW2_ROOT))
+    d_friday = pd.Timestamp("2026-04-03")
+    reason = f"scf_s2_blocked(>={SCF_THRESHOLD})"
+    rows = []
+    for sid in eng.streams:
+        sess = "S1" if sid.endswith("1") else "S2"
+        slot0 = eng.session_time_slots[sess][0]
+        rows.append(
+            {
+                "Stream": sid,
+                "trade_date": d_friday,
+                "Session": sess,
+                "Time": slot0,
+                "Time Change": "",
+                "final_allowed": False,
+                "filter_reasons": reason if sess == "S2" else "dow_filter(monday)",
+            }
+        )
+    df = pd.DataFrame(rows)
+    streams = eng._build_streams_execution_mode(
+        df, date_cls(2026, 4, 6), "2026-04-06", {}
+    )
+    by_s = {x["stream"]: x for x in streams}
+    for sid in eng.streams:
+        sess = "S1" if sid.endswith("1") else "S2"
+        if sess == "S2":
+            assert by_s[sid]["enabled"] is False, by_s[sid]
+            br = by_s[sid].get("block_reason") or ""
+            assert br.startswith("matrix_filter_blocked:"), br
+            assert "scf" in br.lower(), br
+        else:
+            assert by_s[sid]["enabled"] is True, by_s[sid]
+
+
+def test_execution_mode_non_calendar_matrix_block_precedes_monday_calendar_message():
+    """When both fail, first precedence is matrix (non-calendar); no stale Friday DOW in block_reason."""
+    eng = TimetableEngine(project_root=str(QTSW2_ROOT))
+    d_friday = pd.Timestamp("2026-04-03")
+    scf_reason = f"scf_s1_blocked(>={SCF_THRESHOLD})"
+    rows = []
+    for sid in eng.streams:
+        sess = "S1" if sid.endswith("1") else "S2"
+        slot0 = eng.session_time_slots[sess][0]
+        rows.append(
+            {
+                "Stream": sid,
+                "trade_date": d_friday,
+                "Session": sess,
+                "Time": slot0,
+                "Time Change": "",
+                "final_allowed": False,
+                "filter_reasons": f"dow_filter(thursday,friday), {scf_reason}",
+            }
+        )
+    df = pd.DataFrame(rows)
+    sf = {
+        "master": {
+            "exclude_days_of_week": ["Monday"],
+            "exclude_days_of_month": [],
+            "exclude_times": [],
+        }
+    }
+    streams = eng._build_streams_execution_mode(
+        df, date_cls(2026, 4, 6), "2026-04-06", sf
+    )
+    by_s = {x["stream"]: x for x in streams}
+    for sid in eng.streams:
+        assert by_s[sid]["enabled"] is False, by_s[sid]
+        br = by_s[sid].get("block_reason") or ""
+        assert br.startswith("matrix_filter_blocked:"), br
+        assert "dow_filter" not in br.lower(), br
+        assert "scf" in br.lower(), br

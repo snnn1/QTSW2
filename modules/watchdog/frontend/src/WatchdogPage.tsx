@@ -380,7 +380,6 @@ export function WatchdogPage() {
                 marketOpen={status?.market_open ?? null}
                 outOfTimetableActiveStreams={outOfTimetableActiveStreams}
                 executionExpectationGaps={executionExpectationGaps}
-                timetableDrift={status?.timetable_drift ?? null}
               />
             </div>
             

@@ -76,4 +76,5 @@ class ExecutionTimetableRequest(BaseModel):
     trading_date: Optional[str] = None
     streams: List[ExecutionTimetableStream] = Field(default_factory=list)
     replay: bool = False
+    stream_filters: Optional[Dict[str, Any]] = None
 

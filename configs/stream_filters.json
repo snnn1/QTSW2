@@ -1,0 +1,7 @@
+{
+  "master": {
+    "exclude_days_of_week": [],
+    "exclude_days_of_month": [],
+    "exclude_times": []
+  }
+}

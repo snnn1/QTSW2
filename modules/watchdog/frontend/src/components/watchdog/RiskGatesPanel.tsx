@@ -4,7 +4,7 @@
  */
 import type { RiskGateStatus } from '../../types/watchdog'
 import type { OverallExecutionDerived } from '../../utils/executionSeverity'
-import { executionReasonToOperatorMessage } from '../../utils/executionSeverity'
+import { overallExecutionOperatorMessage } from '../../utils/executionSeverity'
 
 interface RiskGatesPanelProps {
   gates: RiskGateStatus | null
@@ -46,7 +46,7 @@ export function RiskGatesPanel({ gates, loading, overallExecution }: RiskGatesPa
 
   const executionSafe =
     gates.execution_safe ?? (gates.recovery_state_allowed && gates.kill_switch_allowed)
-  const reasonMsg = executionReasonToOperatorMessage(overallExecution.overall_execution_reason)
+  const reasonMsg = overallExecutionOperatorMessage(overallExecution)
   const rowClass = executionRowTextClass(overallExecution.overall_execution_severity)
 
   return (

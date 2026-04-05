@@ -15,7 +15,7 @@ import type { OperatorSnapshotInstrument } from './services/watchdogApi'
 import {
   deriveOperatorSystemStatus,
   deriveOverallExecutionStatus,
-  executionReasonToOperatorMessage,
+  overallExecutionOperatorMessage,
 } from './utils/executionSeverity'
 
 const STATUS_ORDER = ['CRITICAL', 'WARNING', 'SAFE'] as const
@@ -280,7 +280,7 @@ export function OperatorConsolePage() {
                 {overallExecution.overall_execution_severity}
               </div>
               <div className="text-xs text-gray-500 max-w-md mt-0.5" data-testid="operator-execution-message">
-                {executionReasonToOperatorMessage(overallExecution.overall_execution_reason)}
+                {overallExecutionOperatorMessage(overallExecution)}
               </div>
             </div>
             <div>

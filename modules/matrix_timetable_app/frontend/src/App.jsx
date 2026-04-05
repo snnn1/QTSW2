@@ -250,6 +250,7 @@ function AppContent() {
       const res = await matrixApi.saveExecutionTimetable({
         reason: 'manual_ui',
         source: 'matrix_ui',
+        streamFilters,
       })
       const tt = await matrixApi.getCurrentTimetable()
       setTimetableSourceMeta(timetableApiDocToSourceMeta(tt))
@@ -269,7 +270,7 @@ function AppContent() {
     } finally {
       setTimetableManualPublishLoading(false)
     }
-  }, [workerApplyExecutionTimetableFromApi])
+  }, [streamFilters, workerApplyExecutionTimetableFromApi])
 
   /** Timetable tab: rows only from GET /api/timetable/current (via workerExecutionTimetable). No worker merge. */
   const timetableRowsForDisplay = useMemo(() => {

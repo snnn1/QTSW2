@@ -207,7 +207,10 @@ def save_master_matrix(
         duration_ms=duration_ms,
     )
     
-    # Persist execution timetable from matrix in background (non-blocking)
+    # Persist execution timetable from matrix in background (non-blocking).
+    # Keeps timetable_current.json aligned with disk matrix when builds only call save_master_matrix.
+    # Server-side hash skip avoids pointless rewrites when content unchanged; TIMETABLE_CURRENT_PUBLISH_AUDIT
+    # can still show a near-simultaneous dashboard publish vs this caller for debugging.
     def _run_timetable_persist():
         try:
             import time
@@ -218,8 +221,10 @@ def save_master_matrix(
             sys.path.insert(0, str(Path(__file__).parent.parent.parent))
             from modules.timetable.timetable_engine import TimetableEngine
             df_copy = df.copy()
-            if 'trade_date' in df_copy.columns and not pd.api.types.is_datetime64_any_dtype(df_copy['trade_date']):
-                df_copy['trade_date'] = pd.to_datetime(df_copy['trade_date'], errors='raise')
+            if "trade_date" in df_copy.columns and not pd.api.types.is_datetime64_any_dtype(
+                df_copy["trade_date"]
+            ):
+                df_copy["trade_date"] = pd.to_datetime(df_copy["trade_date"], errors="raise")
             root = Path(__file__).resolve().parents[2]
             engine = (
                 TimetableEngine(timetable_output_dir=timetable_output_dir, project_root=str(root))
@@ -235,7 +240,11 @@ def save_master_matrix(
                 trade_date=session_td,
                 stream_filters=stream_filters,
                 execution_mode=True,
-                publish_context={"source": "matrix", "reason": "publish"},
+                publish_context={
+                    "source": "matrix",
+                    "reason": "publish",
+                    "caller": "matrix.file_manager.save_master_matrix:background_thread",
+                },
             )
             logger.info("Execution timetable persisted from master matrix")
             duration_ms = int((time.perf_counter() - t_timetable) * 1000)
@@ -248,10 +257,9 @@ def save_master_matrix(
             logger.warning(f"Failed to persist execution timetable: {e}")
             import traceback
             logger.debug(f"Timetable persistence traceback: {traceback.format_exc()}")
-    
-    t = threading.Thread(target=_run_timetable_persist, daemon=True)
-    t.start()
-    
+
+    threading.Thread(target=_run_timetable_persist, daemon=True).start()
+
     return parquet_file, json_file
 
 

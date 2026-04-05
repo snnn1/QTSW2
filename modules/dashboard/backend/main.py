@@ -785,6 +785,9 @@ class ExecutionTimetableRequest(BaseModel):
     replay: bool = False
     reason: Optional[str] = None
     source: Optional[str] = None
+    #: Merged with ``configs/stream_filters.json`` (same shape as matrix build). Strongly recommended for
+    #: manual publish when the JSON file is missing or stale so calendar gating matches the Matrix UI.
+    stream_filters: Optional[Dict[str, Any]] = None
 
 
 class ContentHashRequest(BaseModel):
@@ -834,7 +837,11 @@ async def generate_timetable(request: TimetableRequest):
                     matrix_df,
                     trade_date=session_td,
                     execution_mode=True,
-                    publish_context={"source": "manual", "reason": "publish"},
+                    publish_context={
+                        "source": "manual",
+                        "reason": "publish",
+                        "caller": "POST /api/timetable/generate",
+                    },
                 )
                 return engine.build_timetable_dataframe_from_master_matrix(
                     matrix_df, trade_date=session_td, execution_mode=True
@@ -846,6 +853,10 @@ async def generate_timetable(request: TimetableRequest):
         
         try:
             timetable_df = await asyncio.to_thread(_generate_timetable_sync)
+        except RuntimeError as e:
+            if "TIMETABLE_PUBLISH_BLOCKED" in str(e):
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            raise
         except ValueError as ve:
             raise HTTPException(status_code=400, detail=str(ve)) from ve
 
@@ -916,6 +927,7 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
         pub_ctx = {
             "source": (request.source or "matrix").strip() or "matrix",
             "reason": (request.reason or "publish").strip() or "publish",
+            "caller": "POST /api/timetable/execution",
         }
 
         def _publish_sync():
@@ -938,11 +950,13 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
                     trade_date=td,
                     execution_mode=True,
                     replay=True,
+                    stream_filters=request.stream_filters,
                     publish_context=pub_ctx,
                 )
             return engine.write_execution_timetable_from_master_matrix(
                 matrix_df,
                 execution_mode=True,
+                stream_filters=request.stream_filters,
                 publish_context=pub_ctx,
             )
 
@@ -951,6 +965,11 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
         except TimetableWriteBlockedCmeMismatch as cme_ex:
             logging.error("TIMETABLE_WRITE_BLOCKED_CME_MISMATCH: %s", cme_ex)
             raise HTTPException(status_code=400, detail=str(cme_ex)) from cme_ex
+        except RuntimeError as e:
+            if "TIMETABLE_PUBLISH_BLOCKED" in str(e):
+                logging.error("TIMETABLE_EXECUTION_SAVE_BLOCKED: %s", e)
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            raise
         except ValueError as e:
             logging.error("TIMETABLE_EXECUTION_SAVE_REJECTED: %s", e)
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -1239,7 +1258,11 @@ def _ensure_live_timetable_current_file_sync(timetable_file: Path, session_td: s
         res = engine.write_execution_timetable_from_master_matrix(
             matrix_df,
             execution_mode=True,
-            publish_context={"source": "auto", "reason": reason},
+            publish_context={
+                "source": "auto",
+                "reason": reason,
+                "caller": f"GET /api/timetable/current:auto_ensure({reason})",
+            },
         )
     except TimetableWriteBlockedCmeMismatch as e:
         logging.error("TIMETABLE_AUTO_GENERATE_CME_MISMATCH: %s", e)

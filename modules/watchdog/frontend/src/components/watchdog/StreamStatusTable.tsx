@@ -19,8 +19,6 @@ interface StreamStatusTableProps {
   outOfTimetableActiveStreams?: OutOfTimetableActiveStream[]
   /** Robot-reported slot end without trade (timetable streams only) */
   executionExpectationGaps?: ExecutionExpectationGap[]
-  /** When true, robot heartbeat timetable ≠ system file (global for all rows). */
-  timetableDrift?: boolean | null
 }
 
 export function StreamStatusTable({
@@ -29,7 +27,6 @@ export function StreamStatusTable({
   marketOpen,
   outOfTimetableActiveStreams = [],
   executionExpectationGaps = [],
-  timetableDrift = null,
 }: StreamStatusTableProps) {
   // Session day from API (CME label); never use UTC calendar for carry-over — wrong on Fri/Sat/Sun CT.
   const sessionTradingDay =
@@ -104,19 +101,6 @@ export function StreamStatusTable({
               <th className="px-2 py-1 text-left whitespace-nowrap min-w-[5rem]">Date</th>
               <th className="px-2 py-1 text-left">Stream</th>
               <th className="px-2 py-1 text-left">Instr</th>
-              <th className="px-2 py-1 text-left">Session</th>
-              <th
-                className="px-2 py-1 text-left"
-                title="System tradable now (matches /status execution_safe)"
-              >
-                Tradable
-              </th>
-              <th
-                className="px-2 py-1 text-left whitespace-nowrap"
-                title="Drift compares publisher identity (file JSON timetable_hash vs robot heartbeat), not content hash"
-              >
-                Timetable
-              </th>
               <th className="px-2 py-1 text-left">State</th>
               <th className="px-2 py-1 text-left" title="Time in State">TIS</th>
               <th className="px-2 py-1 text-left">Slot</th>
@@ -160,41 +144,6 @@ export function StreamStatusTable({
                   </td>
                   <td className="px-2 py-1 font-mono">{stream.stream}</td>
                   <td className="px-2 py-1">{stream.execution_instrument || stream.instrument || '-'}</td>
-                  <td className="px-2 py-1">{stream.session || '-'}</td>
-                  <td className="px-2 py-1">
-                    {stream.system_tradable_now === true ? (
-                      <span
-                        className="inline-block w-2.5 h-2.5 rounded-full bg-green-500 shrink-0"
-                        title="Tradable (execution_safe)"
-                        aria-label="Tradable"
-                      />
-                    ) : stream.system_tradable_now === false ? (
-                      <span
-                        className="inline-block w-2.5 h-2.5 rounded-full bg-red-500 shrink-0"
-                        title="Not tradable"
-                        aria-label="Not tradable"
-                      />
-                    ) : (
-                      <span className="text-gray-500 text-xs" title="Unknown">
-                        —
-                      </span>
-                    )}
-                  </td>
-                  <td className="px-2 py-1 text-xs">
-                    {timetableDrift === true ? (
-                      <span title="Timetable drift: robot heartbeat ≠ file publisher identity" className="text-amber-400">
-                        Drift ⚠
-                      </span>
-                    ) : timetableDrift === false ? (
-                      <span title="Publisher identity matches robot heartbeat" className="text-green-500">
-                        Synced ✓
-                      </span>
-                    ) : (
-                      <span title="Unknown (no robot hash or system snapshot)" className="text-gray-500">
-                        —
-                      </span>
-                    )}
-                  </td>
                   <td className="px-2 py-1">
                     {stream.state ? (
                       <span className={`px-2 py-0.5 rounded text-xs ${getStateBadgeColor(stream.state)}`}>

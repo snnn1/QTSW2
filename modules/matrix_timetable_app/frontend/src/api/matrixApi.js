@@ -296,21 +296,53 @@ export async function computeTimetableContentHash({ session_trading_date, stream
 }
 
 /**
+ * Strip UI-only keys; match POST /api/matrix/resequence stream_filters shape for execution publish merge.
+ */
+export function streamFiltersForExecutionApi(streamFilters = {}) {
+  const out = {}
+  Object.keys(streamFilters).forEach(streamId => {
+    const filters = streamFilters[streamId]
+    if (filters && typeof filters === 'object') {
+      out[streamId] = {
+        exclude_days_of_week: filters.exclude_days_of_week || [],
+        exclude_days_of_month: filters.exclude_days_of_month || [],
+        exclude_times: filters.exclude_times || []
+      }
+    }
+  })
+  return out
+}
+
+/**
  * Trigger execution timetable publish from on-disk master matrix (server-side).
  * Optional `tradingDate` only when `replay` is true.
+ * Pass `streamFilters` (Matrix UI state) so calendar rules match background publish when configs/stream_filters.json is missing.
  */
-export async function saveExecutionTimetable({ tradingDate, replay = false, reason, source } = {}) {
+export async function saveExecutionTimetable({
+  tradingDate,
+  replay = false,
+  reason,
+  source,
+  streamFilters
+} = {}) {
+  const payload = {
+    trading_date: tradingDate ?? null,
+    replay,
+    reason: reason ?? null,
+    source: source ?? null
+  }
+  if (streamFilters != null && typeof streamFilters === 'object') {
+    const apiFilters = streamFiltersForExecutionApi(streamFilters)
+    if (Object.keys(apiFilters).length > 0) {
+      payload.stream_filters = apiFilters
+    }
+  }
   const response = await fetch(`${API_BASE}/timetable/execution`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify({
-      trading_date: tradingDate ?? null,
-      replay,
-      reason: reason ?? null,
-      source: source ?? null
-    })
+    body: JSON.stringify(payload)
   })
 
   if (!response.ok) {
