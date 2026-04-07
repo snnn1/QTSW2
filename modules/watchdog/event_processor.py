@@ -6,8 +6,9 @@ Processes events from frontend_feed.jsonl and updates state manager.
 import json
 import logging
 import re
+import threading
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 import pytz
 
@@ -17,12 +18,37 @@ from .config import (
     SESSION_CONNECTION_EVENT_MAX_AGE_SECONDS,
 )
 from .incident_recorder import process_event as incident_recorder_process_event
+from .slot_end_payload import promote_slot_end_summary_fields_from_payload
 from .state_manager import WatchdogStateManager
 from .timetable_poller import compute_timetable_trading_date
-
 logger = logging.getLogger(__name__)
 
 CHICAGO_TZ = pytz.timezone("America/Chicago")
+
+# Cumulative counts since process start: how often each flatten_lookup_reason occurred.
+_FLATTEN_LOOKUP_REASON_COUNTS: Dict[str, int] = {}
+_FLATTEN_LOOKUP_COUNTS_LOCK = threading.Lock()
+
+_FLATTEN_LOOKUP_REASON_KEYS = (
+    "MATCH_CURRENT_DATE",
+    "NO_ROW_FOUND",
+    "MISSING_KEYS",
+    "NO_TRACKER",
+)
+
+
+def _record_flatten_lookup_reason(reason: str) -> None:
+    with _FLATTEN_LOOKUP_COUNTS_LOCK:
+        _FLATTEN_LOOKUP_REASON_COUNTS[reason] = _FLATTEN_LOOKUP_REASON_COUNTS.get(reason, 0) + 1
+
+
+def get_flatten_lookup_reason_counts() -> Dict[str, int]:
+    """
+    Snapshot of cumulative ``stream_session_flatten_fields`` outcomes (process lifetime).
+    Keys are stable for dashboards; values are monotonic until process restart.
+    """
+    with _FLATTEN_LOOKUP_COUNTS_LOCK:
+        return {k: int(_FLATTEN_LOOKUP_REASON_COUNTS.get(k, 0)) for k in _FLATTEN_LOOKUP_REASON_KEYS}
 
 
 def _trading_date_from_timestamp(timestamp_utc: datetime) -> str:
@@ -48,6 +74,151 @@ def get_canonical_instrument(instrument: str) -> str:
     except Exception as e:
         logger.warning(f"Failed to canonicalize instrument '{instrument}': {e}, using as-is")
         return instrument
+
+
+def stream_session_flatten_fields(
+    tracker: Optional[Any],
+    *,
+    trading_date: str,
+    session: str,
+    instrument: str,
+    session_class: Optional[str] = None,
+    stream: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Project session/flatten rollup onto a timetable stream row (read-only).
+
+    Single source of truth: SessionFlattenStateTracker.get_row after ensure_baseline_row.
+    Ingest runs at the start of EventProcessor.process_event (before stream state updates).
+
+    UI contract: flatten_status is never NOT_AVAILABLE when keys are valid — baseline is NOT_TRIGGERED.
+    """
+    td = str(trading_date or "").strip()
+    sess = (str(session or "").strip() or str(session_class or "").strip())
+    inst = str(instrument or "").strip()
+    stream_id = str(stream or "").strip()
+    sc_meta = str(session_class or "").strip()
+
+    if tracker is None:
+        out = {
+            "has_session": False,
+            "flatten_trigger_ct": None,
+            "flatten_status": "NOT_TRIGGERED",
+            "flatten_lookup_reason": "NO_TRACKER",
+            "flatten_triggered": False,
+            "broker_flat": False,
+            "confirmed": False,
+        }
+        logger.info(
+            "FLATTEN_LOOKUP_DEBUG stream=%s instrument=%s session=%s trading_date=%s %s",
+            stream_id,
+            inst,
+            sess,
+            td,
+            out["flatten_lookup_reason"],
+        )
+        _record_flatten_lookup_reason(out["flatten_lookup_reason"])
+        return out
+
+    if not sess or not inst:
+        avail = (
+            tracker.debug_snapshot_keys()
+            if hasattr(tracker, "debug_snapshot_keys")
+            else []
+        )
+        logger.warning(
+            "FLATTEN_STATE_LOOKUP_MISS reason=MISSING_KEYS trading_date=%s stream=%s instrument=%s "
+            "session=%s session_class=%s available_keys=%s",
+            td,
+            stream_id,
+            inst,
+            session,
+            sc_meta,
+            avail,
+        )
+        out = {
+            "has_session": False,
+            "flatten_trigger_ct": None,
+            "flatten_status": "NOT_TRIGGERED",
+            "flatten_lookup_reason": "MISSING_KEYS",
+            "flatten_triggered": False,
+            "broker_flat": False,
+            "confirmed": False,
+        }
+        _record_flatten_lookup_reason(out["flatten_lookup_reason"])
+        return out
+
+    tracker.ensure_baseline_row(
+        trading_date=td,
+        session=str(session or "").strip(),
+        session_class=session_class,
+        instrument=inst,
+        stream=stream_id or None,
+    )
+
+    row = tracker.get_row(td, sess, inst, stream_id or None)
+    if row is None and stream_id:
+        row = tracker.get_row(td, sess, inst, "")
+
+    if row is None:
+        avail = (
+            tracker.debug_snapshot_keys()
+            if hasattr(tracker, "debug_snapshot_keys")
+            else []
+        )
+        logger.warning(
+            "FLATTEN_STATE_LOOKUP_MISS reason=NO_ROW_AFTER_ENSURE trading_date=%s stream=%s instrument=%s "
+            "session_key=%s session_class=%s available_keys=%s",
+            td,
+            stream_id,
+            inst,
+            sess,
+            sc_meta,
+            avail,
+        )
+        out = {
+            "has_session": False,
+            "flatten_trigger_ct": None,
+            "flatten_status": "NOT_TRIGGERED",
+            "flatten_lookup_reason": "NO_ROW_FOUND",
+            "flatten_triggered": False,
+            "broker_flat": False,
+            "confirmed": False,
+        }
+        _record_flatten_lookup_reason(out["flatten_lookup_reason"])
+        return out
+
+    if stream_id and row.stream.strip() and row.stream.strip() != stream_id.strip():
+        logger.warning(
+            "FLATTEN_STATE_STREAM_KEY_MISMATCH trading_date=%s stream_id=%s row_stream=%s instrument=%s session_key=%s",
+            td,
+            stream_id,
+            row.stream,
+            inst,
+            sess,
+        )
+
+    fs = row.flatten_status or "NOT_TRIGGERED"
+    reason = "MATCH_CURRENT_DATE"
+    out = {
+        "has_session": row.has_session,
+        "flatten_trigger_ct": row.flatten_trigger_ct,
+        "flatten_status": fs,
+        "flatten_lookup_reason": reason,
+        "flatten_triggered": fs != "NOT_TRIGGERED",
+        "broker_flat": fs == "BROKER_FLAT",
+        "confirmed": fs == "CONFIRMED",
+    }
+    logger.info(
+        "FLATTEN_LOOKUP_DEBUG stream=%s instrument=%s session=%s trading_date=%s %s",
+        stream_id,
+        inst,
+        sess,
+        td,
+        reason,
+    )
+    _record_flatten_lookup_reason(reason)
+    return out
 
 
 def canonicalize_stream(stream_id: str, execution_instrument: str) -> str:
@@ -119,7 +290,8 @@ class EventProcessor:
         if not isinstance(data, dict):
             data = {}
 
-        # Session / flatten visibility (engine events only; must not depend on timestamp parse)
+        # Session / flatten visibility (engine events only; must not depend on timestamp parse).
+        # Ingest MUST run before stream state updates below so get_stream_states can read tracker rows.
         if self._session_flatten_tracker is not None:
             try:
                 self._session_flatten_tracker.ingest(event)
@@ -535,6 +707,8 @@ class EventProcessor:
                             info.freeze_close = float(freeze_close) if freeze_close is not None else None
         
         elif event_type == "SLOT_END_SUMMARY":
+            # trade_executed / reason often live only in data.payload (frontend_feed shape)
+            promote_slot_end_summary_fields_from_payload(data)
             # Update stream state with slot summary: trade_executed, reason
             trading_date = (
                 self._state_manager.get_trading_date()
@@ -571,14 +745,26 @@ class EventProcessor:
         elif event_type in ("STREAM_STAND_DOWN", "MARKET_CLOSE_NO_TRADE"):
             # Standardized fields are now always at top level (plan requirement #1)
             # MARKET_CLOSE_NO_TRADE is treated the same as STREAM_STAND_DOWN
-            # Prefer timetable's trading_date; fallback to event's for startup (same as STREAM_STATE_TRANSITION)
+            # Terminal events: event/data trading_date must precede watchdog timetable date so
+            # session-close is keyed to the session being closed, not the calendar day after rollover.
             trading_date = (
-                self._state_manager.get_trading_date()
-                or event.get("trading_date")
+                event.get("trading_date")
                 or data.get("trading_date")
+                or self._state_manager.get_trading_date()
+            )
+            logger.info(
+                "STREAM_STATE_TERMINAL_DATE_RESOLUTION "
+                f"event_type={event_type} "
+                f"resolved_trading_date={trading_date} "
+                f"event_td={event.get('trading_date')} "
+                f"data_td={data.get('trading_date')} "
+                f"watchdog_td={self._state_manager.get_trading_date()}"
             )
             if not trading_date:
-                logger.debug(f"{event_type} skipped: no trading_date")
+                logger.error(
+                    "STREAM_STATE_TERMINAL_NO_TRADING_DATE "
+                    f"event_type={event_type} event={event}"
+                )
                 return
             stream = event.get("stream")
             instrument = event.get("instrument")

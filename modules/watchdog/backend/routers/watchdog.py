@@ -401,6 +401,8 @@ async def get_instrument_health():
                 "status": "DATA_STALLED" if stall_detected else "OK",
                 "last_bar_chicago": info.get("last_bar_chicago"),
                 "elapsed_seconds": info.get("elapsed_seconds"),
+                "gap_seconds": info.get("gap_seconds"),
+                "stall_threshold_seconds": info.get("stall_threshold_seconds"),
             })
         return {"instruments": instruments, "count": len(instruments)}
     except HTTPException:

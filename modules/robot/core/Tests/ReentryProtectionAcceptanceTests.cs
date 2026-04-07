@@ -35,17 +35,28 @@ public static class ReentryProtectionAcceptanceTests
             var log = new RobotLogger(tempRoot);
             var journals = new JournalStore(tempRoot);
 
-            // 1. Reentry intent detection: only _REENTRY suffix triggers callback
-            if (!"slot132_REENTRY".EndsWith("_REENTRY", StringComparison.OrdinalIgnoreCase))
-                return (false, "Reentry intent detection: slot132_REENTRY should match _REENTRY suffix");
-            if ("abc123orig".EndsWith("_REENTRY", StringComparison.OrdinalIgnoreCase))
-                return (false, "Original intent abc123orig should NOT match _REENTRY suffix");
-
-            // 2. Create journal with reentry state: ProtectionSubmitted=true, ExecutionInterruptedByClose=true
+            // 1. ReentryIntentId in journal is Intent.ComputeIntentId() (16 hex), aligned with ExecuteSubmitMarketReentry
             var tradingDate = new DateOnly(2026, 3, 15);
             var tradingDateStr = tradingDate.ToString("yyyy-MM-dd");
             var streamId = "ES1";
-            var reentryIntentId = "20260315_ES1_REENTRY";
+            var reentryIntentId = new Intent(
+                tradingDateStr,
+                streamId,
+                "MES",
+                "MES",
+                "S1",
+                "07:30",
+                "Long",
+                null,
+                null,
+                null,
+                null,
+                DateTimeOffset.UtcNow,
+                "SUBMIT_MARKET_REENTRY").ComputeIntentId();
+            if (reentryIntentId.Length != 16)
+                return (false, "Canonical reentry intent id should be 16 chars");
+
+            // 2. Create journal with reentry state: ProtectionSubmitted=true, ExecutionInterruptedByClose=true
 
             var journal = new StreamJournal
             {
@@ -161,7 +172,21 @@ public static class ReentryProtectionAcceptanceTests
             if (!reloaded2.ExecutionInterruptedByClose)
                 return (false, "Original entry: ExecutionInterruptedByClose should remain true (HandleReentryProtectionAccepted does nothing when ProtectionSubmitted=false)");
 
-            // 8. Wrong reentryIntentId: stream has ReentryIntentId="X" but we pass "Y" -> no-op
+            // 8. Wrong reentryIntentId: stream has canonical ReentryIntentId but we pass "Y" -> no-op
+            var canonicalEs3 = new Intent(
+                tradingDateStr,
+                "ES3",
+                "MES",
+                "MES",
+                "S1",
+                "07:30",
+                "Long",
+                null,
+                null,
+                null,
+                null,
+                DateTimeOffset.UtcNow,
+                "SUBMIT_MARKET_REENTRY").ComputeIntentId();
             var journal3 = new StreamJournal
             {
                 TradingDate = tradingDateStr,
@@ -169,7 +194,7 @@ public static class ReentryProtectionAcceptanceTests
                 Committed = false,
                 SlotStatus = SlotStatus.ACTIVE,
                 ExecutionInterruptedByClose = true,
-                ReentryIntentId = "20260315_ES3_REENTRY",
+                ReentryIntentId = canonicalEs3,
                 ProtectionSubmitted = true,
                 ProtectionAccepted = false,
                 SlotInstanceKey = "20260315_ES3_07:30"

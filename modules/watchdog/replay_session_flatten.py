@@ -42,6 +42,7 @@ TRACKED_TYPES = frozenset(
         "FORCED_FLATTEN_REQUEST_SUBMITTED",
         "FORCED_FLATTEN_FAILED",
         "FLATTEN_BROKER_FLAT_CONFIRMED",
+        "SESSION_FORCED_FLATTENED",
         "FORCED_FLATTEN_BROKER_TIMEOUT",
         "FORCED_FLATTEN_EXPOSURE_REMAINING",
         "MANUAL_FLATTEN_REQUIRED",
@@ -282,7 +283,12 @@ def main() -> int:
     print(f"{'Date':<12} | {'Sess':<4} | {'Inst':<6} | {'Status':<14} | {'Req':<5} | {'Alert':<5}")
     print("-" * 72)
     for r in rows:
-        key = (r["trading_date"], r["session_class"], r.get("instrument") or "__engine__")
+        key = (
+            r["trading_date"],
+            r["session_class"],
+            r.get("instrument") or "__engine__",
+            r.get("stream") or "__engine__",
+        )
         row_obj = tracker._rows.get(key)
         alert = "yes" if row_obj and row_obj.alert_emitted else "no"
         req = "yes" if row_obj and row_obj.flatten_required else "no"

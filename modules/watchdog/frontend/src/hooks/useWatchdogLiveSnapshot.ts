@@ -7,6 +7,7 @@ import { fetchWatchdogStatus, fetchStreamStates, fetchSlotLifecycle, type SlotLi
 import { usePollingInterval } from './usePollingInterval'
 import type {
   ExecutionExpectationGap,
+  FlattenLookupMetrics,
   OutOfTimetableActiveStream,
   StreamState,
   WatchdogStatus,
@@ -20,6 +21,7 @@ export function useWatchdogLiveSnapshot() {
   const [timetableUnavailable, setTimetableUnavailable] = useState(false)
   const [outOfTimetableActiveStreams, setOutOfTimetableActiveStreams] = useState<OutOfTimetableActiveStream[]>([])
   const [executionExpectationGaps, setExecutionExpectationGaps] = useState<ExecutionExpectationGap[]>([])
+  const [flattenLookupMetrics, setFlattenLookupMetrics] = useState<FlattenLookupMetrics | null>(null)
   const [slotLifecycle, setSlotLifecycle] = useState<SlotLifecycleSlot[]>([])
   const [statusError, setStatusError] = useState<string | null>(null)
   const [streamsError, setStreamsError] = useState<string | null>(null)
@@ -49,12 +51,14 @@ export function useWatchdogLiveSnapshot() {
       setStreams(ss.data.streams ?? [])
       setOutOfTimetableActiveStreams(ss.data.out_of_timetable_active_streams ?? [])
       setExecutionExpectationGaps(ss.data.execution_expectation_gaps ?? [])
+      setFlattenLookupMetrics(ss.data.flatten_lookup_metrics ?? null)
       setTimetableUnavailable(Boolean(ss.data.timetable_unavailable || ss.data.enabled_streams_unknown))
       setStreamsError(null)
     } else {
       setStreamsError(ss.error ?? 'Stream states request failed')
       setOutOfTimetableActiveStreams([])
       setExecutionExpectationGaps([])
+      setFlattenLookupMetrics(null)
     }
 
     if (sl.data) {
@@ -75,6 +79,7 @@ export function useWatchdogLiveSnapshot() {
     streams,
     outOfTimetableActiveStreams,
     executionExpectationGaps,
+    flattenLookupMetrics,
     timetableUnavailable,
     slotLifecycle,
     statusError,

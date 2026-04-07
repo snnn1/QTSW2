@@ -1272,14 +1272,14 @@ public sealed partial class NinjaTraderSimAdapter
         var utcNow = cmd.TimestampUtc;
         var instrument = cmd.ExecutionInstrument ?? cmd.Instrument ?? "";
         var execInst = string.IsNullOrEmpty(instrument) ? "" : instrument.Trim().ToUpperInvariant();
-        var reentryIntentId = cmd.ReentryIntentId ?? "";
-        var direction = cmd.Direction ?? "";
+        // Align with StreamStateMachine CheckMarketOpenReentry (originalEntry.Direction ?? "Long") so ComputeIntentId matches journal precompute.
+        var direction = string.IsNullOrEmpty(cmd.Direction) ? "Long" : cmd.Direction!;
         var quantity = cmd.Quantity;
 
-        if (string.IsNullOrEmpty(reentryIntentId) || string.IsNullOrEmpty(execInst) || string.IsNullOrEmpty(direction) || quantity <= 0)
+        if (string.IsNullOrEmpty(execInst) || quantity <= 0)
         {
-            _log.Write(RobotEvents.ExecutionBase(utcNow, reentryIntentId, execInst, "SUBMIT_MARKET_REENTRY_SKIPPED",
-                new { reason = "Missing required fields", reentryIntentId, execInst, direction, quantity }));
+            _log.Write(RobotEvents.ExecutionBase(utcNow, cmd.ReentryIntentId ?? "", execInst, "SUBMIT_MARKET_REENTRY_SKIPPED",
+                new { reason = "Missing required fields", reentryIntentId = cmd.ReentryIntentId, execInst, direction, quantity }));
             return;
         }
 
@@ -1297,11 +1297,24 @@ public sealed partial class NinjaTraderSimAdapter
             null,
             utcNow,
             "SUBMIT_MARKET_REENTRY");
-        RegisterIntent(reentryIntent);
-        RegisterIntentPolicy(reentryIntentId, quantity, quantity, instrument, execInst, "EXECUTION_COMMAND");
+        var canonicalIntentId = reentryIntent.ComputeIntentId();
+        if (!string.IsNullOrEmpty(cmd.ReentryIntentId) &&
+            !string.Equals(cmd.ReentryIntentId, canonicalIntentId, StringComparison.Ordinal))
+        {
+            _log.Write(RobotEvents.ExecutionBase(utcNow, canonicalIntentId, execInst, "SUBMIT_MARKET_REENTRY_INTENT_ID_CANONICAL_OVERRIDE",
+                new
+                {
+                    command_reentry_intent_id = cmd.ReentryIntentId,
+                    canonical_intent_id = canonicalIntentId,
+                    note = "Command/journal id did not match Intent.ComputeIntentId — using canonical id for execution"
+                }));
+        }
 
-        var result = SubmitEntryOrder(reentryIntentId, execInst, direction, null, quantity, "MARKET", null, utcNow);
-        _log.Write(RobotEvents.ExecutionBase(utcNow, reentryIntentId, execInst, "SUBMIT_MARKET_REENTRY_COMPLETED",
+        RegisterIntent(reentryIntent);
+        RegisterIntentPolicy(canonicalIntentId, quantity, quantity, instrument, execInst, "EXECUTION_COMMAND");
+
+        var result = SubmitEntryOrder(canonicalIntentId, execInst, direction, null, quantity, "MARKET", null, utcNow);
+        _log.Write(RobotEvents.ExecutionBase(utcNow, canonicalIntentId, execInst, "SUBMIT_MARKET_REENTRY_COMPLETED",
             new { success = result.Success, error = result.ErrorMessage }));
     }
 
@@ -1594,7 +1607,7 @@ public sealed partial class NinjaTraderSimAdapter
     {
         if (_ntAccount == null)
         {
-            var error = "NT account is null - cannot verify Sim account";
+            var error = "NT account is null - cannot verify non-live account";
             _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
                 new { reason = "NOT_SIM_ACCOUNT", error }));
             throw new InvalidOperationException(error);
@@ -1609,14 +1622,9 @@ public sealed partial class NinjaTraderSimAdapter
             throw new InvalidOperationException(error);
         }
 
-        // Assert: account is SIM account (check by name pattern since IsSimAccount may not exist in all NT versions)
-        var accountNameUpper = account.Name.ToUpperInvariant();
-        var isSimAccount = accountNameUpper.Contains("SIM") || 
-                          accountNameUpper.Contains("SIMULATION") ||
-                          accountNameUpper.Contains("DEMO");
-        if (!isSimAccount)
+        if (!NtNonLiveAccountValidation.IsAllowedAlgorithmicPaperAccount(account))
         {
-            var error = $"Account '{account.Name}' is not a Sim account - aborting execution";
+            var error = $"Account '{account.Name}' is not a simulation/playback (non-live) account - aborting execution";
             _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
                 new { reason = "NOT_SIM_ACCOUNT", account_name = account.Name, error }));
             throw new InvalidOperationException(error);
@@ -1624,7 +1632,7 @@ public sealed partial class NinjaTraderSimAdapter
 
         _simAccountVerified = true;
         _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "SIM_ACCOUNT_VERIFIED", state: "ENGINE",
-            new { account_name = account.Name, note = "SIM account verification passed" }));
+            new { account_name = account.Name, note = "Non-live account verification passed (Simulation/Playback or Sim*/Playback* name)" }));
     }
 
     /// <summary>
@@ -2350,6 +2358,7 @@ public sealed partial class NinjaTraderSimAdapter
         if (order == null) return;
 
         var (encodedTag, _) = GetOrderTagWithSource(order);
+        LogAggregatedTagAttributionIfNeeded(encodedTag, "HandleOrderIngressFromNt", DateTimeOffset.UtcNow);
         var parsed = RobotOrderIds.ParseTag(encodedTag);
         var intentId = parsed.IntentId ?? RobotOrderIds.DecodeIntentId(encodedTag);
         var utcNow = DateTimeOffset.UtcNow;
@@ -2391,8 +2400,9 @@ public sealed partial class NinjaTraderSimAdapter
         var fillQtyTrace = 0;
         try { fillQtyTrace = (int)execution.Quantity; } catch { }
         var tagTrace = GetOrderTag(order);
-        var intentTrace = RobotOrderIds.DecodeIntentId(tagTrace) ?? "";
         var utcTrace = DateTimeOffset.UtcNow;
+        LogAggregatedTagAttributionIfNeeded(tagTrace, "HandleExecutionIngressFromNt", utcTrace);
+        var intentTrace = RobotOrderIds.DecodeIntentId(tagTrace) ?? "";
         var instTrace = order.Instrument?.MasterInstrument?.Name ?? "";
         _executionTrace?.WriteExecutionTrace(utcTrace, "OnExecutionUpdate", "raw_callback", instTrace, intentTrace,
             order.OrderId ?? "", execIdTrace ?? "", fillQtyTrace, order.OrderState.ToString());
@@ -2779,7 +2789,8 @@ public sealed partial class NinjaTraderSimAdapter
         // Reentry protective acceptance: when BOTH stop and target for a reentry intent are Working/Accepted,
         // invoke HandleReentryProtectionAccepted (once per intent). Only for reentry protective set, not original entry.
         if ((parsed.Leg == "STOP" || parsed.Leg == "TARGET") &&
-            intentId.EndsWith("_REENTRY", StringComparison.OrdinalIgnoreCase) &&
+            IntentMap.TryGetValue(intentId, out var reentryProtIntent) &&
+            string.Equals(reentryProtIntent.TriggerReason, "SUBMIT_MARKET_REENTRY", StringComparison.OrdinalIgnoreCase) &&
             (orderState == OrderState.Working || orderState == OrderState.Accepted) &&
             !_reentryProtectionAcceptedNotified.Contains(intentId))
         {
@@ -4317,7 +4328,7 @@ public sealed partial class NinjaTraderSimAdapter
                     var cumulativeForIntent = (orderInfo.AggregatedFilledByIntent != null && orderInfo.AggregatedFilledByIntent.TryGetValue(allocIntentId, out var cum))
                         ? cum
                         : allocQty;
-                    if (allocIntentId.EndsWith("_REENTRY", StringComparison.OrdinalIgnoreCase))
+                    if (string.Equals(allocIntent.TriggerReason, "SUBMIT_MARKET_REENTRY", StringComparison.OrdinalIgnoreCase))
                     {
                         _onReentryFillCallback?.Invoke(allocIntentId, utcNow);
                     }
@@ -4333,7 +4344,7 @@ public sealed partial class NinjaTraderSimAdapter
 
                 CheckAndCancelEntryStopsOnPositionFlat(orderInfo.Instrument, utcNow);
 
-                if (intentId.EndsWith("_REENTRY", StringComparison.OrdinalIgnoreCase))
+                if (string.Equals(entryIntent.TriggerReason, "SUBMIT_MARKET_REENTRY", StringComparison.OrdinalIgnoreCase))
                 {
                     _onReentryFillCallback?.Invoke(intentId, utcNow);
                 }

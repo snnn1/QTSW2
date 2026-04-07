@@ -51,10 +51,9 @@ public static class ForcedFlattenSlotExpiryReentryAlignmentTests
         if (FlattenReason.EMERGENCY.ToString() != "EMERGENCY")
             return (false, "FlattenReason.EMERGENCY string mismatch");
 
-        // 4. SubmitMarketReentryCommand has all required fields for reentry
+        // 4. SubmitMarketReentryCommand — ReentryIntentId must match Intent.ComputeIntentId() (same construction as reentry path)
         var reentryCmd = new SubmitMarketReentryCommand
         {
-            ReentryIntentId = "slot1_REENTRY",
             OriginalIntentId = "orig-1",
             Direction = "Short",
             Quantity = 2,
@@ -68,6 +67,24 @@ public static class ForcedFlattenSlotExpiryReentryAlignmentTests
             CallerContext = "CheckMarketOpenReentry",
             TimestampUtc = utcNow
         };
+        {
+            var instrumentRaw = reentryCmd.ExecutionInstrument ?? reentryCmd.Instrument ?? "";
+            var execInstUpper = string.IsNullOrEmpty(instrumentRaw) ? "" : instrumentRaw.Trim().ToUpperInvariant();
+            reentryCmd.ReentryIntentId = new Intent(
+                reentryCmd.TradingDate ?? "",
+                reentryCmd.Stream ?? "",
+                instrumentRaw,
+                execInstUpper,
+                reentryCmd.Session ?? "",
+                reentryCmd.SlotTimeChicago ?? "",
+                reentryCmd.Direction ?? "Long",
+                null,
+                null,
+                null,
+                null,
+                reentryCmd.TimestampUtc,
+                "SUBMIT_MARKET_REENTRY").ComputeIntentId();
+        }
         if (string.IsNullOrEmpty(reentryCmd.ReentryIntentId) || string.IsNullOrEmpty(reentryCmd.Direction) || reentryCmd.Quantity <= 0)
             return (false, "SubmitMarketReentryCommand missing required fields");
 
@@ -91,7 +108,7 @@ public static class ForcedFlattenSlotExpiryReentryAlignmentTests
         capturingAdapter.EnqueueExecutionCommand(reentryCmd);
         if (!capturingAdapter.TryGetLastCommand<SubmitMarketReentryCommand>(out var capturedReentry))
             return (false, "CapturingExecutionAdapter did not record SubmitMarketReentryCommand");
-        if (capturedReentry.ReentryIntentId != "slot1_REENTRY" || capturedReentry.Direction != "Short" || capturedReentry.Quantity != 2)
+        if (capturedReentry.ReentryIntentId != reentryCmd.ReentryIntentId || capturedReentry.Direction != "Short" || capturedReentry.Quantity != 2)
             return (false, "CapturingExecutionAdapter recorded incorrect SubmitMarketReentryCommand fields");
 
         // 6. RequestSessionCloseFlattenImmediate: NullExecutionAdapter returns success (same-cycle path)

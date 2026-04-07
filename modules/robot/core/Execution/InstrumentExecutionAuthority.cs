@@ -750,6 +750,25 @@ public sealed partial class InstrumentExecutionAuthority
     /// </summary>
     public void RegisterIntent(Intent intent)
     {
+        if (!Intent.TryValidateRegistrationPrerequisites(intent, out var registrationFailureReason))
+        {
+            var utcNow = DateTimeOffset.UtcNow;
+            Log?.Write(RobotEvents.EngineBase(utcNow, intent?.TradingDate ?? "", "INTENT_REGISTRATION_REJECTED", "ERROR",
+                new
+                {
+                    failure_reason = registrationFailureReason,
+                    intent_id = intent != null ? intent.ComputeIntentId() : "",
+                    stream = intent?.Stream,
+                    instrument = intent?.Instrument,
+                    session = intent?.Session,
+                    slot_time_chicago = intent?.SlotTimeChicago,
+                    direction = intent?.Direction,
+                    trigger_reason = intent?.TriggerReason,
+                    note = "Intent rejected at IEA registration boundary; not added to IntentMap."
+                }));
+            throw new InvalidOperationException($"Intent registration rejected: {registrationFailureReason}");
+        }
+
         var intentId = intent.ComputeIntentId();
         IntentMap[intentId] = intent;
     }

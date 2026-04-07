@@ -2,8 +2,10 @@
 Session + forced-flatten visibility state + watchdog-only alerts.
 
 INVARIANTS:
-- Derived only from robot engine events in the ingest feed (no NT logs, no local session math).
-- Rollup key: (trading_date, session_class, instrument) — multiple streams may collapse to one row.
+- Derived from robot engine events in the ingest feed (no NT logs, no local session math) plus
+  timetable-driven baseline rows (NOT_TRIGGERED) so UI always has a row per active stream.
+- Rollup key: (trading_date, session_class, instrument, stream) — stream defaults to __engine__ when absent
+  so legacy events without stream still merge; timetable rows use stream_id for per-stream truth.
 - No NO_POSITION / no inference of "flat" from absent events.
 - FORCED_FLATTEN_FAILED ingested only when session_close_forced_flatten is true (session-close path).
 - SESSION_CLOSE_RESOLVED treated as legacy alias for session resolution (harness / older JSONL).
@@ -36,9 +38,12 @@ SESSION_FLATTEN_INGEST_EVENT_TYPES = frozenset(
         "FORCED_FLATTEN_REQUEST_SUBMITTED",
         "FORCED_FLATTEN_FAILED",
         "FLATTEN_BROKER_FLAT_CONFIRMED",
+        "SESSION_FORCED_FLATTENED",
         "FORCED_FLATTEN_BROKER_TIMEOUT",
         "FORCED_FLATTEN_EXPOSURE_REMAINING",
         "MANUAL_FLATTEN_REQUIRED",
+        "FORCED_FLATTEN_POSITION_CLOSED",
+        "FORCED_FLATTEN_MARKET_CLOSE",
     }
 )
 
@@ -69,6 +74,8 @@ def _parse_cs_style_payload_blob(payload: Any) -> Dict[str, Any]:
             "session_close_forced_flatten",
             r"\bsession_close_forced_flatten\s*=\s*(True|False)",
         ),
+        ("instrument", r"\binstrument\s*=\s*([^,}]+)"),
+        ("stream", r"\bstream\s*=\s*([^,}]+)"),
     )
     for key, pat in patterns:
         m = re.search(pat, payload)
@@ -87,6 +94,16 @@ def _parse_cs_style_payload_blob(payload: Any) -> Dict[str, Any]:
     return out
 
 
+def _extract_from_payload(payload: Any, field: str) -> str:
+    """Parse `field = value` from C# ToString-style ``data.payload`` (same idea as slot_end_payload)."""
+    if not isinstance(payload, str) or "=" not in payload:
+        return ""
+    m = re.search(rf"\b{re.escape(field)}\s*=\s*([^,}}]+)", payload, re.IGNORECASE)
+    if not m:
+        return ""
+    return m.group(1).strip()
+
+
 def _merged_payload(event: Dict[str, Any]) -> Dict[str, Any]:
     data = _as_dict(event.get("data"))
     out = {k: v for k, v in data.items() if v is not None}
@@ -95,6 +112,7 @@ def _merged_payload(event: Dict[str, Any]) -> Dict[str, Any]:
         "session_class",
         "session",
         "instrument",
+        "stream",
         "source",
         "has_session",
         "session_close_utc",
@@ -118,6 +136,8 @@ def _merged_payload(event: Dict[str, Any]) -> Dict[str, Any]:
         "buffer_seconds",
         "used_fallback",
         "session_close_forced_flatten",
+        "instrument",
+        "stream",
     )
     for k, v in _parse_cs_style_payload_blob(data.get("payload")).items():
         if k in blob_keys and (k not in out or out.get(k) in ("", None)):
@@ -125,8 +145,24 @@ def _merged_payload(event: Dict[str, Any]) -> Dict[str, Any]:
     td_alt = out.get("trading_day")
     if td_alt and (not out.get("trading_date") or str(out.get("trading_date")).strip() in ("",)):
         out["trading_date"] = td_alt
-    if "session_class" not in out and out.get("session"):
-        out["session_class"] = out["session"]
+    if not str(out.get("session_class") or "").strip() and str(out.get("session") or "").strip():
+        out["session_class"] = str(out["session"]).strip()
+    payload_str = data.get("payload")
+    if isinstance(payload_str, str) and payload_str.strip():
+        if not str(out.get("instrument") or "").strip():
+            inst = _extract_from_payload(payload_str, "instrument")
+            if inst:
+                out["instrument"] = inst
+        if not str(out.get("session_class") or "").strip():
+            sc = _extract_from_payload(payload_str, "session_class")
+            if not sc:
+                sc = _extract_from_payload(payload_str, "session")
+            if sc:
+                out["session_class"] = sc.strip()
+        if not str(out.get("stream") or "").strip():
+            st = _extract_from_payload(payload_str, "stream")
+            if st:
+                out["stream"] = st.strip()
     return out
 
 
@@ -160,12 +196,22 @@ def _parse_utc(iso_str: str) -> Optional[datetime]:
         return None
 
 
-def _dedupe_critical(trading_date: str, session_class: str, instrument_key: str) -> str:
-    return f"SESSION_FLATTEN_NOT_CONFIRMED_CRITICAL:{trading_date}:{session_class}:{instrument_key}"
+def _dedupe_critical(
+    trading_date: str, session_class: str, instrument_key: str, stream_key: str
+) -> str:
+    return (
+        f"SESSION_FLATTEN_NOT_CONFIRMED_CRITICAL:{trading_date}:{session_class}:"
+        f"{instrument_key}:{stream_key}"
+    )
 
 
-def _dedupe_at_risk(trading_date: str, session_class: str, instrument_key: str) -> str:
-    return f"SESSION_FLATTEN_AT_RISK_WARNING:{trading_date}:{session_class}:{instrument_key}"
+def _dedupe_at_risk(
+    trading_date: str, session_class: str, instrument_key: str, stream_key: str
+) -> str:
+    return (
+        f"SESSION_FLATTEN_AT_RISK_WARNING:{trading_date}:{session_class}:"
+        f"{instrument_key}:{stream_key}"
+    )
 
 
 @dataclass
@@ -173,6 +219,7 @@ class SessionFlattenRow:
     trading_date: str = ""
     session_class: str = ""
     instrument: str = ""
+    stream: str = ""
     has_session: Optional[bool] = None
     session_close_utc: str = ""
     session_close_chicago_iso: str = ""
@@ -185,8 +232,19 @@ class SessionFlattenRow:
     alert_emitted: bool = False
     at_risk_alert_emitted: bool = False
 
+    @property
+    def flatten_trigger_ct(self) -> Optional[str]:
+        """Chicago wall time as HH:MM for stream feed (same basis as session-flatten API)."""
+        ft = _fmt_hhmm_chicago(self.flatten_trigger_chicago_iso) or _fmt_hhmm_chicago(
+            self.flatten_trigger_utc
+        )
+        return ft if ft else None
+
     def instrument_key(self) -> str:
         return self.instrument.strip() or "__engine__"
+
+    def stream_key(self) -> str:
+        return self.stream.strip() or "__engine__"
 
     def to_api_dict(self) -> Dict[str, Any]:
         sc_ct = _fmt_hhmm_chicago(self.session_close_chicago_iso) or _fmt_hhmm_chicago(
@@ -195,15 +253,20 @@ class SessionFlattenRow:
         ft_ct = _fmt_hhmm_chicago(self.flatten_trigger_chicago_iso) or _fmt_hhmm_chicago(
             self.flatten_trigger_utc
         )
+        fs = self.flatten_status or "NOT_TRIGGERED"
         return {
             "trading_date": self.trading_date,
             "session_class": self.session_class,
             "instrument": self.instrument,
+            "stream": self.stream,
             "has_session": self.has_session,
             "session_close_chicago": sc_ct,
             "flatten_trigger_chicago": ft_ct,
             "source": self.source,
-            "flatten_status": self.flatten_status,
+            "flatten_status": fs,
+            "flatten_triggered": fs != "NOT_TRIGGERED",
+            "broker_flat": fs == "BROKER_FLAT",
+            "confirmed": fs == "CONFIRMED",
         }
 
 
@@ -211,26 +274,75 @@ class SessionFlattenStateTracker:
     """Incremental state from engine session/flatten visibility events."""
 
     def __init__(self) -> None:
-        self._rows: Dict[Tuple[str, str, str], SessionFlattenRow] = {}
+        self._rows: Dict[Tuple[str, str, str, str], SessionFlattenRow] = {}
         self._pending_resolves: List[str] = []
 
-    def _key(self, event: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
+    def get_row(
+        self,
+        trading_date: str,
+        session_class: str,
+        instrument: str,
+        stream: Optional[str] = None,
+    ) -> Optional[SessionFlattenRow]:
+        """Lookup rollup row; instrument/stream '' → __engine__."""
+        td = str(trading_date or "").strip()
+        sc = str(session_class or "").strip()
+        inst = str(instrument or "").strip()
+        sk = str(stream or "").strip() or "__engine__"
+        if not td or not sc:
+            return None
+        key = (td, sc, inst or "__engine__", sk)
+        return self._rows.get(key)
+
+    def _key(self, event: Dict[str, Any]) -> Optional[Tuple[str, str, str, str]]:
         p = _merged_payload(event)
         td = str(p.get("trading_date") or "").strip()
         sc = str(p.get("session_class") or p.get("session") or "").strip()
         inst = str(p.get("instrument") or "").strip()
+        sk = str(p.get("stream") or "").strip() or "__engine__"
         if not td or not sc:
             return None
-        return (td, sc, inst or "__engine__")
+        return (td, sc, inst or "__engine__", sk)
 
-    def _get_or_create(self, key: Tuple[str, str, str]) -> SessionFlattenRow:
+    def _get_or_create(self, key: Tuple[str, str, str, str]) -> SessionFlattenRow:
         if key not in self._rows:
             self._rows[key] = SessionFlattenRow(
                 trading_date=key[0],
                 session_class=key[1],
                 instrument=key[2] if key[2] != "__engine__" else "",
+                stream=key[3] if key[3] != "__engine__" else "",
             )
         return self._rows[key]
+
+    def ensure_baseline_row(
+        self,
+        *,
+        trading_date: str,
+        session: str,
+        session_class: Optional[str],
+        instrument: str,
+        stream: Optional[str],
+    ) -> Optional[SessionFlattenRow]:
+        """
+        Pre-create a row for timetable/UI lookup when no engine events arrived yet.
+        Key must match stream_session_flatten_fields (session OR session_class merged).
+        """
+        td = str(trading_date or "").strip()
+        sess = (str(session or "").strip() or str(session_class or "").strip())
+        inst = str(instrument or "").strip()
+        sk = str(stream or "").strip() or "__engine__"
+        if not td or not sess:
+            return None
+        key = (td, sess, inst or "__engine__", sk)
+        return self._get_or_create(key)
+
+    def debug_snapshot_keys(self, limit: int = 500) -> List[str]:
+        """Compact key list for FLATTEN_STATE_LOOKUP_MISS logging."""
+        keys = sorted(self._rows.keys())
+        out = [f"{a}|{b}|{c}|{d}" for a, b, c, d in keys[:limit]]
+        if len(keys) > limit:
+            out.append(f"...{len(keys) - limit} more")
+        return out
 
     @staticmethod
     def _set_triggered_if_allowed(row: SessionFlattenRow) -> None:
@@ -307,14 +419,21 @@ class SessionFlattenStateTracker:
             row.flatten_status = "FAILED"
         elif et == "FLATTEN_BROKER_FLAT_CONFIRMED":
             if p.get("session_close_forced_flatten") is True:
-                row.flatten_status = "CONFIRMED"
-                ik = row.instrument_key()
-                self._pending_resolves.extend(
-                    [
-                        _dedupe_critical(row.trading_date, row.session_class, ik),
-                        _dedupe_at_risk(row.trading_date, row.session_class, ik),
-                    ]
-                )
+                if row.flatten_status not in _TERMINAL_STATUSES:
+                    row.flatten_status = "BROKER_FLAT"
+        elif et == "SESSION_FORCED_FLATTENED":
+            if p.get("session_close_forced_flatten") is not True:
+                return
+            row.flatten_required = True
+            row.flatten_status = "CONFIRMED"
+            ik = row.instrument_key()
+            sk = row.stream_key()
+            self._pending_resolves.extend(
+                [
+                    _dedupe_critical(row.trading_date, row.session_class, ik, sk),
+                    _dedupe_at_risk(row.trading_date, row.session_class, ik, sk),
+                ]
+            )
         elif et == "FORCED_FLATTEN_BROKER_TIMEOUT":
             if p.get("session_close_forced_flatten") is True:
                 row.flatten_required = True
@@ -324,6 +443,8 @@ class SessionFlattenStateTracker:
                 return
             row.flatten_required = True
             row.flatten_status = "EXPOSURE_REMAINS"
+        # FORCED_FLATTEN_POSITION_CLOSED / FORCED_FLATTEN_MARKET_CLOSE: listed in SESSION_FLATTEN_INGEST_EVENT_TYPES
+        # for feed/trace visibility; no rollup field updates (terminal success is SESSION_FORCED_FLATTENED).
 
     def tick_alerts(
         self,
@@ -352,6 +473,7 @@ class SessionFlattenStateTracker:
             if close_dt is None:
                 continue
             ik = row.instrument_key()
+            sk = row.stream_key()
 
             if (
                 row.flatten_required
@@ -359,7 +481,7 @@ class SessionFlattenStateTracker:
                 and not row.at_risk_alert_emitted
                 and now_utc >= close_dt - timedelta(seconds=60)
             ):
-                dedupe = _dedupe_at_risk(row.trading_date, row.session_class, ik)
+                dedupe = _dedupe_at_risk(row.trading_date, row.session_class, ik, sk)
                 if is_alert_active and is_alert_active(dedupe):
                     row.at_risk_alert_emitted = True
                 else:
@@ -391,7 +513,7 @@ class SessionFlattenStateTracker:
                 and now_utc >= close_dt
                 and not row.alert_emitted
             ):
-                dedupe = _dedupe_critical(row.trading_date, row.session_class, ik)
+                dedupe = _dedupe_critical(row.trading_date, row.session_class, ik, sk)
                 if is_alert_active and is_alert_active(dedupe):
                     row.alert_emitted = True
                 else:
@@ -420,7 +542,14 @@ class SessionFlattenStateTracker:
     def list_rows_sorted(self, now_utc: Optional[datetime] = None) -> List[Dict[str, Any]]:
         _ = now_utc  # API compatibility; no inferred status
         rows = list(self._rows.values())
-        rows.sort(key=lambda r: (-_date_key(r.trading_date), r.session_class))
+        rows.sort(
+            key=lambda r: (
+                -_date_key(r.trading_date),
+                r.session_class,
+                r.stream_key(),
+                r.instrument_key(),
+            )
+        )
         return [r.to_api_dict() for r in rows]
 
 

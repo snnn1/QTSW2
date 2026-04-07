@@ -182,6 +182,17 @@ public sealed class ExecutionJournal
     /// <summary>
     /// Compute intent ID from canonical intent fields (hash of 15 fields).
     /// </summary>
+    /// <remarks>
+    /// <b>Stability contract</b> — any <see cref="Intent"/> built for the same logical trade must use identical
+    /// string and decimal normalization here, or <see cref="Intent.ComputeIntentId"/> will differ:
+    /// <list type="bullet">
+    /// <item>Prices: <c>F2</c> fixed-point; null → literal <c>NULL</c> in the canonical string.</item>
+    /// <item>Direction: null → <c>NULL</c>; no case folding.</item>
+    /// <item>Other strings: as stored (trim/casing at <see cref="Intent"/> construction sites must match).</item>
+    /// <item>Slot time: verbatim (e.g. <c>09:00</c> vs <c>9:00</c> are different identities).</item>
+    /// <item>Entry time is not part of the hash.</item>
+    /// </list>
+    /// </remarks>
     public static string ComputeIntentId(
         string tradingDate,
         string stream,

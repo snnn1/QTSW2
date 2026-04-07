@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("SiblingProtectiveCancelQueue.Test")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+480dd1be1ea620e7ec41c3838215efc8be008c95")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+00ebbc99db062856b2231a7b9a3cd9d1c7bb6e12")]
 [assembly: System.Reflection.AssemblyProductAttribute("SiblingProtectiveCancelQueue.Test")]
 [assembly: System.Reflection.AssemblyTitleAttribute("SiblingProtectiveCancelQueue.Test")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

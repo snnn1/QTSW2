@@ -17,6 +17,10 @@ public sealed class LoggingConfig
     public int max_file_size_mb { get; set; } = 50;
     public int max_rotated_files { get; set; } = 5;
     public string min_log_level { get; set; } = "INFO";
+
+    /// <summary>Optional: set to DIAGNOSTIC for verbose timetable derivation logs and other diagnostics.</summary>
+    public string? log_profile { get; set; }
+
     public bool enable_diagnostic_logs { get; set; } = false;
     public DiagnosticRateLimits? diagnostic_rate_limits { get; set; }
     public int archive_days { get; set; } = 7;
@@ -77,6 +81,11 @@ public sealed class LoggingConfig
     /// When enabled, events >= WARN + selected INFO events are written to logs/health/ directory.
     /// </summary>
     public bool enable_health_sink { get; set; } = true;
+
+    public bool DiagnosticsEnabled =>
+        !string.IsNullOrWhiteSpace(log_profile)
+            ? string.Equals(log_profile.Trim(), "DIAGNOSTIC", StringComparison.OrdinalIgnoreCase)
+            : (enable_diagnostic_logs || diagnostics_enabled);
 
     public static LoggingConfig LoadFromFile(string projectRoot)
     {

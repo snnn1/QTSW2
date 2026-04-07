@@ -169,7 +169,7 @@ public sealed partial class NinjaTraderSimAdapter
     {
         if (_ntAccount == null)
         {
-            var error = "NT account is null - cannot verify Sim account";
+            var error = "NT account is null - cannot verify non-live account";
             _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
                 new { reason = "NOT_SIM_ACCOUNT", error }));
             throw new InvalidOperationException(error);
@@ -184,14 +184,9 @@ public sealed partial class NinjaTraderSimAdapter
             throw new InvalidOperationException(error);
         }
 
-        // Assert: account is SIM account (check by name pattern since IsSimAccount may not exist in all NT versions)
-        var accountNameUpper = account.Name.ToUpperInvariant();
-        var isSimAccount = accountNameUpper.Contains("SIM") || 
-                          accountNameUpper.Contains("SIMULATION") ||
-                          accountNameUpper.Contains("DEMO");
-        if (!isSimAccount)
+        if (!NtNonLiveAccountValidation.IsAllowedAlgorithmicPaperAccount(account))
         {
-            var error = $"Account '{account.Name}' is not a Sim account - aborting execution";
+            var error = $"Account '{account.Name}' is not a simulation/playback (non-live) account - aborting execution";
             _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
                 new { reason = "NOT_SIM_ACCOUNT", account_name = account.Name, error }));
             throw new InvalidOperationException(error);
@@ -199,7 +194,7 @@ public sealed partial class NinjaTraderSimAdapter
 
         _simAccountVerified = true;
         _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "SIM_ACCOUNT_VERIFIED", state: "ENGINE",
-            new { account_name = account.Name, note = "SIM account verification passed" }));
+            new { account_name = account.Name, note = "Non-live account verification passed (Simulation/Playback or Sim*/Playback* name)" }));
     }
 
     /// <summary>

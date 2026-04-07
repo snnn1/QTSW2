@@ -52,6 +52,8 @@ export type SessionFlattenRow = {
   trading_date: string
   session_class: string
   instrument: string
+  /** Timetable stream id when keyed per-stream; empty when legacy __engine__ rollup */
+  stream?: string
   has_session: boolean | null
   session_close_chicago: string
   flatten_trigger_chicago: string

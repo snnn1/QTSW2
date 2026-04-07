@@ -1,7 +1,7 @@
 // NinjaTrader Strategy host for SIM execution
 // This Strategy runs inside NinjaTrader and provides NT context (Account, Instrument, Events) to RobotEngine
 //
-// IMPORTANT: This Strategy MUST run in SIM account only.
+// IMPORTANT: This Strategy MUST run in a non-live account (Simulation or Playback — e.g. Sim101, Playback101).
 // Copy into a NinjaTrader 8 strategy project and wire references to Robot.Core.
 //
 // REQUIRED FILES: When copying this file to NT project, also include:
@@ -30,7 +30,7 @@ using CoreBar = QTSW2.Robot.Core.Bar; // Alias to avoid ambiguity with NinjaTrad
 namespace NinjaTrader.NinjaScript.Strategies
 {
     /// <summary>
-    /// Robot SIM Strategy: Hosts RobotEngine in NinjaTrader SIM account.
+    /// Robot SIM Strategy: Hosts RobotEngine on NinjaTrader Simulation or Playback (non-live) accounts.
     /// Provides NT context (Account, Instrument, Order/Execution events) to NinjaTraderSimAdapter.
     /// 
     /// INVARIANT: One execution instrument → one strategy instance per account.
@@ -261,7 +261,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 TraceLifecycle("DataLoaded_ENTER", Instrument?.MasterInstrument?.Name, "DataLoaded");
                 try
                 {
-                    // Verify SIM account only
+                    // Verify non-live (Simulation / Playback) account — same rules as NinjaTraderSimAdapter
                     if (Account is null)
                     {
                         Log($"ERROR: Account is null. Aborting.", LogLevel.Error);
@@ -275,23 +275,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                         return;
                     }
 
-                    // Check if account is SIM account by checking account name pattern
-                    // Note: NinjaTrader Account class doesn't have IsSimAccount property
-                    // SIM accounts typically have names like "Sim101", "Simulation", "DEMO123", etc.
-                    var accountName = Account?.Name ?? "";
-                    var accountNameUpper = accountName.ToUpperInvariant();
-                    var isSimAccount = accountNameUpper.Contains("SIM") || 
-                                     accountNameUpper.Contains("SIMULATION") ||
-                                     accountNameUpper.Contains("DEMO");
-                    
-                    if (!isSimAccount)
+                    var accountName = Account.Name ?? "";
+#if NINJATRADER
+                    if (!NtNonLiveAccountValidation.IsAllowedAlgorithmicPaperAccount(Account))
+#else
+                    if (!NtNonLiveAccountValidation.IsAllowedNonLiveAccountName(accountName))
+#endif
                     {
-                        Log($"ERROR: Account '{Account?.Name}' does not appear to be a Sim account. Aborting.", LogLevel.Error);
+                        Log($"ERROR: Account '{Account?.Name}' is not a Simulation/Playback (non-live) account. Aborting.", LogLevel.Error);
                         return;
                     }
 
                     _simAccountVerified = true;
-                    Log($"SIM account verified: {Account.Name}", LogLevel.Information);
+                    Log($"Non-live account verified: {Account.Name}", LogLevel.Information);
                     
                     // FUTURE HARDENING: Check for duplicate instance deployment
                     // INVARIANT: (account, executionInstrument) must be unique
@@ -1455,8 +1451,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     _engine.LogEngineEvent(DateTimeOffset.UtcNow, "TEST_INJECT_SKIPPED", new Dictionary<string, object>
                     {
-                        { "reason", "SIM_GUARD" },
-                        { "note", "Test inject requires SIM account. Skipped." }
+                        { "reason", "NON_LIVE_ACCOUNT_GUARD" },
+                        { "note", "Test inject requires verified Simulation/Playback account. Skipped." }
                     });
                 }
                 else

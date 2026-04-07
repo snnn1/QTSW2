@@ -1,12 +1,20 @@
 # Copy RobotSimStrategy.cs to NinjaTrader Strategies folder
-# Source: RobotCore_For_NinjaTrader (same project as DLL)
+# Source of truth: modules\robot\ninjatrader (editorial); fallback RobotCore_For_NinjaTrader\Strategies
 
 $ErrorActionPreference = "Stop"
 $projectRoot = if ($PSScriptRoot) { $PSScriptRoot } else { $PWD }
 if (-not (Test-Path (Join-Path $projectRoot "RobotCore_For_NinjaTrader\Strategies\RobotSimStrategy.cs"))) {
     $projectRoot = Split-Path $projectRoot -Parent
 }
-$source = Join-Path $projectRoot "RobotCore_For_NinjaTrader\Strategies\RobotSimStrategy.cs"
+$sourceModules = Join-Path $projectRoot "modules\robot\ninjatrader\RobotSimStrategy.cs"
+$sourceRobotCore = Join-Path $projectRoot "RobotCore_For_NinjaTrader\Strategies\RobotSimStrategy.cs"
+if (Test-Path $sourceModules) {
+    $source = $sourceModules
+    Write-Host "Strategy source: modules\robot\ninjatrader (canonical)" -ForegroundColor Gray
+} else {
+    $source = $sourceRobotCore
+    Write-Host "Strategy source: RobotCore_For_NinjaTrader\Strategies" -ForegroundColor Gray
+}
 
 # Resolve NinjaTrader Strategies path(s) — deploy to every Custom folder that exists
 $ntStrategyDirs = @()

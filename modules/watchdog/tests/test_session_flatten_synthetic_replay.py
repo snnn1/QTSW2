@@ -17,7 +17,7 @@ _CASES = Path(__file__).resolve().parent / "session_flatten_cases.jsonl"
 
 
 def _row(tracker, trading_date: str, session_class: str = "S1"):
-    key = (trading_date, session_class, "__engine__")
+    key = (trading_date, session_class, "__engine__", "__engine__")
     return tracker._rows.get(key)
 
 
@@ -51,9 +51,9 @@ def test_synthetic_cases_replay():
     assert r05.alert_emitted is True
 
     r06 = _row(tracker, "2026-06-06")
-    assert r06.flatten_status == "CONFIRMED"
+    assert r06.flatten_status == "TIMEOUT"
     assert r06.flatten_required is True
-    assert r06.alert_emitted is False
+    assert r06.alert_emitted is True
 
     r07 = _row(tracker, "2026-06-07")
     assert r07.flatten_status == "EXPOSURE_REMAINS"

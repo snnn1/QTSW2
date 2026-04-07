@@ -19,7 +19,7 @@ using QTSW2.Robot.Core.Diagnostics;
 namespace QTSW2.Robot.Core.Execution;
 
 /// <summary>
-/// NinjaTrader Sim adapter: places orders in NT Sim account only.
+/// NinjaTrader Sim adapter: places orders on NT Simulation / Playback (non-live) accounts only.
 /// 
 /// Submission Sequencing (Safety-First Approach):
 /// 1. Submit entry order (market order initially)
@@ -28,7 +28,7 @@ namespace QTSW2.Robot.Core.Execution;
 /// 4. On target/stop fill → flatten remaining position
 /// 
 /// Hard Safety Requirements:
-/// - Must verify SIM account usage (fail closed if not Sim)
+/// - Must verify non-live account usage (fail closed if live / disallowed)
 /// - All orders must be namespaced by (intent_id, stream) for isolation
 /// - OCO grouping must be stream-local (no cross-stream interference)
 /// </summary>
@@ -916,6 +916,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
 
     /// <summary>
     /// IEA entry-stop aggregation: every intent in the bundle must pass the same gate as single-path submits.
+    /// Empty or all-invalid id lists are invariant failures (non-latching); real date mismatches use <see cref="TrySessionIdentityGate"/> latch behavior unchanged.
     /// </summary>
     internal bool TrySessionIdentityGateForIntentBundle(
         IReadOnlyList<string> intentIds,
@@ -926,15 +927,59 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     {
         failure = null;
         if (intentIds == null || intentIds.Count == 0)
-            return TrySessionIdentityGate("", instrument, submitPath, utcNow, null, out failure);
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SESSION_IDENTITY_BUNDLE_GATE_REJECTED", state: "ENGINE",
+                new
+                {
+                    reason = "empty_bundle",
+                    instrument,
+                    submit_path = submitPath,
+                    session_identity_latched_armed = false,
+                    note = "Bundle gate requires at least one intent id"
+                }));
+            failure = OrderSubmissionResult.FailureResult("INVALID_INTENT_BUNDLE_EMPTY", utcNow);
+            return false;
+        }
+
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var validatedIntentChecks = 0;
         foreach (var raw in intentIds)
         {
             var id = (raw ?? "").Trim();
             if (string.IsNullOrEmpty(id) || !seen.Add(id)) continue;
+            validatedIntentChecks++;
             if (!TrySessionIdentityGate(id, instrument, submitPath, utcNow, null, out failure))
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SESSION_IDENTITY_BUNDLE_GATE_REJECTED", state: "ENGINE",
+                    new
+                    {
+                        reason = "session_identity_gate_failed",
+                        failed_intent_id = id,
+                        instrument,
+                        submit_path = submitPath,
+                        session_identity_latched_armed = Volatile.Read(ref _sessionMismatchBlocked) != 0,
+                        failure_error = failure?.ErrorMessage
+                    }));
                 return false;
+            }
         }
+
+        if (validatedIntentChecks == 0)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SESSION_IDENTITY_BUNDLE_GATE_REJECTED", state: "ENGINE",
+                new
+                {
+                    reason = "all_intent_ids_invalid",
+                    instrument,
+                    submit_path = submitPath,
+                    session_identity_latched_armed = false,
+                    raw_intent_id_count = intentIds.Count,
+                    note = "Every id was blank or duplicate-only — invariant failure"
+                }));
+            failure = OrderSubmissionResult.FailureResult("INVALID_INTENT_BUNDLE_NO_VALID_IDS", utcNow);
+            return false;
+        }
+
         return true;
     }
 
@@ -954,8 +999,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     }
 
     /// <summary>
-    /// Hard gate: intent/journal trading date must match engine active trading date when the latter is non-empty.
-    /// On first mismatch: latch, emit CRITICAL once, reject. When latched: reject silently (no logs).
+    /// Hard gate: when engine active trading date is non-empty, submission must resolve an attempted date that matches it.
+    /// Blank attempted after explicit + map resolution: non-latching <c>SESSION_IDENTITY_UNRESOLVED</c> (ENGINE log, no latch).
+    /// Resolved attempted ≠ active: latch, <c>SESSION_IDENTITY_MISMATCH_BLOCKED</c> CRITICAL once, <c>SESSION_IDENTITY_MISMATCH</c>. When latched: <c>SESSION_IDENTITY_LATCHED</c>.
     /// </summary>
     private bool TrySessionIdentityGate(
         string intentId,
@@ -982,31 +1028,36 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             return true;
 
         string? attempted = explicitAttemptedTradingDate?.Trim();
+        Intent? intentFromMap = null;
+        var mapLookupSucceeded = false;
         if (string.IsNullOrEmpty(attempted) && !string.IsNullOrEmpty(intentId) &&
             IntentMap.TryGetValue(intentId, out var intent) && intent != null)
+        {
+            mapLookupSucceeded = true;
+            intentFromMap = intent;
             attempted = intent.TradingDate?.Trim();
+        }
 
         if (string.IsNullOrEmpty(attempted))
         {
-            if (Interlocked.CompareExchange(ref _sessionMismatchBlocked, 1, 0) == 0)
-            {
-                Interlocked.Increment(ref _sessionIdentityMismatchCriticalEmitCount);
-                RecordSessionIdentityBlockAttempt();
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: active, eventType: "SESSION_IDENTITY_MISMATCH_BLOCKED", state: "CRITICAL",
-                    new
-                    {
-                        active_trading_date = active,
-                        attempted_trading_date = (string?)null,
-                        intent_id = string.IsNullOrEmpty(intentId) ? null : intentId,
-                        instrument,
-                        submit_path = submitPath,
-                        reason = "session_identity_mismatch",
-                        session_identity_block_count = Volatile.Read(ref _sessionIdentityBlockCount)
-                    }));
-            }
-            else
-                RecordSessionIdentityBlockAttempt();
-            failure = OrderSubmissionResult.FailureResult("SESSION_IDENTITY_MISMATCH", utcNow);
+            var intentIdEmpty = string.IsNullOrEmpty(intentId);
+            var intentMapLookupFailed = !intentIdEmpty && !mapLookupSucceeded;
+            var intentTradingDateBlank = mapLookupSucceeded && string.IsNullOrEmpty(intentFromMap?.TradingDate?.Trim());
+
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: active, eventType: "SESSION_IDENTITY_UNRESOLVED", state: "ENGINE",
+                new
+                {
+                    active_trading_date = active,
+                    attempted_trading_date = (string?)null,
+                    intent_id = intentIdEmpty ? null : intentId,
+                    instrument,
+                    submit_path = submitPath,
+                    reason = "session_identity_unresolved",
+                    intent_id_empty = intentIdEmpty,
+                    intent_map_lookup_failed = intentMapLookupFailed,
+                    intent_trading_date_blank = intentTradingDateBlank
+                }));
+            failure = OrderSubmissionResult.FailureResult("SESSION_IDENTITY_UNRESOLVED", utcNow);
             return false;
         }
 
@@ -1033,6 +1084,67 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             RecordSessionIdentityBlockAttempt();
         failure = OrderSubmissionResult.FailureResult("SESSION_IDENTITY_MISMATCH", utcNow);
         return false;
+    }
+
+    /// <summary>
+    /// Non-latching: rejects a single submission when <paramref name="intentId"/> is non-empty but not in <see cref="IntentMap"/>,
+    /// or when it does not equal <see cref="Intent.ComputeIntentId"/> for the intent stored under that key.
+    /// Empty <paramref name="intentId"/> skips this guard (flatten-only paths). Does not touch <c>_sessionMismatchBlocked</c>.
+    /// </summary>
+    private bool TryIntentIdConsistencyGuard(
+        string intentId,
+        string instrument,
+        string submitPath,
+        DateTimeOffset utcNow,
+        out OrderSubmissionResult? failure)
+    {
+        failure = null;
+        if (string.IsNullOrEmpty(intentId))
+            return true;
+
+        if (!IntentMap.TryGetValue(intentId, out var intent) || intent == null)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "INTENT_LOOKUP_MISS_AT_SUBMIT_REJECTED", state: "CRITICAL",
+                new { intent_id = intentId, submit_path = submitPath, instrument }));
+            failure = OrderSubmissionResult.FailureResult("INTENT_NOT_IN_MAP", utcNow);
+            return false;
+        }
+
+        var canonicalId = intent.ComputeIntentId();
+        if (string.Equals(intentId, canonicalId, StringComparison.Ordinal))
+            return true;
+
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: intent.TradingDate ?? "", eventType: "INTENT_ID_MISMATCH_REJECTED", state: "ERROR",
+            new
+            {
+                provided_intent_id = intentId,
+                canonical_intent_id = canonicalId,
+                stream = intent.Stream ?? "",
+                instrument,
+                submit_path = submitPath,
+                trading_date = intent.TradingDate ?? "",
+                session = intent.Session ?? "",
+                slot_time_chicago = intent.SlotTimeChicago ?? "",
+                direction = intent.Direction,
+                trigger_reason = intent.TriggerReason
+            }));
+        failure = OrderSubmissionResult.FailureResult("INTENT_ID_MISMATCH", utcNow);
+        return false;
+    }
+
+    /// <summary>Logs explicit multi-intent ids when tag uses QTSW2:AGG: — downstream still resolves primary via <see cref="RobotOrderIds.DecodeIntentId"/>.</summary>
+    private void LogAggregatedTagAttributionIfNeeded(string? tag, string context, DateTimeOffset utcNow)
+    {
+        if (string.IsNullOrEmpty(tag) || !RobotOrderIds.IsAggregatedTag(tag)) return;
+        var ids = RobotOrderIds.DecodeAggregatedIntentIds(tag);
+        _log.Write(RobotEvents.ExecutionBase(utcNow, ids?.Count > 0 ? ids[0]! : "", "", "AGG_TAG_ATTRIBUTION",
+            new
+            {
+                context,
+                intent_ids = ids,
+                primary_intent_id = ids?.Count > 0 ? ids[0] : null,
+                note = "Multi-intent tag; single-stream resolution uses primary (first) id unless caller allocates"
+            }));
     }
 
     /// <summary>
@@ -1144,6 +1256,20 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
                 if (IntentMap.ContainsKey(intentId)) continue;
                 var intent = CreateIntentFromJournalEntry(tradingDate, stream, intentId, entry);
                 if (intent == null) continue;
+                var computedId = intent.ComputeIntentId();
+                if (!string.Equals(computedId, intentId, StringComparison.Ordinal))
+                {
+                    _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: tradingDate, eventType: "INTENT_HYDRATION_ID_MISMATCH", state: "CRITICAL",
+                        new
+                        {
+                            filename_intent_id = intentId,
+                            computed_intent_id = computedId,
+                            stream,
+                            instrument = entry.Instrument,
+                            note = "Reconstructed Intent hash does not match journal filename id — skipping registration to avoid silent identity drift"
+                        }));
+                    continue;
+                }
                 RegisterIntent(intent);
                 count++;
             }
@@ -1163,6 +1289,21 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             var (td, st, ent) = adoptionEntry.Value;
             var intent = CreateIntentFromJournalEntry(td, st, intentId, ent);
             if (intent == null) continue;
+            var computedId = intent.ComputeIntentId();
+            if (!string.Equals(computedId, intentId, StringComparison.Ordinal))
+            {
+                _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: td, eventType: "INTENT_HYDRATION_ID_MISMATCH", state: "CRITICAL",
+                    new
+                    {
+                        filename_intent_id = intentId,
+                        computed_intent_id = computedId,
+                        stream = st,
+                        instrument = ent.Instrument,
+                        adoption_candidate = true,
+                        note = "Reconstructed Intent hash does not match journal id — skipping registration to avoid silent identity drift"
+                    }));
+                continue;
+            }
             RegisterIntent(intent);
             count++;
         }
@@ -1365,7 +1506,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         if (!_criticalFlattenCoordinationRetryInflight.TryAdd(key, 0)) return;
 
         var delay = FlattenCoordinationTracker.DefaultStaleOwnerTtl.Add(TimeSpan.FromSeconds(2));
-        _ = Task.Delay(delay).ContinueWith(_ =>
+        _ = Task.Delay(delay).ContinueWith(antecedent =>
         {
             try
             {
@@ -1543,7 +1684,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     }
 
     /// <summary>
-    /// STEP 1: Verify we're connected to NT Sim account (fail closed if not).
+    /// STEP 1: Verify we're connected to a NT non-live account (Simulation/Playback — fail closed if live).
     /// REQUIRES: NINJATRADER preprocessor directive and NT context to be set.
     /// </summary>
     private void VerifySimAccount()
@@ -1583,6 +1724,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         string? ocoGroup,
         DateTimeOffset utcNow)
     {
+        if (!TryIntentIdConsistencyGuard(intentId, instrument, "entry", utcNow, out var intentIdFail))
+            return intentIdFail!;
         if (!TrySessionIdentityGate(intentId, instrument, "entry", utcNow, null, out var sessionFail))
             return sessionFail!;
 
@@ -1684,6 +1827,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         string? ocoGroup,
         DateTimeOffset utcNow)
     {
+        if (!TryIntentIdConsistencyGuard(intentId, instrument, "entry_stop", utcNow, out var intentIdFailStop))
+            return intentIdFailStop!;
         if (!TrySessionIdentityGate(intentId, instrument, "entry_stop", utcNow, null, out var sessionFailStop))
             return sessionFailStop!;
 
@@ -2271,6 +2416,26 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     /// </summary>
     public void RegisterIntent(Intent intent)
     {
+        if (!Intent.TryValidateRegistrationPrerequisites(intent, out var registrationFailureReason))
+        {
+            var utcNow = DateTimeOffset.UtcNow;
+            var intentIdForLog = intent != null ? intent.ComputeIntentId() : "";
+            var instrumentForLog = intent?.Instrument ?? "";
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentIdForLog, instrumentForLog, "INTENT_REGISTRATION_REJECTED",
+                new
+                {
+                    failure_reason = registrationFailureReason,
+                    trading_date = intent?.TradingDate,
+                    stream = intent?.Stream,
+                    session = intent?.Session,
+                    slot_time_chicago = intent?.SlotTimeChicago,
+                    direction = intent?.Direction,
+                    trigger_reason = intent?.TriggerReason,
+                    note = "Intent rejected at registration boundary; not added to IntentMap."
+                }));
+            throw new InvalidOperationException($"Intent registration rejected: {registrationFailureReason}");
+        }
+
         // Option A (Stronger): Fail-closed when execution differs from canonical but ExecutionInstrument is null.
         // Prevents journal/reconciliation mismatch (e.g. RTY stored when M2K expected).
         var execContext = _iea?.ExecutionInstrumentKey ?? _ieaEngineExecutionInstrument ?? "";
@@ -2383,6 +2548,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         string? ocoGroup,
         DateTimeOffset utcNow)
     {
+        if (!TryIntentIdConsistencyGuard(intentId, instrument, "protective", utcNow, out var intentIdFailProt))
+            return intentIdFailProt!;
         if (!TrySessionIdentityGate(intentId, instrument, "protective", utcNow, null, out var sessionFailProt))
             return sessionFailProt!;
 
@@ -2466,6 +2633,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         string? ocoGroup,
         DateTimeOffset utcNow)
     {
+        if (!TryIntentIdConsistencyGuard(intentId, instrument, "target", utcNow, out var intentIdFailTgt))
+            return intentIdFailTgt!;
         if (!TrySessionIdentityGate(intentId, instrument, "target", utcNow, null, out var sessionFailTgt))
             return sessionFailTgt!;
 

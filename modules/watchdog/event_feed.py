@@ -26,6 +26,7 @@ from .config import (
     ORDER_RELATED_EVENT_TYPES,
     ENGINE_TICK_DIAGNOSTIC_EVENT_TYPES,
 )
+from .slot_end_payload import promote_slot_end_summary_fields_from_payload
 
 logger = logging.getLogger(__name__)
 
@@ -296,17 +297,7 @@ class EventFeedGenerator:
         
         # For SLOT_END_SUMMARY, ensure trade_executed and reason are in data (may be in payload string)
         if event_type == "SLOT_END_SUMMARY":
-            payload_str = data.get("payload")
-            if isinstance(payload_str, str) and "trade_executed" not in data:
-                try:
-                    trade_match = re.search(r'trade_executed\s*=\s*(True|False)', payload_str, re.IGNORECASE)
-                    if trade_match:
-                        data["trade_executed"] = trade_match.group(1).lower() == "true"
-                    reason_match = re.search(r'reason\s*=\s*([^,}]+)', payload_str)
-                    if reason_match:
-                        data["reason"] = reason_match.group(1).strip()
-                except Exception:
-                    pass
+            promote_slot_end_summary_fields_from_payload(data)
 
         # For RANGE_LOCKED and RANGE_LOCK_SNAPSHOT events, extract range data from data dict
         # and ensure it's available at top level for event processor

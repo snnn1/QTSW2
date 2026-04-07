@@ -119,3 +119,23 @@ def resolve_live_execution_session_trading_date(
         return expected_s, "clamped_ahead"
 
     return None, "reject_mismatch"
+
+
+def get_previous_trading_date_cme(trading_date: str) -> str:
+    """
+    Previous Mon–Fri session calendar label before ``trading_date`` (YYYY-MM-DD).
+
+    Steps back one calendar day, then skips weekends (parity with CME session labels that
+    do not use Sat/Sun). Does not subtract exchange holidays.
+    """
+    raw = (trading_date or "").strip()
+    if not raw:
+        return ""
+    try:
+        d = date.fromisoformat(raw)
+    except ValueError:
+        return ""
+    d = d - timedelta(days=1)
+    while d.weekday() >= 5:
+        d = d - timedelta(days=1)
+    return d.isoformat()

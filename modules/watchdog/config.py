@@ -3,7 +3,7 @@ Watchdog Aggregator Configuration
 """
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 # Calculate project root: modules/watchdog/config.py -> QTSW2 root (go up 2 levels)
 QTSW2_ROOT = Path(__file__).parent.parent.parent
@@ -32,6 +32,8 @@ REPLAY_TAIL_BYTES = 20 * 1024 * 1024  # 20 MB
 # Status snapshot persistence for post-incident analysis (last 500 critical snapshots)
 STATUS_SNAPSHOTS_FILE = QTSW2_ROOT / "data" / "watchdog" / "status_snapshots.jsonl"
 STATUS_SNAPSHOTS_MAX_ENTRIES = 500
+# Runtime validation: GLOBAL_FEED_STALL_ENTER / CLEAR + full snapshot (append-only JSONL)
+DATA_STALL_RUNTIME_AUDIT_JSONL = INCIDENT_LOG_DIR / "data_stall_runtime_audit.jsonl"
 NOTIFICATIONS_CONFIG_PATH = QTSW2_ROOT / "configs" / "watchdog" / "notifications.json"
 NOTIFICATIONS_SECRETS_PATH = QTSW2_ROOT / "configs" / "watchdog" / "notifications.secrets.json"
 # Phase 4: Incident-based alert rules, thresholds, cooldowns
@@ -66,6 +68,33 @@ UNPROTECTED_TIMEOUT_SECONDS = 10
 # ONBARUPDATE_CALLED and ENGINE_TICK_HEARTBEAT are rate-limited to 60 seconds
 # Aligned with HealthMonitor quant-grade redesign: 300s default, instrument-aware in robot
 DATA_STALL_THRESHOLD_SECONDS = 300
+# Per-instrument root overrides (first token of execution instrument, e.g. "MNG" from "MNG 05-26").
+# Calibrate with: python scripts/audit_mng_tick_gaps.py
+# Sample (10d frontend_feed): MNG p99.5 inter-arrival ~385s vs 300s default → fewer false DATA_STALLED.
+DATA_STALL_THRESHOLD_BY_INSTRUMENT_ROOT: Dict[str, float] = {
+    "MNG": 420.0,
+}
+
+
+def data_stall_threshold_seconds_for_execution_instrument(execution_instrument_full_name: str) -> float:
+    """Bar-age stall threshold for this execution instrument (full contract name)."""
+    if not execution_instrument_full_name or not str(execution_instrument_full_name).strip():
+        return float(DATA_STALL_THRESHOLD_SECONDS)
+    root = str(execution_instrument_full_name).strip().split()[0]
+    return float(DATA_STALL_THRESHOLD_BY_INSTRUMENT_ROOT.get(root, DATA_STALL_THRESHOLD_SECONDS))
+
+
+# Global feed health (DATA_FLOWING / DATA_STALLED): breadth across asset classes + high-liq override.
+# reference_instruments_all_stale = (equity stale) AND (energy stale) AND (metals stale).
+# Equity: at least one of MNQ/MES must be fresh for that class to be non-stale; same pattern for other classes.
+DATA_STALLED_REFERENCE_ASSET_CLASSES: List[List[str]] = [
+    ["MNQ", "MES"],   # equity index micros
+    ["MCL", "CL"],   # energy
+    ["MGC", "GC"],   # metals
+]
+# If ANY of these roots has a fresh bar, do not declare global stall from reference/progression arms.
+HIGH_LIQUIDITY_INSTRUMENT_ROOTS: List[str] = ["MNQ", "MES", "MCL", "CL", "MGC", "GC"]
+
 # Grace period for bar reordering (late bars from multi-file merge)
 DATA_STALL_REORDER_GRACE_SECONDS = 10
 # DATA_EVENT_MAX_AGE_SECONDS: Reject bar events older than this (prevents stale bars from tail causing false DATA FLOWING)
@@ -276,6 +305,7 @@ LIVE_CRITICAL_EVENT_TYPES = {
     "FORCED_FLATTEN_BROKER_TIMEOUT",
     "FLATTEN_BROKER_FLAT_CONFIRMED",
     "FORCED_FLATTEN_POSITION_CLOSED",
+    "FORCED_FLATTEN_MARKET_CLOSE",
     "SESSION_FORCED_FLATTENED",
     "RECONCILIATION_PASS_SUMMARY",
     "FORCED_FLATTEN_FAILED",

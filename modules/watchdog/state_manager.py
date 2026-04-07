@@ -21,7 +21,10 @@ from .config import (
     ENGINE_TICK_STALL_HYSTERESIS_SECONDS,
     STUCK_STREAM_THRESHOLD_SECONDS,
     UNPROTECTED_TIMEOUT_SECONDS,
-    DATA_STALL_THRESHOLD_SECONDS,
+    data_stall_threshold_seconds_for_execution_instrument,
+    DATA_STALLED_REFERENCE_ASSET_CLASSES,
+    DATA_STALL_RUNTIME_AUDIT_JSONL,
+    HIGH_LIQUIDITY_INSTRUMENT_ROOTS,
     RECOVERY_TIMEOUT_SECONDS,
     RECOVERY_LOOP_COUNT_THRESHOLD,
     RECOVERY_LOOP_WINDOW_SECONDS,
@@ -241,6 +244,13 @@ class WatchdogStateManager:
         self._data_status_history: List[tuple] = []   # List of (timestamp, status) tuples
         self._status_history_size = 3  # Keep last 3 status computations (15 seconds at 5s polling)
         self._status_change_threshold = 2  # Require 2 consecutive polls with same status before changing
+
+        # Throttle DATA_STALLED gap-vs-threshold logs (per execution instrument key)
+        self._last_data_stall_log_utc: Dict[str, datetime] = {}
+
+        # Runtime audit: global feed stall enter/clear (data_stall_runtime_audit.jsonl)
+        self._prev_global_feed_health_stall: Optional[bool] = None
+        self._global_feed_stall_started_utc: Optional[datetime] = None
 
         # Phase 7-8: Stuck order and latency spike detection (watchdog-derived)
         # broker_order_id -> {submitted_at, intent_id, instrument, role, stream_key}
@@ -1867,6 +1877,241 @@ class WatchdogStateManager:
             ),
             "currently_disconnected": self._connection_status == "ConnectionLost",
         }
+
+    def _maybe_log_data_stall_warn(
+        self,
+        execution_instrument_full_name: str,
+        gap_seconds: Optional[float],
+        stall_threshold_seconds: float,
+        market_open: bool,
+        now: datetime,
+    ) -> None:
+        """Rate-limited WARNING: DATA_STALLED with gap vs instrument threshold."""
+        interval = 60.0
+        last = self._last_data_stall_log_utc.get(execution_instrument_full_name)
+        if last is not None and (now - last).total_seconds() < interval:
+            return
+        self._last_data_stall_log_utc[execution_instrument_full_name] = now
+        gap_str = f"{gap_seconds:.1f}" if gap_seconds is not None else "None"
+        logger.warning(
+            "DATA_STALLED instrument=%s gap_seconds=%s stall_threshold_seconds=%.1f market_open=%s",
+            execution_instrument_full_name,
+            gap_str,
+            stall_threshold_seconds,
+            market_open,
+        )
+
+    def _asset_class_has_fresh_bar(self, now: datetime, roots: List[str]) -> bool:
+        """True if any execution instrument in this class has bar age <= per-instrument threshold."""
+        for root in roots:
+            for inst, t in self._last_bar_utc_by_execution_instrument.items():
+                ir = inst.split()[0] if " " in inst else inst
+                if ir != root:
+                    continue
+                thr = data_stall_threshold_seconds_for_execution_instrument(inst)
+                if (now - t).total_seconds() <= thr:
+                    return True
+        return False
+
+    def _asset_class_stale(self, now: datetime, roots: List[str]) -> bool:
+        """Stale when no instrument in this class has a fresh bar (feed breadth missing for segment)."""
+        return not self._asset_class_has_fresh_bar(now, roots)
+
+    def _reference_asset_classes_all_stale(self, now: datetime) -> bool:
+        """
+        (equity stale) AND (energy stale) AND (metals stale) — each class uses OR within class for 'fresh'.
+        """
+        classes = DATA_STALLED_REFERENCE_ASSET_CLASSES
+        if not classes:
+            return False
+        return all(self._asset_class_stale(now, roots) for roots in classes)
+
+    def _any_high_liquidity_instrument_updating(self, now: datetime) -> bool:
+        """Any configured high-liquidity root has recent bar activity (blocks false global stall)."""
+        for root in HIGH_LIQUIDITY_INSTRUMENT_ROOTS:
+            for inst, t in self._last_bar_utc_by_execution_instrument.items():
+                ir = inst.split()[0] if " " in inst else inst
+                if ir != root:
+                    continue
+                thr = data_stall_threshold_seconds_for_execution_instrument(inst)
+                if (now - t).total_seconds() <= thr:
+                    return True
+        return False
+
+    def _market_data_feed_alive(self, now: datetime) -> bool:
+        """
+        Global feed heartbeat from market data (bar recency on high-liquidity roots), not ENGINE_TICK alone.
+        """
+        return self._any_high_liquidity_instrument_updating(now)
+
+    def _enabled_streams_no_bar_progression(
+        self,
+        instruments_with_bars_expected: List[str],
+        data_stall_detected: Dict[str, Any],
+        market_open: bool,
+    ) -> bool:
+        """True when 2+ expected instruments all report stall (not a single illiquid leg)."""
+        if not market_open:
+            return False
+        if len(instruments_with_bars_expected) < 2:
+            return False
+        return all(
+            data_stall_detected.get(inst, {}).get("stall_detected", False)
+            for inst in instruments_with_bars_expected
+        )
+
+    def _global_feed_health_stall(
+        self,
+        now: datetime,
+        market_open: bool,
+        grace_period_active: bool,
+        instruments_with_bars_expected: List[str],
+        data_stall_detected: Dict[str, Any],
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """
+        stall =
+          (no_global_feed_heartbeat)
+          OR (reference_asset_classes_all_stale AND NOT any_high_liquidity_updating)
+          OR (enabled_streams_no_bar_progression AND NOT any_high_liquidity_updating)
+
+        no_global_feed_heartbeat uses recent market data on high-liquidity roots, not loop tick alone.
+        """
+        any_hi = self._any_high_liquidity_instrument_updating(now)
+        market_data_alive = self._market_data_feed_alive(now)
+        no_global_feed_heartbeat = bool(market_open) and not market_data_alive
+        ref_stale = self._reference_asset_classes_all_stale(now)
+        prog = self._enabled_streams_no_bar_progression(
+            instruments_with_bars_expected, data_stall_detected, market_open
+        )
+
+        arm_ref = ref_stale and not any_hi
+        arm_prog = prog and not any_hi
+
+        stall = (
+            no_global_feed_heartbeat
+            or arm_ref
+            or arm_prog
+        )
+        if grace_period_active:
+            stall = False
+
+        reasons: Dict[str, Any] = {
+            "no_global_feed_heartbeat": no_global_feed_heartbeat,
+            "market_data_feed_alive": market_data_alive,
+            "any_high_liquidity_updating": any_hi,
+            "reference_asset_classes_all_stale": ref_stale,
+            "reference_stall_arm": arm_ref,
+            "enabled_streams_no_bar_progression": prog,
+            "progression_stall_arm": arm_prog,
+            "grace_period_active": grace_period_active,
+        }
+        return stall, reasons
+
+    def _best_bar_age_seconds_for_root(self, now: datetime, root: str) -> Optional[float]:
+        """Age in seconds of the newest bar row matching root (execution instrument prefix)."""
+        best_ts: Optional[datetime] = None
+        for inst, t in self._last_bar_utc_by_execution_instrument.items():
+            ir = inst.split()[0] if " " in inst else inst
+            if ir != root:
+                continue
+            if best_ts is None or t > best_ts:
+                best_ts = t
+        if best_ts is None:
+            return None
+        return (now - best_ts).total_seconds()
+
+    def _high_liquidity_root_ages_seconds(self, now: datetime) -> Dict[str, Optional[float]]:
+        return {root: self._best_bar_age_seconds_for_root(now, root) for root in HIGH_LIQUIDITY_INSTRUMENT_ROOTS}
+
+    def _class_has_any_loaded_bar_key(self, roots: List[str]) -> bool:
+        for inst in self._last_bar_utc_by_execution_instrument.keys():
+            ir = inst.split()[0] if " " in inst else inst
+            if ir in roots:
+                return True
+        return False
+
+    def _reference_asset_class_runtime_audit(self, now: datetime) -> List[Dict[str, Any]]:
+        labels = ("equity", "energy", "metals")
+        out: List[Dict[str, Any]] = []
+        for i, roots in enumerate(DATA_STALLED_REFERENCE_ASSET_CLASSES):
+            label = labels[i] if i < len(labels) else f"class_{i}"
+            loaded = self._class_has_any_loaded_bar_key(roots)
+            fresh = self._asset_class_has_fresh_bar(now, roots)
+            if fresh:
+                stale_reason = "has_fresh"
+            elif not loaded:
+                stale_reason = "no_loaded_roots"
+            else:
+                stale_reason = "all_stale"
+            out.append(
+                {
+                    "label": label,
+                    "roots": list(roots),
+                    "fresh": fresh,
+                    "stale": not fresh,
+                    "any_execution_instrument_loaded": loaded,
+                    "stale_reason": stale_reason,
+                }
+            )
+        return out
+
+    def _emit_data_stall_runtime_audit_line(self, record: Dict[str, Any]) -> None:
+        """Append one JSON line for offline validation; also log a single-line summary."""
+        try:
+            DATA_STALL_RUNTIME_AUDIT_JSONL.parent.mkdir(parents=True, exist_ok=True)
+            with open(DATA_STALL_RUNTIME_AUDIT_JSONL, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, default=str) + "\n")
+        except OSError as e:
+            logger.debug("data_stall_runtime_audit jsonl append failed: %s", e)
+        # Log full structured payload at INFO (grep DATA_STALL_RUNTIME_AUDIT)
+        logger.info("DATA_STALL_RUNTIME_AUDIT %s", json.dumps(record, default=str))
+
+    def _maybe_record_global_feed_stall_runtime_audit(
+        self,
+        now: datetime,
+        engine_alive: bool,
+        market_data_feed_alive: bool,
+        global_feed_health_stall: bool,
+        global_feed_health_stall_reasons: Dict[str, Any],
+        smoothed_data_status: str,
+        feed_health_classification: str,
+    ) -> None:
+        """On global_feed_health_stall edge: ENTER/CLEAR with full snapshot for runtime validation."""
+        prev = self._prev_global_feed_health_stall
+        any_hi = bool(global_feed_health_stall_reasons.get("any_high_liquidity_updating"))
+        redundant = market_data_feed_alive == any_hi
+
+        base: Dict[str, Any] = {
+            "event": "",
+            "ts_utc": now.isoformat().replace("+00:00", "Z"),
+            "global_feed_health_stall": global_feed_health_stall,
+            "global_feed_health_stall_reasons": dict(global_feed_health_stall_reasons),
+            "high_liquidity_root_ages_seconds": self._high_liquidity_root_ages_seconds(now),
+            "reference_asset_classes": self._reference_asset_class_runtime_audit(now),
+            "any_high_liquidity_updating": any_hi,
+            "market_data_feed_alive": market_data_feed_alive,
+            "engine_alive": engine_alive,
+            "engine_alive_differs_from_market_data_feed_alive": engine_alive != market_data_feed_alive,
+            "market_data_feed_alive_redundant_with_any_hi": redundant,
+            "smoothed_data_status": smoothed_data_status,
+            "feed_health_classification": feed_health_classification,
+        }
+
+        if prev is not True and global_feed_health_stall:
+            base["event"] = "GLOBAL_FEED_STALL_ENTER"
+            self._global_feed_stall_started_utc = now
+            self._emit_data_stall_runtime_audit_line(base)
+        elif prev is True and not global_feed_health_stall:
+            dur: Optional[float] = None
+            if self._global_feed_stall_started_utc is not None:
+                dur = (now - self._global_feed_stall_started_utc).total_seconds()
+            base["event"] = "GLOBAL_FEED_STALL_CLEAR"
+            base["seconds_since_stall_start"] = dur
+            base["stall_cleared_on_next_poll"] = True
+            self._global_feed_stall_started_utc = None
+            self._emit_data_stall_runtime_audit_line(base)
+
+        self._prev_global_feed_health_stall = global_feed_health_stall
     
     def compute_watchdog_status(self) -> Dict:
         """Compute watchdog status derived field."""
@@ -2032,26 +2277,52 @@ class WatchdogStateManager:
                     pass
             if last_bar_utc:
                 elapsed = (now - last_bar_utc).total_seconds()
-                stall_detected = (
-                    elapsed > DATA_STALL_THRESHOLD_SECONDS
-                    and market_open
+                stall_threshold = data_stall_threshold_seconds_for_execution_instrument(
+                    execution_instrument_full_name
                 )
+                stall_detected = elapsed > stall_threshold and market_open
                 data_stall_detected[execution_instrument_full_name] = {
                     "instrument": execution_instrument_full_name,  # Execution instrument full name
                     "last_bar_chicago": last_bar_utc.astimezone(CHICAGO_TZ).isoformat(),
                     "stall_detected": stall_detected,
-                    "market_open": market_open
+                    "market_open": market_open,
+                    "stall_threshold_seconds": stall_threshold,
+                    "gap_seconds": elapsed,
+                    "elapsed_seconds": elapsed,
                 }
+                if stall_detected:
+                    self._maybe_log_data_stall_warn(
+                        execution_instrument_full_name,
+                        elapsed,
+                        stall_threshold,
+                        market_open,
+                        now,
+                    )
             else:
                 # Execution instrument expects bars but hasn't received any yet
                 # Only mark as stalled if grace period has elapsed
                 if not grace_period_active:
+                    stall_threshold = data_stall_threshold_seconds_for_execution_instrument(
+                        execution_instrument_full_name
+                    )
+                    stall_detected = bool(market_open)
                     data_stall_detected[execution_instrument_full_name] = {
                         "instrument": execution_instrument_full_name,
                         "last_bar_chicago": None,
-                        "stall_detected": market_open,  # Stall if market is open and no bars received
-                        "market_open": market_open
+                        "stall_detected": stall_detected,  # Stall if market is open and no bars received
+                        "market_open": market_open,
+                        "stall_threshold_seconds": stall_threshold,
+                        "gap_seconds": None,
+                        "elapsed_seconds": None,
                     }
+                    if stall_detected:
+                        self._maybe_log_data_stall_warn(
+                            execution_instrument_full_name,
+                            None,
+                            stall_threshold,
+                            market_open,
+                            now,
+                        )
         
         # Compute worst_last_bar_age_seconds for ALL execution instruments that have received bars
         # This helps detect data flow even when streams aren't in bar-dependent states yet
@@ -2064,6 +2335,18 @@ class WatchdogStateManager:
                     bar_age = (now - last_bar_utc).total_seconds()
                     if worst_last_bar_age_seconds is None or bar_age > worst_last_bar_age_seconds:
                         worst_last_bar_age_seconds = bar_age
+
+        # True if any instrument's bar age exceeds its own stall threshold (not global 300s)
+        any_bar_exceeds_instrument_threshold = False
+        if self._last_bar_utc_by_execution_instrument:
+            for execution_instrument_full_name, last_bar_utc in self._last_bar_utc_by_execution_instrument.items():
+                if not last_bar_utc:
+                    continue
+                bar_age = (now - last_bar_utc).total_seconds()
+                thr = data_stall_threshold_seconds_for_execution_instrument(execution_instrument_full_name)
+                if bar_age > thr:
+                    any_bar_exceeds_instrument_threshold = True
+                    break
         
         # Also check instruments that have received bars but aren't currently expecting them
         # This catches stalls when streams aren't in bar-dependent states yet
@@ -2073,8 +2356,7 @@ class WatchdogStateManager:
         # 2. Are not enabled on the timetable (e.g., NG not enabled)
         # Use a "recent activity" threshold (e.g., 1 hour) AND check if instrument has enabled streams
         RECENT_ACTIVITY_THRESHOLD_SECONDS = 3600  # 1 hour - if no bars in last hour, instrument is inactive
-        if market_open and worst_last_bar_age_seconds is not None:
-            if worst_last_bar_age_seconds > DATA_STALL_THRESHOLD_SECONDS:
+        if market_open and any_bar_exceeds_instrument_threshold:
                 # Find instruments with old bars that aren't already in data_stall_detected
                 # BUT only if:
                 # 1. They've received bars recently (within RECENT_ACTIVITY_THRESHOLD)
@@ -2109,11 +2391,14 @@ class WatchdogStateManager:
                     
                     if execution_instrument_full_name not in data_stall_detected and last_bar_utc:
                         bar_age = (now - last_bar_utc).total_seconds()
+                        inst_thr = data_stall_threshold_seconds_for_execution_instrument(
+                            execution_instrument_full_name
+                        )
                         # Only flag as stalled if:
-                        # 1. Bar age exceeds stall threshold (> 120s)
+                        # 1. Bar age exceeds this instrument's stall threshold
                         # 2. Instrument was active recently (< 1 hour ago)
                         # 3. Instrument has enabled streams (check if any stream for this instrument is enabled)
-                        if bar_age > DATA_STALL_THRESHOLD_SECONDS and bar_age < RECENT_ACTIVITY_THRESHOLD_SECONDS:
+                        if bar_age > inst_thr and bar_age < RECENT_ACTIVITY_THRESHOLD_SECONDS:
                             # Check if this instrument has any enabled streams
                             has_enabled_streams = False
                             if self._enabled_streams is None:
@@ -2134,8 +2419,18 @@ class WatchdogStateManager:
                                     "instrument": execution_instrument_full_name,
                                     "last_bar_chicago": last_bar_utc.astimezone(CHICAGO_TZ).isoformat(),
                                     "stall_detected": True,
-                                    "market_open": market_open
+                                    "market_open": market_open,
+                                    "stall_threshold_seconds": inst_thr,
+                                    "gap_seconds": bar_age,
+                                    "elapsed_seconds": bar_age,
                                 }
+                                self._maybe_log_data_stall_warn(
+                                    execution_instrument_full_name,
+                                    bar_age,
+                                    inst_thr,
+                                    market_open,
+                                    now,
+                                )
         
         # PATTERN 1: Additional observability (recommended)
         # Count execution instruments where bars_expected == True and worst last_bar_age
@@ -2226,15 +2521,27 @@ class WatchdogStateManager:
         # Apply smoothing to data stall detection
         # Compute data status: 'FLOWING' | 'STALLED' | 'ACCEPTABLE_SILENCE' | 'UNKNOWN'
         # UNKNOWN when we've never received any bar events (broker may be off, robot not started)
+        # Global STALLED is NOT "any single instrument stale" (e.g. MNG alone): see _global_feed_health_stall.
+        global_feed_health_stall, global_feed_health_stall_reasons = self._global_feed_health_stall(
+            now, market_open, grace_period_active, instruments_with_bars_expected, data_stall_detected
+        )
+        market_data_feed_alive = bool(global_feed_health_stall_reasons.get("market_data_feed_alive"))
+        if global_feed_health_stall:
+            logger.debug(
+                "GLOBAL_FEED_HEALTH_STALL reasons=%s",
+                global_feed_health_stall_reasons,
+            )
+
         if not self._last_bar_utc_by_execution_instrument:
             data_status = "UNKNOWN"
+        elif global_feed_health_stall:
+            data_status = "STALLED"
         elif data_stall_detected:
             critical_stall = any(d.get('stall_detected', False) and d.get('market_open', False)
                                 for d in data_stall_detected.values())
             if critical_stall:
-                # When ticks flowing (ENGINE_TICK_CALLSITE recent), bar age can lag - treat as FLOWING
-                # Bar age lags due to ONBARUPDATE_CALLED rate limit (1/min) or bar type (e.g. 5-min bars)
-                data_status = "FLOWING" if engine_alive else "STALLED"
+                # Per-instrument stall while aggregate feed is OK: engine tick heartbeat still drives FLOWING
+                data_status = "FLOWING" if engine_alive else "ACCEPTABLE_SILENCE"
             elif any(d.get('stall_detected', False) for d in data_stall_detected.values()):
                 data_status = "ACCEPTABLE_SILENCE"  # Market closed or acceptable pause
             else:
@@ -2318,11 +2625,26 @@ class WatchdogStateManager:
         elif not market_open:
             feed_health_classification = "MARKET_CLOSED"
         else:
-            # market open: UNKNOWN, ACCEPTABLE_SILENCE, etc. — use engine liveness, not "market closed"
-            feed_health_classification = "DATA_FLOWING" if engine_alive else "DATA_STALLED"
+            # market open: UNKNOWN, ACCEPTABLE_SILENCE, etc.
+            # When no bar rows yet, fall back to engine tick; once bars exist, prefer high-liq market data.
+            if not self._last_bar_utc_by_execution_instrument:
+                feed_health_classification = "DATA_FLOWING" if engine_alive else "DATA_STALLED"
+            else:
+                feed_health_classification = "DATA_FLOWING" if market_data_feed_alive else "DATA_STALLED"
+
+        self._maybe_record_global_feed_stall_runtime_audit(
+            now=now,
+            engine_alive=engine_alive,
+            market_data_feed_alive=market_data_feed_alive,
+            global_feed_health_stall=global_feed_health_stall,
+            global_feed_health_stall_reasons=global_feed_health_stall_reasons,
+            smoothed_data_status=smoothed_data_status,
+            feed_health_classification=feed_health_classification,
+        )
         
         return {
             "engine_alive": engine_alive,
+            "market_data_feed_alive": market_data_feed_alive,
             "engine_activity_state": frontend_engine_state,  # Mapped to frontend-expected values (smoothed)
             "engine_activity_classification": engine_activity_classification,  # RUNNING | IDLE | STALLED
             "feed_health_classification": feed_health_classification,  # DATA_FLOWING | DATA_STALLED | MARKET_CLOSED
@@ -2402,6 +2724,8 @@ class WatchdogStateManager:
             "execution_fill_unmapped_count": len(self._execution_fill_unmapped_events),
             "data_stall_detected": smoothed_data_stall_detected,  # Smoothed to prevent flickering
             "data_status": smoothed_data_status,  # FLOWING | STALLED | ACCEPTABLE_SILENCE | UNKNOWN
+            "global_feed_health_stall": global_feed_health_stall,
+            "global_feed_health_stall_reasons": global_feed_health_stall_reasons,
             "market_open": market_open,  # Always included, even if error occurred
             # PATTERN 1: Bars expected observability
             "bars_expected_count": bars_expected_count,
@@ -2490,6 +2814,10 @@ class StreamStateInfo:
         # SLOT_END_SUMMARY fields
         self.trade_executed: Optional[bool] = None
         self.slot_reason: Optional[str] = None
+        # Session flatten (derived from SessionFlattenStateTracker in API layer; defaults here for tests/serialization)
+        self.has_session: bool = False
+        self.flatten_trigger_ct: Optional[str] = None
+        self.flatten_status: str = "NOT_TRIGGERED"
 
 
 class IntentExposureInfo:

@@ -50,6 +50,7 @@ export function WatchdogPage() {
     timetableUnavailable,
     outOfTimetableActiveStreams,
     executionExpectationGaps,
+    flattenLookupMetrics,
     slotLifecycle,
     statusError,
     streamsError,
@@ -380,6 +381,7 @@ export function WatchdogPage() {
                 marketOpen={status?.market_open ?? null}
                 outOfTimetableActiveStreams={outOfTimetableActiveStreams}
                 executionExpectationGaps={executionExpectationGaps}
+                flattenLookupMetrics={flattenLookupMetrics ?? undefined}
               />
             </div>
             

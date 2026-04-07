@@ -7,6 +7,7 @@ import { formatDuration, computeTimeInState } from '../../utils/timeUtils.ts'
 import { useStreamPnl } from '../../hooks/useStreamPnl'
 import type {
   ExecutionExpectationGap,
+  FlattenLookupMetrics,
   OutOfTimetableActiveStream,
   StreamState,
 } from '../../types/watchdog'
@@ -19,6 +20,8 @@ interface StreamStatusTableProps {
   outOfTimetableActiveStreams?: OutOfTimetableActiveStream[]
   /** Robot-reported slot end without trade (timetable streams only) */
   executionExpectationGaps?: ExecutionExpectationGap[]
+  /** Cumulative flatten lookup counts (watchdog process lifetime) from stream-states */
+  flattenLookupMetrics?: FlattenLookupMetrics | null
 }
 
 export function StreamStatusTable({
@@ -27,6 +30,7 @@ export function StreamStatusTable({
   marketOpen,
   outOfTimetableActiveStreams = [],
   executionExpectationGaps = [],
+  flattenLookupMetrics,
 }: StreamStatusTableProps) {
   // Session day from API (CME label); never use UTC calendar for carry-over — wrong on Fri/Sat/Sun CT.
   const sessionTradingDay =
@@ -91,6 +95,65 @@ export function StreamStatusTable({
     return 'text-white'
   }
 
+  const flattenInfoCell = (reason: string | undefined) => {
+    const r = reason ?? 'NO_ROW_FOUND'
+    switch (r) {
+      case 'MATCH_CURRENT_DATE':
+        return (
+          <span className="text-emerald-400 text-xs" title={r}>
+            ✅ Normal
+          </span>
+        )
+      case 'NO_ROW_FOUND':
+        return (
+          <span className="text-gray-500 text-xs" title={r}>
+            ⚠️ No row
+          </span>
+        )
+      case 'MISSING_KEYS':
+        return (
+          <span className="text-red-400 text-xs font-medium" title={r}>
+            🔴 Missing keys
+          </span>
+        )
+      case 'NO_TRACKER':
+        return (
+          <span className="text-red-400 text-xs font-medium" title={r}>
+            🔴 No tracker
+          </span>
+        )
+      default:
+        return (
+          <span className="text-gray-400 text-xs font-mono" title={r}>
+            {r}
+          </span>
+        )
+    }
+  }
+
+  const flattenStatusBadgeClass = (status: string | undefined) => {
+    const s = status ?? 'NOT_TRIGGERED'
+    switch (s) {
+      case 'NOT_TRIGGERED':
+        return 'bg-gray-600 text-gray-200'
+      case 'TRIGGERED':
+        return 'bg-yellow-500 text-gray-900'
+      case 'CONFIRMED':
+        return 'bg-green-600 text-white'
+      case 'FAILED':
+        return 'bg-red-600 text-white'
+      case 'TIMEOUT':
+        return 'bg-orange-600 text-white'
+      case 'EXPOSURE_REMAINS':
+      case 'EXPOSURE_REMAINING':
+        return 'bg-red-700 text-white'
+      case 'BROKER_FLAT':
+        return 'bg-blue-600 text-white'
+      default:
+        return 'bg-gray-700 text-gray-500'
+    }
+  }
+
   return (
     <>
     <div className="bg-gray-800 rounded-lg overflow-hidden">
@@ -110,6 +173,14 @@ export function StreamStatusTable({
               <th className="px-2 py-1 text-left" title="Entry / Exit price">Entry/Exit</th>
               <th className="px-2 py-1 text-left">Commit</th>
               <th className="px-2 py-1 text-left">Issues</th>
+              <th className="px-2 py-1 text-left" title="Session rollup row present">
+                Has Session
+              </th>
+              <th className="px-2 py-1 text-left">Flatten Trigger</th>
+              <th className="px-2 py-1 text-left">Flatten Status</th>
+              <th className="px-2 py-1 text-left" title="Why flatten lookup succeeded or failed">
+                Flatten Info
+              </th>
             </tr>
           </thead>
           <tbody>
@@ -137,8 +208,11 @@ export function StreamStatusTable({
                   onClick={() => onStreamClick(stream)}
                   className="border-b border-gray-700 hover:bg-gray-700 cursor-pointer"
                 >
-                  <td className="px-2 py-1 whitespace-nowrap min-w-[5rem]" title={stream.trading_date || undefined}>
-                    <span className={isCarryOver ? 'text-amber-400 font-medium' : 'text-gray-300'}>
+                  <td className="px-2 py-1 whitespace-nowrap min-w-[5rem]">
+                    <span
+                      className={isCarryOver ? 'text-amber-400 font-medium' : 'text-gray-300'}
+                      title={stream.trading_date || undefined}
+                    >
                       {dateLabel}
                     </span>
                   </td>
@@ -250,11 +324,43 @@ export function StreamStatusTable({
                       )
                     })()}
                   </td>
+                  <td className="px-2 py-1 text-sm text-gray-300">
+                    {stream.has_session === true ? 'YES' : '—'}
+                  </td>
+                  <td className="px-2 py-1 font-mono text-sm text-gray-300">
+                    {stream.flatten_trigger_ct ?? '—'}
+                  </td>
+                  <td className="px-2 py-1">
+                    <span
+                      className={`px-2 py-0.5 rounded text-xs font-medium ${flattenStatusBadgeClass(stream.flatten_status)}`}
+                    >
+                      {stream.flatten_status ?? 'NOT_TRIGGERED'}
+                    </span>
+                  </td>
+                  <td className="px-2 py-1 whitespace-nowrap">
+                    {flattenInfoCell(stream.flatten_lookup_reason)}
+                  </td>
                 </tr>
               )
             })}
           </tbody>
         </table>
+        {flattenLookupMetrics != null && (
+          <div
+            className="px-3 py-2 border-t border-gray-700 bg-gray-900/50 text-[11px] text-gray-400 font-mono leading-relaxed"
+            title="Cumulative counts since watchdog process start (stream_session_flatten_fields). Expect MATCH_CURRENT_DATE dominant; MISSING_KEYS and NO_TRACKER ideally zero."
+          >
+            <span className="text-gray-500 uppercase tracking-wide mr-2">Flatten lookup (lifetime)</span>
+            {(
+              ['MATCH_CURRENT_DATE', 'NO_ROW_FOUND', 'MISSING_KEYS', 'NO_TRACKER'] as const
+            ).map((k) => (
+              <span key={k} className="mr-3 whitespace-nowrap">
+                <span className="text-gray-500">{k}</span>
+                <span className="text-gray-200 ml-0.5">{flattenLookupMetrics[k] ?? 0}</span>
+              </span>
+            ))}
+          </div>
+        )}
       </div>
     </div>
 

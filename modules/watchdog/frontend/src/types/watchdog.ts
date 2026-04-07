@@ -173,6 +173,21 @@ export interface StreamState {
   range_locked_time_chicago: string | null;
   trade_executed?: boolean | null;
   slot_reason?: string | null;
+  /** True when SessionFlattenStateTracker has a rollup row for (trading_date, session, instrument) */
+  has_session?: boolean;
+  /** Chicago flatten trigger time HH:MM from tracker (null if unknown) */
+  flatten_trigger_ct?: string | null;
+  /** Rollup flatten status from tracker; baseline NOT_TRIGGERED when no flatten activity yet */
+  flatten_status?: string;
+  flatten_triggered?: boolean;
+  broker_flat?: boolean;
+  confirmed?: boolean;
+  /** How flatten lookup resolved (stream_session_flatten_fields); always set by current API */
+  flatten_lookup_reason?: string;
+  /** @deprecated Execution feed no longer carries prior-session flags */
+  carried_over_from_prior_date?: boolean;
+  /** @deprecated */
+  carried_over_trading_date?: string | null;
 }
 
 export enum StreamStateEnum {
@@ -214,6 +229,15 @@ export interface ExecutionExpectationGap {
   slot_boundary_chicago?: string | null;
 }
 
+/** Cumulative counts since watchdog process start (stream_session_flatten_fields). */
+export type FlattenLookupMetrics = Record<
+  | 'MATCH_CURRENT_DATE'
+  | 'NO_ROW_FOUND'
+  | 'MISSING_KEYS'
+  | 'NO_TRACKER',
+  number
+>;
+
 export interface StreamStatesResponse {
   snapshot_utc?: string;
   timestamp_chicago: string;
@@ -222,6 +246,8 @@ export interface StreamStatesResponse {
   out_of_timetable_active_streams?: OutOfTimetableActiveStream[];
   /** Timetable streams with explicit slot-end “no trade” vs planned slot (see backend doc). */
   execution_expectation_gaps?: ExecutionExpectationGap[];
+  /** Cumulative flatten lookup outcomes (process lifetime); omit on older backends. */
+  flatten_lookup_metrics?: FlattenLookupMetrics;
   timetable_unavailable?: boolean;
   enabled_streams_unknown?: boolean;
   timetable_source?: string | null;

@@ -196,6 +196,15 @@ public sealed class StreamStateMachine
     // - What deduplication happened
     private int _historicalBarCount = 0; // Bars from BarsRequest/pre-hydration
     private int _liveBarCount = 0; // Bars from live feed (OnBar)
+
+    /// <summary>
+    /// Running max high / min low for bars with barUtc &gt; SlotTimeUtc (strictly after slot).
+    /// Authoritative source for pre-submit &quot;breakout already happened&quot;; journal flags are supplemental (e.g. restart).
+    /// </summary>
+    private bool _postSlotExcursionHasSamples;
+    private decimal _postSlotMaxHighSinceSlot = decimal.MinValue;
+    private decimal _postSlotMinLowSinceSlot = decimal.MaxValue;
+
     private int _filteredFutureBarCount = 0; // Bars filtered (future)
     private int _filteredPartialBarCount = 0; // Bars filtered (partial/in-progress)
     private int _dedupedBarCount = 0; // Bars deduplicated (replaced existing)
@@ -3254,6 +3263,22 @@ public sealed class StreamStateMachine
         // Update last bar received timestamp for data feed health monitoring
         _lastBarReceivedUtc = utcNow;
         _lastBarTimestampUtc = barUtc;
+
+        // Post-slot OHLC envelope (all states): feeds pre-submit breakout scan; journal flags are optional memory.
+        if (barUtc > SlotTimeUtc && high >= low && close >= low && close <= high)
+        {
+            if (!_postSlotExcursionHasSamples)
+            {
+                _postSlotExcursionHasSamples = true;
+                _postSlotMaxHighSinceSlot = high;
+                _postSlotMinLowSinceSlot = low;
+            }
+            else
+            {
+                if (high > _postSlotMaxHighSinceSlot) _postSlotMaxHighSinceSlot = high;
+                if (low < _postSlotMinLowSinceSlot) _postSlotMinLowSinceSlot = low;
+            }
+        }
         
         // Buffer bars that fall within [range_start, slot_time] using Chicago time comparison
         // Bar timestamps represent OPEN time (converted from NinjaTrader close time for Analyzer parity)
@@ -3846,7 +3871,23 @@ public sealed class StreamStateMachine
             return (false, "POST_LOCK_BREAKOUT_ALREADY_OCCURRED", new
             {
                 post_lock_long = _journal.PostLockLongBreakoutTouched,
-                post_lock_short = _journal.PostLockShortBreakoutTouched
+                post_lock_short = _journal.PostLockShortBreakoutTouched,
+                breakout_source = "JOURNAL_FLAGS"
+            });
+        }
+
+        var (ohlcL, ohlcS) = GetPostSlotBreakoutTouchFromOhlcEnvelope(_brkLongRounded.Value, _brkShortRounded.Value);
+        if (ohlcL || ohlcS)
+        {
+            return (false, "POST_LOCK_BREAKOUT_ALREADY_OCCURRED", new
+            {
+                post_lock_long = ohlcL || _journal.PostLockLongBreakoutTouched,
+                post_lock_short = ohlcS || _journal.PostLockShortBreakoutTouched,
+                ohlc_long = ohlcL,
+                ohlc_short = ohlcS,
+                max_high_since_slot = _postSlotExcursionHasSamples ? _postSlotMaxHighSinceSlot : (decimal?)null,
+                min_low_since_slot = _postSlotExcursionHasSamples ? _postSlotMinLowSinceSlot : (decimal?)null,
+                breakout_source = "OHLC_ENVELOPE"
             });
         }
         
@@ -3859,6 +3900,73 @@ public sealed class StreamStateMachine
     /// </summary>
     public bool IsPostLockBreakoutSetupExpired()
         => _journal.PostLockLongBreakoutTouched || _journal.PostLockShortBreakoutTouched;
+
+    /// <summary>
+    /// Primary signal for &quot;breakout already occurred&quot; before first bracket submit: tracked OHLC strictly after SlotTimeUtc.
+    /// </summary>
+    private (bool longTouched, bool shortTouched) GetPostSlotBreakoutTouchFromOhlcEnvelope(decimal brkLong, decimal brkShort)
+    {
+        if (!_postSlotExcursionHasSamples) return (false, false);
+        return (_postSlotMaxHighSinceSlot >= brkLong, _postSlotMinLowSinceSlot <= brkShort);
+    }
+
+    /// <summary>
+    /// If OHLC since slot or persisted journal shows post-lock excursion, commit NO_TRADE and return true.
+    /// Call before initial SubmitStopEntryBracketsAtLock from TryLockRange Phase B.
+    /// </summary>
+    private bool TryCommitNoTradeIfPostLockBreakoutDetected(DateTimeOffset utcNow, string detectionPath)
+    {
+        if (_journal.Committed) return false;
+        if (!_brkLongRounded.HasValue || !_brkShortRounded.HasValue) return false;
+
+        var brkL = _brkLongRounded.Value;
+        var brkS = _brkShortRounded.Value;
+        var (ohlcL, ohlcS) = GetPostSlotBreakoutTouchFromOhlcEnvelope(brkL, brkS);
+        var journalL = _journal.PostLockLongBreakoutTouched;
+        var journalS = _journal.PostLockShortBreakoutTouched;
+        if (!ohlcL && !ohlcS && !journalL && !journalS)
+            return false;
+
+        if (ohlcL) _journal.PostLockLongBreakoutTouched = true;
+        if (ohlcS) _journal.PostLockShortBreakoutTouched = true;
+        _journals.Save(_journal);
+
+        var source = (ohlcL || ohlcS) && (journalL || journalS)
+            ? "OHLC_AND_JOURNAL"
+            : (ohlcL || ohlcS ? "OHLC_ENVELOPE" : "JOURNAL_FLAGS_ONLY");
+
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "INITIAL_SUBMISSION_BLOCKED_POST_LOCK_EXCURSION", State.ToString(),
+            new
+            {
+                stream_id = Stream,
+                trading_date = TradingDate,
+                detection_path = detectionPath,
+                source,
+                ohlc_long = ohlcL,
+                ohlc_short = ohlcS,
+                post_lock_long = _journal.PostLockLongBreakoutTouched,
+                post_lock_short = _journal.PostLockShortBreakoutTouched,
+                max_high_since_slot = _postSlotExcursionHasSamples ? _postSlotMaxHighSinceSlot : (decimal?)null,
+                min_low_since_slot = _postSlotExcursionHasSamples ? _postSlotMinLowSinceSlot : (decimal?)null,
+                breakout_long = brkL,
+                breakout_short = brkS,
+                note = "Post-slot OHLC envelope or journal memory — no stop-entry brackets (strict product rule)"
+            }));
+
+        Commit(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", "NO_TRADE_BREAKOUT_ALREADY_OCCURRED");
+        return true;
+    }
+
+    private void SyncJournalPostLockFlagsFromOhlcEnvelopeIfTouched()
+    {
+        if (!_brkLongRounded.HasValue || !_brkShortRounded.HasValue) return;
+        var (l, s) = GetPostSlotBreakoutTouchFromOhlcEnvelope(_brkLongRounded.Value, _brkShortRounded.Value);
+        if (!l && !s) return;
+        if (l) _journal.PostLockLongBreakoutTouched = true;
+        if (s) _journal.PostLockShortBreakoutTouched = true;
+        _journals.Save(_journal);
+    }
 
     /// <summary>
     /// Deterministic post-lock excursion: bar must be strictly after slot end; uses bar high/low vs rounded breakout stops.
@@ -3946,6 +4054,7 @@ public sealed class StreamStateMachine
         {
             if (canSubmitResult.Reason == "POST_LOCK_BREAKOUT_ALREADY_OCCURRED")
             {
+                SyncJournalPostLockFlagsFromOhlcEnvelopeIfTouched();
                 Commit(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", "NO_TRADE_BREAKOUT_ALREADY_OCCURRED");
             }
             _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
@@ -5315,22 +5424,8 @@ public sealed class StreamStateMachine
             }
             else if (utcNow < MarketCloseUtc && !_breakoutLevelsMissing && _brkLongRounded.HasValue && _brkShortRounded.HasValue)
             {
-                // Post-lock breakout opportunity uses bar path only (not snapshot bid/ask). At first lock,
-                // no post-slot bar has been processed yet, so excursion flags are false unless restored from journal.
-                if (IsPostLockBreakoutSetupExpired())
-                {
-                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                        "INITIAL_SUBMISSION_BLOCKED_POST_LOCK_EXCURSION", State.ToString(),
-                        new
-                        {
-                            stream_id = Stream,
-                            post_lock_long = _journal.PostLockLongBreakoutTouched,
-                            post_lock_short = _journal.PostLockShortBreakoutTouched,
-                            note = "Journal/history shows post-lock breakout touch before brackets — no initial submission"
-                        }));
-                    Commit(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", "NO_TRADE_BREAKOUT_ALREADY_OCCURRED");
-                }
-                else
+                // Pre-submit: OHLC strictly after slot is authoritative; journal flags are optional memory (e.g. restart).
+                if (!TryCommitNoTradeIfPostLockBreakoutDetected(utcNow, "TRY_LOCK_RANGE_PHASE_B"))
                 {
                     var (bid, ask) = _executionAdapter?.GetCurrentMarketPrice(ExecutionInstrument, utcNow) ?? (null, null);
                     var brkLong = _brkLongRounded.Value;
@@ -6704,6 +6799,10 @@ public sealed class StreamStateMachine
         _lastBarOpenChicago = null;
         _rangeInvalidated = false;
         _rangeInvalidatedNotified = false;
+
+        _postSlotExcursionHasSamples = false;
+        _postSlotMaxHighSinceSlot = decimal.MinValue;
+        _postSlotMinLowSinceSlot = decimal.MaxValue;
         
         // Logging state
         _slotEndSummaryLogged = false;
@@ -7138,6 +7237,7 @@ public sealed class StreamStateMachine
         _journals.Save(_journal);
         
         // Phase 4: Verify no exposure remains (risk guarantee)
+        var exposureVerifiedOk = false;
         try
         {
             var snap = _executionAdapter.GetAccountSnapshot(utcNow);
@@ -7155,6 +7255,10 @@ public sealed class StreamStateMachine
                     new { instrument = ExecutionInstrument, quantity = posQty });
                 LogSessionCloseManualFlattenRequiredEngine(utcNow, posQty);
                 _engine?.OnForcedFlattenFailed(ExecutionInstrument, "FORCED_FLATTEN_EXPOSURE_REMAINING", utcNow);
+            }
+            else
+            {
+                exposureVerifiedOk = true;
             }
         }
         catch (Exception ex)
@@ -7174,6 +7278,20 @@ public sealed class StreamStateMachine
                 slot_status = _journal.SlotStatus.ToString(),
                 note = "Pre-close flatten complete - slot remains ACTIVE for market-open reentry"
             }));
+
+        if (exposureVerifiedOk)
+        {
+            _engine?.LogEngineEvent(utcNow, "SESSION_FORCED_FLATTENED", new Dictionary<string, object?>
+            {
+                ["trading_date"] = TradingDate,
+                ["session_class"] = Session,
+                ["stream"] = Stream,
+                ["instrument"] = ExecutionInstrument,
+                ["original_intent_id"] = _journal.OriginalIntentId ?? "",
+                ["session_close_forced_flatten"] = true,
+                ["note"] = "Session forced flatten workflow complete — broker flat, protective handling finished, exposure verified zero"
+            });
+        }
     }
     
     /// <summary>
@@ -7413,17 +7531,10 @@ public sealed class StreamStateMachine
         // Pre-re-entry safety check: Verify stop price validity and protection placement conditions
         // For now, assume safety checks pass (can be enhanced with actual price gap detection)
         // TODO: Add explicit gap detection and price validity checks
-        
-        // Generate deterministic ReentryIntentId (does NOT include TradingDate)
-        if (string.IsNullOrWhiteSpace(_journal.ReentryIntentId))
-        {
-            _journal.ReentryIntentId = $"{_journal.SlotInstanceKey}_REENTRY";
-        }
-        
-        // Submit MARKET entry using direction/quantity from ExecutionJournalEntry, with ReentryIntentId
-        var direction = originalEntry.Direction;
+
+        var direction = originalEntry.Direction ?? "Long";
         var quantity = originalEntry.EntryFilledQuantityTotal;
-        
+
         if (quantity <= 0)
         {
             // Invalid quantity - fail closed
@@ -7446,6 +7557,26 @@ public sealed class StreamStateMachine
                 new { original_intent_id = _journal.OriginalIntentId, quantity });
             return;
         }
+
+        // Canonical reentry intent id — must match NinjaTraderSimAdapter.ExecuteSubmitMarketReentry Intent construction
+        // (same strings: F2/NULL rules in ExecutionJournal.ComputeIntentId; slot/session verbatim; direction defaults to Long when empty in NT).
+        var instrumentRaw = ExecutionInstrument ?? Instrument ?? "";
+        var execInstUpper = string.IsNullOrEmpty(instrumentRaw) ? "" : instrumentRaw.Trim().ToUpperInvariant();
+        var reentryIntentForCanonicalId = new Intent(
+            TradingDate ?? "",
+            Stream,
+            instrumentRaw,
+            execInstUpper,
+            Session,
+            SlotTimeChicago,
+            direction,
+            null,
+            null,
+            null,
+            null,
+            utcNow,
+            "SUBMIT_MARKET_REENTRY");
+        _journal.ReentryIntentId = reentryIntentForCanonicalId.ComputeIntentId();
 
         _engine?.LogEngineEvent(utcNow, "SESSION_REENTRY_ATTEMPT", new Dictionary<string, object?>
         {
@@ -7474,7 +7605,7 @@ public sealed class StreamStateMachine
             ExecutionInstrument = ExecutionInstrument ?? Instrument ?? "",
             ReentryIntentId = _journal.ReentryIntentId,
             OriginalIntentId = _journal.OriginalIntentId,
-            Direction = direction ?? "Long",
+            Direction = direction,
             Quantity = (int)quantity,
             Reason = "MARKET_REENTRY",
             CallerContext = "CheckMarketOpenReentry"

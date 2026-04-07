@@ -55,10 +55,71 @@ public sealed class Intent
     }
 
     /// <summary>
-    /// Compute intent ID from canonical fields.
+    /// Compute intent ID from canonical fields (delegates to <see cref="ExecutionJournal.ComputeIntentId"/>).
     /// </summary>
+    /// <remarks>Call sites must supply the same field normalization as registration (see <see cref="ExecutionJournal.ComputeIntentId"/> remarks).</remarks>
     public string ComputeIntentId() =>
         ExecutionJournal.ComputeIntentId(
             TradingDate, Stream, Instrument, Session, SlotTimeChicago,
             Direction, EntryPrice, StopPrice, TargetPrice, BeTrigger);
+
+    /// <summary>
+    /// Validates identity fields required before an intent may enter <see cref="NinjaTraderSimAdapter.RegisterIntent"/> /
+    /// <see cref="InstrumentExecutionAuthority.RegisterIntent"/>. Fails closed so invalid intents do not propagate to submission.
+    /// Direction must be Long or Short (case-insensitive); use canonical casing at construction when stable intent IDs matter.
+    /// </summary>
+    public static bool TryValidateRegistrationPrerequisites(Intent intent, out string failureReason)
+    {
+        failureReason = "";
+        if (intent is null)
+        {
+            failureReason = "intent_null";
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(intent.TradingDate))
+        {
+            failureReason = "trading_date_empty";
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(intent.Stream))
+        {
+            failureReason = "stream_empty";
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(intent.Instrument))
+        {
+            failureReason = "instrument_empty";
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(intent.Session))
+        {
+            failureReason = "session_empty";
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(intent.SlotTimeChicago))
+        {
+            failureReason = "slot_time_empty";
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(intent.Direction))
+        {
+            failureReason = "direction_empty";
+            return false;
+        }
+
+        if (!string.Equals(intent.Direction, "Long", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(intent.Direction, "Short", StringComparison.OrdinalIgnoreCase))
+        {
+            failureReason = "direction_invalid";
+            return false;
+        }
+
+        return true;
+    }
 }

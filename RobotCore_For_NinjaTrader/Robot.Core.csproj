@@ -45,8 +45,15 @@
     <Compile Include="..\modules\robot\core\Execution\ReconciliationDeferPolicy.cs" Link="Execution\ReconciliationDeferPolicy.cs" />
     <Compile Include="..\modules\robot\core\Execution\FlattenCoordinationTracker.cs" Link="Execution\FlattenCoordinationTracker.cs" />
     <Compile Include="..\modules\robot\core\Execution\ReleaseReconciliationRedundancySuppression.cs" Link="Execution\ReleaseReconciliationRedundancySuppression.cs" />
+    <Compile Include="..\modules\robot\core\Execution\NtNonLiveAccountValidation.cs" Link="Execution\NtNonLiveAccountValidation.cs" />
     <Compile Include="..\modules\robot\core\reconciliation\ReconciliationStateTracker.cs" Link="reconciliation\ReconciliationStateTracker.cs" />
     <Compile Include="..\modules\robot\core\Diagnostics\RuntimeAudit.cs" Link="Diagnostics\RuntimeAudit.cs" />
     <Compile Include="..\modules\robot\core\Diagnostics\ExecutionTraceWriter.cs" Link="Diagnostics\ExecutionTraceWriter.cs" />
+    <Compile Include="..\modules\robot\core\Execution\ExecutionReplayReader.cs" Link="Execution\ExecutionReplayReader.cs" />
+    <Compile Include="..\modules\robot\core\Execution\ExecutionReplayRebuilder.cs" Link="Execution\ExecutionReplayRebuilder.cs" />
+    <Compile Include="..\modules\robot\core\Execution\ExecutionScenarioRunner.cs" Link="Execution\ExecutionScenarioRunner.cs" />
+    <Compile Include="..\modules\robot\core\Execution\ExecutionScenarioDefinitions.cs" Link="Execution\ExecutionScenarioDefinitions.cs" />
+    <Compile Include="..\modules\robot\core\Execution\IdentityReplayScenarioDefinitions.cs" Link="Execution\IdentityReplayScenarioDefinitions.cs" />
+    <Compile Include="..\modules\robot\core\Execution\IdentityReplayScenarioRunner.cs" Link="Execution\IdentityReplayScenarioRunner.cs" />
   </ItemGroup>
 </Project>

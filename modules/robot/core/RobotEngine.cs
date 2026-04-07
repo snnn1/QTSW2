@@ -3730,21 +3730,27 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     }
     
     /// <summary>
-    /// PHASE 1: Get canonical instrument for a given execution instrument.
-    /// Maps micro futures (MES, MNQ, etc.) to their base instruments (ES, NQ, etc.).
-    /// Returns execution instrument unchanged if not a micro or if spec is unavailable.
+    /// PHASE 1: Get canonical instrument for a given execution or root symbol.
+    /// Maps micro futures (MES, MNQ, M2K, etc.) to base instruments (ES, NQ, RTY, etc.).
+    /// Returns the uppercased symbol when not a known micro in spec. Empty input yields empty string.
     /// </summary>
-    private string GetCanonicalInstrument(string executionInstrument)
+    private string GetCanonicalInstrument(string instrument)
     {
+        if (string.IsNullOrWhiteSpace(instrument))
+            return "";
+
+        instrument = instrument.ToUpperInvariant();
+
         if (_spec != null &&
-            _spec.TryGetInstrument(executionInstrument, out var inst) &&
-            inst.is_micro &&
-            !string.IsNullOrWhiteSpace(inst.base_instrument))
+            _spec.TryGetInstrument(instrument, out var inst))
         {
-            return inst.base_instrument.ToUpperInvariant(); // MES → ES
+            if (inst.is_micro && !string.IsNullOrWhiteSpace(inst.base_instrument))
+            {
+                return inst.base_instrument.ToUpperInvariant();
+            }
         }
 
-        return executionInstrument.ToUpperInvariant(); // ES → ES
+        return instrument;
     }
 
     /// <summary>
@@ -4223,8 +4229,38 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         if (timetable.streams != null)
         {
+            var deriveTradingDateStr = tradingDate.ToString("yyyy-MM-dd");
             foreach (var d in timetable.streams)
-                TimetableStream.EnsureExecutionFields(d);
+            {
+                if (string.IsNullOrWhiteSpace(d.instrument))
+                {
+                    d.instrument = TimetableStream.DeriveInstrumentFromStreamId(d.stream ?? "");
+                }
+
+                if (string.IsNullOrWhiteSpace(d.session))
+                {
+                    d.session = TimetableStream.DeriveSessionFromStreamId(d.stream ?? "");
+                }
+
+                if (string.IsNullOrWhiteSpace(d.decision_time))
+                {
+                    d.decision_time = d.slot_time ?? "";
+                }
+
+                if (_loggingConfig.DiagnosticsEnabled)
+                {
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: deriveTradingDateStr, eventType: "TIMETABLE_DERIVED", state: "ENGINE",
+                        new
+                        {
+                            stream = d.stream,
+                            instrument = d.instrument,
+                            canonical = GetCanonicalInstrument(d.instrument ?? ""),
+                            session = d.session,
+                            slot_time = d.slot_time,
+                            enabled = d.enabled
+                        }));
+                }
+            }
         }
 
         var incoming = timetable.streams.Where(s => s.enabled).ToList();
@@ -4351,18 +4387,42 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // This check happens FIRST before any processing to avoid unnecessary work
             if (!string.IsNullOrWhiteSpace(_executionInstrument))
             {
+                if (string.IsNullOrWhiteSpace(canonicalInstrument))
+                {
+                    skippedCount++;
+                    var missReason = "MISSING_CANONICAL";
+                    if (!skippedReasons.ContainsKey(missReason))
+                        skippedReasons[missReason] = 0;
+                    skippedReasons[missReason]++;
+                    var missTradingDateStr = tradingDate.ToString("yyyy-MM-dd");
+                    DateTimeOffset? missSlotUtc = null;
+                    try
+                    {
+                        if (!string.IsNullOrWhiteSpace(slotTimeChicago))
+                            missSlotUtc = _time.ConvertChicagoToUtc(_time.ConstructChicagoTime(tradingDate, slotTimeChicago));
+                    }
+                    catch { }
+                    LogEvent(RobotEvents.Base(_time, utcNow, missTradingDateStr, directive.stream ?? "", canonicalInstrument, session, slotTimeChicago, missSlotUtc,
+                        "STREAM_SKIPPED", "ENGINE", new
+                        {
+                            reason = "MISSING_CANONICAL",
+                            stream_id = directive.stream,
+                            timetable_instrument_raw = timetableInstrument,
+                            note = "Timetable canonical is empty after derivation — cannot match NinjaTrader anchor"
+                        }));
+                    continue;
+                }
+
                 // Use MasterInstrument.Name for explicit canonical matching (as per authoritative rule)
-                // CRITICAL FIX: Must canonicalize MasterInstrument.Name (e.g., M2K -> NQ, MGC -> GC) before comparison
+                // CRITICAL FIX: Must canonicalize MasterInstrument.Name (e.g., M2K -> RTY, MGC -> GC) before comparison
                 string? ntCanonical = null;
                 if (!string.IsNullOrWhiteSpace(_masterInstrumentName))
                 {
-                    // Explicit: Canonicalize MasterInstrument.Name (e.g., "M2K" -> "NQ", "MGC" -> "GC")
-                    ntCanonical = GetCanonicalInstrument(_masterInstrumentName.ToUpperInvariant());
+                    ntCanonical = GetCanonicalInstrument(_masterInstrumentName);
                 }
                 else
                 {
-                    // Fallback: Derive canonical from execution instrument (for backwards compatibility)
-                    ntCanonical = GetCanonicalInstrument(_executionInstrument.ToUpperInvariant());
+                    ntCanonical = GetCanonicalInstrument(_executionInstrument);
                 }
                 
                 if (!string.Equals(ntCanonical, canonicalInstrument, StringComparison.OrdinalIgnoreCase))

@@ -31,6 +31,19 @@ internal static class Program
 
     private static int Main(string[] args)
     {
+        if (args.Length > 0 && args[0].Equals("IDENTITY_REPLAY_SCENARIOS", StringComparison.OrdinalIgnoreCase))
+        {
+            var (pass, err) = IdentityReplayScenarioTests.RunAll(Console.WriteLine);
+            if (pass)
+            {
+                Console.WriteLine("PASS: identity replay scenarios (all)");
+                return 0;
+            }
+
+            Console.Error.WriteLine("FAIL: " + err);
+            return 1;
+        }
+
         if (args.Length > 0 && args[0].Equals("QTSW2_HYDRATION_DEFER", StringComparison.OrdinalIgnoreCase))
         {
             var (pass, err) = Qtsw2HydrationDeferPolicyTests.RunQtsw2HydrationDeferPolicyTests();

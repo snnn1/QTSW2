@@ -1383,6 +1383,45 @@ public sealed partial class InstrumentExecutionAuthority
         _ = RequestAdoptionScan(AdoptionScanRequestSource.Bootstrap, applyRecoveryThrottle: false, Post);
     }
 
+    /// <summary>DEBUG-only adoption skip reason (one line per broker order per scan; deduped by broker_order_id).</summary>
+    private void LogAdoptionSkipReason(
+        DateTimeOffset utcNow,
+        Order? order,
+        string brokerOrderId,
+        string? rawTag,
+        string? decodedIntentId,
+        bool hasCandidate,
+        int activeIntentCount,
+        string skipReason,
+        HashSet<string> oncePerBrokerOrderIdInScan)
+    {
+        if (Log == null) return;
+        var oidKey = string.IsNullOrEmpty(brokerOrderId) ? "UNKNOWN_ORDER_ID" : brokerOrderId;
+        if (!oncePerBrokerOrderIdInScan.Add(oidKey)) return;
+        string? submitPath = null;
+        var orderState = "";
+        if (order != null)
+        {
+            try { orderState = order.OrderState.ToString(); } catch { /* best effort */ }
+            try { submitPath = order.OrderType.ToString(); } catch { submitPath = null; }
+        }
+
+        Log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ADOPTION_SKIP_REASON", state: "DEBUG",
+            new
+            {
+                skip_reason = skipReason,
+                broker_order_id = oidKey,
+                raw_tag = rawTag,
+                decoded_intent_id = decodedIntentId,
+                has_candidate = hasCandidate,
+                active_intent_count = activeIntentCount,
+                execution_instrument_key = ExecutionInstrumentKey,
+                order_state = orderState,
+                submit_path = submitPath,
+                iea_instance_id = InstanceId
+            }));
+    }
+
     /// <summary>
     /// Gap 4: On first execution update, sync OrderMap with broker reality. Hydration does not mutate broker state.
     /// For each QTSW2 protective (STOP/TARGET) with entry filled per journal, populate OrderMap.
@@ -1426,9 +1465,47 @@ public sealed partial class InstrumentExecutionAuthority
 
     private void ScanAndAdoptExistingOrdersCore(AdoptionScanRequestSource source, ref AdoptionScanPhaseTelemetry tel)
     {
-        if (Executor == null || Log == null) return;
+        if (Log == null) return;
+        if (Executor == null)
+        {
+            Log.Write(RobotEvents.EngineBase(NowEvent(), tradingDate: "", eventType: "ADOPTION_SKIP_REASON", state: "DEBUG",
+                new
+                {
+                    skip_reason = "executor_missing",
+                    broker_order_id = "_SCAN_",
+                    raw_tag = (string?)null,
+                    decoded_intent_id = (string?)null,
+                    has_candidate = false,
+                    active_intent_count = 0,
+                    execution_instrument_key = ExecutionInstrumentKey,
+                    order_state = "",
+                    submit_path = (string?)null,
+                    iea_instance_id = InstanceId
+                }));
+            return;
+        }
+
         var account = Executor.GetAccount() as Account;
-        if (account?.Orders == null) return;
+        if (account?.Orders == null)
+        {
+            Log.Write(RobotEvents.EngineBase(NowEvent(), tradingDate: "", eventType: "ADOPTION_SKIP_REASON", state: "DEBUG",
+                new
+                {
+                    skip_reason = "account_orders_null",
+                    broker_order_id = "_SCAN_",
+                    raw_tag = (string?)null,
+                    decoded_intent_id = (string?)null,
+                    has_candidate = false,
+                    active_intent_count = 0,
+                    execution_instrument_key = ExecutionInstrumentKey,
+                    order_state = "",
+                    submit_path = (string?)null,
+                    iea_instance_id = InstanceId
+                }));
+            return;
+        }
+
+        var adoptionSkipOncePerOrder = new HashSet<string>(StringComparer.Ordinal);
         var accountOrdersTotal = account.Orders.Count;
         tel.AccountOrdersTotal = accountOrdersTotal;
         MaybeLogExpensivePathThread(NowEvent(), "ScanAndAdoptExistingOrders");
@@ -1528,6 +1605,20 @@ public sealed partial class InstrumentExecutionAuthority
                     iea_instance_id = InstanceId,
                     note = "Candidates empty but this instrument has QTSW2 working orders; defer UNOWNED to allow journal load"
                 });
+                Log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ADOPTION_SKIP_REASON", state: "DEBUG",
+                    new
+                    {
+                        skip_reason = "no_active_intents",
+                        broker_order_id = "_SCAN_",
+                        raw_tag = (string?)null,
+                        decoded_intent_id = (string?)null,
+                        has_candidate = false,
+                        active_intent_count = activeIntentIds.Count,
+                        execution_instrument_key = ExecutionInstrumentKey,
+                        order_state = "",
+                        submit_path = (string?)null,
+                        iea_instance_id = InstanceId
+                    }));
                 return;
             }
             _adoptionDeferred = false;
@@ -1572,6 +1663,20 @@ public sealed partial class InstrumentExecutionAuthority
                 iea_instance_id = InstanceId,
                 note = "Nothing to adopt on this instrument"
             });
+            Log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ADOPTION_SKIP_REASON", state: "DEBUG",
+                new
+                {
+                    skip_reason = "no_active_intents",
+                    broker_order_id = "_SCAN_",
+                    raw_tag = (string?)null,
+                    decoded_intent_id = (string?)null,
+                    has_candidate = false,
+                    active_intent_count = activeIntentIds.Count,
+                    execution_instrument_key = ExecutionInstrumentKey,
+                    order_state = "",
+                    submit_path = (string?)null,
+                    iea_instance_id = InstanceId
+                }));
             return;
         }
 
@@ -1587,9 +1692,26 @@ public sealed partial class InstrumentExecutionAuthority
 
         foreach (Order o in account.Orders)
         {
-            if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted) continue;
+            var orderIdEarly = o.OrderId?.ToString() ?? "";
+            if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted)
+            {
+                LogAdoptionSkipReason(utcNow, o, orderIdEarly, null, null, false, activeIntentIds.Count, "invalid_order_state",
+                    adoptionSkipOncePerOrder);
+                continue;
+            }
+
             var tag = Executor.GetOrderTag(o);
-            if (string.IsNullOrEmpty(tag) || !tag.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase)) continue;
+            if (string.IsNullOrEmpty(tag))
+            {
+                LogAdoptionSkipReason(utcNow, o, orderIdEarly, tag, null, false, activeIntentIds.Count, "empty_tag", adoptionSkipOncePerOrder);
+                continue;
+            }
+
+            if (!tag.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase))
+            {
+                LogAdoptionSkipReason(utcNow, o, orderIdEarly, tag, null, false, activeIntentIds.Count, "non_qtsw2_tag", adoptionSkipOncePerOrder);
+                continue;
+            }
 
             var brokerInstrument = o.Instrument?.MasterInstrument?.Name ?? "";
             if (!AdoptionScanInstrumentGate.BrokerOrderMatchesExecutionInstrument(ExecutionInstrumentKey, brokerInstrument))
@@ -1608,16 +1730,20 @@ public sealed partial class InstrumentExecutionAuthority
                         sample_sequence = n
                     });
                 }
+
+                LogAdoptionSkipReason(utcNow, o, orderIdEarly, tag, null, false, activeIntentIds.Count, "foreign_instrument",
+                    adoptionSkipOncePerOrder);
                 continue;
             }
 
             scanSeen++;
             Interlocked.Increment(ref _metricAdoptionScannedOrdersTotal);
-            var orderId = o.OrderId?.ToString() ?? "";
+            var orderId = orderIdEarly;
             if (_adoptionConvergence.IsQuarantined(orderId, utcNow))
             {
                 Interlocked.Increment(ref _metricAdoptionSuppressedRechecksTotal);
                 scanSuppressed++;
+                LogAdoptionSkipReason(utcNow, o, orderId, tag, null, false, activeIntentIds.Count, "quarantined", adoptionSkipOncePerOrder);
                 continue;
             }
 
@@ -1660,8 +1786,13 @@ public sealed partial class InstrumentExecutionAuthority
                     execution_instrument_key = ExecutionInstrumentKey
                 });
             }
+
             if (suppressHeavy)
+            {
+                LogAdoptionSkipReason(utcNow, o, orderId, tag, intentId, hasCandidate, activeIntentIds.Count, "suppressed_by_convergence",
+                    adoptionSkipOncePerOrder);
                 continue;
+            }
 
             if (isStop || isTarget)
             {
@@ -1707,11 +1838,28 @@ public sealed partial class InstrumentExecutionAuthority
                             iea_instance_id = InstanceId
                         }));
                     }
+                    else
+                    {
+                        LogAdoptionSkipReason(utcNow, o, orderId, tag, intentId, hasCandidate, activeIntentIds.Count, "already_tracked",
+                            adoptionSkipOncePerOrder);
+                    }
                 }
                 else
                 {
                     if (TryResolveByBrokerOrderId(orderId, out _))
+                    {
+                        LogAdoptionSkipReason(utcNow, o, orderId, tag, intentId, hasCandidate, activeIntentIds.Count, "already_tracked",
+                            adoptionSkipOncePerOrder);
                         continue;
+                    }
+
+                    var staleSkipReasonProtective = activeIntentIds.Count == 0
+                        ? "no_active_intents"
+                        : string.IsNullOrWhiteSpace(intentId)
+                            ? "decode_failed"
+                            : "no_candidate_match";
+                    LogAdoptionSkipReason(utcNow, o, orderId, tag, intentId, hasCandidate, activeIntentIds.Count, staleSkipReasonProtective,
+                        adoptionSkipOncePerOrder);
 
                     var corrupt = string.IsNullOrWhiteSpace(intentId);
                     Interlocked.Increment(ref _metricAdoptionStaleQtsw2OrdersTotal);
@@ -1771,7 +1919,13 @@ public sealed partial class InstrumentExecutionAuthority
             }
             else
             {
-                if (TryResolveByBrokerOrderId(o.OrderId, out _)) continue;
+                if (TryResolveByBrokerOrderId(o.OrderId, out _))
+                {
+                    LogAdoptionSkipReason(utcNow, o, orderId, tag, intentId, hasCandidate, activeIntentIds.Count, "already_tracked",
+                        adoptionSkipOncePerOrder);
+                    continue;
+                }
+
                 if (!string.IsNullOrEmpty(intentId) && hasCandidate)
                 {
                     LogIeaEngine(utcNow, "ADOPTION_CANDIDATE_FOUND", new
@@ -1812,7 +1966,20 @@ public sealed partial class InstrumentExecutionAuthority
                 else
                 {
                     if (TryResolveByBrokerOrderId(orderId, out _))
+                    {
+                        LogAdoptionSkipReason(utcNow, o, orderId, tag, intentId, hasCandidate, activeIntentIds.Count, "already_tracked",
+                            adoptionSkipOncePerOrder);
                         continue;
+                    }
+
+                    var staleSkipReasonEntry = activeIntentIds.Count == 0
+                        ? "no_active_intents"
+                        : string.IsNullOrWhiteSpace(intentId)
+                            ? "decode_failed"
+                            : "no_candidate_match";
+                    LogAdoptionSkipReason(utcNow, o, orderId, tag, intentId, hasCandidate, activeIntentIds.Count, staleSkipReasonEntry,
+                        adoptionSkipOncePerOrder);
+
                     var corrupt = string.IsNullOrWhiteSpace(intentId);
                     Interlocked.Increment(ref _metricAdoptionStaleQtsw2OrdersTotal);
                     scanStale++;

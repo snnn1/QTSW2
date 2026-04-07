@@ -96,8 +96,50 @@ public static class SessionIdentityGateTests
             adapter2.RegisterIntentPolicy(idOk, 1, 5, "MES", "MES", "TEST");
             var rOk = adapter2.SubmitEntryOrder(idOk, "MES", "Long", null, 1, "MARKET", null, utc);
             if (string.Equals(rOk.ErrorMessage, "SESSION_IDENTITY_MISMATCH", StringComparison.Ordinal) ||
+                string.Equals(rOk.ErrorMessage, "SESSION_IDENTITY_UNRESOLVED", StringComparison.Ordinal) ||
                 string.Equals(rOk.ErrorMessage, "SESSION_IDENTITY_LATCHED", StringComparison.Ordinal))
                 return (false, "Correct-session intent should pass session gate (may fail later for SIM/NT)");
+
+            // Not in IntentMap — non-latching INTENT_NOT_IN_MAP (consistency guard before session gate)
+            var adapterU1 = new NinjaTraderSimAdapter(tempRoot, log, journal);
+            adapterU1.SetEngineCallbacks(null, null, null, getActiveTradingDateString: () => activeDay);
+            var rUnregistered = adapterU1.SubmitEntryOrder("intent-not-registered", "MES", "Long", null, 1, "MARKET", null, utc);
+            if (rUnregistered.Success)
+                return (false, "Unregistered intent: expected gate failure");
+            if (!string.Equals(rUnregistered.ErrorMessage, "INTENT_NOT_IN_MAP", StringComparison.Ordinal))
+                return (false, $"Unregistered intent: expected INTENT_NOT_IN_MAP, got {rUnregistered.ErrorMessage}");
+            if (adapterU1.IsSessionIdentityLatched || adapterU1.SessionIdentityMismatchCriticalEmitCount != 0 || adapterU1.SessionIdentityBlockCount != 0)
+                return (false, "INTENT_NOT_IN_MAP must not latch or emit mismatch CRITICAL / block count");
+
+            // Blank TradingDate: rejected at RegisterIntent (does not enter map); no latch / mismatch counters
+            var adapterU2 = new NinjaTraderSimAdapter(tempRoot, log, journal);
+            adapterU2.SetEngineCallbacks(null, null, null, getActiveTradingDateString: () => activeDay);
+            var blankDateIntent = new Intent(
+                "",
+                "S1",
+                "MES",
+                "MES",
+                "S1",
+                "07:30",
+                "Long",
+                null,
+                5000m,
+                6000m,
+                5000m,
+                utc,
+                "TEST");
+            try
+            {
+                adapterU2.RegisterIntent(blankDateIntent);
+                return (false, "Blank TradingDate: expected RegisterIntent to reject");
+            }
+            catch (InvalidOperationException ex) when (ex.Message.StartsWith("Intent registration rejected:", StringComparison.Ordinal))
+            {
+                // expected
+            }
+
+            if (adapterU2.IsSessionIdentityLatched || adapterU2.SessionIdentityMismatchCriticalEmitCount != 0 || adapterU2.SessionIdentityBlockCount != 0)
+                return (false, "Blank-date registration reject must not latch or increment mismatch counters");
 
             // Reentry path uses SubmitEntryOrder — covered by same gate; recovery queue uses TrySessionIdentityGate in ProcessRecoveryQueue (no harness hook).
 

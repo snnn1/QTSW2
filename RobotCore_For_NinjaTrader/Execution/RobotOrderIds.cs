@@ -145,4 +145,3 @@ public struct ParsedTagResult
     public string? Stream { get; set; }
     public string? TradingDate { get; set; }
 }
-

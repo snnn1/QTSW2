@@ -1,5 +1,6 @@
 /**
- * Session + forced flatten audit table (engine-sourced via /api/watchdog/session-flatten-state).
+ * DEBUG / secondary audit: session + forced flatten rollup (engine-sourced via /api/watchdog/session-flatten-state).
+ * Primary operational view is StreamStatusTable (stream-states includes flatten columns from the same tracker).
  */
 import { useCallback, useState } from 'react'
 import { usePollingInterval } from '../../hooks/usePollingInterval'
@@ -8,6 +9,7 @@ import { fetchSessionFlattenState, type SessionFlattenRow } from '../../services
 const STATUS_STYLE: Record<string, { color: string }> = {
   NOT_TRIGGERED: { color: '#6b7280' },
   TRIGGERED: { color: '#ca8a04' },
+  BROKER_FLAT: { color: '#2563eb' },
   FAILED: { color: '#ea580c' },
   CONFIRMED: { color: '#16a34a' },
   TIMEOUT: { color: '#dc2626' },
@@ -39,10 +41,10 @@ export function SessionFlattenTab() {
   return (
     <div className="space-y-4">
       <div className="flex justify-between items-center text-sm text-gray-400 gap-4">
-        <span title="Rollup per instrument and session class (S1/S2). Multiple timetable streams can combine into one row.">
+        <span title="Rollup per (trading_date, session, instrument, stream). Stream omitted in older events → __engine__ bucket.">
           Source: robot engine events only (no watchdog-side session math). Polls every 5s.{' '}
           <span className="text-gray-500 border-b border-dotted border-gray-600 cursor-help">
-            Rollup: one row per instrument / session — streams may combine.
+            Terminal success is CONFIRMED (ingested from SESSION_FORCED_FLATTENED). BROKER_FLAT is broker-flat only.
           </span>
         </span>
         {lastPoll && (
@@ -61,6 +63,7 @@ export function SessionFlattenTab() {
               <th className="px-3 py-2 font-medium">Trading Date</th>
               <th className="px-3 py-2 font-medium">Session</th>
               <th className="px-3 py-2 font-medium">Instrument</th>
+              <th className="px-3 py-2 font-medium">Stream</th>
               <th className="px-3 py-2 font-medium">Has Session</th>
               <th className="px-3 py-2 font-medium">Session Close (CT)</th>
               <th className="px-3 py-2 font-medium">Flatten Trigger (CT)</th>
@@ -71,14 +74,14 @@ export function SessionFlattenTab() {
           <tbody className="divide-y divide-gray-800 bg-gray-950">
             {rows.length === 0 && (
               <tr>
-                <td colSpan={8} className="px-3 py-6 text-gray-500 text-center">
+                <td colSpan={9} className="px-3 py-6 text-gray-500 text-center">
                   No session/flatten visibility rows yet — run the robot with a loaded timetable and session resolver.
                 </td>
               </tr>
             )}
             {rows.map((r, i) => (
               <tr
-                key={`${r.trading_date}-${r.session_class}-${r.instrument}-${i}`}
+                key={`${r.trading_date}-${r.session_class}-${r.instrument}-${r.stream ?? ''}-${i}`}
                 className={
                   r.flatten_status === 'TIMEOUT' || r.flatten_status === 'EXPOSURE_REMAINS'
                     ? 'bg-red-950/40 hover:bg-red-950/55 border-l-4 border-l-red-600'
@@ -90,6 +93,7 @@ export function SessionFlattenTab() {
                 <td className="px-3 py-2 text-gray-200 whitespace-nowrap">{r.trading_date}</td>
                 <td className="px-3 py-2 text-gray-200">{r.session_class}</td>
                 <td className="px-3 py-2 text-gray-200">{r.instrument || '—'}</td>
+                <td className="px-3 py-2 text-gray-200 font-mono text-xs">{r.stream || '—'}</td>
                 <td className="px-3 py-2 text-gray-200">
                   {r.has_session === true ? 'Yes' : r.has_session === false ? 'No' : '—'}
                 </td>

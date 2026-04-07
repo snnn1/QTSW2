@@ -74,12 +74,11 @@ public static class ExecutionCommandTests
             return (false, $"NullExecutionAdapter.EnqueueExecutionCommand threw: {ex.Message}");
         }
 
-        // 5. SubmitMarketReentryCommand can be created (IEA alignment)
+        // 5. SubmitMarketReentryCommand can be created (IEA alignment); ReentryIntentId = canonical hash
         var reentryCmd = new SubmitMarketReentryCommand
         {
             Instrument = "MNQ",
             ExecutionInstrument = "MNQ",
-            ReentryIntentId = "slot1_REENTRY",
             OriginalIntentId = "original-1",
             Direction = "Long",
             Quantity = 1,
@@ -91,7 +90,25 @@ public static class ExecutionCommandTests
             CallerContext = "CheckMarketOpenReentry",
             TimestampUtc = utcNow
         };
-        if (reentryCmd.ReentryIntentId != "slot1_REENTRY" || reentryCmd.Direction != "Long" || reentryCmd.Quantity != 1)
+        {
+            var instrumentRaw = reentryCmd.ExecutionInstrument ?? reentryCmd.Instrument ?? "";
+            var execInstUpper = string.IsNullOrEmpty(instrumentRaw) ? "" : instrumentRaw.Trim().ToUpperInvariant();
+            reentryCmd.ReentryIntentId = new Intent(
+                reentryCmd.TradingDate ?? "",
+                reentryCmd.Stream ?? "",
+                instrumentRaw,
+                execInstUpper,
+                reentryCmd.Session ?? "",
+                reentryCmd.SlotTimeChicago ?? "",
+                reentryCmd.Direction ?? "Long",
+                null,
+                null,
+                null,
+                null,
+                reentryCmd.TimestampUtc,
+                "SUBMIT_MARKET_REENTRY").ComputeIntentId();
+        }
+        if (string.IsNullOrEmpty(reentryCmd.ReentryIntentId) || reentryCmd.Direction != "Long" || reentryCmd.Quantity != 1)
             return (false, "SubmitMarketReentryCommand fields not set correctly");
         if (!(reentryCmd is ExecutionCommandBase))
             return (false, "SubmitMarketReentryCommand should inherit ExecutionCommandBase");

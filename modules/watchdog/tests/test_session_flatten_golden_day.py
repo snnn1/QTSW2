@@ -21,7 +21,7 @@ _GOLDEN = Path(__file__).resolve().parent / "session_flatten_golden_engine_day.j
 
 def test_golden_engine_day_confirm_path():
     tracker, collector, _e, _t = replay_engine_log(_GOLDEN, target_date="2026-07-20")
-    key = ("2026-07-20", "S1", "__engine__")
+    key = ("2026-07-20", "S1", "__engine__", "__engine__")
     row = tracker._rows.get(key)
     assert row is not None
     assert row.has_session is True

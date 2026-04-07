@@ -7,6 +7,7 @@ using System.Threading;
 
 namespace QTSW2.Robot.Core;
 
+using QTSW2.Robot.Contracts;
 using QTSW2.Robot.Core.Execution;
 
 public enum StreamState
@@ -6376,6 +6377,7 @@ public sealed class StreamStateMachine
         _journals.Save(_journal);
         
         // Phase 4: Verify no exposure remains (risk guarantee)
+        var exposureVerifiedOk = false;
         try
         {
             var snap = _executionAdapter.GetAccountSnapshot(utcNow);
@@ -6393,6 +6395,10 @@ public sealed class StreamStateMachine
                     new { instrument = ExecutionInstrument, quantity = posQty });
                 LogSessionCloseManualFlattenRequiredEngine(utcNow, posQty);
                 _engine?.OnForcedFlattenFailed(ExecutionInstrument, "FORCED_FLATTEN_EXPOSURE_REMAINING", utcNow);
+            }
+            else
+            {
+                exposureVerifiedOk = true;
             }
         }
         catch (Exception ex)
@@ -6412,6 +6418,20 @@ public sealed class StreamStateMachine
                 slot_status = _journal.SlotStatus.ToString(),
                 note = "Pre-close flatten complete - slot remains ACTIVE for market-open reentry"
             }));
+
+        if (exposureVerifiedOk)
+        {
+            _engine?.LogEngineEvent(utcNow, "SESSION_FORCED_FLATTENED", new Dictionary<string, object?>
+            {
+                ["trading_date"] = TradingDate,
+                ["session_class"] = Session,
+                ["stream"] = Stream,
+                ["instrument"] = ExecutionInstrument,
+                ["original_intent_id"] = _journal.OriginalIntentId ?? "",
+                ["session_close_forced_flatten"] = true,
+                ["note"] = "Session forced flatten workflow complete — broker flat, protective handling finished, exposure verified zero"
+            });
+        }
     }
     
     /// <summary>
@@ -6643,17 +6663,10 @@ public sealed class StreamStateMachine
         // Pre-re-entry safety check: Verify stop price validity and protection placement conditions
         // For now, assume safety checks pass (can be enhanced with actual price gap detection)
         // TODO: Add explicit gap detection and price validity checks
-        
-        // Generate deterministic ReentryIntentId (does NOT include TradingDate)
-        if (string.IsNullOrWhiteSpace(_journal.ReentryIntentId))
-        {
-            _journal.ReentryIntentId = $"{_journal.SlotInstanceKey}_REENTRY";
-        }
-        
-        // Submit MARKET entry using direction/quantity from ExecutionJournalEntry, with ReentryIntentId
-        var direction = originalEntry.Direction;
+
+        var direction = originalEntry.Direction ?? "Long";
         var quantity = originalEntry.EntryFilledQuantityTotal;
-        
+
         if (quantity <= 0)
         {
             // Invalid quantity - fail closed
@@ -6677,6 +6690,26 @@ public sealed class StreamStateMachine
             return;
         }
 
+        // Canonical reentry intent id — must match NinjaTraderSimAdapter.ExecuteSubmitMarketReentry Intent construction
+        // (same strings: F2/NULL rules in ExecutionJournal.ComputeIntentId; slot/session verbatim; direction defaults to Long when empty in NT).
+        var instrumentRaw = ExecutionInstrument ?? Instrument ?? "";
+        var execInstUpper = string.IsNullOrEmpty(instrumentRaw) ? "" : instrumentRaw.Trim().ToUpperInvariant();
+        var reentryIntentForCanonicalId = new Intent(
+            TradingDate ?? "",
+            Stream,
+            instrumentRaw,
+            execInstUpper,
+            Session,
+            SlotTimeChicago,
+            direction,
+            null,
+            null,
+            null,
+            null,
+            utcNow,
+            "SUBMIT_MARKET_REENTRY");
+        _journal.ReentryIntentId = reentryIntentForCanonicalId.ComputeIntentId();
+
         _engine?.LogEngineEvent(utcNow, "SESSION_REENTRY_ATTEMPT", new Dictionary<string, object?>
         {
             ["trading_date"] = TradingDate,
@@ -6687,13 +6720,42 @@ public sealed class StreamStateMachine
             ["reentry_intent_id"] = _journal.ReentryIntentId ?? "",
             ["reason"] = "MARKET_OPEN_GATES_PASSED"
         });
-        
+
         // Mark re-entry as submitted (idempotency)
         _journal.ReentrySubmitted = true;
         _journals.Save(_journal);
-        
-        // Submit MARKET order (implementation depends on execution adapter)
-        // For now, log the re-entry attempt - actual order submission will be handled by execution adapter
+
+        // Enqueue SubmitMarketReentryCommand through IEA for actual order placement
+        var cmd = new SubmitMarketReentryCommand
+        {
+            CommandId = Guid.NewGuid().ToString(),
+            TimestampUtc = utcNow,
+            Stream = Stream,
+            Session = Session,
+            SlotTimeChicago = SlotTimeChicago,
+            TradingDate = TradingDate,
+            ExecutionInstrument = ExecutionInstrument ?? Instrument ?? "",
+            ReentryIntentId = _journal.ReentryIntentId,
+            OriginalIntentId = _journal.OriginalIntentId,
+            Direction = direction,
+            Quantity = (int)quantity,
+            Reason = "MARKET_REENTRY",
+            CallerContext = "CheckMarketOpenReentry"
+        };
+        _executionAdapter.EnqueueExecutionCommand(cmd);
+
+        _engine?.LogEngineEvent(utcNow, "SESSION_REENTRY_EXECUTED", new Dictionary<string, object?>
+        {
+            ["trading_date"] = TradingDate,
+            ["session_class"] = Session,
+            ["instrument"] = ExecutionInstrument ?? Instrument ?? "",
+            ["stream"] = Stream,
+            ["original_intent_id"] = _journal.OriginalIntentId ?? "",
+            ["reentry_intent_id"] = _journal.ReentryIntentId ?? "",
+            ["command_id"] = cmd.CommandId,
+            ["reason"] = "REENTRY_COMMAND_ENQUEUED"
+        });
+
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
             "REENTRY_SUBMITTED", State.ToString(),
             new
@@ -6705,22 +6767,9 @@ public sealed class StreamStateMachine
                 stop_price = originalEntry.StopPrice,
                 target_price = originalEntry.TargetPrice,
                 entry_price = originalEntry.EntryPrice,
-                note = "Re-entry MARKET order submitted at market open"
+                command_id = cmd.CommandId,
+                note = "Re-entry MARKET order enqueued via IEA"
             }));
-
-        _engine?.LogEngineEvent(utcNow, "SESSION_REENTRY_EXECUTED", new Dictionary<string, object?>
-        {
-            ["trading_date"] = TradingDate,
-            ["session_class"] = Session,
-            ["instrument"] = ExecutionInstrument ?? Instrument ?? "",
-            ["stream"] = Stream,
-            ["original_intent_id"] = _journal.OriginalIntentId ?? "",
-            ["reentry_intent_id"] = _journal.ReentryIntentId ?? "",
-            ["reason"] = "REENTRY_MARKET_LOGGED"
-        });
-        
-        // Note: Actual order submission and fill handling will be done by execution adapter
-        // On fill, execution adapter should call HandleReentryFill() which will submit protective bracket
     }
     
     /// <summary>
@@ -6732,10 +6781,10 @@ public sealed class StreamStateMachine
         {
             return; // Not our re-entry or already filled
         }
-        
+
         _journal.ReentryFilled = true;
         _journals.Save(_journal);
-        
+
         // Load bracket levels from OriginalIntentId
         if (string.IsNullOrWhiteSpace(_journal.OriginalIntentId) || _executionJournal == null)
         {
@@ -6759,39 +6808,85 @@ public sealed class StreamStateMachine
                 new { original_intent_id = _journal.OriginalIntentId });
             return;
         }
-        
-        // Submit protective bracket (implementation depends on execution adapter)
-        // For now, mark protection as submitted - actual submission will be handled by execution adapter
+
+        // Resolve original trading date and stream from PriorJournalKey
+        string? originalTradingDate = null;
+        string? originalStream = null;
+        if (!string.IsNullOrWhiteSpace(_journal.PriorJournalKey))
+        {
+            var parts = _journal.PriorJournalKey.Split('_');
+            if (parts.Length >= 1) originalTradingDate = parts[0];
+            if (parts.Length >= 2) originalStream = string.Join("_", parts.Skip(1));
+        }
+        if (string.IsNullOrEmpty(originalTradingDate)) originalTradingDate = TradingDate;
+        if (string.IsNullOrEmpty(originalStream)) originalStream = Stream;
+
+        var originalEntry = _executionJournal.GetEntry(_journal.OriginalIntentId, originalTradingDate, originalStream);
+        if (originalEntry == null || !originalEntry.StopPrice.HasValue || !originalEntry.TargetPrice.HasValue)
+        {
+            _journal.SlotStatus = SlotStatus.FAILED_RUNTIME;
+            Commit(utcNow, "REENTRY_PROTECTION_FAILED_CANNOT_LOAD_BRACKET", "REENTRY_PROTECTION_FAILED");
+            LogHealth("CRITICAL", "REENTRY_PROTECTION_FAILED", $"Re-entry protection failed: Cannot load bracket levels for intent {_journal.OriginalIntentId}",
+                new { original_intent_id = _journal.OriginalIntentId });
+            return;
+        }
+
+        var stopPrice = originalEntry.StopPrice.Value;
+        var targetPrice = originalEntry.TargetPrice.Value;
+        var direction = originalEntry.Direction ?? "Long";
+        var quantity = originalEntry.EntryFilledQuantityTotal;
+        if (quantity <= 0) quantity = 1;
+
         _journal.ProtectionSubmitted = true;
         _journals.Save(_journal);
-        
+
+        // Submit protective bracket via execution adapter
+        if (_executionAdapter != null)
+        {
+            var stopResult = _executionAdapter.SubmitProtectiveStop(reentryIntentId, ExecutionInstrument ?? Instrument, direction, stopPrice, quantity, null, utcNow);
+            var targetResult = _executionAdapter.SubmitTargetOrder(reentryIntentId, ExecutionInstrument ?? Instrument, direction, targetPrice, quantity, null, utcNow);
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "REENTRY_PROTECTIVES_SUBMITTED", State.ToString(),
+                new
+                {
+                    reentry_intent_id = reentryIntentId,
+                    stop_success = stopResult.Success,
+                    target_success = targetResult.Success,
+                    stop_price = stopPrice,
+                    target_price = targetPrice
+                }));
+        }
+
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
             "REENTRY_FILLED", State.ToString(),
             new
             {
                 reentry_intent_id = reentryIntentId,
                 original_intent_id = _journal.OriginalIntentId,
-                note = "Re-entry filled - protective bracket should be submitted"
+                note = "Re-entry filled - protective bracket submitted"
             }));
-        
-        // Note: Actual protective order submission will be done by execution adapter
-        // On acceptance, execution adapter should call HandleReentryProtectionAccepted()
     }
-    
+
     /// <summary>
     /// Handle re-entry protection acceptance (called by execution adapter when protective orders accepted).
     /// </summary>
-    public void HandleReentryProtectionAccepted(DateTimeOffset utcNow)
+    /// <param name="utcNow">Current UTC time.</param>
+    /// <param name="reentryIntentId">Reentry intent ID that had protectives accepted. If non-null, must match _journal.ReentryIntentId.</param>
+    public void HandleReentryProtectionAccepted(DateTimeOffset utcNow, string? reentryIntentId = null)
     {
         if (!_journal.ProtectionSubmitted)
         {
-            return; // Protection not submitted
+            return; // Protection not submitted (ensures we only process reentry, not original entry)
         }
-        
+        if (!string.IsNullOrEmpty(reentryIntentId) && _journal.ReentryIntentId != reentryIntentId)
+        {
+            return; // Not our reentry intent
+        }
+
         _journal.ProtectionAccepted = true;
         _journal.ExecutionInterruptedByClose = false; // Clear interruption flag after protection confirmed
         _journals.Save(_journal);
-        
+
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
             "REENTRY_PROTECTION_ACCEPTED", State.ToString(),
             new

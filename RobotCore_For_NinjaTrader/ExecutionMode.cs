@@ -13,7 +13,7 @@ public enum ExecutionMode
     DRYRUN = 0,
 
     /// <summary>
-    /// SIM: Places orders in NinjaTrader Sim account only.
+    /// SIM: Places orders on NinjaTrader Simulation / Playback (non-live) accounts only.
     /// </summary>
     SIM = 1,
 
