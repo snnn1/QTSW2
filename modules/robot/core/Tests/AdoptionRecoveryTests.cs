@@ -144,8 +144,11 @@ public static class AdoptionRecoveryTests
     private static (bool Pass, string? Error) TestNoAdoptableEvidenceFailClosed()
     {
         var mismatchType = MismatchClassification.Classify(
-            brokerQty: 0,
-            localQty: 0,
+            brokerQtyAbs: 0,
+            grossJournalQty: 0,
+            netBrokerQty: 0,
+            netJournalQty: 0,
+            opposingMultiIntentOpen: false,
             brokerWorkingOrderCount: 2,
             localWorkingOrderCount: 0);
         if (mismatchType != MismatchType.ORDER_REGISTRY_MISSING)

@@ -182,11 +182,11 @@
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\Robot.Core.csproj",
+      "projectUniqueName": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\Robot.Core.csproj",
       "projectName": "Robot.Core",
-      "projectPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\Robot.Core.csproj",
+      "projectPath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\Robot.Core.csproj",
       "packagesPath": "C:\\Users\\jakej\\.nuget\\packages\\",
-      "outputPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\obj\\",
+      "outputPath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\core\\obj\\",
       "projectStyle": "PackageReference",
       "configFilePaths": [
         "C:\\Users\\jakej\\AppData\\Roaming\\NuGet\\NuGet.Config"
@@ -201,8 +201,8 @@
         "net8.0": {
           "targetAlias": "net8.0",
           "projectReferences": {
-            "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj": {
-              "projectPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj"
+            "c:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj": {
+              "projectPath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj"
             }
           }
         }

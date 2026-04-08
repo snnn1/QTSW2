@@ -96,6 +96,8 @@ public static class MixedStopMarketEntryTests
             => _base.RequestSessionCloseFlattenImmediate(intentId, instrument, utcNow);
         public bool TryEnqueueEmergencyFlattenProtective(string instrument, DateTimeOffset utcNow)
             => _base.TryEnqueueEmergencyFlattenProtective(instrument, utcNow);
+
+        public bool IsExecutionContextReady => _base.IsExecutionContextReady;
     }
 
     public static (bool Pass, string? Error) RunMixedStopMarketEntryTests()

@@ -125,10 +125,26 @@ export function DailyJournalPage() {
                               <td className="px-4 py-2 font-mono">
                                 <span
                                   className={
-                                    (t.realized_pnl ?? 0) >= 0 ? 'text-green-400' : 'text-red-400'
+                                    (t.realized_pnl ?? t.realized_pnl_inferred ?? 0) >= 0
+                                      ? 'text-green-400'
+                                      : 'text-red-400'
+                                  }
+                                  title={
+                                    t.pnl_authority === 'INFERRED'
+                                      ? 'P&L from target/stop or entry proxy — not broker-attested (see exit_price_source)'
+                                      : undefined
                                   }
                                 >
-                                  {t.realized_pnl != null ? `$${t.realized_pnl.toFixed(2)}` : '-'}
+                                  {t.realized_pnl != null ? (
+                                    `$${t.realized_pnl.toFixed(2)}`
+                                  ) : t.realized_pnl_inferred != null ? (
+                                    <span className="text-gray-400">
+                                      ~${t.realized_pnl_inferred.toFixed(2)}{' '}
+                                      <span className="text-xs text-gray-500">(est)</span>
+                                    </span>
+                                  ) : (
+                                    '-'
+                                  )}
                                 </span>
                               </td>
                               <td className="px-4 py-2">

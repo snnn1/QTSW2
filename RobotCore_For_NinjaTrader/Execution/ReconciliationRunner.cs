@@ -7,6 +7,8 @@ using QTSW2.Robot.Core.Diagnostics;
 namespace QTSW2.Robot.Core.Execution;
 
 /// <summary>
+/// Repair mechanism: nudges journal structure toward broker truth. Does not alone define correctness —
+/// broker snapshot is authority, journal is the model, gate enforces release invariants.
 /// Reconciles orphaned execution journals when broker position is flat.
 /// Run on Realtime start and periodically (throttled) to close journals
 /// for trades closed externally (e.g. strategy stop before slot expiry).

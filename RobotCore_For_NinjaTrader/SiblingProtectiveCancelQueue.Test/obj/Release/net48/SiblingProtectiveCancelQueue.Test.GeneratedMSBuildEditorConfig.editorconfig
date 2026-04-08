@@ -1,0 +1,5 @@
+is_global = true
+build_property.RootNamespace = QTSW2.Robot.SiblingProtectiveCancelQueue.Test
+build_property.ProjectDir = c:\Users\jakej\QTSW2\RobotCore_For_NinjaTrader\SiblingProtectiveCancelQueue.Test\
+build_property.EnableComHosting = 
+build_property.EnableGeneratedComInterfaceComImportInterop = 

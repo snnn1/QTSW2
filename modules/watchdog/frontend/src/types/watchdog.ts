@@ -379,7 +379,14 @@ export interface DailyJournalTrade {
   exit_price: number | null;
   entry_qty: number | null;
   exit_qty: number;
+  /** Authoritative realized $ (null when exit economics are inferred from target/stop/entry proxy) */
   realized_pnl: number | null;
+  /** Model estimate when pnl_authority is INFERRED; for debugging / non-accounting display */
+  realized_pnl_inferred?: number | null;
+  /** JOURNAL_NET | EXIT_ECONOMICS | INFERRED | NONE */
+  pnl_authority?: string;
+  /** EXIT_FILLS | JOURNAL_EXIT_AVG | TARGET_STOP | ENTRY_FALLBACK | NONE | NO_EXIT_PRICE */
+  exit_price_source?: string | null;
   costs_allocated: number;
   status: string;
   exit_order_type: string | null;

@@ -1,15 +1,15 @@
 {
-  "run_id": "e02f449e-f9a6-4c45-9e30-db1b812039c9",
+  "run_id": "052986dd-522f-4a13-9813-88891eb72236",
   "state": "success",
   "current_stage": "merger",
-  "started_at": "2026-04-06T20:45:03.594281-05:00",
-  "updated_at": "2026-04-06T20:45:49.262873-05:00",
+  "started_at": "2026-04-07T21:30:05.882574-05:00",
+  "updated_at": "2026-04-07T21:30:56.245084-05:00",
   "retry_count": 0,
   "error": null,
   "metadata": {
     "manual": false,
     "manual_override": false,
-    "triggered_at": "2026-04-07T01:45:03.594261+00:00",
+    "triggered_at": "2026-04-08T02:30:05.882558+00:00",
     "run_health": "healthy",
     "run_health_reasons": [
       "No health issues detected"

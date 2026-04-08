@@ -172,7 +172,7 @@ public static class StateConsistencyGateTests
         coord5.ProcessObservationForTest(new MismatchObservation
         {
             Instrument = "CL",
-            MismatchType = MismatchType.POSITION_QTY_MISMATCH,
+            MismatchType = MismatchType.NET_POSITION_MISMATCH,
             Present = true,
             ObservedUtc = t0
         });

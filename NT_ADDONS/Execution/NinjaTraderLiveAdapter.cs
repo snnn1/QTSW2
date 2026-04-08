@@ -14,7 +14,11 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
 {
     private readonly RobotLogger _log;
     private readonly TimeService _time;
+    private object? _ntAccount;   // NinjaTrader.Cbi.Account when SetNTContext called
     private object? _ntInstrument; // NinjaTrader.Cbi.Instrument when SetNTContext called
+
+    /// <inheritdoc />
+    public bool IsExecutionContextReady => _ntAccount != null && _ntInstrument != null;
 
     public NinjaTraderLiveAdapter(RobotLogger log, TimeService time)
     {
@@ -235,9 +239,10 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
     /// </summary>
     public void SetNTContext(object account, object instrument)
     {
+        _ntAccount = account;
         _ntInstrument = instrument;
         _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "LIVE_ADAPTER_NT_CONTEXT_SET", state: "ENGINE",
-            new { note = "NinjaTrader Instrument set for live market price (breakout validity gate)" }));
+            new { note = "NinjaTrader Account and Instrument set for live execution and market price (breakout validity gate)" }));
     }
 
     public (decimal? Bid, decimal? Ask) GetCurrentMarketPrice(string instrument, DateTimeOffset utcNow)

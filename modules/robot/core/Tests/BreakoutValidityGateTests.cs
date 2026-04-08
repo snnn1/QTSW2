@@ -25,6 +25,8 @@ public static class BreakoutValidityGateTests
 
         public MockPriceAdapter(RobotLogger log) => _base = new NullExecutionAdapter(log);
 
+        public bool IsExecutionContextReady => _base.IsExecutionContextReady;
+
         public (decimal? Bid, decimal? Ask) GetCurrentMarketPrice(string instrument, DateTimeOffset utcNow)
             => (TestBid, TestAsk);
 

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -423,6 +424,16 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     /// <summary>Suppresses redundant release-readiness evaluation and periodic reconciliation when inputs are stable.</summary>
     private readonly ReleaseReconciliationRedundancySuppression _releaseReconRedundancy = new();
+
+    /// <summary>Set when <see cref="JournalIntegrityGuarantee.EnsureJournalIntegrity"/> ran during release input build (post-eval invariant).</summary>
+    private readonly ConcurrentDictionary<string, byte> _journalIntegrityEnsuredForInstrument =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private sealed class JournalParityRegistryViewImpl : IJournalParityRegistryView
+    {
+        public bool UseInstrumentExecutionAuthority { get; init; }
+        public int IeaOwnedPlusAdoptedWorking { get; init; }
+    }
 
     // Disconnect recovery state machine
     private ConnectionRecoveryState _recoveryState = ConnectionRecoveryState.CONNECTED_OK;
@@ -1328,7 +1339,18 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 runtimeAudit: _runtimeAudit,
                 runForcedBrokerAlignment: RunForcedBrokerAlignment,
                 onForcedConvergenceFailure: OnForcedBrokerConvergenceFailure,
-                getExecutionActivityGeneration: () => _releaseReconRedundancy.ExecutionActivityGeneration);
+                getExecutionActivityGeneration: () => _releaseReconRedundancy.ExecutionActivityGeneration,
+                onHedgedNetFlatPersistentEscalation: (inst, utc) =>
+                {
+                    _reconciliationRunner?.ForceRunGateRecoveryForInstrument(utc, inst);
+                    LogEvent(RobotEvents.EngineBase(utc, tradingDate: TradingDateString,
+                        eventType: "HEDGED_NET_FLAT_GROSS_OPEN_CONVERGENCE_HOOK", state: "ENGINE",
+                        new
+                        {
+                            instrument = inst,
+                            note = "Persistent hedged net-flat gross-open — gate recovery scheduled (broker truth; journal model)"
+                        }));
+                });
 
             // P2 Phase 1: gate probe for aggregation guard + stream containment after blocked instrument flatten
             if (_executionAdapter is NinjaTraderSimAdapter simP2)
@@ -1338,6 +1360,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     _releaseReconRedundancy.NotifyExecutionActivity();
                     _mismatchCoordinator?.NotifyReconciliationAuditWake();
                     _mismatchCoordinator?.NotifyExecutionTrigger(inst, utc, d);
+                    TryEnsureJournalIntegrityAfterExecutionActivity(inst, utc);
                 });
                 simP2.SetInstrumentMismatchGateEngagedCallback(inst =>
                     _mismatchCoordinator != null && _mismatchCoordinator.IsInstrumentBlockedByMismatch(inst));
@@ -3230,6 +3253,20 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     bar_count = bars.Count,
                     reason = "Streams not yet created",
                     note = "Bars will be buffered when streams are created or via OnBar()"
+                }));
+            return;
+        }
+
+        // Race hardening: BarsRequest may complete on a thread pool worker before DataLoaded finishes
+        // WireNTContextToAdapter(). Do not feed pre-hydration bars into streams until SIM verify + NT context exist.
+        if (_executionAdapter != null && !_executionAdapter.IsExecutionContextReady)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "PRE_HYDRATION_DEFERRED_EXECUTION_CONTEXT_NOT_READY", state: "ENGINE",
+                new
+                {
+                    instrument = instrument,
+                    bar_count = bars?.Count ?? 0,
+                    note = "LoadPreHydrationBars skipped — execution adapter not ready (SetNTContext/SIM verify). Bars will arrive via OnBar when strategy is ready."
                 }));
             return;
         }
@@ -5520,9 +5557,46 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     }
 
     /// <summary>
-    /// Freeze instrument (block execution) and stand down only streams that have positions.
-    /// Streams without positions (e.g. PRE_HYDRATION, RANGE_BUILDING) continue to compute range; execution blocked via RiskGate.
+    /// Execution policy for <see cref="MismatchType.STRUCTURAL_MULTI_INTENT"/> (also used for stand-down on block).
+    /// Delegates side effects to <see cref="StructuralMultiIntentPolicyRuntime.Invoke"/> — see harness test STRUCTURAL_AUTO_OFFSET.
+    /// For stand-down-only: freeze instrument and stand down streams that have positions; others continue range-build; RiskGate blocks execution.
     /// </summary>
+    private void ApplyStructuralMultiIntentPolicy(string instrument, DateTimeOffset utcNow)
+    {
+        var p = _executionPolicy?.StructuralMultiIntentPolicy ?? StructuralMultiIntentPolicy.Allow;
+        var kind = StructuralMultiIntentPolicyRuntime.Invoke(
+            p,
+            instrument,
+            utcNow,
+            StandDownStreamsForInstrument,
+            (inst, u) => _reconciliationRunner?.ForceRunGateRecoveryForInstrument(u, inst));
+        switch (kind)
+        {
+            case StructuralMultiIntentPolicyActionKind.AllowObservation:
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STRUCTURAL_MULTI_INTENT_POLICY", state: "ENGINE",
+                    new
+                    {
+                        instrument,
+                        policy = "allow",
+                        note = "Structural multi-intent still drives complexity — observation-only until policy is tightened"
+                    }));
+                break;
+            case StructuralMultiIntentPolicyActionKind.BlockNewEntries:
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STRUCTURAL_MULTI_INTENT_POLICY", state: "ENGINE",
+                    new { instrument, policy = "block_new_entries" }));
+                break;
+            case StructuralMultiIntentPolicyActionKind.GateRecoveryRequested:
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "STRUCTURAL_MULTI_INTENT_POLICY", state: "ENGINE",
+                    new
+                    {
+                        instrument,
+                        policy = "auto_offset_request",
+                        note = "Gate recovery requested toward broker truth"
+                    }));
+                break;
+        }
+    }
+
     private void StandDownStreamsForInstrument(string instrument, DateTimeOffset utcNow, string reason)
     {
         lock (_engineLock)
@@ -5577,8 +5651,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         (!string.IsNullOrEmpty(w.OcoGroup) && w.OcoGroup.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
-    /// Gap 4: Assemble mismatch observations from broker snapshot and journal for mismatch coordinator.
+    /// Gap 4: Assemble mismatch observations from broker snapshot and journal for mismatch coordinator (mismatch-sweep view).
     /// A1: Accepts snapshot as parameter — exactly one snapshot per coordinator tick.
+    /// Not the same keying as <see cref="JournalParityChecker.CheckJournalParity"/>; see docs/robot/contracts/BROKER_QUANTITY_VIEWS.md.
+    /// Hierarchy: broker snapshot = authority; journal = model; reconciliation = repair; gate = enforcement.
+    /// Aggregate "clean" (qty + net + working) is uncommon when multiple intents share an instrument — do not treat as steady-state default.
     /// </summary>
     private IReadOnlyList<MismatchObservation> AssembleMismatchObservations(AccountSnapshot snap, DateTimeOffset utcNow)
     {
@@ -5606,6 +5683,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
 
         var brokerQtyByInst = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var brokerNetByInst = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         var brokerWorkingByInst = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var p in snap.Positions ?? new List<PositionSnapshot>())
@@ -5615,6 +5693,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             var qty = Math.Abs(p.Quantity);
             brokerQtyByInst.TryGetValue(inst, out var existing);
             brokerQtyByInst[inst] = existing + qty;
+            brokerNetByInst.TryGetValue(inst, out var existingNet);
+            brokerNetByInst[inst] = existingNet + p.Quantity;
         }
 
         foreach (var w in snap.WorkingOrders ?? new List<WorkingOrderSnapshot>())
@@ -5641,9 +5721,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         foreach (var inst in allInstruments)
         {
             var brokerQty = brokerQtyByInst.TryGetValue(inst, out var bq) ? bq : 0;
+            var netBrokerQty = brokerNetByInst.TryGetValue(inst, out var nbq) ? nbq : 0;
             var brokerWorking = brokerWorkingByInst.TryGetValue(inst, out var bw) ? bw : 0;
             var canonicalForJournalAgg = GetCanonicalInstrument(inst) ?? inst;
             var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrumentFromMap(openByInst, inst, canonicalForJournalAgg);
+            var netJournalQty = _executionJournal.GetOpenJournalSignedNetForInstrumentFromMap(openByInst, inst, canonicalForJournalAgg);
+            var opposingMultiIntent = _executionJournal.HasOpposingDirectionOpenIntentsFromMap(openByInst, inst, canonicalForJournalAgg);
             var actGen = _releaseReconRedundancy.ExecutionActivityGeneration;
 
             var nonOwnerAssembleGate = useIea &&
@@ -5799,9 +5882,34 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         new { instrument = inst, broker_working = brokerWorking, note = "UseInstrumentExecutionAuthority=false; cannot reconcile working orders; failing closed" }));
             }
 
-            if (brokerQty == journalQty && brokerWorking == localWorking)
+            // Abs sums are not canonical for safety — use signed nets for net truth. See MismatchObservation.BrokerQty / NetBrokerQty.
+            var aggregatesAligned = brokerQty == journalQty && netBrokerQty == netJournalQty && brokerWorking == localWorking;
+            if (aggregatesAligned)
             {
                 _ieaUnavailableDegradedSuppressByInstrument.Remove(inst);
+                var hedgedNetFlatGrossOpen = netJournalQty == 0 && journalQty > 0;
+                if (hedgedNetFlatGrossOpen)
+                {
+                    list.Add(new MismatchObservation
+                    {
+                        Instrument = inst,
+                        MismatchType = MismatchType.HEDGED_NET_FLAT_GROSS_OPEN,
+                        Present = true,
+                        Summary =
+                            $"hedged_net_flat_gross_open broker_qty_abs={brokerQty} gross_journal={journalQty} net_broker={netBrokerQty} net_journal={netJournalQty} broker_working={brokerWorking} local_working={localWorking}",
+                        BrokerQty = brokerQty,
+                        LocalQty = journalQty,
+                        NetBrokerQty = netBrokerQty,
+                        NetJournalQty = netJournalQty,
+                        BrokerWorkingOrderCount = brokerWorking,
+                        LocalWorkingOrderCount = localWorking < 0 ? 0 : localWorking,
+                        JournalOpenEntryCount = journalWorking,
+                        IntentIdsCsv = BuildIntentIdsCsvFromOpenJournal(openByInst, inst, canonicalForJournalAgg),
+                        ObservedUtc = utcNow,
+                        Severity = "WARN"
+                    });
+                }
+
                 continue;
             }
 
@@ -5833,7 +5941,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         new { instrument = inst, broker_working = brokerWorking, iea_working_before = effectiveLocalWorking }));
                 }
                 recoveryAdoptionInvocations++;
-                if (ieaForInstrument.TryScheduleRecoveryAdoptionScan(out var adoptedSync))
+                var schedOut = ieaForInstrument.TryScheduleRecoveryAdoptionScan(out var adoptedSync);
+                RunPostAdoptionJournalIntegrity(inst, snap, utcNow);
+                if (ReconciliationScheduleSignals.AdoptionWorkOrQueueInflight(schedOut))
                 {
                     var localAfter = ieaForInstrument.GetMismatchTrustedWorkingCount();
                     if (adoptedSync > 0)
@@ -5858,7 +5968,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
             var mismatchType = localWorking < 0
                 ? MismatchType.ORDER_REGISTRY_MISSING
-                : MismatchClassification.Classify(brokerQty, journalQty, brokerWorking, effectiveLocalWorking);
+                : MismatchClassification.Classify(
+                    brokerQty,
+                    journalQty,
+                    netBrokerQty,
+                    netJournalQty,
+                    opposingMultiIntent,
+                    brokerWorking,
+                    effectiveLocalWorking);
 
             if (mismatchType == MismatchType.ORDER_REGISTRY_MISSING && brokerWorking > 0 && effectiveLocalWorking == 0)
             {
@@ -5886,21 +6003,33 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 }
             }
 
+            var sev = mismatchType switch
+            {
+                MismatchType.NET_POSITION_MISMATCH => "CRITICAL",
+                MismatchType.UNCLASSIFIED_CRITICAL_MISMATCH => "CRITICAL",
+                MismatchType.ORDER_REGISTRY_MISSING => "CRITICAL",
+                _ => "WARN"
+            };
             list.Add(new MismatchObservation
             {
                 Instrument = inst,
                 MismatchType = mismatchType,
                 Present = true,
-                Summary = $"broker_qty={brokerQty} local_qty={journalQty} broker_working={brokerWorking} local_working={effectiveLocalWorking}",
+                Summary =
+                    $"broker_qty_abs={brokerQty} gross_journal_qty={journalQty} net_broker={netBrokerQty} net_journal={netJournalQty} structural_multi_intent={opposingMultiIntent} broker_working={brokerWorking} local_working={effectiveLocalWorking}",
                 BrokerQty = brokerQty,
                 LocalQty = journalQty,
+                NetBrokerQty = netBrokerQty,
+                NetJournalQty = netJournalQty,
                 BrokerWorkingOrderCount = brokerWorking,
                 LocalWorkingOrderCount = effectiveLocalWorking,
                 JournalOpenEntryCount = journalWorking,
                 IntentIdsCsv = BuildIntentIdsCsvFromOpenJournal(openByInst, inst, canonicalForJournalAgg),
                 ObservedUtc = utcNow,
-                Severity = "CRITICAL"
+                Severity = sev
             });
+            if (mismatchType == MismatchType.STRUCTURAL_MULTI_INTENT)
+                ApplyStructuralMultiIntentPolicy(inst, utcNow);
         }
 
         swAssemble.Stop();
@@ -6044,6 +6173,29 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         var input = BuildStateConsistencyReleaseEvaluationInput(inst, snapshot, utcNow);
         var result = StateConsistencyReleaseEvaluator.Evaluate(input);
 
+        if (snapshot != null && input.SnapshotSufficient && _journalIntegrityEnsuredForInstrument.ContainsKey(inst))
+        {
+            var canonicalPost = GetCanonicalInstrument(inst) ?? inst;
+            var parityPost = JournalParityChecker.CheckJournalParity(inst, snapshot, _executionJournal,
+                new JournalParityRegistryViewImpl
+                {
+                    UseInstrumentExecutionAuthority = input.UseInstrumentExecutionAuthority,
+                    IeaOwnedPlusAdoptedWorking = input.IeaOwnedPlusAdoptedWorking
+                }, canonicalPost, utcNow);
+            if (!parityPost.IsOk)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, "", "JOURNAL_INTEGRITY_INVARIANT_CYCLE", "CRITICAL",
+                    new
+                    {
+                        instrument = inst,
+                        status = parityPost.Status.ToString(),
+                        broker_qty = parityPost.BrokerPositionQty,
+                        journal_qty = parityPost.JournalOpenQty,
+                        note = "CheckJournalParity != PARITY_OK after integrity pipeline and release evaluation"
+                    }));
+            }
+        }
+
         if (snapshot != null && input.SnapshotSufficient)
         {
             var fp = ReleaseReconciliationRedundancySuppression.BuildReleaseMaterialFingerprint(input, result);
@@ -6069,6 +6221,93 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             _releaseReconRedundancy.RecordReleaseFullEvaluation(inst, input, result, utcNow, genAtStart);
 
         return result;
+    }
+
+    /// <summary>Authoritative journal integrity pipeline (parity check + deterministic repair). Used by release input and post-adoption hooks.</summary>
+    private JournalIntegrityEnsureResult RunEnsureJournalIntegrity(string inst, AccountSnapshot snap, DateTimeOffset utcNow,
+        bool markEnsuredForInvariant)
+    {
+        var useIea = _executionPolicy?.UseInstrumentExecutionAuthority ?? false;
+        var account = _accountName ?? "";
+        var bw = CountBrokerWorkingOrders(snap, inst);
+        InstrumentExecutionAuthority? ieaResolved = null;
+        HashSet<string>? registryIntentIds = null;
+        var ieaOwned = 0;
+        if (useIea && ReconciliationIeaLookup.TryResolveForMismatchAssembly(account, inst, bw, GetExecutionInstrument, out ieaResolved, out _) &&
+            ieaResolved != null)
+        {
+            ieaOwned = ieaResolved.GetMismatchTrustedWorkingCount();
+            registryIntentIds = ieaResolved.GetMismatchTrustedWorkingIntentIds();
+        }
+        else
+            ieaOwned = useIea ? -1 : 0;
+
+        var canonical = GetCanonicalInstrument(inst) ?? inst;
+        var robotIntentIds = CollectRobotTaggedIntentIdsForInstrument(snap, inst);
+        var parityRegistryView = new JournalParityRegistryViewImpl
+        {
+            UseInstrumentExecutionAuthority = useIea,
+            IeaOwnedPlusAdoptedWorking = ieaOwned
+        };
+
+        var integrityResult = JournalIntegrityGuarantee.EnsureJournalIntegrity(
+            inst,
+            snap,
+            _executionJournal,
+            parityRegistryView,
+            ieaResolved?.ExecutionInstrumentKey ?? inst,
+            canonical,
+            robotIntentIds,
+            registryIntentIds,
+            ieaResolved,
+            utcNow,
+            (evt, st, extra) => LogEvent(RobotEvents.EngineBase(utcNow, "", evt, st, extra)),
+            allowReconstruction: true,
+            tradingDateForJournal: string.IsNullOrEmpty(TradingDateString) ? utcNow.ToString("yyyy-MM-dd") : TradingDateString);
+        if (markEnsuredForInvariant)
+            _journalIntegrityEnsuredForInstrument[inst] = 1;
+        return integrityResult;
+    }
+
+    /// <summary>Runs after recovery adoption scheduling attempt — integrity layer owns parity, not adoption.</summary>
+    private void RunPostAdoptionJournalIntegrity(string inst, AccountSnapshot snap, DateTimeOffset utcNow)
+    {
+        if (snap == null) return;
+        RunEnsureJournalIntegrity(inst, snap, utcNow, markEnsuredForInvariant: true);
+    }
+
+    /// <summary>Fast path: only runs full ensure when parity is already broken (avoids log noise on hot execution paths).</summary>
+    private void TryEnsureJournalIntegrityAfterExecutionActivity(string inst, DateTimeOffset utcNow)
+    {
+        if (_executionAdapter == null || string.IsNullOrWhiteSpace(inst)) return;
+        AccountSnapshot? snap;
+        try
+        {
+            snap = _executionAdapter.GetAccountSnapshot(utcNow);
+        }
+        catch
+        {
+            return;
+        }
+
+        if (snap == null) return;
+        var trimmed = inst.Trim();
+        var useIea = _executionPolicy?.UseInstrumentExecutionAuthority ?? false;
+        var account = _accountName ?? "";
+        var bw = CountBrokerWorkingOrders(snap, trimmed);
+        InstrumentExecutionAuthority? iea = null;
+        var ieaOwned = 0;
+        if (useIea && ReconciliationIeaLookup.TryResolveForMismatchAssembly(account, trimmed, bw, GetExecutionInstrument, out iea, out _) &&
+            iea != null)
+            ieaOwned = iea.GetMismatchTrustedWorkingCount();
+        else
+            ieaOwned = useIea ? -1 : 0;
+        var canonical = GetCanonicalInstrument(trimmed) ?? trimmed;
+        var pre = JournalParityChecker.CheckJournalParity(trimmed, snap, _executionJournal,
+            new JournalParityRegistryViewImpl { UseInstrumentExecutionAuthority = useIea, IeaOwnedPlusAdoptedWorking = ieaOwned },
+            canonical, utcNow);
+        if (pre.IsOk) return;
+        RunEnsureJournalIntegrity(trimmed, snap, utcNow, markEnsuredForInvariant: true);
     }
 
     private StateConsistencyReleaseEvaluationInput BuildStateConsistencyReleaseEvaluationInput(string inst, AccountSnapshot snap, DateTimeOffset utcNow)
@@ -6104,22 +6343,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         else
             input.IeaOwnedPlusAdoptedWorking = useIea ? -1 : 0;
 
-        var staleExecKey = ieaResolved?.ExecutionInstrumentKey ?? inst;
         var journalOpenQtyBeforePreSum =
             _executionJournal.GetOpenJournalStructuralStateForInstrument(inst, canonical).OpenQtySum;
-        var staleAdoptionJournalClosedCount = _executionJournal.ReconcileStaleAdoptionJournalCandidatesForRelease(
-            staleExecKey,
-            canonical,
-            input.BrokerPositionQty,
-            robotIntentIds,
-            utcNow);
-        var journalAlignmentWriteCount = _executionJournal.ReconcileJournalOpenQuantityWithBroker(
-            inst,
-            canonical,
-            input.BrokerPositionQty,
-            robotIntentIds,
-            registryIntentIds,
-            utcNow);
+        var integrityResult = RunEnsureJournalIntegrity(inst, snap, utcNow, markEnsuredForInvariant: true);
+        var staleAdoptionJournalClosedCount = integrityResult.Reconstruction?.StaleAdoptionRowsClosed ?? 0;
+        var journalAlignmentWriteCount = integrityResult.Reconstruction?.JournalWritesFromAlignment ?? 0;
+        var recoveredIntentWrites = integrityResult.RecoveredIntentWrites;
 
         var openJournalMap = _executionJournal.GetOpenJournalEntriesByInstrument();
         var (journalOpenQty, journalOpenIntentHash) =
@@ -6129,7 +6358,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         if (input.BrokerPositionQty != 0 && journalOpenQty == 0 ||
             journalOpenQtyBeforePreSum != journalOpenQty ||
             staleAdoptionJournalClosedCount != 0 ||
-            journalAlignmentWriteCount != 0)
+            journalAlignmentWriteCount != 0 ||
+            recoveredIntentWrites != 0)
         {
             LogEvent(RobotEvents.EngineBase(utcNow, "", "RELEASE_READINESS_JOURNAL_PRE_SUM_CHAIN", "ENGINE",
                 new
@@ -6141,6 +6371,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     journal_open_qty_before_pre_sum_chain = journalOpenQtyBeforePreSum,
                     stale_adoption_journal_closed_count = staleAdoptionJournalClosedCount,
                     journal_alignment_write_count = journalAlignmentWriteCount,
+                    recovered_intent_writes = recoveredIntentWrites,
                     journal_open_qty_after_pre_sum_chain = journalOpenQty,
                     note =
                         "Journal scan before ReconcileStaleAdoptionJournalCandidatesForRelease vs structural sum after ReconcileJournalOpenQuantityWithBroker; use with RELEASE_READINESS_INPUT_AUDIT to detect pre-audit zeroing"
@@ -6279,6 +6510,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "RELEASE_SUPPRESSION_DECISION", "ENGINE",
             new
             {
+                instrumentation_source = "ReleaseReconciliationRedundancySuppression.release_readiness_cache",
                 instrument,
                 skipped,
                 reason = MapReleaseSuppressionPayloadReason(skipped, internalReason),
@@ -6390,7 +6622,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         {
             try
             {
-                adoptionScheduled = ieaRecover.TryScheduleRecoveryAdoptionScan(out adoptedInline);
+                var so = ieaRecover.TryScheduleRecoveryAdoptionScan(out adoptedInline);
+                adoptionScheduled = ReconciliationScheduleSignals.AdoptionWorkOrQueueInflight(so);
             }
             catch
             {
@@ -6678,20 +6911,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         if (snap == null)
             return ReconciliationForcedConvergenceResult.Failed("null_snapshot");
 
-        InstrumentExecutionAuthority? ieaForStale = null;
-        if (useIea && ReconciliationIeaLookup.TryResolve(account, inst, CountBrokerWorkingOrders(snap, inst), GetExecutionInstrument, out var ieaSnap) &&
-            ieaSnap != null)
-            ieaForStale = ieaSnap;
-        var canonicalForJournal = GetCanonicalInstrument(inst) ?? inst;
-        var posAbs = SumBrokerPositionQty(snap, inst);
-        var tagIds = CollectRobotTaggedIntentIdsForInstrument(snap, inst);
-        _executionJournal.ReconcileStaleAdoptionJournalCandidatesForRelease(
-            ieaForStale?.ExecutionInstrumentKey ?? inst,
-            canonicalForJournal,
-            posAbs,
-            tagIds,
-            utcNow);
-
         var readiness = EvaluateStateConsistencyReleaseReadiness(inst, snap, utcNow, forceFullEvaluation: true);
         if (!readiness.ReleaseReady)
             return ReconciliationForcedConvergenceResult.Failed(readiness.Summary ?? "not_release_ready");
@@ -6724,13 +6943,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// </summary>
     private FlattenResult FlattenIntent(string intentId, string instrument, DateTimeOffset utcNow)
     {
+        FlattenResult r;
         if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
-        {
-            return simAdapter.FlattenIntent(intentId, instrument, utcNow);
-        }
-        
-        // Fallback to regular flatten
-        return _executionAdapter.Flatten(intentId, instrument, utcNow);
+            r = simAdapter.FlattenIntent(intentId, instrument, utcNow);
+        else
+            r = _executionAdapter.Flatten(intentId, instrument, utcNow);
+        if (r.Success)
+            TryEnsureJournalIntegrityAfterExecutionActivity(instrument, utcNow);
+        return r;
     }
     
     /// <summary>
@@ -6812,6 +7032,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         var utcNow = req.AuditUtc;
         var result = _executionAdapter.SubmitProtectiveStop(intentId, req.Instrument, direction, stopPrice.Value, qty, null, utcNow);
+        if (result.Success)
+            TryEnsureJournalIntegrityAfterExecutionActivity(req.Instrument, utcNow);
         return new ProtectiveCorrectiveResult
         {
             Submitted = result.Success,

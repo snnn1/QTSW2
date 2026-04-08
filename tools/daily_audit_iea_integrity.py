@@ -141,7 +141,11 @@ def _mismatch_severity_rank(mt: str) -> int:
     ranks = {
         "BROKER_AHEAD": 10,
         "JOURNAL_AHEAD": 20,
-        "POSITION_QTY_MISMATCH": 30,
+        "STRUCTURAL_MULTI_INTENT": 27,
+        "HEDGED_NET_FLAT_GROSS_OPEN": 26,
+        "GROSS_POSITION_DIVERGENCE": 28,
+        "NET_POSITION_MISMATCH": 30,
+        "POSITION_QTY_MISMATCH": 30,  # legacy; replaced by NET/GROSS/STRUCTURAL
         "PROTECTIVE_STATE_DIVERGENCE": 35,
         "ORDER_REGISTRY_MISSING": 40,
         "LIFECYCLE_BROKER_DIVERGENCE": 42,

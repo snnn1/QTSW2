@@ -229,6 +229,86 @@ public sealed partial class NinjaTraderSimAdapter
     (string JournalDir, int FileCount, bool DirectoryExists) IIEAOrderExecutor.GetJournalDiagnostics(string? executionInstrument) =>
         GetJournalDiagnostics(executionInstrument);
 
+    void IIEAOrderExecutor.EmitRecoveryAdoptionZeroDeltaDiagnostics(
+        string executionInstrumentKey,
+        string adoptionScanEpisodeId,
+        int adoptedDelta,
+        bool isRecoveryAdoptionScan,
+        IReadOnlyCollection<string>? registryMismatchTrustedIntentIds) =>
+        EmitRecoveryAdoptionZeroDeltaDiagnosticsCore(
+            executionInstrumentKey,
+            adoptionScanEpisodeId,
+            adoptedDelta,
+            isRecoveryAdoptionScan,
+            registryMismatchTrustedIntentIds);
+
+    private void EmitRecoveryAdoptionZeroDeltaDiagnosticsCore(
+        string executionInstrumentKey,
+        string adoptionScanEpisodeId,
+        int adoptedDelta,
+        bool isRecoveryAdoptionScan,
+        IReadOnlyCollection<string>? registryMismatchTrustedIntentIds)
+    {
+        if (!isRecoveryAdoptionScan || adoptedDelta != 0 || _log == null || string.IsNullOrWhiteSpace(executionInstrumentKey))
+            return;
+        var execVariant = executionInstrumentKey.StartsWith("M", StringComparison.OrdinalIgnoreCase) && executionInstrumentKey.Length > 1
+            ? executionInstrumentKey
+            : "M" + executionInstrumentKey;
+        var canonical = DeriveCanonicalFromExecutionInstrument(executionInstrumentKey);
+        var exposure = GetBrokerCanonicalExposureInternal(executionInstrumentKey);
+        var brokerAbs = exposure.ReconciliationAbsQuantityTotal;
+        var brokerSigned = 0;
+        foreach (var leg in exposure.Legs)
+            brokerSigned += leg.SignedQuantity;
+        var robotTags = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var account = _ntAccount as Account;
+        if (account?.Orders != null)
+        {
+            var instRoot = (executionInstrumentKey ?? "").Split(' ').FirstOrDefault() ?? executionInstrumentKey;
+            foreach (var o in account.Orders)
+            {
+                if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted) continue;
+                if (!ExecutionInstrumentResolver.IsSameInstrument(o.Instrument?.MasterInstrument?.Name ?? o.Instrument?.FullName ?? "", instRoot))
+                    continue;
+                var tag = GetOrderTag(o);
+                if (string.IsNullOrEmpty(tag) || !tag.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase)) continue;
+                var id = RobotOrderIds.DecodeIntentId(tag);
+                if (!string.IsNullOrEmpty(id)) robotTags.Add(id);
+            }
+        }
+
+        var diagnostics = _executionJournal.BuildReleaseBlockingCandidateDiagnostics(
+            executionInstrumentKey,
+            canonical,
+            brokerAbs,
+            brokerSigned,
+            robotTags,
+            registryMismatchTrustedIntentIds);
+        var rows = new object[diagnostics.Count];
+        for (var i = 0; i < diagnostics.Count; i++)
+        {
+            var d = diagnostics[i];
+            rows[i] = new
+            {
+                intent_id = d.IntentId,
+                category = d.Category.ToString(),
+                disposition = d.Disposition.ToString(),
+                d.RecoveryAdoptionShouldConsume,
+                non_adoption_reason = d.NonAdoptionReason
+            };
+        }
+        _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "RECOVERY_ADOPTION_ZERO_DELTA_BLOCKERS", state: "ENGINE",
+            new
+            {
+                adoption_scan_episode_id = adoptionScanEpisodeId,
+                execution_instrument_key = executionInstrumentKey,
+                broker_position_qty_abs = brokerAbs,
+                broker_position_qty_signed = brokerSigned,
+                blocking_candidates = diagnostics.Count,
+                candidates = rows
+            }));
+    }
+
     OrderModificationResult IIEAOrderExecutor.ModifyStopToBreakEven(string intentId, string instrument, decimal beStopPrice, DateTimeOffset utcNow) =>
         ModifyStopToBreakEven(intentId, instrument, beStopPrice, utcNow);
 

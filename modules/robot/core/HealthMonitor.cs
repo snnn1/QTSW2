@@ -81,7 +81,9 @@ public sealed class HealthMonitor
     
     // Session awareness: callback to check if any streams are in active trading state
     private Func<bool>? _hasActiveStreamsCallback;
-    
+    /// <summary>When set and returns false, suppress engine tick stall (market closed — no bars/ticks expected).</summary>
+    private Func<bool>? _isMarketOpenCallback;
+
     // Rate limiting
     private readonly Dictionary<string, DateTimeOffset> _lastNotifyUtcByKey = new(StringComparer.OrdinalIgnoreCase);
     private DateTimeOffset _lastEvaluateUtc = DateTimeOffset.MinValue;
@@ -208,7 +210,15 @@ public sealed class HealthMonitor
     {
         _hasActiveStreamsCallback = callback;
     }
-    
+
+    /// <summary>
+    /// Set callback to check if CME market is open. When closed, suppress engine tick stall false positives.
+    /// </summary>
+    public void SetMarketOpenCallback(Func<bool>? callback)
+    {
+        _isMarketOpenCallback = callback;
+    }
+
     /// <summary>
     /// Check if any streams are in active trading state (ARMED, RANGE_BUILDING, or RANGE_LOCKED).
     /// </summary>
@@ -608,7 +618,10 @@ public sealed class HealthMonitor
         // Session awareness: only check during active trading
         if (!HasActiveStreams())
             return; // Suppress during startup/shutdown/outside sessions
-        
+
+        if (_isMarketOpenCallback != null && !_isMarketOpenCallback())
+            return;
+
         var elapsed = (utcNow - _lastEngineTickUtc).TotalSeconds;
         
         if (elapsed >= ENGINE_TICK_STALL_SECONDS)

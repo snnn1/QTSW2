@@ -143,6 +143,12 @@ public interface IExecutionAdapter
     /// <param name="snap">Account snapshot from GetAccountSnapshot</param>
     /// <param name="utcNow">Current UTC timestamp</param>
     void CancelRobotOwnedWorkingOrders(AccountSnapshot snap, DateTimeOffset utcNow);
+
+    /// <summary>
+    /// True when the adapter is safe to drive real or simulated submission paths (NT context wired; SIM verified when applicable).
+    /// Used to gate pre-hydration and bracket submission during startup before DataLoaded wiring completes.
+    /// </summary>
+    bool IsExecutionContextReady { get; }
 }
 
 /// <summary>

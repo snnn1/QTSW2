@@ -6,10 +6,16 @@ namespace QTSW2.Robot.Core.Execution;
 /// <summary>Simple explicit rules for classifying broker vs local divergence.</summary>
 public static class MismatchClassification
 {
-    /// <summary>Classify based on broker qty, local qty, and optional registry/lifecycle flags.</summary>
+    /// <summary>
+    /// Classify using gross journal, broker abs sum, and signed nets. Replaces single POSITION_QTY_MISMATCH with
+    /// net vs gross distinctions; see <see cref="MismatchType.NET_POSITION_MISMATCH"/>.
+    /// </summary>
     public static MismatchType Classify(
-        int brokerQty,
-        int localQty,
+        int brokerQtyAbs,
+        int grossJournalQty,
+        int netBrokerQty,
+        int netJournalQty,
+        bool opposingMultiIntentOpen,
         int brokerWorkingOrderCount = 0,
         int localWorkingOrderCount = 0,
         bool lifecycleSaysProtected = false,
@@ -25,14 +31,21 @@ public static class MismatchClassification
         if (brokerWorkingOrderCount > 0 && localWorkingOrderCount == 0)
             return MismatchType.ORDER_REGISTRY_MISSING;
 
-        if (brokerQty != 0 && localQty == 0)
+        if (brokerQtyAbs != 0 && grossJournalQty == 0)
             return MismatchType.BROKER_AHEAD;
 
-        if (brokerQty == 0 && localQty != 0)
+        if (brokerQtyAbs == 0 && grossJournalQty != 0)
             return MismatchType.JOURNAL_AHEAD;
 
-        if (brokerQty != localQty && brokerQty != 0 && localQty != 0)
-            return MismatchType.POSITION_QTY_MISMATCH;
+        if (netBrokerQty != netJournalQty)
+            return MismatchType.NET_POSITION_MISMATCH;
+
+        if (grossJournalQty != brokerQtyAbs)
+        {
+            if (opposingMultiIntentOpen)
+                return MismatchType.STRUCTURAL_MULTI_INTENT;
+            return MismatchType.GROSS_POSITION_DIVERGENCE;
+        }
 
         return MismatchType.UNCLASSIFIED_CRITICAL_MISMATCH;
     }

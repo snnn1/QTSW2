@@ -18,6 +18,9 @@ public sealed partial class NinjaTraderLiveAdapter : IExecutionAdapter
     private object? _ntAccount;   // NinjaTrader.Cbi.Account when SetNTContext called
     private object? _ntInstrument; // NinjaTrader.Cbi.Instrument when SetNTContext called
 
+    /// <inheritdoc />
+    public bool IsExecutionContextReady => _ntAccount != null && _ntInstrument != null;
+
     public NinjaTraderLiveAdapter(RobotLogger log, TimeService time)
     {
         _log = log;

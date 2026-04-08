@@ -341,6 +341,8 @@ public sealed partial class InstrumentExecutionAuthority
         _onEnqueueFailureCallback?.Invoke(ExecutionInstrumentKey, now, "EXECUTION_COMMAND_STALLED");
     }
 
+    partial void MaybeDeferredRecoveryAdoptionFlushAfterWorkItem();
+
     private void WorkerLoop()
     {
         while (_workerRunning)
@@ -367,6 +369,7 @@ public sealed partial class InstrumentExecutionAuthority
                             if (ieaCpu != 0)
                                 RuntimeAuditHubRef.Active?.CpuEnd(ieaCpu, RuntimeAuditSubsystem.IeaWorkTotal, ExecutionInstrumentKey, stream: "", onIeaWorker: true);
                         }
+                        MaybeDeferredRecoveryAdoptionFlushAfterWorkItem();
                         if (_pendingRecoveryAdoptionMutationAlignUtc.HasValue)
                         {
                             var aligned = _pendingRecoveryAdoptionMutationAlignUtc.Value;

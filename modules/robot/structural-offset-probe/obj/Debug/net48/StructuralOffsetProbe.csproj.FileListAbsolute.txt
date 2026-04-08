@@ -1,0 +1,8 @@
+c:\Users\jakej\QTSW2\modules\robot\structural-offset-probe\obj\Debug\net48\StructuralOffsetProbe.csproj.AssemblyReference.cache
+c:\Users\jakej\QTSW2\modules\robot\structural-offset-probe\obj\Debug\net48\StructuralOffsetProbe.csproj.SuggestedBindingRedirects.cache
+c:\Users\jakej\QTSW2\modules\robot\structural-offset-probe\obj\Debug\net48\StructuralOffsetProbe.exe.config
+c:\Users\jakej\QTSW2\modules\robot\structural-offset-probe\obj\Debug\net48\StructuralOffsetProbe.GeneratedMSBuildEditorConfig.editorconfig
+c:\Users\jakej\QTSW2\modules\robot\structural-offset-probe\obj\Debug\net48\StructuralOffsetProbe.AssemblyInfoInputs.cache
+c:\Users\jakej\QTSW2\modules\robot\structural-offset-probe\obj\Debug\net48\StructuralOffsetProbe.AssemblyInfo.cs
+c:\Users\jakej\QTSW2\modules\robot\structural-offset-probe\obj\Debug\net48\StructuralOffsetProbe.csproj.CoreCompileInputs.cache
+c:\Users\jakej\QTSW2\modules\robot\structural-offset-probe\obj\Debug\net48\StructuralOffsetProbe.sourcelink.json

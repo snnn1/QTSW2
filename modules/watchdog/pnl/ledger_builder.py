@@ -560,8 +560,8 @@ class LedgerBuilder:
                 exit_qty = row["entry_qty"]  # trade_completed implies full exit
         row["exit_qty"] = exit_qty
 
-        # Step 2: Determine exit price (weighted average from fills; fallback to journal or stop/target)
-        avg_exit_price, price_confidence = self._determine_exit_price(
+        # Step 2: Exit price — only EXIT_ORDER_TYPES fills count as exit economics; never average entry fills as exit.
+        avg_exit_price, price_confidence, exit_price_source = self._determine_exit_price(
             execution_fill_events, exit_qty, row.get("stop_price"), row.get("target_price")
         )
         if avg_exit_price is None and exit_qty > 0 and journal.get("trade_completed"):
@@ -570,15 +570,19 @@ class LedgerBuilder:
             if journal_exit_price is not None:
                 avg_exit_price = float(journal_exit_price)
                 price_confidence = "MEDIUM"
+                exit_price_source = "JOURNAL_EXIT_AVG"
             elif row.get("stop_price") or row.get("target_price"):
-                # RECONCILIATION_BROKER_FLAT: exit price unknown; infer from stop/target for display
+                # Exit price unknown in logs; infer from protective levels (not broker-attested)
                 avg_exit_price = row.get("target_price") or row.get("stop_price")
                 price_confidence = "LOW"
+                exit_price_source = "TARGET_STOP"
             elif row.get("entry_price"):
                 # Last resort: use entry price so status shows CLOSED (P&L will show ~0)
                 avg_exit_price = float(row["entry_price"])
                 price_confidence = "LOW"
+                exit_price_source = "ENTRY_FALLBACK"
         row["avg_exit_price"] = avg_exit_price
+        row["exit_price_source"] = exit_price_source
 
         # Step 3: Determine status
         status = self._determine_status(exit_qty, row["entry_qty"], avg_exit_price)
@@ -631,53 +635,44 @@ class LedgerBuilder:
         exit_qty: int,
         stop_price: Optional[float],
         target_price: Optional[float]
-    ) -> Tuple[Optional[float], str]:
+    ) -> Tuple[Optional[float], str, str]:
         """
-        Determine average exit price from EXECUTION_FILLED events.
-        
+        Average exit price from EXIT_ORDER_TYPES fills only (never entry fills).
+
         Returns:
-            (avg_exit_price, confidence)
-            - avg_exit_price: Weighted average if fills exist, None otherwise
-            - confidence: "HIGH" if fills exist, "MEDIUM" if inferred from stop/target, "LOW" if missing
+            (avg_exit_price, confidence, exit_price_source)
+            exit_price_source:
+              EXIT_FILLS — weighted average from exit-role fills in robot logs
+              TARGET_STOP — inferred from target/stop (no usable exit fills)
+              NO_EXIT_PRICE — exit_qty > 0 but no price could be derived here
+              NONE — exit_qty == 0; no exit price applicable
         """
-        if not execution_fill_events:
-            # No execution fills - try to infer from stop/target prices
-            if exit_qty > 0:
-                # If we have exits but no fill prices, infer from stop/target
-                # Prefer target (profit) over stop (loss) if both exist
-                inferred_price = target_price or stop_price
-                if inferred_price:
-                    logger.debug(f"Inferring exit price from stop/target: {inferred_price}")
-                    return inferred_price, "MEDIUM"
-                else:
-                    logger.warning(f"Exit qty {exit_qty} but no exit price available")
-                    return None, "LOW"
-            else:
-                return None, "HIGH"  # No exits, no price needed
-        
-        # Calculate weighted average from execution fills
+        exit_events = [
+            e for e in execution_fill_events
+            if (e.get("order_type") or "").upper() in self.EXIT_ORDER_TYPES
+            and not (e.get("order_type") or "").upper().startswith(self.ENTRY_ORDER_TYPE)
+        ]
         total_price_qty = 0.0
         total_qty = 0
-        
-        for event in execution_fill_events:
+        for event in exit_events:
             fill_price = event.get("fill_price")
-            fill_qty = event.get("fill_qty", 0)
-            
+            fill_qty = event.get("fill_qty", 0) or 0
             if fill_price is not None and fill_qty > 0:
-                total_price_qty += fill_price * fill_qty
+                total_price_qty += float(fill_price) * fill_qty
                 total_qty += fill_qty
-        
         if total_qty > 0:
-            avg_price = total_price_qty / total_qty
-            return avg_price, "HIGH"
-        else:
-            # Fills exist but no valid price/qty
-            if exit_qty > 0:
-                inferred_price = target_price or stop_price
-                if inferred_price:
-                    return inferred_price, "MEDIUM"
-                return None, "LOW"
-            return None, "HIGH"
+            return total_price_qty / total_qty, "HIGH", "EXIT_FILLS"
+
+        if exit_qty <= 0:
+            return None, "HIGH", "NONE"
+
+        inferred_price = target_price or stop_price
+        if inferred_price is not None:
+            logger.debug("Inferring exit price from stop/target (no exit fills): %s", inferred_price)
+            return float(inferred_price), "MEDIUM", "TARGET_STOP"
+
+        logger.warning("Exit qty %s but no exit fills and no stop/target to infer", exit_qty)
+        return None, "LOW", "NO_EXIT_PRICE"
     
     def _determine_status(
         self,

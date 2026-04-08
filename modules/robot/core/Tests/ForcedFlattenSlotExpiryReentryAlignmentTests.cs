@@ -194,4 +194,6 @@ internal sealed class CapturingExecutionAdapter : IExecutionAdapter
     public FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow)
         => FlattenResult.SuccessResult(utcNow);
     public bool TryEnqueueEmergencyFlattenProtective(string instrument, DateTimeOffset utcNow) => true;
+
+    public bool IsExecutionContextReady => true;
 }

@@ -3855,6 +3855,14 @@ public sealed class StreamStateMachine
         { 
             return (false, "NULL_DEPENDENCIES", new { execution_adapter_null = _executionAdapter == null, execution_journal_null = _executionJournal == null, risk_gate_null = _riskGate == null }); 
         }
+
+        if (!_executionAdapter.IsExecutionContextReady)
+        {
+            return (false, "EXECUTION_CONTEXT_NOT_READY", new
+            {
+                note = "NT context not wired or SIM not verified — bracket submission deferred (startup/readiness contract)"
+            });
+        }
         
         if (!_brkLongRounded.HasValue || !_brkShortRounded.HasValue) 
         { 
@@ -4329,7 +4337,7 @@ public sealed class StreamStateMachine
                         new { stream = Stream, side = "SHORT", submitted_price = brkShort, current_bid = bid, current_ask = ask }));
             }
 
-                if (longRes.Success && shortRes.Success)
+            if (longRes.Success && shortRes.Success)
             {
                 _stopBracketsSubmittedAtLock = true;
                 
@@ -4368,6 +4376,18 @@ public sealed class StreamStateMachine
                     persisted_to_journal = true,
                     note = "Stop entry brackets submitted; breakout fill should not require additional submission"
                 }));
+                
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "BRACKET_SUBMIT_OUTCOME", State.ToString(),
+                    new
+                    {
+                        outcome = "submitted_both",
+                        stream_id = Stream,
+                        trading_date = TradingDate,
+                        slot_time_chicago = SlotTimeChicago,
+                        note = "Post-submit truth: both stop entry brackets accepted by adapter"
+                    }));
+                LogSlotEndSummary(utcNow, "RANGE_VALID", true, false, "Range locked; stop brackets submitted, awaiting fill");
             }
             else
             {
@@ -4383,6 +4403,28 @@ public sealed class StreamStateMachine
                     short_error = shortRes.ErrorMessage,
                     note = "Failed to submit one or both stop entry brackets"
                 }));
+                var bothRejected = !longRes.Success && !shortRes.Success;
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "BRACKET_SUBMIT_OUTCOME", State.ToString(),
+                    new
+                    {
+                        outcome = bothRejected ? "rejected_both" : "rejected_partial",
+                        stream_id = Stream,
+                        trading_date = TradingDate,
+                        slot_time_chicago = SlotTimeChicago,
+                        long_success = longRes.Success,
+                        short_success = shortRes.Success,
+                        note = "Post-submit truth: stop entry bracket submission did not succeed for both sides"
+                    }));
+                LogSlotEndSummary(utcNow, "RANGE_VALID", true, false,
+                    bothRejected
+                        ? "Range locked; stop bracket submission failed (both sides) — no working entry orders"
+                        : "Range locked; stop bracket submission incomplete (one side) — review adapter errors");
+                if (bothRejected)
+                {
+                    // Terminal NO_TRADE: avoid substring FAILED in commit reason (classified as FAILED_RUNTIME elsewhere)
+                    Commit(utcNow, "NO_TRADE_ENTRY_BRACKETS_AT_LOCK_REJECTED", "NO_TRADE_ENTRY_BRACKETS_AT_LOCK_REJECTED");
+                }
             }
         }
         catch (Exception ex)
@@ -5387,8 +5429,8 @@ public sealed class StreamStateMachine
             // 1. EmitRangeLockedEvents
             EmitRangeLockedEvents(utcNow, rangeResult);
             
-            // 2. LogSlotEndSummary
-            LogSlotEndSummary(utcNow, "RANGE_VALID", true, false, "Range locked, awaiting signal");
+            // 2. SLOT_END_SUMMARY is emitted from SubmitStopEntryBracketsAtLock after submit (truth-bearing:
+            //    brackets submitted vs failed). Pre-submit "awaiting signal" was misleading when submit failed.
             
             // SIMPLIFICATION: Removed immediate entry path - always use stop brackets
             // Stop brackets handle all entry scenarios:

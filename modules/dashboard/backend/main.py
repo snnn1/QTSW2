@@ -28,6 +28,7 @@ import sys
 import json
 import subprocess
 import asyncio
+import threading
 import time
 from pathlib import Path
 from typing import Optional, Dict, List, Any, Tuple
@@ -76,6 +77,9 @@ SCHEDULE_CONFIG_FILE = QTSW2_ROOT / "configs" / "schedule.json"
 # Global orchestrator instance
 orchestrator_instance = None
 
+# Timetable Supervisor shutdown (set on app shutdown)
+_timetable_supervisor_stop: Optional[threading.Event] = None
+
 # File counts cache (for fast response times)
 _file_counts_cache = {
     "raw_files": 0,
@@ -117,7 +121,17 @@ async def lifespan(app: FastAPI):
     logger = logging.getLogger(__name__)
     logger.info("Pipeline Dashboard API started")
     hydrate_in_memory_matrix_on_startup()
-    
+
+    global _timetable_supervisor_stop
+    try:
+        from modules.timetable.timetable_supervisor import start_timetable_supervisor
+
+        _timetable_supervisor_stop = start_timetable_supervisor(QTSW2_ROOT)
+        logger.info("Timetable Supervisor thread started (after matrix hydrate)")
+    except Exception as sup_e:
+        logger.error("TIMETABLE_SUPERVISOR_START_FAILED: %s", sup_e, exc_info=True)
+        _timetable_supervisor_stop = None
+
     # Initialize orchestrator
     print("\n" + "=" * 60)
     print("INITIALIZING ORCHESTRATOR")
@@ -210,7 +224,11 @@ async def lifespan(app: FastAPI):
             logger.info("Pipeline Orchestrator stopped")
         except Exception as e:
             logger.error(f"Error stopping orchestrator: {e}")
-    
+
+    if _timetable_supervisor_stop is not None:
+        _timetable_supervisor_stop.set()
+        logger.info("Timetable Supervisor stop event set")
+
     # Legacy scheduler removed - Windows Task Scheduler runs pipeline directly
 
 
@@ -852,32 +870,34 @@ async def generate_timetable(request: TimetableRequest):
             """Matrix-first: use matrix when available (no analyzer reads for RS/SCF)"""
             from datetime import datetime, timezone
             from modules.timetable.cme_session import get_cme_trading_date
+            from modules.timetable.timetable_supervisor import timetable_publish_blocking
 
-            matrix_df = get_current_master_matrix_df()
-            if matrix_df is None:
-                raise RuntimeError(
-                    "TIMETABLE_NO_IN_MEMORY_MATRIX: No in-memory master matrix available for publish. "
-                    "Save or rebuild the matrix in this server process before generating the timetable."
+            with timetable_publish_blocking():
+                matrix_df = get_current_master_matrix_df()
+                if matrix_df is None:
+                    raise RuntimeError(
+                        "TIMETABLE_NO_IN_MEMORY_MATRIX: No in-memory master matrix available for publish. "
+                        "Save or rebuild the matrix in this server process before generating the timetable."
+                    )
+                if not matrix_df.empty:
+                    session_td = (request.date or "").strip() or get_cme_trading_date(datetime.now(timezone.utc))
+                    engine.write_execution_timetable_from_master_matrix(
+                        matrix_df,
+                        trade_date=session_td,
+                        execution_mode=True,
+                        publish_context={
+                            "source": "manual",
+                            "reason": "publish",
+                            "caller": "POST /api/timetable/generate",
+                            "matrix_source": "in_memory",
+                        },
+                    )
+                    return engine.build_timetable_dataframe_from_master_matrix(
+                        matrix_df, trade_date=session_td, execution_mode=True
+                    )
+                raise ValueError(
+                    "Master matrix is empty in memory — build or reload the matrix in this server, then try again."
                 )
-            if not matrix_df.empty:
-                session_td = (request.date or "").strip() or get_cme_trading_date(datetime.now(timezone.utc))
-                engine.write_execution_timetable_from_master_matrix(
-                    matrix_df,
-                    trade_date=session_td,
-                    execution_mode=True,
-                    publish_context={
-                        "source": "manual",
-                        "reason": "publish",
-                        "caller": "POST /api/timetable/generate",
-                        "matrix_source": "in_memory",
-                    },
-                )
-                return engine.build_timetable_dataframe_from_master_matrix(
-                    matrix_df, trade_date=session_td, execution_mode=True
-                )
-            raise ValueError(
-                "Master matrix is empty in memory — build or reload the matrix in this server, then try again."
-            )
         
         try:
             timetable_df = await asyncio.to_thread(_generate_timetable_sync)
@@ -931,6 +951,7 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
             TimetableEngine,
             TimetableWriteBlockedCmeMismatch,
         )
+        from modules.timetable.timetable_supervisor import timetable_publish_blocking
 
         output_dir = QTSW2_ROOT / "data" / "timetable"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -962,39 +983,40 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
         }
 
         def _publish_sync():
-            matrix_df = get_current_master_matrix_df()
-            if matrix_df is None:
-                raise RuntimeError(
-                    "TIMETABLE_NO_IN_MEMORY_MATRIX: No in-memory master matrix available for publish. "
-                    "Save or rebuild the matrix in this server process before publishing the execution timetable."
+            with timetable_publish_blocking():
+                matrix_df = get_current_master_matrix_df()
+                if matrix_df is None:
+                    raise RuntimeError(
+                        "TIMETABLE_NO_IN_MEMORY_MATRIX: No in-memory master matrix available for publish. "
+                        "Save or rebuild the matrix in this server process before publishing the execution timetable."
+                    )
+                if matrix_df.empty:
+                    raise ValueError(
+                        "Master matrix is empty in memory — build or reload the matrix before publishing."
+                    )
+                engine = TimetableEngine(
+                    master_matrix_dir=str(QTSW2_ROOT / "data" / "master_matrix"),
+                    analyzer_runs_dir=str(QTSW2_ROOT / "data" / "analyzed"),
+                    project_root=str(QTSW2_ROOT),
                 )
-            if matrix_df.empty:
-                raise ValueError(
-                    "Master matrix is empty in memory — build or reload the matrix before publishing."
-                )
-            engine = TimetableEngine(
-                master_matrix_dir=str(QTSW2_ROOT / "data" / "master_matrix"),
-                analyzer_runs_dir=str(QTSW2_ROOT / "data" / "analyzed"),
-                project_root=str(QTSW2_ROOT),
-            )
-            if request.replay:
-                td = (request.trading_date or "").strip()
-                if not td:
-                    raise ValueError("replay=True requires trading_date (YYYY-MM-DD)")
+                if request.replay:
+                    td = (request.trading_date or "").strip()
+                    if not td:
+                        raise ValueError("replay=True requires trading_date (YYYY-MM-DD)")
+                    return engine.write_execution_timetable_from_master_matrix(
+                        matrix_df,
+                        trade_date=td,
+                        execution_mode=True,
+                        replay=True,
+                        stream_filters=request.stream_filters,
+                        publish_context=pub_ctx,
+                    )
                 return engine.write_execution_timetable_from_master_matrix(
                     matrix_df,
-                    trade_date=td,
                     execution_mode=True,
-                    replay=True,
                     stream_filters=request.stream_filters,
                     publish_context=pub_ctx,
                 )
-            return engine.write_execution_timetable_from_master_matrix(
-                matrix_df,
-                execution_mode=True,
-                stream_filters=request.stream_filters,
-                publish_context=pub_ctx,
-            )
 
         try:
             pub_res = await asyncio.to_thread(_publish_sync)
@@ -1246,108 +1268,25 @@ def _finalize_current_timetable_api_payload(timetable: dict, utc_now: datetime) 
     return out
 
 
-def _ensure_live_timetable_current_file_sync(timetable_file: Path, session_td: str) -> None:
-    """
-    Single-writer path: if file missing or session label != current CME day (live docs only),
-    publish from on-disk master matrix (execution_mode=True).
-    """
-    sys.path.insert(0, str(QTSW2_ROOT))
-    from modules.matrix.file_manager import get_current_master_matrix_df
-    from modules.timetable.timetable_engine import (
-        TimetableEngine,
-        TimetableWriteBlockedCmeMismatch,
-    )
-
-    need_publish = True
-    if timetable_file.exists():
-        try:
-            with open(timetable_file, "r", encoding="utf-8") as f:
-                doc = json.load(f)
-        except Exception:
-            doc = {}
-        replay = doc.get("replay") is True
-        meta = doc.get("metadata")
-        if isinstance(meta, dict) and meta.get("replay") is True:
-            replay = True
-        if replay:
-            need_publish = False
-        else:
-            raw = (doc.get("session_trading_date") or doc.get("trading_date") or "")
-            if isinstance(raw, str):
-                raw = raw.strip()
-            else:
-                raw = str(raw).strip() if raw is not None else ""
-            if raw == session_td:
-                need_publish = False
-
-    if not need_publish:
-        return
-
-    reason = "auto_generate"
-    if timetable_file.exists():
-        reason = "session_roll"
-
-    matrix_df = get_current_master_matrix_df()
-    if matrix_df is None:
-        logging.warning(
-            "TIMETABLE_AUTO_ENSURE_SKIP: no in-memory master matrix (session_td=%s reason=%s)",
-            session_td,
-            reason,
-        )
-        raise RuntimeError(
-            "TIMETABLE_NO_IN_MEMORY_MATRIX: Cannot auto-publish timetable without in-process matrix; "
-            "load or rebuild the matrix in this server process."
-        )
-    engine = TimetableEngine(
-        master_matrix_dir=str(QTSW2_ROOT / "data" / "master_matrix"),
-        analyzer_runs_dir=str(QTSW2_ROOT / "data" / "analyzed"),
-        project_root=str(QTSW2_ROOT),
-    )
-    try:
-        res = engine.write_execution_timetable_from_master_matrix(
-            matrix_df,
-            execution_mode=True,
-            publish_context={
-                "source": "auto",
-                "reason": reason,
-                "caller": f"GET /api/timetable/current:auto_ensure({reason})",
-                "matrix_source": "in_memory",
-            },
-        )
-    except TimetableWriteBlockedCmeMismatch as e:
-        logging.error("TIMETABLE_AUTO_GENERATE_CME_MISMATCH: %s", e)
-        raise
-
-    if res and res.changed:
-        logging.info(
-            "TIMETABLE_AUTO_GENERATED_ON_REQUEST: session_td=%s path=%s hash=%s reason=%s",
-            session_td,
-            timetable_file,
-            res.timetable_hash,
-            reason,
-        )
-
-    if not timetable_file.exists():
-        raise RuntimeError("timetable_current.json missing after auto-publish")
-
-
 @app.get("/api/timetable/current")
 async def get_current_timetable():
-    """Live execution timetable (timetable_current.json). Always 200 with streams[] when publish succeeds."""
+    """Live execution timetable (timetable_current.json). Read-only; session alignment is Timetable Supervisor."""
     try:
         sys.path.insert(0, str(QTSW2_ROOT))
-        from modules.timetable.cme_session import get_cme_trading_date
 
         timetable_file = QTSW2_ROOT / "data" / "timetable" / "timetable_current.json"
         timetable_file.parent.mkdir(parents=True, exist_ok=True)
 
         utc_now = datetime.now(timezone.utc)
-        session_td = get_cme_trading_date(utc_now)
-
-        await asyncio.to_thread(_ensure_live_timetable_current_file_sync, timetable_file, session_td)
 
         if not timetable_file.exists():
-            raise RuntimeError("timetable_current.json not found after ensure")
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "timetable_current.json not present yet. "
+                    "Timetable Supervisor publishes when CME session aligns and matrix is in memory."
+                ),
+            )
 
         with open(timetable_file, "r", encoding="utf-8") as f:
             timetable = json.load(f)

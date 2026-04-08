@@ -17,6 +17,9 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
         _log = log;
     }
 
+    /// <inheritdoc />
+    public bool IsExecutionContextReady => true;
+
     public OrderSubmissionResult SubmitEntryOrder(
         string intentId,
         string instrument,

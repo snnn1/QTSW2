@@ -170,23 +170,23 @@ public interface IExecutionAdapter
     /// <param name="tickPrice">Current tick price</param>
     /// <param name="tickTimeFromEvent">Event timestamp from market data (for de-dupe). Null = use UtcNow fallback.</param>
     /// <param name="executionInstrument">Execution instrument filter (e.g. MNQ, MGC)</param>
-    void EvaluateBreakEven(decimal tickPrice, DateTimeOffset? tickTimeFromEvent, string executionInstrument);
+    void EvaluateBreakEven(decimal tickPrice, DateTimeOffset? tickTimeFromEvent, string executionInstrument) { }
 
     /// <summary>
     /// Phase 1: Process pending unresolved executions (non-blocking grace retry). Called from strategy thread on OnBarUpdate/OnMarketData.
     /// Non-IEA path only; IEA uses queue-based retry.
     /// </summary>
-    void ProcessPendingUnresolvedExecutions();
+    void ProcessPendingUnresolvedExecutions() { }
 
     /// <summary>
     /// Phase 3: Request recovery for instrument. Routes to IEA when bound. No-op for adapters without IEA.
     /// </summary>
-    void RequestRecoveryForInstrument(string instrument, string reason, object context, DateTimeOffset utcNow);
+    void RequestRecoveryForInstrument(string instrument, string reason, object context, DateTimeOffset utcNow) { }
 
     /// <summary>
     /// Phase 5: Request supervisory action for instrument. Routes to IEA when bound. No-op for adapters without IEA.
     /// </summary>
-    void RequestSupervisoryActionForInstrument(string instrument, SupervisoryTriggerReason reason, SupervisorySeverity severity, object? context, DateTimeOffset utcNow);
+    void RequestSupervisoryActionForInstrument(string instrument, SupervisoryTriggerReason reason, SupervisorySeverity severity, object? context, DateTimeOffset utcNow) { }
 
     /// <summary>
     /// Enqueue execution command for IEA processing. Strategy layers should use this instead of calling
@@ -199,27 +199,32 @@ public interface IExecutionAdapter
     /// union of BE-monitoring actives (filled, open) and adoption candidates (EntrySubmitted, !TradeCompleted).
     /// Aligns expected intent context with state-consistency release semantics.
     /// </summary>
-    IReadOnlyCollection<string> GetActiveIntentIdsForProtectiveAudit(string instrument);
+    IReadOnlyCollection<string> GetActiveIntentIdsForProtectiveAudit(string instrument) => Array.Empty<string>();
 
     /// <summary>
     /// Broker shows open position but journal open filled sum is zero: attempt tagged recovery journal upsert when
     /// robot ownership evidence is strong (tags, OrderMap, adoption candidates). Not used for empty decoded intent (untracked path).
     /// </summary>
     /// <returns>True when a qualifying journal row was written.</returns>
-    bool TryRepairTaggedBrokerWithoutJournal(string instrument, int accountQtyAbs, int journalOpenQtySum, DateTimeOffset utcNow, out string resultCode, out string? detail);
+    bool TryRepairTaggedBrokerWithoutJournal(string instrument, int accountQtyAbs, int journalOpenQtySum, DateTimeOffset utcNow, out string resultCode, out string? detail)
+    {
+        resultCode = "NOT_IMPLEMENTED";
+        detail = null;
+        return false;
+    }
 
     /// <summary>
     /// Retry deferred adoption scan when candidates were empty but broker had orders (journal load race).
     /// Call from periodic path (e.g. reconciliation) so retry does not depend only on execution updates.
     /// No-op for adapters without IEA.
     /// </summary>
-    void TryRetryDeferredAdoptionScan();
+    void TryRetryDeferredAdoptionScan() { }
 
     /// <summary>
     /// Before mismatch assembly: all IEAs for this instrument reclassify recoverable UNOWNED rows and attempt broker-id alias links from snapshot.
     /// Does not submit, modify, or cancel orders. No-op when registry unavailable.
     /// </summary>
-    void PrepareOrderRegistryForMismatchAssembly(string instrument, AccountSnapshot snap, DateTimeOffset utcNow);
+    void PrepareOrderRegistryForMismatchAssembly(string instrument, AccountSnapshot snap, DateTimeOffset utcNow) { }
 
     /// <summary>
     /// Session-close flatten: enqueue cancel+flatten NtActions (no drain). Strategy thread drains the queue.
@@ -227,6 +232,12 @@ public interface IExecutionAdapter
     /// Returns null if not supported (caller should use Flatten fallback + broker wait).
     /// </summary>
     FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow);
+
+    /// <summary>
+    /// True when the adapter is safe to drive real or simulated submission paths (NT context wired; SIM verified when applicable).
+    /// Used to gate pre-hydration and bracket submission during startup before DataLoaded wiring completes.
+    /// </summary>
+    bool IsExecutionContextReady { get; }
 }
 
 /// <summary>

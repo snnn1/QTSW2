@@ -1,7 +1,7 @@
 # Full-System Daily Audit Framework (Robot + Watchdog)
 
-**Version:** 1.6  
-**Date:** 2026-03-24  
+**Version:** 1.7  
+**Date:** 2026-04-06  
 **Purpose:** Decision-grade daily risk intelligence — not a log dump. Answers: *“Is it safe to trade tomorrow?”*
 
 ---
@@ -18,6 +18,7 @@
 | **Confidence** | **`confidence`** (HIGH / MEDIUM / LOW) states how trustworthy the conclusion is — **never** treat `overall_status: OK` as meaningful when confidence is **LOW**. |
 | **Timeline** | A single compressed Chicago-time narrative of high-signal events; domain **[DETAILS]** cite relevant spans (`→ See timeline …`). |
 | **Causality** | **Incident chains** group events into recoverable sequences so the report answers *why*, not only *what*. |
+| **Upstream root** | **First upstream divergence** (§1.2): the audit must not stop at terminal symptoms (`FAIL_CLOSED`, gate state); it must identify the **earliest** point where independent state streams **first** disagreed (or where evidence proves that cannot be determined). |
 | **Predictive focus** | **Tier 1–2 signals only** (§3.0): early warning **without** expanding the report into a log viewer; Tier 3 stays **debug-only** (see §3.0). |
 
 **Five layers (institutional stack):**
@@ -36,6 +37,30 @@
 
 **Before (reactive):** mismatch → stuck → fail-closed.  
 **After (predictive):** `STATE_CONSISTENCY_GATE_*` engaged → adoption strain (`GATE_ANOMALY` / non-convergence) → **slow** mismatch→recovery latency → *(optional)* `PASS_SUMMARY` hash loop → explicit mismatch → stuck → fail.
+
+### 1.2 First upstream divergence (mandatory causal depth)
+
+**Problem:** A narrative that ends at *“logs show `RECONCILIATION_MISMATCH_FAIL_CLOSED` / gate `FAIL_CLOSED`”* describes **downstream enforcement**, not **why** two reconciled views diverged. That is **insufficient** for decision-grade risk.
+
+**Requirement:** For any **non-trivial** episode (WARNING/CRITICAL reconciliation or safety domain, or any incident chain with classification **DEGRADED** or **FAILED**), the audit must identify the **first upstream divergence** — the **earliest** time-order position in the day where evidence shows **material disagreement** between independent state sources the engine uses together, **or** explicitly conclude **unknown** with the narrowest gap in evidence (missing logs, single-stream visibility only).
+
+**Independent streams (conceptual — map events to these, not to a story title):**
+
+| Stream | Typical evidence in logs |
+|--------|---------------------------|
+| **Broker / account snapshot** | Position and working-order views feeding reconciliation assembly (`RECONCILIATION_*`, snapshot-adjacent events). |
+| **Execution journal / open lifecycle** | Journal health, intent rows, `EXECUTION_JOURNAL_*`, qty reconstruction. |
+| **Registry / IEA ownership** | `REGISTRY_BROKER_DIVERGENCE`, `STALE_QTSW2_ORDER_DETECTED`, adoption strain Tier 1, `RECONCILIATION_ORDER_SOURCE_BREAKDOWN`-class lines when present. |
+| **Protective / supervisory** | Protective lifecycle vs broker when those lines exist for the episode. |
+
+**Method (human or automated, same outcome):**
+
+1. **Order all candidate events** in the episode by `ts_utc` (after §2.3 normalization and §9 dedupe).
+2. **Prefer earlier predictive Tier 1–2 signals** (§3.0) over terminal **`FAIL_CLOSED`** / **`RECONCILIATION_MISMATCH_*`** alone — e.g. `REGISTRY_BROKER_DIVERGENCE` or adoption anomalies **before** first `RECONCILIATION_MISMATCH_DETECTED` may be the true start; gate engaged is **not** assumed to be the first divergence unless nothing earlier qualifies.
+3. **Use `mismatch_type` / payload fields** when present to state *which relationship* broke (broker-ahead vs journal-ahead vs registry missing, etc.) — as **classification of the split**, not as automatic blame on a single subsystem.
+4. **If only terminal events exist**, say so: *first upstream divergence **not identifiable** from corpus* (and lower **confidence** per §4.3 if logs are thin).
+
+**Deliverable:** The **human** `[SUMMARY]` or `[INCIDENT CHAINS]` block must include **one line per serious episode**: *first upstream divergence ≈ `<time>` — `<earliest qualifying event or stream split>` — `<instruments/keys>`* (or *unknown*). Machine JSON may add `incident_chains[].first_upstream_divergence` (optional object: `ts_utc`, `event`, `stream_hypothesis`, `confidence`).
 
 ---
 
@@ -654,6 +679,7 @@ Confidence: HIGH | MEDIUM | LOW
 - Max CPU parallelism (raw / normalized): ...
 - Dominant subsystem: ...
 - First failure: <HH:mm:ss Chicago — EVENT — instrument — chain #N> | none
+- First upstream divergence (§1.2): <time — earliest stream split / event — keys> | unknown | n/a (clean day)
 - Recovery quality: chain avg/max <Xm>s/<Ym>s; mismatch→recovery median <Zm>s; success/fail: <a>/<b>
 - Drift (if history): mismatch <UP|STABLE|DOWN>, CPU ..., recovery time ...; drift_risk: NONE | ELEVATED | HIGH
 - Silent failure: none | SILENT_FAILURE_DETECTED (see details)
@@ -687,7 +713,7 @@ If a signal is **neither** status-changing (domain / `overall_status` / `confide
 
 ## 6. Incident chain builder (causal sequences)
 
-**Objective:** Group high-signal timeline events into **incident chains** so the report answers *why*, not only *what*. This is **Layer 3** (see §1).
+**Objective:** Group high-signal timeline events into **incident chains** so the report answers *why*, not only *what*. This is **Layer 3** (see §1). Chains **must** be reconciled with **§1.2**: the chain’s **trigger** is often a **symptom**; the narrative and optional JSON must still record **first upstream divergence** when the day’s logs support it (earliest qualifying event **before** terminal fail-closed when applicable).
 
 ### 6.1 Start a chain when
 

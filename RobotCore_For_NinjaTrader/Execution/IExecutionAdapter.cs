@@ -16,6 +16,13 @@ namespace QTSW2.Robot.Core.Execution;
 public interface IExecutionAdapter
 {
     /// <summary>
+    /// True when the adapter is allowed to submit broker orders: SIM/LIVE NT context is wired and
+    /// SIM account verification has passed (SIM); DRYRUN is always ready. Used to gate stream logic
+    /// and pre-hydration bar feeding before DataLoaded wiring can race background BarsRequest.
+    /// </summary>
+    bool IsExecutionContextReady { get; }
+
+    /// <summary>
     /// Place an entry order (market, limit, or stop-market).
     /// </summary>
     /// <param name="intentId">Unique intent identifier (hash of canonical fields)</param>

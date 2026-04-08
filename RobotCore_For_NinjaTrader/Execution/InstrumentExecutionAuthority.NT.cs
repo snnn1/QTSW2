@@ -779,6 +779,7 @@ public sealed partial class InstrumentExecutionAuthority
         {
             scan_request_source = source.ToString(),
             disposition = reason,
+            skip_reason_code = reason,
             adoption_scan_gate = _adoptionSingleFlightGate.State.ToString(),
             thread_id = t.ManagedThreadId,
             thread_name = t.Name,
@@ -923,6 +924,15 @@ public sealed partial class InstrumentExecutionAuthority
                     last_scan_completed_utc_before_this_run = _lastRecoveryScanCompletedUtc == DateTimeOffset.MinValue ? null : _lastRecoveryScanCompletedUtc.ToString("o")
                 });
                 MaybeLogAdoptionScanPhaseTiming(utcDone, source, adoptionScanEpisodeId, sw.ElapsedMilliseconds, ref phaseTelemetry, adoptedDelta);
+                if (source == AdoptionScanRequestSource.RecoveryAdoption && adoptedDelta == 0 && Executor != null)
+                {
+                    Executor.EmitRecoveryAdoptionZeroDeltaDiagnostics(
+                        ExecutionInstrumentKey,
+                        adoptionScanEpisodeId,
+                        adoptedDelta,
+                        isRecoveryAdoptionScan: true,
+                        GetMismatchTrustedWorkingIntentIds());
+                }
                 if (source == AdoptionScanRequestSource.RecoveryAdoption && recoveryFpOk)
                 {
                     _hasLastRecoveryScanSnapshot = true;
@@ -1208,6 +1218,8 @@ public sealed partial class InstrumentExecutionAuthority
                 if (_lastTryRecoveryAdoptionUtc != DateTimeOffset.MinValue &&
                     (utcNow - _lastTryRecoveryAdoptionUtc).TotalSeconds < TryRecoveryAdoptionMinIntervalSeconds)
                 {
+                    if (source == AdoptionScanRequestSource.RecoveryAdoption)
+                        _pendingRecoveryAdoptionAfterThrottle = true;
                     MaybeLogAdoptionScanRequestSkipped(utcNow, source, AdoptionScanRequestLogOutcome.SkippedThrottled);
                     return new AdoptionScanRequestDispatchResult(AdoptionScanRequestLogOutcome.SkippedThrottled, queueDepthAtDecision: depth);
                 }
@@ -1227,7 +1239,10 @@ public sealed partial class InstrumentExecutionAuthority
             }
 
             if (applyRecoveryThrottle && source == AdoptionScanRequestSource.RecoveryAdoption)
+            {
                 _lastTryRecoveryAdoptionUtc = utcNow;
+                _pendingRecoveryAdoptionAfterThrottle = false;
+            }
 
             MaybeLogExpensivePathThread(utcNow, "RequestAdoptionScan_inline");
             if (source == AdoptionScanRequestSource.RecoveryAdoption)
@@ -1254,6 +1269,8 @@ public sealed partial class InstrumentExecutionAuthority
             if (_lastTryRecoveryAdoptionUtc != DateTimeOffset.MinValue &&
                 (utcNow - _lastTryRecoveryAdoptionUtc).TotalSeconds < TryRecoveryAdoptionMinIntervalSeconds)
             {
+                if (source == AdoptionScanRequestSource.RecoveryAdoption)
+                    _pendingRecoveryAdoptionAfterThrottle = true;
                 MaybeLogAdoptionScanRequestSkipped(utcNow, source, AdoptionScanRequestLogOutcome.SkippedThrottled);
                 return new AdoptionScanRequestDispatchResult(AdoptionScanRequestLogOutcome.SkippedThrottled, queueDepthAtDecision: depth);
             }
@@ -1272,7 +1289,10 @@ public sealed partial class InstrumentExecutionAuthority
         }
 
         if (applyRecoveryThrottle && source == AdoptionScanRequestSource.RecoveryAdoption)
+        {
             _lastTryRecoveryAdoptionUtc = utcNow;
+            _pendingRecoveryAdoptionAfterThrottle = false;
+        }
 
         if (source == AdoptionScanRequestSource.RecoveryAdoption)
         {
@@ -1308,6 +1328,8 @@ public sealed partial class InstrumentExecutionAuthority
     /// </summary>
     private DateTimeOffset _lastTryRecoveryAdoptionUtc = DateTimeOffset.MinValue;
     private const double TryRecoveryAdoptionMinIntervalSeconds = 10.0;
+    private bool _pendingRecoveryAdoptionAfterThrottle;
+    private DateTimeOffset _lastDeferredRecoveryAdoptionFlushUtc = DateTimeOffset.MinValue;
 
     /// <summary>True when adoption retry is pending (heartbeat / execution paths should consider enqueueing a scan).</summary>
     internal bool HasDeferredAdoptionScanPending => _adoptionDeferred;
@@ -1335,30 +1357,104 @@ public sealed partial class InstrumentExecutionAuthority
     }
 
     /// <summary>
-    /// Schedules recovery adoption on the IEA worker. Returns true when a scan was queued, ran inline, or is already queued/running (caller may skip immediate mismatch classification).
-    /// Returns false when recovery throttle rejects a new request. <paramref name="adoptedCountIfRanSynchronously"/> is non-zero only if the scan ran inline on the IEA worker (unusual for engine callers).
+    /// Schedules recovery adoption on the IEA worker. <see cref="ReconciliationScheduleOutcome"/> is execution-only and does not imply the domain problem is solved.
+    /// Use <see cref="ReconciliationScheduleSignals"/> to interpret. <paramref name="adoptedCountIfRanSynchronously"/> is non-zero only when the scan ran inline on the worker.
     /// </summary>
-    public bool TryScheduleRecoveryAdoptionScan(out int adoptedCountIfRanSynchronously)
+    public ReconciliationScheduleOutcome TryScheduleRecoveryAdoptionScan(out int adoptedCountIfRanSynchronously,
+        int? pendingCandidateCountVisibleToRelease = null)
     {
         adoptedCountIfRanSynchronously = 0;
+        var utcProbe = NowEvent();
         var r = RequestAdoptionScan(AdoptionScanRequestSource.RecoveryAdoption, applyRecoveryThrottle: true, postScanOnWorker: null);
         adoptedCountIfRanSynchronously = r.AdoptedDeltaIfInline;
-        var ok = r.Outcome == AdoptionScanRequestLogOutcome.AcceptedAndQueued
-                 || r.Outcome == AdoptionScanRequestLogOutcome.AcceptedInline
-                 || r.Outcome == AdoptionScanRequestLogOutcome.SkippedAlreadyRunning
-                 || r.Outcome == AdoptionScanRequestLogOutcome.SkippedAlreadyQueued;
+        var scheduleOutcome = MapToReconciliationScheduleOutcome(r.Outcome, utcProbe);
+        var gate = _adoptionSingleFlightGate.State;
+        var secSinceAccept = _lastTryRecoveryAdoptionUtc == DateTimeOffset.MinValue
+            ? (double?)null
+            : (utcProbe - _lastTryRecoveryAdoptionUtc).TotalSeconds;
+        var secSinceScan = _lastRecoveryScanCompletedUtc == DateTimeOffset.MinValue
+            ? (double?)null
+            : (utcProbe - _lastRecoveryScanCompletedUtc).TotalSeconds;
+        var wouldPass = _lastTryRecoveryAdoptionUtc == DateTimeOffset.MinValue
+            ? (DateTimeOffset?)null
+            : _lastTryRecoveryAdoptionUtc.AddSeconds(TryRecoveryAdoptionMinIntervalSeconds);
         Log?.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "ADOPTION_RECOVERY_SCHEDULE_PROBE", state: "ENGINE",
             new
             {
                 execution_instrument_key = ExecutionInstrumentKey,
                 iea_instance_id = InstanceId,
+                schedule_outcome = scheduleOutcome.ToString(),
                 outcome = r.Outcome.ToString(),
                 adopted_delta_if_inline = r.AdoptedDeltaIfInline,
                 queue_depth_at_decision = r.QueueDepthAtDecision,
-                schedule_accepted_or_in_flight = ok,
-                note = "Instrumentation only — recovery adoption request decision after gate reconciliation trigger"
+                adoption_work_or_queue_inflight = ReconciliationScheduleSignals.AdoptionWorkOrQueueInflight(scheduleOutcome),
+                new_work_accepted = ReconciliationScheduleSignals.NewWorkAccepted(scheduleOutcome),
+                last_recovery_schedule_accept_utc = _lastTryRecoveryAdoptionUtc == DateTimeOffset.MinValue ? null : _lastTryRecoveryAdoptionUtc.ToString("o"),
+                seconds_since_last_recovery_schedule_accept = secSinceAccept,
+                last_recovery_scan_completed_utc = _lastRecoveryScanCompletedUtc == DateTimeOffset.MinValue ? null : _lastRecoveryScanCompletedUtc.ToString("o"),
+                seconds_since_last_recovery_scan_completed = secSinceScan,
+                last_recovery_adopted_delta = _lastRecoveryScanCompletedUtc == DateTimeOffset.MinValue ? (int?)null : _lastRecoveryScanAdoptedDelta,
+                throttle_interval_sec = TryRecoveryAdoptionMinIntervalSeconds,
+                within_recovery_throttle_window = _lastTryRecoveryAdoptionUtc != DateTimeOffset.MinValue &&
+                    (utcProbe - _lastTryRecoveryAdoptionUtc).TotalSeconds < TryRecoveryAdoptionMinIntervalSeconds,
+                would_pass_throttle_at_utc = wouldPass?.ToString("o"),
+                adoption_gate_state = gate.ToString(),
+                recovery_scan_in_flight = gate == AdoptionScanGateState.Running,
+                recovery_scan_queued = gate == AdoptionScanGateState.Queued,
+                pending_recovery_reschedule_after_throttle = _pendingRecoveryAdoptionAfterThrottle,
+                pending_candidate_count_visible_to_release = pendingCandidateCountVisibleToRelease,
+                pending_candidate_count_visible_to_release_unavailable = pendingCandidateCountVisibleToRelease == null,
+                note = "schedule_outcome is authoritative; adoption_work_or_queue_inflight does not mean mismatch is resolved"
             }));
-        return ok;
+        Log?.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "RECONCILIATION_SCHEDULER_OUTCOME", state: "ENGINE",
+            new
+            {
+                execution_instrument_key = ExecutionInstrumentKey,
+                iea_instance_id = InstanceId,
+                decision_triggered = "RECOVERY_ADOPTION",
+                schedule_outcome = scheduleOutcome.ToString(),
+                throttle_state = scheduleOutcome == ReconciliationScheduleOutcome.THROTTLED ||
+                                   scheduleOutcome == ReconciliationScheduleOutcome.COMPLETED_RECENTLY,
+                in_flight_state = gate.ToString()
+            }));
+        return scheduleOutcome;
+    }
+
+    private ReconciliationScheduleOutcome MapToReconciliationScheduleOutcome(AdoptionScanRequestLogOutcome o, DateTimeOffset utcNow)
+    {
+        switch (o)
+        {
+            case AdoptionScanRequestLogOutcome.AcceptedAndQueued:
+            case AdoptionScanRequestLogOutcome.AcceptedInline:
+                return ReconciliationScheduleOutcome.ACCEPTED;
+            case AdoptionScanRequestLogOutcome.SkippedAlreadyRunning:
+                return ReconciliationScheduleOutcome.ALREADY_RUNNING;
+            case AdoptionScanRequestLogOutcome.SkippedAlreadyQueued:
+                return ReconciliationScheduleOutcome.ALREADY_QUEUED;
+            case AdoptionScanRequestLogOutcome.SkippedThrottled:
+                if (_lastRecoveryScanCompletedUtc != DateTimeOffset.MinValue &&
+                    (utcNow - _lastRecoveryScanCompletedUtc).TotalSeconds < TryRecoveryAdoptionMinIntervalSeconds)
+                    return ReconciliationScheduleOutcome.COMPLETED_RECENTLY;
+                return ReconciliationScheduleOutcome.THROTTLED;
+            default:
+                return ReconciliationScheduleOutcome.SKIPPED;
+        }
+    }
+
+    partial void MaybeDeferredRecoveryAdoptionFlushAfterWorkItem()
+    {
+        if (!_pendingRecoveryAdoptionAfterThrottle)
+            return;
+        if (_adoptionSingleFlightGate.State != AdoptionScanGateState.Idle)
+            return;
+        var utc = NowEvent();
+        if (_lastDeferredRecoveryAdoptionFlushUtc != DateTimeOffset.MinValue &&
+            (utc - _lastDeferredRecoveryAdoptionFlushUtc).TotalSeconds < TryRecoveryAdoptionMinIntervalSeconds)
+            return;
+        _pendingRecoveryAdoptionAfterThrottle = false;
+        var r = RequestAdoptionScan(AdoptionScanRequestSource.RecoveryAdoption, applyRecoveryThrottle: false, postScanOnWorker: null);
+        if (r.Outcome == AdoptionScanRequestLogOutcome.AcceptedAndQueued || r.Outcome == AdoptionScanRequestLogOutcome.AcceptedInline)
+            _lastDeferredRecoveryAdoptionFlushUtc = utc;
     }
 
     /// <summary>Run adoption for late recovery (reconciliation). Prefer <see cref="TryScheduleRecoveryAdoptionScan"/> for engine paths; this returns adopted count only when the scan ran synchronously on the worker.</summary>

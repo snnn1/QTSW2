@@ -986,11 +986,19 @@ class WatchdogAggregator:
                         else:
                             result = "Loss"
                     elif exit_type == "FLATTEN":
-                        # FLATTEN: infer from P&L
-                        pnl_val = float(r.get("realized_pnl") or r.get("realized_pnl_net") or r.get("realized_pnl_gross") or 0)
+                        # FLATTEN: infer from P&L (authoritative first, else inferred estimate)
+                        _rp = r.get("realized_pnl")
+                        _ri = r.get("realized_pnl_inferred")
+                        pnl_val = float(
+                            _rp if _rp is not None else (_ri if _ri is not None else r.get("realized_pnl_net") or r.get("realized_pnl_gross") or 0)
+                        )
                         result = "Win" if pnl_val > 2 else ("Loss" if pnl_val < -2 else "BE")
                     else:
-                        pnl_val = float(r.get("realized_pnl") or r.get("realized_pnl_net") or r.get("realized_pnl_gross") or 0)
+                        _rp = r.get("realized_pnl")
+                        _ri = r.get("realized_pnl_inferred")
+                        pnl_val = float(
+                            _rp if _rp is not None else (_ri if _ri is not None else r.get("realized_pnl_net") or r.get("realized_pnl_gross") or 0)
+                        )
                         result = "Win" if pnl_val > 2 else ("Loss" if pnl_val < -2 else "BE")
                     trades.append({
                         "intent_id": r.get("intent_id"),
@@ -1000,6 +1008,9 @@ class WatchdogAggregator:
                         "entry_qty": r.get("entry_qty"),
                         "exit_qty": r.get("exit_qty", 0),
                         "realized_pnl": r.get("realized_pnl"),
+                        "realized_pnl_inferred": r.get("realized_pnl_inferred"),
+                        "pnl_authority": r.get("pnl_authority"),
+                        "exit_price_source": r.get("exit_price_source"),
                         "costs_allocated": r.get("costs_allocated", 0),
                         "status": r.get("status"),
                         "exit_order_type": exit_type,

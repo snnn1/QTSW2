@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -66,6 +67,21 @@ public sealed class StateConsistencyReleaseEvaluationInput
     /// </summary>
     public int PendingAdoptionCandidateCount { get; set; }
 
+    /// <summary>
+    /// Subset of <see cref="PendingAdoptionCandidateCount"/> that recovery adoption is designed to clear
+    /// (<see cref="ReleaseAdoptionDisposition.AdoptableAndRetryable"/>). When diagnostics are unavailable, mirrors raw count.
+    /// </summary>
+    public int AdoptablePendingAdoptionCandidateCount { get; set; }
+
+    /// <summary>Optional per-candidate classification (PR2/PR3). Null when engine did not run journal diagnostics pass.</summary>
+    public IReadOnlyList<ReleaseBlockingCandidateDiagnostic>? BlockingCandidateDiagnostics { get; set; }
+
+    /// <summary>Canonical blocker list (classification layer). Preferred over raw pending counts.</summary>
+    public IReadOnlyList<ReconciliationBlocker>? ReconciliationBlockers { get; set; }
+
+    /// <summary>Fingerprint for redundancy suppression (from <see cref="ReconciliationBlockerFingerprint"/>).</summary>
+    public long ReconciliationBlockersFingerprint { get; set; }
+
     /// <summary>64-bit sorted blocking adoption intent set surrogate (release suppression; not logged as raw ids).</summary>
     public long BlockingAdoptionIntentSetHash { get; set; }
 
@@ -104,6 +120,18 @@ public sealed class StateConsistencyReleaseReadinessResult
     public int DiagnosticBrokerWorkingCount { get; set; }
     public int DiagnosticIeaOwnedPlusAdoptedWorking { get; set; }
     public int DiagnosticPendingAdoptionCandidateCount { get; set; }
+
+    /// <summary>Count of blockers whose domain decision is <see cref="ReconciliationDecision.ADOPT"/>.</summary>
+    public int DiagnosticAdoptDecisionCount { get; set; }
+
+    /// <summary>True when blocker list could not be fully resolved (fail-closed signal).</summary>
+    public bool BlockerInvariantViolation { get; set; }
+
+    /// <summary>Per-blocker domain decisions (for audits).</summary>
+    public IReadOnlyList<(ReconciliationBlocker Blocker, ReconciliationDecision Decision)>? ResolvedBlockers { get; set; }
+
+    /// <summary>True when pending-adoption counts exist but classifier produced no diagnostics/blockers (modeling gap).</summary>
+    public bool LegacyClassifierGap { get; set; }
 }
 
 /// <summary>P1.5-E: Structured result after an instrument-scoped gate reconciliation pass.</summary>
@@ -142,10 +170,76 @@ public static class StateConsistencyReleaseEvaluator
             return r;
         }
 
-        var pending = i.PendingAdoptionCandidateCount > 0;
-        r.PendingAdoptionExists = pending;
-        if (pending)
-            r.Contradictions.Add("pending_adoption_candidates");
+        var utcSynth = DateTimeOffset.UtcNow;
+        IReadOnlyList<ReconciliationBlocker>? blockers = i.ReconciliationBlockers;
+        if (blockers == null && i.BlockingCandidateDiagnostics != null && i.BlockingCandidateDiagnostics.Count > 0)
+        {
+            blockers = i.BlockingCandidateDiagnostics
+                .Where(d => d.BlocksRelease)
+                .Select(d => ReconciliationBlockerFactory.FromDiagnostic(d, utcSynth))
+                .ToList();
+        }
+
+        IReadOnlyList<(ReconciliationBlocker Blocker, ReconciliationDecision Decision)> resolved =
+            ReconciliationDecisionResolver.ResolveAll(blockers, utcSynth);
+        r.ResolvedBlockers = resolved;
+
+        if (!ReconciliationDecisionResolver.ValidateAllBlockersResolved(blockers, resolved, out var invErr) ||
+            invErr != null)
+        {
+            r.BlockerInvariantViolation = true;
+            r.Contradictions.Add($"blocker_invariant:{invErr ?? "unresolved"}");
+        }
+
+        var adoptCount = resolved.Count(x => x.Decision == ReconciliationDecision.ADOPT);
+        r.DiagnosticAdoptDecisionCount = adoptCount;
+        r.PendingAdoptionExists = adoptCount > 0;
+        if (r.PendingAdoptionExists)
+            r.Contradictions.Add("pending_adoption_adopt_decision");
+
+        foreach (var x in resolved)
+        {
+            var b = x.Blocker;
+            var d = x.Decision;
+            switch (d)
+            {
+                case ReconciliationDecision.ESCALATE:
+                    if (ReconciliationDecisionResolver.IsTransientRetryExhausted(b, utcSynth))
+                        r.Contradictions.Add($"blocker_escalate_transient_retry_exhaustion:{b.ReasonCode}:{b.IntentId}");
+                    else
+                        r.Contradictions.Add($"blocker_escalate:{b.ReasonCode}:{b.IntentId}");
+                    break;
+                case ReconciliationDecision.ALTERNATE_LANE:
+                    r.Contradictions.Add(
+                        $"blocker_alternate_lane:{b.ReasonCode}:{b.IntentId}:lane={(int)b.LaneType}:owner={b.ResolutionOwner}:terminal={b.IsTerminal?.ToString() ?? "unknown"}");
+                    break;
+                case ReconciliationDecision.ADOPT:
+                    r.Contradictions.Add($"blocker_adopt:{b.ReasonCode}:{b.IntentId}");
+                    break;
+                case ReconciliationDecision.RETRY:
+                    r.Contradictions.Add($"blocker_retry:{b.ReasonCode}:{b.IntentId}");
+                    break;
+            }
+        }
+
+        static bool BlocksReleaseByDecision(ReconciliationDecision d) =>
+            d is ReconciliationDecision.ADOPT
+                or ReconciliationDecision.RETRY
+                or ReconciliationDecision.ESCALATE
+                or ReconciliationDecision.ALTERNATE_LANE;
+
+        var legacyClassifierGap = (blockers == null || blockers.Count == 0) &&
+                                  (i.BlockingCandidateDiagnostics == null ||
+                                   i.BlockingCandidateDiagnostics.Count == 0) &&
+                                  i.PendingAdoptionCandidateCount > 0;
+        r.LegacyClassifierGap = legacyClassifierGap;
+        var hasStructuralBlocker = resolved.Any(x => BlocksReleaseByDecision(x.Decision)) || legacyClassifierGap;
+        if (legacyClassifierGap)
+        {
+            r.Contradictions.Add("release_blocker_legacy_count_without_classifier");
+            if (i.AdoptablePendingAdoptionCandidateCount > 0)
+                r.PendingAdoptionExists = true;
+        }
 
         var ieaOk = i.IeaOwnedPlusAdoptedWorking >= 0;
         if (!ieaOk && i.UseInstrumentExecutionAuthority)
@@ -166,7 +260,9 @@ public static class StateConsistencyReleaseEvaluator
         var unexplainedW = ieaOk ? Math.Max(0, i.BrokerWorkingCount - ieaWorking) : i.BrokerWorkingCount;
         r.UnexplainedBrokerWorkingCount = unexplainedW;
 
-        if (i.BrokerWorkingCount > 0 && ieaWorking == 0 && !pending && ieaOk)
+        var adoptOrRetryPending = resolved.Any(x =>
+            x.Decision is ReconciliationDecision.ADOPT or ReconciliationDecision.RETRY);
+        if (i.BrokerWorkingCount > 0 && ieaWorking == 0 && !adoptOrRetryPending && ieaOk)
         {
             r.Contradictions.Add("broker_working_without_iea_coverage");
             r.LocalStateCoherent = false;
@@ -176,10 +272,13 @@ public static class StateConsistencyReleaseEvaluator
         if (!r.BrokerWorkingExplainable && ieaOk)
             r.Contradictions.Add($"unexplained_working_{unexplainedW}");
 
-        r.IsExplainable = r.BrokerPositionExplainable && r.BrokerWorkingExplainable && r.LocalStateCoherent && !pending &&
+        r.IsExplainable = r.BrokerPositionExplainable && r.BrokerWorkingExplainable && r.LocalStateCoherent &&
                           r.UnexplainedBrokerPositionQty == 0 && r.UnexplainedBrokerWorkingCount == 0;
 
-        r.ReleaseReady = r.IsExplainable && !pending;
+        if (r.BlockerInvariantViolation)
+            r.IsExplainable = false;
+
+        r.ReleaseReady = r.IsExplainable && !hasStructuralBlocker && !r.BlockerInvariantViolation;
         r.Summary = r.ReleaseReady
             ? "release_ready"
             : string.Join(";", r.Contradictions);
@@ -189,7 +288,8 @@ public static class StateConsistencyReleaseEvaluator
         r.DiagnosticJournalOpenQty = i.JournalOpenQty;
         r.DiagnosticBrokerWorkingCount = i.BrokerWorkingCount;
         r.DiagnosticIeaOwnedPlusAdoptedWorking = i.IeaOwnedPlusAdoptedWorking;
-        r.DiagnosticPendingAdoptionCandidateCount = i.PendingAdoptionCandidateCount;
+        r.DiagnosticPendingAdoptionCandidateCount = adoptCount;
+        r.DiagnosticAdoptDecisionCount = adoptCount;
         return r;
     }
 

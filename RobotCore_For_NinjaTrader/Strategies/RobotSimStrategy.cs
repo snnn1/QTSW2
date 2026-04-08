@@ -460,6 +460,58 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // Strategy will continue but may not function properly
                     Log("WARNING: Continuing despite trading date not locked - strategy may not function properly", LogLevel.Warning);
                 }
+                TraceLifecycle("DataLoaded_BEFORE_EXECUTION_CONTEXT_WIRE", engineInstrumentName, "DataLoaded");
+
+                // Wire NT + SIM verify BEFORE queuing background BarsRequest. Otherwise LoadPreHydrationBars can run on a
+                // thread-pool worker and feed streams (RANGE_LOCKED / bracket retry) before SetNTContext completes.
+                if (_engine != null)
+                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "DATALOADED_WIRE_STARTING", new Dictionary<string, object> { { "instrument", Instrument?.MasterInstrument?.Name ?? "" }, { "note", "About to call WireNTContextToAdapter()" } });
+                TraceLifecycle("DataLoaded_BEFORE_WIRE", Instrument?.MasterInstrument?.Name, "DataLoaded");
+                try
+                {
+                    WireNTContextToAdapter();
+                }
+                catch (Exception ex)
+                {
+                    Log($"CRITICAL: Failed to wire NT context to adapter: {ex.Message}. Strategy will not function properly.", LogLevel.Error);
+                    Log($"Exception details: {ex.GetType().Name} - {ex.StackTrace}", LogLevel.Error);
+                    if (_engine != null)
+                    {
+                        try
+                        {
+                            _engine.LogEngineEvent(DateTimeOffset.UtcNow, "DATALOADED_WIRE_FAILED", new Dictionary<string, object>
+                            {
+                                { "instrument", Instrument?.MasterInstrument?.Name ?? "" },
+                                { "exception_type", ex.GetType().Name },
+                                { "exception_message", ex.Message },
+                                { "stack_trace", ex.StackTrace ?? "" },
+                                { "note", "WireNTContextToAdapter threw - strategy will not function" }
+                            });
+                        }
+                        catch { /* ignore */ }
+                    }
+                    return;
+                }
+                if (_engine != null)
+                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "DATALOADED_WIRE_DONE", new Dictionary<string, object> { { "instrument", Instrument?.MasterInstrument?.Name ?? "" }, { "note", "WireNTContextToAdapter completed" } });
+                TraceLifecycle("DataLoaded_WIRE_DONE", Instrument?.MasterInstrument?.Name, "DataLoaded");
+
+                _engineReady = true;
+                TraceLifecycle("DataLoaded_ENGINE_READY_TRUE", Instrument?.MasterInstrument?.Name, "DataLoaded");
+                var instrumentName = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+                Log($"Engine ready (execution context wired) - proceeding to BarsRequest. Instrument={instrumentName}, EngineReady={_engineReady}, InitFailed={_initFailed}", LogLevel.Information);
+
+                if (_engine != null)
+                {
+                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "DATALOADED_INITIALIZATION_COMPLETE", new Dictionary<string, object>
+                    {
+                        { "instrument", instrumentName },
+                        { "engine_ready", _engineReady },
+                        { "init_failed", _initFailed },
+                        { "note", "DataLoaded: execution context ready — BarsRequest may run; OnBarUpdate allowed" }
+                    });
+                }
+
                 TraceLifecycle("DataLoaded_BEFORE_BARSREQUEST", engineInstrumentName, "DataLoaded");
 
                 // CRITICAL FIX: Request bars for ALL execution instruments from enabled streams (State.DataLoaded, not Configure).
@@ -622,64 +674,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
 
                 if (_engine != null)
-                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "DATALOADED_BARSREQUEST_DONE", new Dictionary<string, object> { { "instrument", Instrument?.MasterInstrument?.Name ?? "" }, { "note", "BarsRequest block finished - proceeding to WireNTContext" } });
+                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "DATALOADED_BARSREQUEST_DONE", new Dictionary<string, object> { { "instrument", Instrument?.MasterInstrument?.Name ?? "" }, { "note", "BarsRequest block finished (execution context was wired before BarsRequest was queued)" } });
                 TraceLifecycle("DataLoaded_AFTER_BARSREQUEST", Instrument?.MasterInstrument?.Name, "DataLoaded");
-
-                // Get the adapter instance and wire NT context
-                // Note: This requires exposing adapter from engine or using dependency injection
-                // For now, we'll wire events directly to adapter via reflection or adapter registration
-                if (_engine != null)
-                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "DATALOADED_WIRE_STARTING", new Dictionary<string, object> { { "instrument", Instrument?.MasterInstrument?.Name ?? "" }, { "note", "About to call WireNTContextToAdapter()" } });
-                TraceLifecycle("DataLoaded_BEFORE_WIRE", Instrument?.MasterInstrument?.Name, "DataLoaded");
-                try
-                {
-                    WireNTContextToAdapter();
-                }
-                catch (Exception ex)
-                {
-                    // CRITICAL FIX: Catch exceptions during adapter wiring to prevent strategy from hanging
-                    Log($"CRITICAL: Failed to wire NT context to adapter: {ex.Message}. Strategy will not function properly.", LogLevel.Error);
-                    Log($"Exception details: {ex.GetType().Name} - {ex.StackTrace}", LogLevel.Error);
-                    if (_engine != null)
-                    {
-                        try
-                        {
-                            _engine.LogEngineEvent(DateTimeOffset.UtcNow, "DATALOADED_WIRE_FAILED", new Dictionary<string, object>
-                            {
-                                { "instrument", Instrument?.MasterInstrument?.Name ?? "" },
-                                { "exception_type", ex.GetType().Name },
-                                { "exception_message", ex.Message },
-                                { "stack_trace", ex.StackTrace ?? "" },
-                                { "note", "WireNTContextToAdapter threw - strategy will not function" }
-                            });
-                        }
-                        catch { /* ignore */ }
-                    }
-                    // Don't set _engineReady = true, preventing further execution
-                    return;
-                }
-                if (_engine != null)
-                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "DATALOADED_WIRE_DONE", new Dictionary<string, object> { { "instrument", Instrument?.MasterInstrument?.Name ?? "" }, { "note", "WireNTContextToAdapter completed" } });
-                TraceLifecycle("DataLoaded_WIRE_DONE", Instrument?.MasterInstrument?.Name, "DataLoaded");
-                
-                // ENGINE_READY latch: Set once when all initialization is complete
-                // This flag guards all execution paths to simplify reasoning and reduce repetition
-                _engineReady = true;
-                TraceLifecycle("DataLoaded_ENGINE_READY_TRUE", Instrument?.MasterInstrument?.Name, "DataLoaded");
-                var instrumentName = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
-                Log($"Engine ready - all initialization complete. Instrument={instrumentName}, EngineReady={_engineReady}, InitFailed={_initFailed}", LogLevel.Information);
-                
-                // DIAGNOSTIC: Log initialization completion to help diagnose "stuck in loading" issues
-                if (_engine != null)
-                {
-                    _engine.LogEngineEvent(DateTimeOffset.UtcNow, "DATALOADED_INITIALIZATION_COMPLETE", new Dictionary<string, object>
-                    {
-                        { "instrument", instrumentName },
-                        { "engine_ready", _engineReady },
-                        { "init_failed", _initFailed },
-                        { "note", "DataLoaded initialization complete - strategy ready to transition to Realtime state" }
-                    });
-                }
                 }
                 catch (Exception ex)
                 {

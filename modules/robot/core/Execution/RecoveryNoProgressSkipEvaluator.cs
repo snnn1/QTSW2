@@ -45,7 +45,8 @@ internal readonly struct RecoveryNoProgressSkipDiagnosticSnapshot
 }
 
 /// <summary>
-/// Pure logic for recovery adoption no-progress short-circuit. Fail-safe: any uncertainty → do not skip.
+/// Pure logic for recovery adoption no-progress short-circuit (IEA scheduling / adoption scan path — not journal parity).
+/// Fail-safe: any uncertainty → do not skip. Distinct from mismatch-sweep and family views; see docs/robot/contracts/BROKER_QUANTITY_VIEWS.md.
 /// </summary>
 internal static class RecoveryNoProgressSkipEvaluator
 {

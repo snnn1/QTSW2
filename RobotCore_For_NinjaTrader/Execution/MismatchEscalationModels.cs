@@ -7,6 +7,21 @@ using System.Linq;
 
 namespace QTSW2.Robot.Core.Execution;
 
+/// <summary>
+/// Policy when <see cref="MismatchType.STRUCTURAL_MULTI_INTENT"/> is present — not informational-only; controls enforcement beyond logging.
+/// </summary>
+public enum StructuralMultiIntentPolicy
+{
+    /// <summary>Observe + gate telemetry only (default).</summary>
+    Allow,
+
+    /// <summary>Block new risk on the instrument (stand down streams / freeze).</summary>
+    BlockNewEntries,
+
+    /// <summary>Request reconciliation convergence toward broker (e.g. gate recovery pass); does not replace broker truth.</summary>
+    AutoOffsetRequest
+}
+
 /// <summary>Explicit mismatch categories. Do not collapse into one generic mismatch.</summary>
 public enum MismatchType
 {
@@ -16,8 +31,20 @@ public enum MismatchType
     /// <summary>Local journal/intent state claims exposure or progress that broker state does not support.</summary>
     JOURNAL_AHEAD,
 
-    /// <summary>Broker quantity and reconstructed local quantity differ (both nonzero).</summary>
-    POSITION_QTY_MISMATCH,
+    /// <summary>Signed net broker position ≠ signed net journal (open rows); fail-closed eligible.</summary>
+    NET_POSITION_MISMATCH,
+
+    /// <summary>Gross journal open sum ≠ broker abs position sum, but signed nets agree (e.g. view mismatch, not missing exposure).</summary>
+    GROSS_POSITION_DIVERGENCE,
+
+    /// <summary>Multiple opposing open intents on the same execution instrument (structural multi-stream exposure).</summary>
+    STRUCTURAL_MULTI_INTENT,
+
+    /// <summary>
+    /// Journal net is flat (signed net 0) but gross open quantity &gt; 0 (hedged offsetting rows). Aggregates may still
+    /// align with broker — use for monitoring / convergence; not fail-closed by itself.
+    /// </summary>
+    HEDGED_NET_FLAT_GROSS_OPEN,
 
     /// <summary>Broker working order exists but local registry/order map does not reliably own or classify it.</summary>
     ORDER_REGISTRY_MISSING,
@@ -54,8 +81,17 @@ public sealed class MismatchObservation
     public MismatchType MismatchType { get; set; }
     public bool Present { get; set; }
     public string? Summary { get; set; }
+    /// <summary>
+    /// Sum of abs(position qty) per broker snapshot row — <b>diagnostics / display only</b>. Not canonical for safety
+    /// decisions (multiple rows, netting, platform aggregation). Prefer <see cref="NetBrokerQty"/> for net truth.
+    /// </summary>
     public int BrokerQty { get; set; }
+    /// <summary>Gross sum of remaining open quantity across journal rows (same as structural <c>OpenQtySum</c>).</summary>
     public int LocalQty { get; set; }
+    /// <summary>Signed net position from broker snapshot rows — use for net safety comparisons.</summary>
+    public int NetBrokerQty { get; set; }
+    /// <summary>Signed net from open journal rows (direction × remaining).</summary>
+    public int NetJournalQty { get; set; }
     public int BrokerWorkingOrderCount { get; set; }
     public int LocalWorkingOrderCount { get; set; }
     /// <summary>Open journal rows (intents) for this instrument keys; for audit "journal_orders".</summary>
@@ -198,6 +234,11 @@ public static class MismatchEscalationPolicy
     public const int MISMATCH_AUDIT_MANDATORY_MAX_GAP_MS = 90_000;
     public const int MISMATCH_PERSISTENT_THRESHOLD_MS = 10000;
     public const int MISMATCH_FAIL_CLOSED_THRESHOLD_MS = 30000;
+
+    /// <summary>
+    /// When <see cref="MismatchType.HEDGED_NET_FLAT_GROSS_OPEN"/> persists, escalate (monitor + optional gate recovery), not fail-closed.
+    /// </summary>
+    public const int HEDGED_NET_FLAT_CONVERGENCE_ESCALATION_MS = 60_000;
     public const int MISMATCH_CLEAR_CONSECUTIVE_CLEAN_PASSES = 2;
     public const int MISMATCH_MAX_RETRIES = 3;
 
@@ -473,7 +514,10 @@ public static class GateProgressEvaluator
     {
         MismatchType.BROKER_AHEAD => 10,
         MismatchType.JOURNAL_AHEAD => 20,
-        MismatchType.POSITION_QTY_MISMATCH => 30,
+        MismatchType.NET_POSITION_MISMATCH => 30,
+        MismatchType.GROSS_POSITION_DIVERGENCE => 28,
+        MismatchType.STRUCTURAL_MULTI_INTENT => 27,
+        MismatchType.HEDGED_NET_FLAT_GROSS_OPEN => 26,
         MismatchType.ORDER_REGISTRY_MISSING => 40,
         MismatchType.PROTECTIVE_STATE_DIVERGENCE => 35,
         MismatchType.UNKNOWN_EXECUTION_PERSISTENT => 50,

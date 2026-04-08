@@ -80,4 +80,18 @@ public sealed class ReplayExecutor : IIEAOrderExecutor
 
     public (string JournalDir, int FileCount, bool DirectoryExists) GetJournalDiagnostics(string? executionInstrument) =>
         ("", 0, false);
+
+    public void EmitRecoveryAdoptionZeroDeltaDiagnostics(
+        string executionInstrumentKey,
+        string adoptionScanEpisodeId,
+        int adoptedDelta,
+        bool isRecoveryAdoptionScan,
+        IReadOnlyCollection<string>? registryMismatchTrustedIntentIds)
+    {
+        _ = executionInstrumentKey;
+        _ = adoptionScanEpisodeId;
+        _ = adoptedDelta;
+        _ = isRecoveryAdoptionScan;
+        _ = registryMismatchTrustedIntentIds;
+    }
 }

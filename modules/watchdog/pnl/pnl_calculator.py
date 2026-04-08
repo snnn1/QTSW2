@@ -9,6 +9,10 @@ from typing import Dict, Optional, Any, List
 
 logger = logging.getLogger(__name__)
 
+# Exit prices from these sources are treated as broker/log-attested for Daily Journal "authoritative" P&L.
+# TARGET_STOP / ENTRY_FALLBACK / NO_EXIT_PRICE: may still yield a computed $ number for debugging only.
+AUTHORITATIVE_EXIT_PRICE_SOURCES = frozenset({"EXIT_FILLS", "JOURNAL_EXIT_AVG"})
+
 # Single source of truth for contract multipliers
 # Full-size contracts
 INSTRUMENT_MULTIPLIERS = {
@@ -82,9 +86,10 @@ def compute_intent_realized_pnl(ledger_row: Dict[str, Any]) -> Dict[str, Any]:
     
     Returns:
         Updated ledger_row with calculated fields:
-        - gross_pnl, realized_pnl, costs_allocated
-        - status (OPEN/PARTIAL/CLOSED)
-        - pnl_confidence (HIGH/MEDIUM/LOW)
+        - gross_pnl, costs_allocated, status (OPEN/PARTIAL/CLOSED), pnl_confidence
+        - realized_pnl: authoritative realized $ only (None when estimate is from target/stop/entry proxy)
+        - realized_pnl_inferred: model estimate when exit economics are not log/journal-attested (else None)
+        - pnl_authority: JOURNAL_NET | EXIT_ECONOMICS | INFERRED | NONE
     """
     entry_price = ledger_row.get("entry_price")
     entry_qty = ledger_row.get("entry_qty")
@@ -127,11 +132,14 @@ def compute_intent_realized_pnl(ledger_row: Dict[str, Any]) -> Dict[str, Any]:
     trade_completed = ledger_row.get("trade_completed", False)
     journal_realized_gross = ledger_row.get("realized_pnl_gross")
     journal_realized_net = ledger_row.get("realized_pnl_net")
+    exit_price_source = ledger_row.get("exit_price_source") or "NONE"
 
     # Only calculate realized P&L if exits exist
     if status == "OPEN" or avg_exit_price is None or exit_qty == 0:
         ledger_row["gross_pnl"] = None
         ledger_row["realized_pnl"] = None
+        ledger_row["realized_pnl_inferred"] = None
+        ledger_row["pnl_authority"] = "NONE"
         ledger_row["costs_allocated"] = 0.0
         # Keep pnl_confidence from ledger builder if set, otherwise LOW for OPEN
         if "pnl_confidence" not in ledger_row:
@@ -143,6 +151,8 @@ def compute_intent_realized_pnl(ledger_row: Dict[str, Any]) -> Dict[str, Any]:
         ledger_row["gross_pnl"] = float(journal_realized_gross) if journal_realized_gross is not None else None
         ledger_row["costs_allocated"] = total_costs  # Journal net = gross - costs
         ledger_row["realized_pnl"] = float(journal_realized_net)
+        ledger_row["realized_pnl_inferred"] = None
+        ledger_row["pnl_authority"] = "JOURNAL_NET"
     else:
         # Calculate gross P&L
         price_diff = avg_exit_price - entry_price
@@ -169,7 +179,14 @@ def compute_intent_realized_pnl(ledger_row: Dict[str, Any]) -> Dict[str, Any]:
 
         # Calculate realized P&L
         realized_pnl = gross_pnl - costs_allocated
-        ledger_row["realized_pnl"] = realized_pnl
+        if exit_price_source in AUTHORITATIVE_EXIT_PRICE_SOURCES:
+            ledger_row["realized_pnl"] = realized_pnl
+            ledger_row["realized_pnl_inferred"] = None
+            ledger_row["pnl_authority"] = "EXIT_ECONOMICS"
+        else:
+            ledger_row["realized_pnl"] = None
+            ledger_row["realized_pnl_inferred"] = realized_pnl
+            ledger_row["pnl_authority"] = "INFERRED"
     
     # Set pnl_confidence if not already set (ledger builder may have set it)
     if "pnl_confidence" not in ledger_row:
@@ -185,7 +202,7 @@ def aggregate_stream_pnl(ledger_rows: List[Dict[str, Any]], stream: str) -> Dict
     Returns:
     {
         "stream": str,
-        "realized_pnl": float,  # Sum of closed/partial intents only
+        "realized_pnl": float,  # Sum of authoritative realized_pnl only (excludes inferred estimates)
         "open_positions": int,
         "total_costs_realized": float,  # Only allocated costs for CLOSED/PARTIAL
         "intent_count": int,

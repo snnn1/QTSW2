@@ -251,6 +251,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     /// <summary>Stable executor id for investigation logs (matches flatten coordination prefix).</summary>
     public int InvestigationAdapterInstanceId => _adapterInstanceId;
 
+    /// <inheritdoc />
+    public bool IsExecutionContextReady => _ntContextSet && _simAccountVerified;
+
     /// <summary>Set strategy instance id for RUNTIME_FINGERPRINT / EXECUTOR_REBOUND correlation. Call before SetNTContext.</summary>
     public void SetInvestigationRuntimeContext(string? strategyInstanceId) =>
         _strategyInstanceIdForAudit = string.IsNullOrWhiteSpace(strategyInstanceId) ? null : strategyInstanceId.Trim();

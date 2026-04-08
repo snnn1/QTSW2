@@ -59,6 +59,29 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def _final_allowed_matrix_true(val: Any) -> bool:
+    """
+    True when master matrix explicitly allows the stream for the target day.
+
+    Parquet/pandas exposes ``final_allowed`` as :class:`numpy.bool_`, which is not the
+    Python ``True`` singleton — ``val is True`` incorrectly rejects allowed rows and
+    produces misleading ``master_matrix_filtered_True`` block reasons. Use value
+    semantics, not identity.
+    """
+    if val is True:
+        return True
+    if val is False:
+        return False
+    try:
+        if pd.isna(val):
+            return False
+    except (TypeError, ValueError):
+        pass
+    if isinstance(val, (bool, np.bool_)):
+        return bool(val) is True
+    return False
+
+
 def eligibility_trade_date_ymd_from_matrix_df(master_matrix_df: pd.DataFrame) -> Optional[str]:
     """
     Latest ``trade_date`` in the master matrix (YYYY-MM-DD): written as ``eligibility_trade_date``
@@ -1686,7 +1709,7 @@ class TimetableEngine:
                 if not current_day_row.empty:
                     final_allowed = current_day_row.iloc[0].get('final_allowed')
                     # If final_allowed is False/NaN/None, mark as blocked
-                    if final_allowed is not True:
+                    if not _final_allowed_matrix_true(final_allowed):
                         enabled = False
                         block_reason = f"master_matrix_filtered_{final_allowed}"
             else:

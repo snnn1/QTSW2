@@ -72,10 +72,10 @@ public static class MismatchEscalationTests
             isFlattenInProgress: _ => false,
             isRecoveryInProgress: _ => false,
             log: null);
-        coord2.ProcessObservationForTest(new MismatchObservation { Instrument = "NQ", MismatchType = MismatchType.JOURNAL_AHEAD, Present = true, BrokerQty = 0, LocalQty = 1, ObservedUtc = utcNow });
+        coord2.ProcessObservationForTest(new MismatchObservation { Instrument = "NQ", MismatchType = MismatchType.NET_POSITION_MISMATCH, Present = true, BrokerQty = 2, LocalQty = 1, NetBrokerQty = 2, NetJournalQty = 1, ObservedUtc = utcNow });
         var t2 = utcNow.AddMilliseconds(MismatchEscalationPolicy.MISMATCH_FAIL_CLOSED_THRESHOLD_MS + 100);
-        coord2.ProcessObservationForTest(new MismatchObservation { Instrument = "NQ", MismatchType = MismatchType.JOURNAL_AHEAD, Present = true, BrokerQty = 0, LocalQty = 1, ObservedUtc = utcNow.AddMilliseconds(MismatchEscalationPolicy.MISMATCH_PERSISTENT_THRESHOLD_MS + 100) });
-        coord2.ProcessObservationForTest(new MismatchObservation { Instrument = "NQ", MismatchType = MismatchType.JOURNAL_AHEAD, Present = true, BrokerQty = 0, LocalQty = 1, ObservedUtc = t2 });
+        coord2.ProcessObservationForTest(new MismatchObservation { Instrument = "NQ", MismatchType = MismatchType.NET_POSITION_MISMATCH, Present = true, BrokerQty = 2, LocalQty = 1, NetBrokerQty = 2, NetJournalQty = 1, ObservedUtc = utcNow.AddMilliseconds(MismatchEscalationPolicy.MISMATCH_PERSISTENT_THRESHOLD_MS + 100) });
+        coord2.ProcessObservationForTest(new MismatchObservation { Instrument = "NQ", MismatchType = MismatchType.NET_POSITION_MISMATCH, Present = true, BrokerQty = 2, LocalQty = 1, NetBrokerQty = 2, NetJournalQty = 1, ObservedUtc = t2 });
         state = coord2.GetStateForTest("NQ");
         if (state?.EscalationState != MismatchEscalationState.FAIL_CLOSED)
             return (false, $"After fail-closed threshold: expected FAIL_CLOSED, got {state?.EscalationState}");
@@ -89,7 +89,7 @@ public static class MismatchEscalationTests
             isFlattenInProgress: _ => false,
             isRecoveryInProgress: _ => false,
             log: null);
-        coord3.ProcessObservationForTest(new MismatchObservation { Instrument = "RTY", MismatchType = MismatchType.POSITION_QTY_MISMATCH, Present = true, BrokerQty = 2, LocalQty = 1, ObservedUtc = utcNow });
+        coord3.ProcessObservationForTest(new MismatchObservation { Instrument = "RTY", MismatchType = MismatchType.NET_POSITION_MISMATCH, Present = true, BrokerQty = 2, LocalQty = 1, NetBrokerQty = 2, NetJournalQty = 1, ObservedUtc = utcNow });
         coord3.ProcessCleanPassForTest("RTY", utcNow.AddSeconds(1));
         coord3.ProcessCleanPassForTest("RTY", utcNow.AddSeconds(2));
         state = coord3.GetStateForTest("RTY");
@@ -135,10 +135,10 @@ public static class MismatchEscalationTests
             isFlattenInProgress: _ => false,
             isRecoveryInProgress: _ => false,
             log: null);
-        coord5.ProcessObservationForTest(new MismatchObservation { Instrument = "CL", MismatchType = MismatchType.POSITION_QTY_MISMATCH, Present = true, BrokerQty = 3, LocalQty = 1, ObservedUtc = utcNow });
+        coord5.ProcessObservationForTest(new MismatchObservation { Instrument = "CL", MismatchType = MismatchType.NET_POSITION_MISMATCH, Present = true, BrokerQty = 3, LocalQty = 1, NetBrokerQty = 3, NetJournalQty = 1, ObservedUtc = utcNow });
         state = coord5.GetStateForTest("CL");
-        if (state?.MismatchType != MismatchType.POSITION_QTY_MISMATCH)
-            return (false, $"Position qty mismatch: expected POSITION_QTY_MISMATCH, got {state?.MismatchType}");
+        if (state?.MismatchType != MismatchType.NET_POSITION_MISMATCH)
+            return (false, $"Net position mismatch: expected NET_POSITION_MISMATCH, got {state?.MismatchType}");
 
         // 9. Entry gating: coordinator blocks; RiskGate integration tested via IsInstrumentBlockedByMismatch
         if (!coordinator.IsInstrumentBlockedByMismatch("ES"))
@@ -148,6 +148,55 @@ public static class MismatchEscalationTests
         var reason = coordinator.GetBlockReason("ES");
         if (string.IsNullOrEmpty(reason) || (!reason.Contains("PERSISTENT") && !reason.Contains("RECONCILIATION")))
             return (false, $"Block reason: expected persistent mismatch reason, got '{reason}'");
+
+        // 11. STRUCTURAL_MULTI_INTENT does not escalate to FAIL_CLOSED (only NET_POSITION_MISMATCH does)
+        var coord6 = new MismatchEscalationCoordinator(
+            getSnapshot: () => emptySnap,
+            getActiveInstruments: () => Array.Empty<string>(),
+            getMismatchObservations: (_, _) => Array.Empty<MismatchObservation>(),
+            isInstrumentBlocked: _ => false,
+            isFlattenInProgress: _ => false,
+            isRecoveryInProgress: _ => false,
+            log: null);
+        coord6.ProcessObservationForTest(new MismatchObservation
+        {
+            Instrument = "MNG",
+            MismatchType = MismatchType.STRUCTURAL_MULTI_INTENT,
+            Present = true,
+            BrokerQty = 2,
+            LocalQty = 4,
+            NetBrokerQty = 0,
+            NetJournalQty = 0,
+            ObservedUtc = utcNow
+        });
+        var tFail = utcNow.AddMilliseconds(MismatchEscalationPolicy.MISMATCH_FAIL_CLOSED_THRESHOLD_MS + 100);
+        coord6.ProcessObservationForTest(new MismatchObservation
+        {
+            Instrument = "MNG",
+            MismatchType = MismatchType.STRUCTURAL_MULTI_INTENT,
+            Present = true,
+            BrokerQty = 2,
+            LocalQty = 4,
+            NetBrokerQty = 0,
+            NetJournalQty = 0,
+            ObservedUtc = utcNow.AddMilliseconds(MismatchEscalationPolicy.MISMATCH_PERSISTENT_THRESHOLD_MS + 100)
+        });
+        coord6.ProcessObservationForTest(new MismatchObservation
+        {
+            Instrument = "MNG",
+            MismatchType = MismatchType.STRUCTURAL_MULTI_INTENT,
+            Present = true,
+            BrokerQty = 2,
+            LocalQty = 4,
+            NetBrokerQty = 0,
+            NetJournalQty = 0,
+            ObservedUtc = tFail
+        });
+        state = coord6.GetStateForTest("MNG");
+        if (state?.EscalationState == MismatchEscalationState.FAIL_CLOSED)
+            return (false, "STRUCTURAL_MULTI_INTENT: should not reach FAIL_CLOSED");
+        if (state?.EscalationState != MismatchEscalationState.PERSISTENT_MISMATCH)
+            return (false, $"STRUCTURAL_MULTI_INTENT: expected PERSISTENT_MISMATCH after long persistence, got {state?.EscalationState}");
 
         return (true, null);
     }

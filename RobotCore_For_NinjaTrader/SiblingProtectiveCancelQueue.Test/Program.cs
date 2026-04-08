@@ -1,6 +1,8 @@
 // Regression for urgent sibling-protective cancel lane. Build/run:
 //   dotnet run --project RobotCore_For_NinjaTrader/SiblingProtectiveCancelQueue.Test/SiblingProtectiveCancelQueue.Test.csproj
 //   dotnet run --project ... -- QTSW2_HYDRATION_DEFER
+//   dotnet run --project ... -- EXECUTION_CONTEXT_CONTRACT
+//   dotnet run --project ... -- STARTUP_EXEC_CONTEXT_RACE
 // (mirrors modules/robot/core/Tests/SiblingProtectiveCancelQueueTests.cs; runnable when harness core snapshot is broken.)
 
 using System;
@@ -54,6 +56,20 @@ internal static class Program
             }
 
             Console.Error.WriteLine("FAIL: " + err);
+            return 1;
+        }
+
+        if (args.Length > 0 && args[0].Equals("EXECUTION_CONTEXT_CONTRACT", StringComparison.OrdinalIgnoreCase))
+        {
+            if (ExecutionContextReadyContractTests.RunAll(Console.WriteLine))
+                return 0;
+            return 1;
+        }
+
+        if (args.Length > 0 && args[0].Equals("STARTUP_EXEC_CONTEXT_RACE", StringComparison.OrdinalIgnoreCase))
+        {
+            if (StartupExecutionContextRaceScenarioTests.RunAll(Console.WriteLine))
+                return 0;
             return 1;
         }
 

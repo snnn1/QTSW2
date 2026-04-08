@@ -253,21 +253,23 @@ def save_master_matrix(
                 else TimetableEngine(project_root=str(root))
             )
             from modules.timetable.cme_session import get_cme_trading_date
+            from modules.timetable.timetable_supervisor import timetable_publish_blocking
 
             # Live execution: CME wall clock only — ignore specific_date / UI / latest matrix date
             session_td = get_cme_trading_date(datetime.now(timezone.utc))
-            engine.write_execution_timetable_from_master_matrix(
-                df_copy,
-                trade_date=session_td,
-                stream_filters=stream_filters,
-                execution_mode=True,
-                publish_context={
-                    "source": "matrix",
-                    "reason": "publish",
-                    "caller": "matrix.file_manager.save_master_matrix:background_thread",
-                    "matrix_source": "in_memory",
-                },
-            )
+            with timetable_publish_blocking():
+                engine.write_execution_timetable_from_master_matrix(
+                    df_copy,
+                    trade_date=session_td,
+                    stream_filters=stream_filters,
+                    execution_mode=True,
+                    publish_context={
+                        "source": "matrix",
+                        "reason": "publish",
+                        "caller": "matrix.file_manager.save_master_matrix:background_thread",
+                        "matrix_source": "in_memory",
+                    },
+                )
             logger.info("Execution timetable persisted from master matrix")
             duration_ms = int((time.perf_counter() - t_timetable) * 1000)
             from .instrumentation import log_timing_event

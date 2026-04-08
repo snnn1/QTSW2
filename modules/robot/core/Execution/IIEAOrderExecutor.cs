@@ -75,6 +75,17 @@ public interface IIEAOrderExecutor
     /// </summary>
     (string JournalDir, int FileCount, bool DirectoryExists) GetJournalDiagnostics(string? executionInstrument);
 
+    /// <summary>
+    /// When recovery adoption completes with <paramref name="adoptedDelta"/> == 0, emit per-candidate reasons (PR2).
+    /// No-op when not a recovery scan or adoption succeeded.
+    /// </summary>
+    void EmitRecoveryAdoptionZeroDeltaDiagnostics(
+        string executionInstrumentKey,
+        string adoptionScanEpisodeId,
+        int adoptedDelta,
+        bool isRecoveryAdoptionScan,
+        IReadOnlyCollection<string>? registryMismatchTrustedIntentIds);
+
     /// <summary>Phase 3: Evaluate BE triggers and dispatch modify. Single evaluation function; branch only at mutation.</summary>
     void EvaluateBreakEvenCore(decimal tickPrice, DateTimeOffset eventTime, string executionInstrument);
 

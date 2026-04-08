@@ -1,0 +1,15 @@
+c:\Users\jakej\QTSW2\modules\robot\harness\obj\Debug\net8.0\Robot.ReconciliationHarness.GeneratedMSBuildEditorConfig.editorconfig
+c:\Users\jakej\QTSW2\modules\robot\harness\obj\Debug\net8.0\Robot.ReconciliationHarness.AssemblyInfoInputs.cache
+c:\Users\jakej\QTSW2\modules\robot\harness\obj\Debug\net8.0\Robot.ReconciliationHarness.AssemblyInfo.cs
+c:\Users\jakej\QTSW2\modules\robot\harness\obj\Debug\net8.0\Robot.ReconciliationHarness.csproj.CoreCompileInputs.cache
+c:\Users\jakej\QTSW2\modules\robot\harness\obj\Debug\net8.0\Robot.ReconciliationHarness.sourcelink.json
+c:\Users\jakej\QTSW2\modules\robot\harness\bin\Debug\net8.0\Robot.ReconciliationHarness.exe
+c:\Users\jakej\QTSW2\modules\robot\harness\bin\Debug\net8.0\Robot.ReconciliationHarness.deps.json
+c:\Users\jakej\QTSW2\modules\robot\harness\bin\Debug\net8.0\Robot.ReconciliationHarness.runtimeconfig.json
+c:\Users\jakej\QTSW2\modules\robot\harness\bin\Debug\net8.0\Robot.ReconciliationHarness.dll
+c:\Users\jakej\QTSW2\modules\robot\harness\bin\Debug\net8.0\Robot.ReconciliationHarness.pdb
+c:\Users\jakej\QTSW2\modules\robot\harness\obj\Debug\net8.0\Robot.ReconciliationHarness.dll
+c:\Users\jakej\QTSW2\modules\robot\harness\obj\Debug\net8.0\refint\Robot.ReconciliationHarness.dll
+c:\Users\jakej\QTSW2\modules\robot\harness\obj\Debug\net8.0\Robot.ReconciliationHarness.pdb
+c:\Users\jakej\QTSW2\modules\robot\harness\obj\Debug\net8.0\Robot.ReconciliationHarness.genruntimeconfig.cache
+c:\Users\jakej\QTSW2\modules\robot\harness\obj\Debug\net8.0\ref\Robot.ReconciliationHarness.dll

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using QTSW2.Robot.Core.Execution;
 
 namespace QTSW2.Robot.Core;
 
@@ -26,8 +27,20 @@ public sealed class ExecutionPolicy
     /// <summary>Phase 3: Break-even policy. Null = use defaults.</summary>
     public BreakEvenPolicy? BreakEven { get; }
 
+    /// <summary>
+    /// When <see cref="MismatchType.STRUCTURAL_MULTI_INTENT"/> is detected: allow (telemetry only), block new entries, or request auto-offset/reconciliation toward broker.
+    /// </summary>
+    public StructuralMultiIntentPolicy StructuralMultiIntentPolicy { get; }
+
     // Private constructor - use LoadFromFile
-    private ExecutionPolicy(Dictionary<string, CanonicalMarketPolicy> canonicalMarkets, string schema, bool useInstrumentExecutionAuthority, bool disableCanonicalMarketLock, AggregationPolicy? aggregation, BreakEvenPolicy? breakEven)
+    private ExecutionPolicy(
+        Dictionary<string, CanonicalMarketPolicy> canonicalMarkets,
+        string schema,
+        bool useInstrumentExecutionAuthority,
+        bool disableCanonicalMarketLock,
+        AggregationPolicy? aggregation,
+        BreakEvenPolicy? breakEven,
+        StructuralMultiIntentPolicy structuralMultiIntentPolicy)
     {
         _canonicalMarkets = canonicalMarkets;
         this.schema = schema;
@@ -35,6 +48,7 @@ public sealed class ExecutionPolicy
         DisableCanonicalMarketLock = disableCanonicalMarketLock;
         Aggregation = aggregation;
         BreakEven = breakEven;
+        StructuralMultiIntentPolicy = structuralMultiIntentPolicy;
     }
     
     public static ExecutionPolicy LoadFromFile(string path)
@@ -88,9 +102,23 @@ public sealed class ExecutionPolicy
         
         var aggregation = ParseAggregation(rawPolicy.aggregation);
         var breakEven = ParseBreakEven(rawPolicy.break_even);
-        var policy = new ExecutionPolicy(normalizedCanonicalMarkets, rawPolicy.schema ?? "", rawPolicy.use_instrument_execution_authority, rawPolicy.disable_canonical_market_lock, aggregation, breakEven);
+        var smip = ParseStructuralMultiIntentPolicy(rawPolicy.structural_multi_intent_policy);
+        var policy = new ExecutionPolicy(normalizedCanonicalMarkets, rawPolicy.schema ?? "", rawPolicy.use_instrument_execution_authority, rawPolicy.disable_canonical_market_lock, aggregation, breakEven, smip);
         policy.ValidateOrThrow();
         return policy;
+    }
+
+    private static StructuralMultiIntentPolicy ParseStructuralMultiIntentPolicy(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return StructuralMultiIntentPolicy.Allow;
+        var u = raw.Trim().ToUpperInvariant().Replace("-", "_");
+        return u switch
+        {
+            "ALLOW" => StructuralMultiIntentPolicy.Allow,
+            "BLOCK" or "BLOCK_NEW_ENTRIES" or "BLOCKNEWENTRIES" => StructuralMultiIntentPolicy.BlockNewEntries,
+            "AUTO_OFFSET" or "AUTO_OFFSET_REQUEST" or "AUTOOFFSET" => StructuralMultiIntentPolicy.AutoOffsetRequest,
+            _ => StructuralMultiIntentPolicy.Allow
+        };
     }
 
     private static AggregationPolicy? ParseAggregation(AggregationPolicyRaw? raw)
@@ -213,6 +241,9 @@ internal sealed class ExecutionPolicyRaw
     public AggregationPolicyRaw? aggregation { get; set; }
     /// <summary>Phase 3: Break-even policy. Optional.</summary>
     public BreakEvenPolicyRaw? break_even { get; set; }
+
+    /// <summary>Optional: allow | block | auto_offset — <see cref="ExecutionPolicy.StructuralMultiIntentPolicy"/>.</summary>
+    public string? structural_multi_intent_policy { get; set; }
 }
 
 /// <summary>Phase 2: Bracket/aggregation policy for IEA.</summary>

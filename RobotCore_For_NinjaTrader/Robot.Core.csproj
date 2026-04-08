@@ -31,6 +31,8 @@
     <Compile Remove="Strategies\RobotSimStrategy.cs" />
     <!-- Standalone regression console (separate csproj); do not merge into Robot.Core.dll -->
     <Compile Remove="SiblingProtectiveCancelQueue.Test\**\*" />
+    <!-- Modules harness stubs — NT + OrderRegistryPhase2 supply real implementations -->
+    <Compile Remove="Execution\InstrumentExecutionAuthority.HarnessPartial.cs" />
   </ItemGroup>
   <ItemGroup>
     <!-- Shared types from modules/robot/core (NT project targets net48, core targets net8) -->
@@ -41,6 +43,10 @@
     <Compile Include="..\modules\robot\core\Execution\AdoptionScanSingleFlightGate.cs" Link="Execution\AdoptionScanSingleFlightGate.cs" />
     <Compile Include="..\modules\robot\core\Execution\AdoptionScanRecoveryFingerprint.cs" Link="Execution\AdoptionScanRecoveryFingerprint.cs" />
     <Compile Include="..\modules\robot\core\Execution\RecoveryNoProgressSkipEvaluator.cs" Link="Execution\RecoveryNoProgressSkipEvaluator.cs" />
+    <Compile Include="..\modules\robot\core\Execution\ReleaseAdoptionContractModels.cs" Link="Execution\ReleaseAdoptionContractModels.cs" />
+    <Compile Include="..\modules\robot\core\Execution\ReconciliationBlockerModels.cs" Link="Execution\ReconciliationBlockerModels.cs" />
+    <Compile Include="..\modules\robot\core\Execution\StateConsistencyGateModels.cs" Link="Execution\StateConsistencyGateModels.cs" />
+    <Compile Include="..\modules\robot\core\Execution\JournalIntegrityGuarantee.cs" Link="Execution\JournalIntegrityGuarantee.cs" />
     <Compile Include="..\modules\robot\core\Execution\Qtsw2OrderUpdateHydrationPolicy.cs" Link="Execution\Qtsw2OrderUpdateHydrationPolicy.cs" />
     <Compile Include="..\modules\robot\core\Execution\ReconciliationDeferPolicy.cs" Link="Execution\ReconciliationDeferPolicy.cs" />
     <Compile Include="..\modules\robot\core\Execution\FlattenCoordinationTracker.cs" Link="Execution\FlattenCoordinationTracker.cs" />

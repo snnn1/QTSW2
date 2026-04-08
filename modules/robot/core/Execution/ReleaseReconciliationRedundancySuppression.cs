@@ -16,6 +16,8 @@ public readonly struct ReleaseReadinessSuppressionProbe
     public int BrokerWorkingCount { get; init; }
     public int JournalOpenQty { get; init; }
     public int PendingCandidateCount { get; init; }
+    /// <summary>Adoptable-only pending count (aligned with <see cref="StateConsistencyReleaseEvaluationInput.AdoptablePendingAdoptionCandidateCount"/>).</summary>
+    public int AdoptablePendingCandidateCount { get; init; }
     public int IeaTrustedWorkingCount { get; init; }
     public bool UseIea { get; init; }
     /// <summary>64-bit deterministic surrogate; not cryptographic. Mixed with set cardinality internally.</summary>
@@ -23,6 +25,9 @@ public readonly struct ReleaseReadinessSuppressionProbe
 
     public long RegistryMismatchTrustedIntentSetHash { get; init; }
     public long JournalOpenIntentSetHash { get; init; }
+
+    /// <summary>Fingerprint of classified reconciliation blockers (see <see cref="ReconciliationBlockerFingerprint"/>).</summary>
+    public long ReconciliationBlockersFingerprint { get; init; }
 }
 
 /// <summary>
@@ -148,11 +153,13 @@ public sealed class ReleaseReconciliationRedundancySuppression
             p.BrokerWorkingCount,
             p.JournalOpenQty,
             p.PendingCandidateCount,
+            p.AdoptablePendingCandidateCount,
             p.IeaTrustedWorkingCount,
             p.UseIea ? 1 : 0,
             p.BlockingAdoptionIntentSetHash,
             p.RegistryMismatchTrustedIntentSetHash,
-            p.JournalOpenIntentSetHash);
+            p.JournalOpenIntentSetHash,
+            p.ReconciliationBlockersFingerprint);
 
     public static string BuildStructuralSuppressionKeyFromInput(StateConsistencyReleaseEvaluationInput i) =>
         string.Join("|",
@@ -160,11 +167,13 @@ public sealed class ReleaseReconciliationRedundancySuppression
             i.BrokerWorkingCount,
             i.JournalOpenQty,
             i.PendingAdoptionCandidateCount,
+            i.AdoptablePendingAdoptionCandidateCount,
             i.IeaOwnedPlusAdoptedWorking,
             i.UseInstrumentExecutionAuthority ? 1 : 0,
             i.BlockingAdoptionIntentSetHash,
             i.RegistryMismatchTrustedIntentSetHash,
-            i.JournalOpenIntentSetHash);
+            i.JournalOpenIntentSetHash,
+            i.ReconciliationBlockersFingerprint);
 
     public static string BuildReleaseMaterialFingerprint(StateConsistencyReleaseEvaluationInput input,
         StateConsistencyReleaseReadinessResult result)
@@ -177,10 +186,12 @@ public sealed class ReleaseReconciliationRedundancySuppression
             input.BrokerWorkingCount,
             input.JournalOpenQty,
             input.PendingAdoptionCandidateCount,
+            input.AdoptablePendingAdoptionCandidateCount,
             input.IeaOwnedPlusAdoptedWorking,
             input.BlockingAdoptionIntentSetHash,
             input.RegistryMismatchTrustedIntentSetHash,
             input.JournalOpenIntentSetHash,
+            input.ReconciliationBlockersFingerprint,
             result.ReleaseReady ? 1 : 0,
             contra);
     }
@@ -208,7 +219,8 @@ public sealed class ReleaseReconciliationRedundancySuppression
         var inst = instrument.Trim();
         if (string.IsNullOrEmpty(inst)) return false;
 
-        if (probe.PendingCandidateCount > 0)
+        if (probe.AdoptablePendingCandidateCount > 0 || probe.PendingCandidateCount > 0 ||
+            probe.ReconciliationBlockersFingerprint != 0)
         {
             reason = "forced_eval_non_idle_pending";
             return false;
@@ -372,7 +384,10 @@ public sealed class ReleaseReconciliationRedundancySuppression
             DiagnosticJournalOpenQty = r.DiagnosticJournalOpenQty,
             DiagnosticBrokerWorkingCount = r.DiagnosticBrokerWorkingCount,
             DiagnosticIeaOwnedPlusAdoptedWorking = r.DiagnosticIeaOwnedPlusAdoptedWorking,
-            DiagnosticPendingAdoptionCandidateCount = r.DiagnosticPendingAdoptionCandidateCount
+            DiagnosticPendingAdoptionCandidateCount = r.DiagnosticPendingAdoptionCandidateCount,
+            DiagnosticAdoptDecisionCount = r.DiagnosticAdoptDecisionCount,
+            BlockerInvariantViolation = r.BlockerInvariantViolation,
+            ResolvedBlockers = r.ResolvedBlockers
         };
     }
 

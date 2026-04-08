@@ -18,8 +18,96 @@ import sys
 QTSW2_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(QTSW2_ROOT))
 
+import numpy as np
+import pandas as pd
+
 from modules.timetable.cme_session import get_trading_date_cme
 from modules.timetable.eligibility_writer import write_eligibility_file, load_eligibility
+from modules.timetable.timetable_engine import TimetableEngine, _final_allowed_matrix_true
+
+
+class TestFinalAllowedNumpyBoolContract:
+    """Regression: parquet-backed numpy.bool_ must not fail identity ``is True`` checks."""
+
+    def test_final_allowed_helper_accepts_numpy_true(self):
+        assert _final_allowed_matrix_true(np.True_) is True
+        assert _final_allowed_matrix_true(np.bool_(True)) is True
+
+    def test_final_allowed_helper_rejects_numpy_false(self):
+        assert _final_allowed_matrix_true(np.False_) is False
+
+    def test_build_streams_enables_cl2_when_final_allowed_numpy_true(self):
+        """build_streams_from_master_matrix(..., execution_mode=False) enables CL2 for numpy.bool_ True."""
+        td = "2026-04-07"
+        trade_date = pd.to_datetime(td)
+        rows = []
+        for stream, fa, sess, slot in [
+            ("CL1", np.False_, "S1", "09:00"),
+            ("CL2", np.True_, "S2", "10:00"),
+        ]:
+            rows.append(
+                {
+                    "Stream": stream,
+                    "Instrument": "CL",
+                    "Session": sess,
+                    "trade_date": trade_date,
+                    "Time": slot,
+                    "Result": "Win",
+                    "final_allowed": fa,
+                    "Time Change": "",
+                }
+            )
+        df = pd.DataFrame(rows)
+        if "Date" not in df.columns:
+            df["Date"] = df["trade_date"]
+
+        engine = TimetableEngine(
+            master_matrix_dir=str(QTSW2_ROOT / "data" / "master_matrix"),
+            analyzer_runs_dir=str(QTSW2_ROOT / "data" / "analyzed"),
+            project_root=str(QTSW2_ROOT),
+        )
+        streams = engine.build_streams_from_master_matrix(df, trade_date=td, execution_mode=False)
+        by_stream = {s["stream"]: s for s in streams}
+        assert by_stream["CL2"]["enabled"] is True, by_stream.get("CL2")
+        assert by_stream["CL1"]["enabled"] is False
+
+    def test_eligible_stream_count_nonzero_with_numpy_bool_allowed(self):
+        """write_eligibility_file eligible_stream_count reflects enabled streams with numpy.bool_."""
+        td = "2026-04-07"
+        trade_date = pd.to_datetime(td)
+        df = pd.DataFrame(
+            {
+                "Stream": ["CL2", "ES1"],
+                "Instrument": ["CL", "ES"],
+                "Session": ["S2", "S1"],
+                "trade_date": [trade_date, trade_date],
+                "Time": ["10:00", "08:00"],
+                "Result": ["Win", "Win"],
+                "final_allowed": [np.True_, np.False_],
+                "Time Change": ["", ""],
+            }
+        )
+        df["Date"] = df["trade_date"]
+        engine = TimetableEngine(
+            master_matrix_dir=str(QTSW2_ROOT / "data" / "master_matrix"),
+            analyzer_runs_dir=str(QTSW2_ROOT / "data" / "analyzed"),
+            project_root=str(QTSW2_ROOT),
+        )
+        streams = engine.build_streams_from_master_matrix(df, trade_date=td, execution_mode=False)
+        enabled_count = sum(1 for s in streams if s.get("enabled"))
+        assert enabled_count >= 1
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_eligibility_file(
+                streams=streams,
+                session_trading_date=td,
+                output_dir=tmp,
+                source_matrix_hash="testhash",
+                overwrite=True,
+            )
+            assert path is not None
+            data = json.loads(path.read_text(encoding="utf-8"))
+            assert data["eligible_stream_count"] >= 1
 
 
 class TestCMETradingDate:

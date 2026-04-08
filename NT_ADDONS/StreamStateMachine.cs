@@ -63,6 +63,7 @@ public sealed class StreamStateMachine
 
     public StreamState State { get; private set; } = StreamState.PRE_HYDRATION; // Initial state, will be set in constructor based on execution mode
     public bool Committed => _journal.Committed;
+    public string? CommitReason => _journal.CommitReason;
     public bool RangeInvalidated => _rangeInvalidated; // Expose range invalidation status for engine-level tracking
     public string TradingDate => _journal.TradingDate;
 
@@ -76,6 +77,46 @@ public sealed class StreamStateMachine
     public DateTimeOffset RangeStartUtc { get; private set; }
     public DateTimeOffset SlotTimeUtc { get; private set; }
     public DateTimeOffset MarketCloseUtc { get; private set; }
+
+    /// <summary>
+    /// Returns whether entry orders for this stream are still eligible (no cancellation needed when position flat).
+    /// When false, entry orders should be cancelled when position is flat (invalid lifecycle state).
+    /// Eligible: ACTIVE RANGE_LOCKED. Non-eligible: EXPIRED, COMMITTED, POST-FLATTEN, forced_flatten.
+    /// </summary>
+    public (bool Eligible, string? Reason) GetEntryOrderCancellationEligibility()
+    {
+        if (Committed) return (false, "committed");
+        if (State != StreamState.RANGE_LOCKED) return (false, "invalid_state");
+        if (_journal.SlotStatus != SlotStatus.ACTIVE) return (false, "slot_expired");
+        if (_journal.ExecutionInterruptedByClose) return (false, "forced_flatten");
+        return (true, null);
+    }
+
+    /// <summary>
+    /// Returns a dictionary of stream status fields for logging (STREAM_STATUS_SUMMARY, STREAM_STATE_SNAPSHOT).
+    /// </summary>
+    public Dictionary<string, object> GetStatusForLogging(DateTimeOffset utcNow)
+    {
+        return new Dictionary<string, object>
+        {
+            ["stream_id"] = Stream,
+            ["instrument"] = Instrument,
+            ["execution_instrument"] = ExecutionInstrument,
+            ["canonical_instrument"] = CanonicalInstrument,
+            ["session"] = Session,
+            ["slot_time_chicago"] = SlotTimeChicago,
+            ["state"] = State.ToString(),
+            ["committed"] = Committed,
+            ["range_invalidated"] = RangeInvalidated,
+            ["trading_date"] = TradingDate,
+            ["range_high"] = RangeHigh ?? (object)"UNSET",
+            ["range_low"] = RangeLow ?? (object)"UNSET",
+            ["range_start_utc"] = RangeStartUtc.ToString("o"),
+            ["slot_time_utc"] = SlotTimeUtc.ToString("o"),
+            ["market_close_utc"] = MarketCloseUtc.ToString("o"),
+            ["now_utc"] = utcNow.ToString("o")
+        };
+    }
     
     // Chicago time boundaries for range computation (authoritative for bar filtering)
     // CRITICAL: These are DateTimeOffset values in Chicago timezone, not strings
@@ -91,6 +132,7 @@ public sealed class StreamStateMachine
     private readonly string _projectRoot;
     private readonly RangeLockedEventPersister? _rangePersister;
     private readonly HydrationEventPersister? _hydrationPersister;
+    private readonly RangeBuildingSnapshotPersister? _rangeBuildingSnapshotPersister;
     private StreamJournal _journal;
     private readonly decimal _tickSize;
     private readonly string _timetableHash;
@@ -100,10 +142,21 @@ public sealed class StreamStateMachine
     private readonly RiskGate? _riskGate;
     private readonly ExecutionJournal? _executionJournal;
     private readonly RobotEngine? _engine; // Optional: engine reference for BarsRequest status checks
+
+    // IEA alignment: block checks and fallbacks for forced flatten, slot expiry, reentry
+    private readonly Func<string, bool>? _isInstrumentBlockedForReentry;
+    private readonly Func<string, DateTimeOffset, FlattenResult>? _emergencyFlatten;
+    private readonly Func<string, bool>? _isIeaQueueHealthyForInstrument;
+
+    // Canonical event writer for replay reconstruction (forced flatten, slot expiry)
+    private readonly ExecutionEventWriter? _eventWriter;
+
     private readonly int _orderQuantity; // PHASE 3.2: Fixed order quantity for all intents (code-controlled)
     private readonly int _maxQuantity; // Policy max_size
     private bool _stopBracketsSubmittedAtLock = false;
-    private bool _reconciliationRequestedResubmit = false;
+    
+    /// <summary>Invariant-based recovery: typed action (None, ResubmitClean, CancelAndRebuild). Replaces coarse _reconciliationRequestedResubmit.</summary>
+    private EntryOrderRecoveryState _entryOrderRecoveryState = EntryOrderRecoveryState.None();
     
     // PHASE 4: Alert callback for missing data incidents
     private Action<string, string, string, int>? _alertCallback;
@@ -125,6 +178,10 @@ public sealed class StreamStateMachine
     private bool _rangeLockCommitted = false; // Track if lock was successfully committed (for duplicate detection)
     private bool _breakoutLevelsMissing = false; // Gate flag: prevents entries if breakout levels failed
     
+    // RANGE_BUILDING restore: cutoff for bar deduplication (bars with timestamp <= this are already in snapshot)
+    private DateTimeOffset? _lastProcessedBarTimeUtc = null;
+    private bool _restoredFromRangeBuildingSnapshot = false;
+    
     // Bar source tracking for deduplication precedence
     // CRITICAL: Track bar sources to enforce precedence: LIVE > BARSREQUEST > CSV
     // This dictionary maps bar timestamp to its source, used for centralized deduplication
@@ -139,6 +196,15 @@ public sealed class StreamStateMachine
     // - What deduplication happened
     private int _historicalBarCount = 0; // Bars from BarsRequest/pre-hydration
     private int _liveBarCount = 0; // Bars from live feed (OnBar)
+
+    /// <summary>
+    /// Running max high / min low for bars with barUtc &gt; SlotTimeUtc (strictly after slot).
+    /// Authoritative source for pre-submit &quot;breakout already happened&quot;; journal flags are supplemental (e.g. restart).
+    /// </summary>
+    private bool _postSlotExcursionHasSamples;
+    private decimal _postSlotMaxHighSinceSlot = decimal.MinValue;
+    private decimal _postSlotMinLowSinceSlot = decimal.MaxValue;
+
     private int _filteredFutureBarCount = 0; // Bars filtered (future)
     private int _filteredPartialBarCount = 0; // Bars filtered (partial/in-progress)
     private int _dedupedBarCount = 0; // Bars deduplicated (replaced existing)
@@ -193,6 +259,7 @@ public sealed class StreamStateMachine
     private bool _firstBarAcceptedAssertEmitted = false; // RANGE_FIRST_BAR_ACCEPTED emitted
     private bool _rangeLockAssertEmitted = false; // RANGE_LOCK_ASSERT emitted
 
+    /// <summary>Once per (trading_date|stream|reason) SESSION_REENTRY_BLOCKED engine events (avoids tick spam).</summary>
     private readonly HashSet<string> _sessionReentryBlockedLogKeys = new(StringComparer.Ordinal);
 
     private decimal? _lastCloseBeforeLock;
@@ -235,7 +302,11 @@ public sealed class StreamStateMachine
         RiskGate? riskGate = null,
         ExecutionJournal? executionJournal = null,
         LoggingConfig? loggingConfig = null, // Optional: logging configuration for diagnostic control
-        RobotEngine? engine = null // Optional: engine reference for BarsRequest status checks
+        RobotEngine? engine = null, // Optional: engine reference for BarsRequest status checks
+        Func<string, bool>? isInstrumentBlockedForReentry = null,
+        Func<string, DateTimeOffset, FlattenResult>? emergencyFlatten = null,
+        Func<string, bool>? isIeaQueueHealthyForInstrument = null,
+        ExecutionEventWriter? eventWriter = null
     )
     {
         _time = time;
@@ -249,12 +320,19 @@ public sealed class StreamStateMachine
         _riskGate = riskGate;
         _executionJournal = executionJournal;
         _engine = engine;
-        
+        _isInstrumentBlockedForReentry = isInstrumentBlockedForReentry;
+        _emergencyFlatten = emergencyFlatten;
+        _isIeaQueueHealthyForInstrument = isIeaQueueHealthyForInstrument;
+        _eventWriter = eventWriter;
+
         // Initialize range event persister (singleton)
         _rangePersister = RangeLockedEventPersister.GetInstance(_projectRoot);
         
         // Initialize hydration event persister (singleton)
         _hydrationPersister = HydrationEventPersister.GetInstance(_projectRoot);
+        
+        // Initialize RANGE_BUILDING snapshot persister (singleton)
+        _rangeBuildingSnapshotPersister = RangeBuildingSnapshotPersister.GetInstance(_projectRoot);
         
         // PHASE 3.2: Store and validate order quantity
         _orderQuantity = orderQuantity;
@@ -287,6 +365,8 @@ public sealed class StreamStateMachine
         _enableDiagnosticLogs = loggingConfig?.enable_diagnostic_logs ?? false;
         _barDiagnosticRateLimitSeconds = loggingConfig?.diagnostic_rate_limits?.bar_diagnostic_seconds ?? (_enableDiagnosticLogs ? 30 : 300);
         _slotGateDiagnosticRateLimitSeconds = loggingConfig?.diagnostic_rate_limits?.slot_gate_diagnostic_seconds ?? (_enableDiagnosticLogs ? 30 : 60);
+
+        TimetableStream.EnsureExecutionFields(directive);
 
         Stream = directive.stream;
         Session = directive.session;
@@ -362,6 +442,10 @@ public sealed class StreamStateMachine
                         note = "Mid-session restart detected - will reconstruct range from historical + live bars. Result may differ from uninterrupted operation."
                     }));
                 
+                // Notify HealthMonitor to send push notification (OnConnectionStatusUpdate never fires when process crashes)
+                var prevUpdateUtc = DateTimeOffset.TryParse(existing.LastUpdateUtc, out var parsed) ? parsed : DateTimeOffset.MinValue;
+                _engine?.OnMidSessionRestartDetected(Stream, tradingDateStr, existing.LastState ?? "", prevUpdateUtc, nowUtc);
+                
                 // Signal that BarsRequest should be called for restart
                 // Strategy will check for restart state after Realtime transition
                 // Log event for diagnostics
@@ -434,6 +518,17 @@ public sealed class StreamStateMachine
             // Restore order submission flag from journal
             _stopBracketsSubmittedAtLock = existing.StopBracketsSubmittedAtLock;
             
+            // Restore recovery action from journal (invariant-based model)
+            if (!string.IsNullOrEmpty(existing.RecoveryAction) && existing.RecoveryAction != "None")
+            {
+                _entryOrderRecoveryState = new EntryOrderRecoveryState
+                {
+                    Action = Enum.TryParse<EntryOrderRecoveryAction>(existing.RecoveryAction, true, out var a) ? a : EntryOrderRecoveryAction.None,
+                    Reason = existing.RecoveryActionReason ?? "",
+                    IssuedUtc = DateTimeOffset.TryParse(existing.RecoveryActionIssuedUtc, null, System.Globalization.DateTimeStyles.RoundtripKind, out var dt) ? dt : default
+                };
+            }
+            
             // Restore entry detection from execution journal (Option B)
             if (_executionJournal != null && !existing.EntryDetected)
             {
@@ -490,6 +585,12 @@ public sealed class StreamStateMachine
                 // ARCHITECTURAL DOCTRINE: Hydration logs are canonical. Journal is advisory only.
                 // If hydration log restoration failed, range must be recomputed (explicit failure, not hidden fallback).
                 // Removed journal fallback to enforce single canonical source of truth.
+                
+                // RANGE_BUILDING restore: if previous state was RANGE_BUILDING and RANGE_LOCKED restore did not apply
+                if (existing.LastState == "RANGE_BUILDING" && !_rangeLocked)
+                {
+                    RestoreRangeBuildingFromSnapshot(tradingDateStr, Stream);
+                }
             }
         }
         
@@ -601,14 +702,15 @@ public sealed class StreamStateMachine
         _reportCriticalCallback = callback;
     }
 
-    public void ApplyDirectiveUpdate(string newSlotTimeChicago, DateOnly tradingDate, DateTimeOffset utcNow)
+    public bool ApplyDirectiveUpdate(string newSlotTimeChicago, DateOnly tradingDate, DateTimeOffset utcNow)
     {
-        // NQ2 FIX: Prevent slot_time changes after stream initialization if stream is past PRE_HYDRATION
-        // This prevents timetable updates from changing slot_time mid-session
-        if (State != StreamState.PRE_HYDRATION && SlotTimeChicago != newSlotTimeChicago)
+        // NQ2 FIX: Allow slot_time updates during PRE_HYDRATION and RANGE_BUILDING (before range lock).
+        // Reject once RANGE_LOCKED or beyond - prevents mid-session changes after commitment.
+        var allowUpdate = State == StreamState.PRE_HYDRATION || State == StreamState.RANGE_BUILDING;
+        if (!allowUpdate && SlotTimeChicago != newSlotTimeChicago)
         {
             var warningMsg = $"WARNING: Attempted to update slot_time from '{SlotTimeChicago}' to '{newSlotTimeChicago}' " +
-                           $"but stream is already in state '{State}'. Slot_time changes are only allowed during PRE_HYDRATION. " +
+                           $"but stream is already in state '{State}'. Slot_time changes are only allowed during PRE_HYDRATION or RANGE_BUILDING. " +
                            $"Ignoring update to prevent mid-session slot_time changes.";
             
             LogHealth("WARN", "SLOT_TIME_UPDATE_REJECTED", warningMsg, new
@@ -633,7 +735,7 @@ public sealed class StreamStateMachine
                 }, TradingDate);
             }
             
-            return; // Reject the update
+            return false; // Reject the update
         }
         
         // Allowed only if not committed
@@ -647,6 +749,7 @@ public sealed class StreamStateMachine
         
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc, "UPDATE_APPLIED", State.ToString(),
             new { slot_time_chicago = SlotTimeChicago, slot_time_chicago_time = SlotTimeChicagoTime.ToString("o"), slot_time_utc = SlotTimeUtc.ToString("o") }));
+        return true;
     }
 
     public void UpdateTradingDate(DateOnly newTradingDate, DateTimeOffset utcNow)
@@ -2239,6 +2342,14 @@ public sealed class StreamStateMachine
                     _rangeComputeStartLogged = false;
                     _lastRangeComputeFailedLogUtc = null;
                     
+                    // Persist RANGE_BUILDING snapshot for restart recovery
+                    var barsAtStart = GetBarBufferSnapshot();
+                    if (barsAtStart.Count > 0)
+                    {
+                        var lastBarAtStart = barsAtStart[barsAtStart.Count - 1];
+                        PersistRangeBuildingSnapshot(lastBarAtStart.TimestampUtc);
+                    }
+                    
                     // Request range lock when slot_time is reached
                     // State handlers may REQUEST but not PERFORM computation
                     if (utcNow >= SlotTimeUtc && !_rangeLocked)
@@ -2458,6 +2569,335 @@ public sealed class StreamStateMachine
         }
     }
 
+    /// <summary>
+    /// Handle RANGE_LOCKED state logic.
+    /// </summary>
+    private void HandleRangeLockedState(DateTimeOffset utcNow)
+    {
+        EnsureCommittedForPostLockExcursion(utcNow);
+
+        // Phase B: Execute pending recovery action (invariant-based model)
+        if (_entryOrderRecoveryState.IsPending && _executionAdapter != null)
+        {
+            try
+            {
+                var snap = _executionAdapter.GetAccountSnapshot(utcNow);
+                if (ExecutePendingRecoveryAction(snap, utcNow))
+                    return; // Action handled (resubmit or cancel sent)
+            }
+            catch (Exception ex)
+            {
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "ENTRY_ORDERS_RESUBMIT_POSITION_CHECK_ERROR", State.ToString(),
+                    new { error = ex.Message, note = "Phase B execution failed - will retry next tick" }));
+            }
+        }
+
+        // RESTART RECOVERY: Retry stop bracket placement if it failed previously
+        // This handles the case where stop orders failed to place (e.g., missing policy expectations)
+        // and the strategy was restarted. On restart, we retry placement if:
+        // - Stop brackets weren't submitted yet (_stopBracketsSubmittedAtLock = false)
+        // - Entry not detected
+        // - Before market close
+        // - Range and breakout levels are available
+        if (!_stopBracketsSubmittedAtLock && !_entryDetected && utcNow < MarketCloseUtc &&
+            RangeHigh.HasValue && RangeLow.HasValue &&
+            _brkLongRounded.HasValue && _brkShortRounded.HasValue)
+        {
+            // Check if intents were already submitted (idempotency check)
+            var longIntentId = ComputeIntentId("Long", _brkLongRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_LONG");
+            var shortIntentId = ComputeIntentId("Short", _brkShortRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_SHORT");
+            
+            bool alreadySubmitted = false;
+            if (_executionJournal != null)
+            {
+                alreadySubmitted = _executionJournal.IsIntentSubmitted(longIntentId, TradingDate, Stream) ||
+                                  _executionJournal.IsIntentSubmitted(shortIntentId, TradingDate, Stream);
+            }
+            
+            if (!alreadySubmitted)
+            {
+                if (IsPostLockBreakoutSetupExpired())
+                {
+                    Commit(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", "NO_TRADE_BREAKOUT_ALREADY_OCCURRED");
+                }
+                else
+                {
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "RESTART_RETRY_STOP_BRACKETS", State.ToString(),
+                        new
+                        {
+                            stream_id = Stream,
+                            trading_date = TradingDate,
+                            slot_time_chicago = SlotTimeChicago,
+                            previous_attempt_failed = true,
+                            note = "Retrying stop bracket placement on restart after previous failure"
+                        }));
+                    SubmitStopEntryBracketsAtLock(utcNow);
+                }
+            }
+        }
+        
+        // Check for market close cutoff (all execution modes)
+        if (!_entryDetected && utcNow >= MarketCloseUtc)
+        {
+            LogNoTradeMarketClose(utcNow);
+            Commit(utcNow, "NO_TRADE_MARKET_CLOSE", "MARKET_CLOSE_NO_TRADE");
+        }
+    }
+    
+    /// <summary>
+    /// Helper to compute intent ID for restart recovery check.
+    /// </summary>
+    private string ComputeIntentId(string direction, decimal entryPrice, DateTimeOffset entryTimeUtc, string triggerReason)
+    {
+        var intent = new Intent(
+            TradingDate,
+            Stream,
+            Instrument,
+            ExecutionInstrument,
+            Session,
+            SlotTimeChicago,
+            direction,
+            entryPrice,
+            stopPrice: null, // Not needed for intent ID computation
+            targetPrice: null,
+            beTrigger: null,
+            entryTimeUtc,
+            triggerReason);
+        return intent.ComputeIntentId();
+    }
+
+    /// <summary>
+    /// STRICT: True only if broker has exactly one valid entry-order set.
+    /// Valid set = both orders exist, correct instrument, intent IDs, breakout prices, OCO linkage, no duplicates.
+    /// Any incomplete, wrong-price, duplicate, or malformed structure → false.
+    /// </summary>
+    public bool HasValidEntryOrdersOnBroker(AccountSnapshot snap)
+    {
+        if (!RangeHigh.HasValue || !RangeLow.HasValue ||
+            !_brkLongRounded.HasValue || !_brkShortRounded.HasValue)
+            return false;
+
+        var longIntentId = ComputeIntentId("Long", _brkLongRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_LONG");
+        var shortIntentId = ComputeIntentId("Short", _brkShortRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_SHORT");
+        var brkLong = _brkLongRounded.Value;
+        var brkShort = _brkShortRounded.Value;
+
+        var working = snap.WorkingOrders ?? new List<WorkingOrderSnapshot>();
+        WorkingOrderSnapshot? longOrder = null;
+        WorkingOrderSnapshot? shortOrder = null;
+        int longCount = 0, shortCount = 0;
+
+        foreach (var o in working)
+        {
+            if (!IsSameInstrument(o.Instrument))
+                continue;
+            var tag = o.Tag ?? "";
+            if (string.IsNullOrEmpty(tag) || tag.EndsWith(":STOP", StringComparison.OrdinalIgnoreCase) || tag.EndsWith(":TARGET", StringComparison.OrdinalIgnoreCase))
+                continue;
+            var decoded = RobotOrderIds.DecodeIntentId(tag);
+            if (decoded == longIntentId) { longCount++; longOrder = o; }
+            else if (decoded == shortIntentId) { shortCount++; shortOrder = o; }
+        }
+
+        // INVARIANT: Exactly 1 long, 1 short. No partial, no duplicates.
+        if (longCount != 1 || shortCount != 1)
+            return false;
+
+        // Strict: match expected breakout prices (StopPrice)
+        if (longOrder != null && longOrder.StopPrice.HasValue && Math.Abs(longOrder.StopPrice.Value - brkLong) > 0.0001m)
+            return false;
+        if (shortOrder != null && shortOrder.StopPrice.HasValue && Math.Abs(shortOrder.StopPrice.Value - brkShort) > 0.0001m)
+            return false;
+
+        // OCO linkage: both must share same OcoGroup (if OCO is used)
+        if (longOrder != null && shortOrder != null)
+        {
+            var ocoLong = longOrder.OcoGroup ?? "";
+            var ocoShort = shortOrder.OcoGroup ?? "";
+            if (!string.IsNullOrEmpty(ocoLong) && !string.IsNullOrEmpty(ocoShort) && ocoLong != ocoShort)
+                return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Get counts of matching entry orders (excludes protectives). Returns (longCount, shortCount, orderIds).
+    /// </summary>
+    private (int LongCount, int ShortCount, List<string> OrderIds) GetMatchingEntryOrderCounts(
+        AccountSnapshot snap, string longIntentId, string shortIntentId)
+    {
+        var working = snap.WorkingOrders ?? new List<WorkingOrderSnapshot>();
+        int longCount = 0, shortCount = 0;
+        var orderIds = new List<string>();
+
+        foreach (var o in working)
+        {
+            if (!IsSameInstrument(o.Instrument))
+                continue;
+            var tag = o.Tag ?? "";
+            if (string.IsNullOrEmpty(tag) || tag.EndsWith(":STOP", StringComparison.OrdinalIgnoreCase) || tag.EndsWith(":TARGET", StringComparison.OrdinalIgnoreCase))
+                continue;
+            var decoded = RobotOrderIds.DecodeIntentId(tag);
+            if (decoded == longIntentId) { longCount++; orderIds.Add(o.OrderId ?? ""); }
+            else if (decoded == shortIntentId) { shortCount++; orderIds.Add(o.OrderId ?? ""); }
+        }
+        return (longCount, shortCount, orderIds);
+    }
+
+    /// <summary>
+    /// Phase A: Audit and classify broker state. Assign recovery action. Do NOT execute.
+    /// Returns (reconciled: we checked, needsResubmit: action is ResubmitClean or CancelAndRebuild).
+    /// </summary>
+    public (bool Reconciled, bool NeedsResubmit) AuditAndClassifyEntryOrders(AccountSnapshot snap, DateTimeOffset utcNow)
+    {
+        if (Committed || State != StreamState.RANGE_LOCKED)
+            return (false, false);
+        if (_journal.ExecutionInterruptedByClose)
+            return (false, false); // Safe by design: no entry resubmit when waiting for re-entry after forced flatten
+        if (_entryDetected || utcNow >= MarketCloseUtc)
+            return (false, false);
+        if (!RangeHigh.HasValue || !RangeLow.HasValue || !_brkLongRounded.HasValue || !_brkShortRounded.HasValue)
+            return (false, false);
+
+        var longIntentId = ComputeIntentId("Long", _brkLongRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_LONG");
+        var shortIntentId = ComputeIntentId("Short", _brkShortRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_SHORT");
+        var expectedLongPrice = _brkLongRounded.Value;
+        var expectedShortPrice = _brkShortRounded.Value;
+
+        var posQty = snap.Positions?.Where(p => IsSameInstrument(p.Instrument)).Sum(p => p.Quantity) ?? 0;
+        var classification = ClassifyBrokerState(snap, longIntentId, shortIntentId, expectedLongPrice, expectedShortPrice, posQty);
+
+        _entryOrderRecoveryState.LastClassificationUtc = utcNow;
+        _entryOrderRecoveryState.LastClassificationResult = classification.ToString();
+
+        switch (classification)
+        {
+            case BrokerStateClassification.PositionExists:
+                return (true, false);
+
+            case BrokerStateClassification.ValidSetPresent:
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "ENTRY_ORDER_SET_VALID", State.ToString(),
+                    new { stream_id = Stream, trading_date = TradingDate, long_intent_id = longIntentId, short_intent_id = shortIntentId }));
+                ClearRecoveryAction(utcNow);
+                return (true, false);
+
+            case BrokerStateClassification.MissingSet:
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "ENTRY_ORDER_SET_MISSING", State.ToString(),
+                    new { stream_id = Stream, trading_date = TradingDate, long_intent_id = longIntentId, short_intent_id = shortIntentId, expected_long_price = expectedLongPrice, expected_short_price = expectedShortPrice }));
+                SetRecoveryAction(EntryOrderRecoveryAction.ResubmitClean, "missing", utcNow);
+                return (true, true);
+
+            case BrokerStateClassification.BrokenSet:
+                var (longCount, shortCount, orderIds) = GetMatchingEntryOrderCounts(snap, longIntentId, shortIntentId);
+                var reason = longCount + shortCount == 0 ? "missing" : longCount + shortCount == 1 ? "partial" : "duplicate_or_invalid";
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    longCount + shortCount > 2 ? "ENTRY_ORDER_SET_DUPLICATE_DETECTED" : "ENTRY_ORDER_SET_BROKEN", State.ToString(),
+                    new { stream_id = Stream, trading_date = TradingDate, long_intent_id = longIntentId, short_intent_id = shortIntentId, actual_long_count = longCount, actual_short_count = shortCount, order_ids = orderIds, reason }));
+                SetRecoveryAction(EntryOrderRecoveryAction.CancelAndRebuild, reason, utcNow);
+                return (true, true);
+        }
+
+        return (true, false);
+    }
+
+    /// <summary>
+    /// Phase A backward compatibility: ReconcileEntryOrders delegates to AuditAndClassifyEntryOrders.
+    /// </summary>
+    public (bool Reconciled, bool NeedsResubmit) ReconcileEntryOrders(AccountSnapshot snap, DateTimeOffset utcNow)
+        => AuditAndClassifyEntryOrders(snap, utcNow);
+
+    /// <summary>
+    /// Classify broker state for this stream.
+    /// </summary>
+    public BrokerStateClassification ClassifyBrokerState(AccountSnapshot snap, string longIntentId, string shortIntentId)
+    {
+        if (!_brkLongRounded.HasValue || !_brkShortRounded.HasValue)
+            return BrokerStateClassification.MissingSet;
+        var posQty = snap.Positions?.Where(p => IsSameInstrument(p.Instrument)).Sum(p => p.Quantity) ?? 0;
+        return ClassifyBrokerState(snap, longIntentId, shortIntentId, _brkLongRounded.Value, _brkShortRounded.Value, posQty);
+    }
+
+    private BrokerStateClassification ClassifyBrokerState(AccountSnapshot snap, string longIntentId, string shortIntentId, decimal expectedLongPrice, decimal expectedShortPrice, int posQty)
+    {
+        if (posQty != 0 || _entryDetected)
+            return BrokerStateClassification.PositionExists;
+
+        var (longCount, shortCount, _) = GetMatchingEntryOrderCounts(snap, longIntentId, shortIntentId);
+        var total = longCount + shortCount;
+
+        if (longCount == 1 && shortCount == 1)
+        {
+            var working = snap.WorkingOrders ?? new List<WorkingOrderSnapshot>();
+            WorkingOrderSnapshot? longOrder = null, shortOrder = null;
+            foreach (var o in working)
+            {
+                if (!IsSameInstrument(o.Instrument)) continue;
+                var tag = o.Tag ?? "";
+                if (string.IsNullOrEmpty(tag) || tag.EndsWith(":STOP", StringComparison.OrdinalIgnoreCase) || tag.EndsWith(":TARGET", StringComparison.OrdinalIgnoreCase)) continue;
+                var decoded = RobotOrderIds.DecodeIntentId(tag);
+                if (decoded == longIntentId) longOrder = o;
+                else if (decoded == shortIntentId) shortOrder = o;
+            }
+            if (longOrder != null && longOrder.StopPrice.HasValue && Math.Abs(longOrder.StopPrice.Value - expectedLongPrice) > 0.0001m)
+                return BrokerStateClassification.BrokenSet;
+            if (shortOrder != null && shortOrder.StopPrice.HasValue && Math.Abs(shortOrder.StopPrice.Value - expectedShortPrice) > 0.0001m)
+                return BrokerStateClassification.BrokenSet;
+            if (longOrder != null && shortOrder != null)
+            {
+                var ocoLong = longOrder.OcoGroup ?? "";
+                var ocoShort = shortOrder.OcoGroup ?? "";
+                if (!string.IsNullOrEmpty(ocoLong) && !string.IsNullOrEmpty(ocoShort) && ocoLong != ocoShort)
+                    return BrokerStateClassification.BrokenSet;
+            }
+            return BrokerStateClassification.ValidSetPresent;
+        }
+
+        if (total == 0)
+            return BrokerStateClassification.MissingSet;
+
+        return BrokerStateClassification.BrokenSet;
+    }
+
+    private void SetRecoveryAction(EntryOrderRecoveryAction action, string reason, DateTimeOffset utcNow)
+    {
+        _entryOrderRecoveryState = new EntryOrderRecoveryState { Action = action, Reason = reason, IssuedUtc = utcNow };
+        _journal.RecoveryAction = action.ToString();
+        _journal.RecoveryActionReason = reason;
+        _journal.RecoveryActionIssuedUtc = utcNow.ToString("o");
+        _journals.Save(_journal);
+        _stopBracketsSubmittedAtLock = false;
+        _journal.StopBracketsSubmittedAtLock = false;
+        _journals.Save(_journal);
+    }
+
+    private void ClearRecoveryAction(DateTimeOffset utcNow)
+    {
+        if (_entryOrderRecoveryState.Action == EntryOrderRecoveryAction.None) return;
+        _entryOrderRecoveryState = EntryOrderRecoveryState.None();
+        _journal.RecoveryAction = "None";
+        _journal.RecoveryActionReason = null;
+        _journal.RecoveryActionIssuedUtc = null;
+        _journals.Save(_journal);
+    }
+
+    /// <summary>
+    /// Get broker order IDs for this stream's entry orders (for cancel).
+    /// </summary>
+    public List<string> GetEntryOrderIdsForStream(AccountSnapshot snap)
+    {
+        if (!_brkLongRounded.HasValue || !_brkShortRounded.HasValue)
+            return new List<string>();
+        var longIntentId = ComputeIntentId("Long", _brkLongRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_LONG");
+        var shortIntentId = ComputeIntentId("Short", _brkShortRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_SHORT");
+        var (_, _, orderIds) = GetMatchingEntryOrderCounts(snap, longIntentId, shortIntentId);
+        return orderIds;
+    }
+
     /// <summary>P2.10: Single tick-distance rule vs breakout stops (parity: <see cref="ParityInstrument.breakout_validity_tolerance_ticks"/>).</summary>
     private int GetBreakoutValidityToleranceTicks()
     {
@@ -2557,212 +2997,80 @@ public sealed class StreamStateMachine
     }
 
     /// <summary>
-    /// Handle RANGE_LOCKED state logic.
+    /// Phase B: Execute pending recovery action. Runs pre-execution gate, then resubmit or cancel-rebuild.
     /// </summary>
-    private void HandleRangeLockedState(DateTimeOffset utcNow)
+    public bool ExecutePendingRecoveryAction(AccountSnapshot snap, DateTimeOffset utcNow)
     {
-        // RESTART RECOVERY: Retry stop bracket placement if it failed previously
-        // This handles the case where stop orders failed to place (e.g., missing policy expectations)
-        // and the strategy was restarted. On restart, we retry placement if:
-        // - Stop brackets weren't submitted yet (_stopBracketsSubmittedAtLock = false)
-        // - Entry not detected
-        // - NOT waiting for re-entry after forced flatten (ExecutionInterruptedByClose)
-        // - Before market close
-        // - Range and breakout levels are available
-        if (!_journal.ExecutionInterruptedByClose &&
-            !_stopBracketsSubmittedAtLock && !_entryDetected && utcNow < MarketCloseUtc &&
-            RangeHigh.HasValue && RangeLow.HasValue &&
-            _brkLongRounded.HasValue && _brkShortRounded.HasValue)
-        {
-            // Check if intents were already submitted (idempotency check)
-            var longIntentId = ComputeIntentId("Long", _brkLongRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_LONG");
-            var shortIntentId = ComputeIntentId("Short", _brkShortRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_SHORT");
-            
-            bool alreadySubmitted = false;
-            if (_executionJournal != null)
-            {
-                alreadySubmitted = _executionJournal.IsIntentSubmitted(longIntentId, TradingDate, Stream) ||
-                                  _executionJournal.IsIntentSubmitted(shortIntentId, TradingDate, Stream);
-            }
-            
-            if (!alreadySubmitted)
-            {
-                if (LogAndEvaluateUnifiedBreakoutEntryValidity(utcNow, "RESTART", failClosedOnMissingQuotes: true))
-                {
-                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                        "RESTART_RETRY_STOP_BRACKETS", State.ToString(),
-                        new
-                        {
-                            stream_id = Stream,
-                            trading_date = TradingDate,
-                            slot_time_chicago = SlotTimeChicago,
-                            previous_attempt_failed = true,
-                            note = "Retrying stop bracket placement on restart after previous failure"
-                        }));
-                    SubmitStopEntryBracketsAtLock(utcNow);
-                }
-                else
-                {
-                    Commit(utcNow, "NO_TRADE_RESTART_RETRY_BREAKOUT_ALREADY_TRIGGERED", "NO_TRADE_RESTART_RETRY_BREAKOUT_ALREADY_TRIGGERED");
-                }
-            }
-        }
-        
-        // Check for market close cutoff (all execution modes)
-        if (!_entryDetected && utcNow >= MarketCloseUtc)
-        {
-            LogNoTradeMarketClose(utcNow);
-            Commit(utcNow, "NO_TRADE_MARKET_CLOSE", "MARKET_CLOSE_NO_TRADE");
-        }
-    }
-    
-    /// <summary>
-    /// Helper to compute intent ID for restart recovery check.
-    /// </summary>
-    private string ComputeIntentId(string direction, decimal entryPrice, DateTimeOffset entryTimeUtc, string triggerReason)
-    {
-        var intent = new Intent(
-            TradingDate,
-            Stream,
-            Instrument,
-            Session,
-            SlotTimeChicago,
-            direction,
-            entryPrice,
-            stopPrice: null, // Not needed for intent ID computation
-            targetPrice: null,
-            beTrigger: null,
-            entryTimeUtc,
-            triggerReason);
-        return intent.ComputeIntentId();
-    }
-
-    /// <summary>
-    /// True if exactly one long and one short entry order exist on broker for this stream.
-    /// INVARIANT: A stream can never have more than 1 valid entry structure (exactly 2 orders).
-    /// Matching by intent ID / tag; excludes protectives (:STOP, :TARGET).
-    /// Partial or duplicate structures are invalid.
-    /// </summary>
-    public bool HasValidEntryOrdersOnBroker(AccountSnapshot snap)
-    {
-        if (!RangeHigh.HasValue || !RangeLow.HasValue ||
-            !_brkLongRounded.HasValue || !_brkShortRounded.HasValue)
+        if (_entryOrderRecoveryState.Action == EntryOrderRecoveryAction.None)
             return false;
-
-        var longIntentId = ComputeIntentId("Long", _brkLongRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_LONG");
-        var shortIntentId = ComputeIntentId("Short", _brkShortRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_SHORT");
-
-        var working = snap.WorkingOrders ?? new List<WorkingOrderSnapshot>();
-        int longCount = 0, shortCount = 0;
-
-        foreach (var o in working)
-        {
-            if (!IsSameInstrument(o.Instrument))
-                continue;
-            var tag = o.Tag ?? "";
-            if (string.IsNullOrEmpty(tag) || tag.EndsWith(":STOP", StringComparison.OrdinalIgnoreCase) || tag.EndsWith(":TARGET", StringComparison.OrdinalIgnoreCase))
-                continue;
-            var decoded = RobotOrderIds.DecodeIntentId(tag);
-            if (decoded == longIntentId) longCount++;
-            else if (decoded == shortIntentId) shortCount++;
-        }
-
-        return longCount == 1 && shortCount == 1;
-    }
-
-    private (int LongCount, int ShortCount, List<string> OrderIds) GetMatchingEntryOrderCounts(
-        AccountSnapshot snap, string longIntentId, string shortIntentId)
-    {
-        var working = snap.WorkingOrders ?? new List<WorkingOrderSnapshot>();
-        int longCount = 0, shortCount = 0;
-        var orderIds = new List<string>();
-
-        foreach (var o in working)
-        {
-            if (!IsSameInstrument(o.Instrument))
-                continue;
-            var tag = o.Tag ?? "";
-            if (string.IsNullOrEmpty(tag) || tag.EndsWith(":STOP", StringComparison.OrdinalIgnoreCase) || tag.EndsWith(":TARGET", StringComparison.OrdinalIgnoreCase))
-                continue;
-            var decoded = RobotOrderIds.DecodeIntentId(tag);
-            if (decoded == longIntentId) { longCount++; orderIds.Add(o.OrderId ?? ""); }
-            else if (decoded == shortIntentId) { shortCount++; orderIds.Add(o.OrderId ?? ""); }
-        }
-        return (longCount, shortCount, orderIds);
-    }
-
-    /// <summary>
-    /// Reconcile entry orders for recovery. If we should have orders but don't, reset _stopBracketsSubmittedAtLock
-    /// and set _reconciliationRequestedResubmit so next tick resubmits.
-    /// Returns (reconciled: we checked this stream, needsResubmit: we flagged for resubmission).
-    /// </summary>
-    public (bool Reconciled, bool NeedsResubmit) ReconcileEntryOrders(AccountSnapshot snap, DateTimeOffset utcNow)
-    {
-        if (Committed || State != StreamState.RANGE_LOCKED)
-            return (false, false);
-        if (_journal.ExecutionInterruptedByClose)
-            return (false, false); // Safe by design: no entry resubmit when waiting for re-entry after forced flatten
-        if (_entryDetected || utcNow >= MarketCloseUtc)
-            return (false, false);
-        if (!RangeHigh.HasValue || !RangeLow.HasValue || !_brkLongRounded.HasValue || !_brkShortRounded.HasValue)
-            return (false, false);
-
-        // Require flat position for this stream's instrument
-        var posQty = snap.Positions?.Where(p => IsSameInstrument(p.Instrument)).Sum(p => p.Quantity) ?? 0;
-        if (posQty != 0)
-            return (false, false);
-
-        var longIntentId = ComputeIntentId("Long", _brkLongRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_LONG");
-        var shortIntentId = ComputeIntentId("Short", _brkShortRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_SHORT");
-        const int expectedCount = 2;
-
-        var (longCount, shortCount, orderIdList) = GetMatchingEntryOrderCounts(snap, longIntentId, shortIntentId);
-        var validStructure = longCount == 1 && shortCount == 1;
-        if (validStructure)
+        if (Committed || State != StreamState.RANGE_LOCKED || _journal.ExecutionInterruptedByClose || _entryDetected || utcNow >= MarketCloseUtc)
         {
             _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                "ENTRY_ORDERS_VERIFIED_PRESENT", State.ToString(),
-                new
-                {
-                    stream_id = Stream,
-                    trading_date = TradingDate,
-                    slot_time_chicago = SlotTimeChicago,
-                    long_intent_id = longIntentId,
-                    short_intent_id = shortIntentId,
-                    expected_count = expectedCount,
-                    actual_count = orderIdList.Count,
-                    order_ids = orderIdList,
-                    reason = "RECOVERY_RECONCILIATION"
-                }));
-            return (true, false);
+                "ENTRY_ORDER_ACTION_CLEARED_STREAM_INELIGIBLE", State.ToString(),
+                new { stream_id = Stream, reason = "stream_no_longer_eligible" }));
+            ClearRecoveryAction(utcNow);
+            return false;
+        }
+        if (IsPostLockBreakoutSetupExpired())
+        {
+            ClearRecoveryAction(utcNow);
+            Commit(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", "NO_TRADE_BREAKOUT_ALREADY_OCCURRED");
+            return false;
+        }
+        var posQty = snap.Positions?.Where(p => IsSameInstrument(p.Instrument)).Sum(p => p.Quantity) ?? 0;
+        if (posQty != 0)
+        {
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "ENTRY_ORDER_SET_RESUBMIT_SKIPPED_POSITION_EXISTS", State.ToString(),
+                new { stream_id = Stream, position_qty = posQty }));
+            ClearRecoveryAction(utcNow);
+            return false;
+        }
+        if (HasValidEntryOrdersOnBroker(snap))
+        {
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "ENTRY_ORDER_SET_RESUBMIT_SKIPPED_VALID_EXISTS", State.ToString(),
+                new { stream_id = Stream }));
+            ClearRecoveryAction(utcNow);
+            return false;
         }
 
-        // Orders missing or incomplete - reset flag and request resubmission
-        _stopBracketsSubmittedAtLock = false;
-        _journal.StopBracketsSubmittedAtLock = false;
-        _journals.Save(_journal);
-        _reconciliationRequestedResubmit = true;
-
-        var totalMatch = longCount + shortCount;
-        var reasonStr = totalMatch == 0 ? "missing" : totalMatch == 1 ? "partial_incomplete" : "duplicate_or_invalid";
-        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-            "ENTRY_ORDERS_MISSING_DETECTED", State.ToString(),
-            new
+        if (_entryOrderRecoveryState.Action == EntryOrderRecoveryAction.CancelAndRebuild)
+        {
+            var orderIds = GetEntryOrderIdsForStream(snap);
+            if (orderIds.Count > 0)
             {
-                stream_id = Stream,
-                trading_date = TradingDate,
-                slot_time_chicago = SlotTimeChicago,
-                long_intent_id = longIntentId,
-                short_intent_id = shortIntentId,
-                expected_count = expectedCount,
-                actual_long_count = longCount,
-                actual_short_count = shortCount,
-                actual_total = totalMatch,
-                reason = reasonStr,
-                note = "Any incomplete structure (0, 1, or >2 matching orders) requires resubmission"
-            }));
-
-        return (true, true);
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "ENTRY_ORDER_SET_CANCEL_REQUESTED", State.ToString(),
+                    new { stream_id = Stream, order_ids = orderIds }));
+                _executionAdapter?.CancelOrders(orderIds, utcNow);
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "ENTRY_ORDER_SET_REBUILD_BLOCKED_CANCEL_INCOMPLETE", State.ToString(),
+                    new { stream_id = Stream, note = "Cancel sent; will retry rebuild on next cycle after confirmation" }));
+                return true; // Don't clear - wait for next cycle when orders are gone
+            }
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "ENTRY_ORDER_SET_REBUILD_REQUESTED", State.ToString(),
+                new { stream_id = Stream }));
+            _entryOrderRecoveryState = new EntryOrderRecoveryState { Action = EntryOrderRecoveryAction.ResubmitClean, Reason = _entryOrderRecoveryState.Reason + "_after_cancel", IssuedUtc = utcNow };
+            _journal.RecoveryAction = "ResubmitClean";
+            _journal.RecoveryActionReason = _entryOrderRecoveryState.Reason;
+            _journal.RecoveryActionIssuedUtc = utcNow.ToString("o");
+            _journals.Save(_journal);
+        }
+        if (_entryOrderRecoveryState.Action == EntryOrderRecoveryAction.ResubmitClean)
+        {
+            SubmitStopEntryBracketsAtLock(utcNow);
+            if (_stopBracketsSubmittedAtLock)
+            {
+                ClearRecoveryAction(utcNow);
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "ENTRY_ORDERS_RESUBMITTED", State.ToString(),
+                    new { stream_id = Stream, reason = "recovery_resubmit" }));
+            }
+            return true;
+        }
+        return false;
     }
 
     public void Arm(DateTimeOffset utcNow)
@@ -2792,6 +3100,7 @@ public sealed class StreamStateMachine
                 // Force transition to correct state
                 Transition(utcNow, StreamState.RANGE_LOCKED, "RANGE_LOCKED_RESTORED_FIX");
             }
+            EnsureCommittedForPostLockExcursion(utcNow);
             // Skip normal flow - restoration already completed
             return;
         }
@@ -2872,13 +3181,14 @@ public sealed class StreamStateMachine
         // regardless of stream state. State should only gate decisions (e.g., range computation, execution),
         // not data ingestion. Bar timestamps represent bar end time for range window comparisons.
         
-        // DIAGNOSTIC: Log bar reception details (only if diagnostic logs enabled)
+        // DIAGNOSTIC: Log bar reception + admission proof (only if diagnostic logs enabled, rate-limited).
+        // BAR_ADMISSION_PROOF was previously unconditional and dominated log volume during busy windows.
         bool shouldLogBar = false;
         if (_enableDiagnosticLogs)
         {
-            shouldLogBar = !_lastBarDiagnosticTime.HasValue || 
+            shouldLogBar = !_lastBarDiagnosticTime.HasValue ||
                           (utcNow - _lastBarDiagnosticTime.Value).TotalSeconds >= _barDiagnosticRateLimitSeconds;
-            
+
             if (shouldLogBar)
             {
                 _lastBarDiagnosticTime = utcNow;
@@ -2898,6 +3208,28 @@ public sealed class StreamStateMachine
                         in_range_window = inRange,
                         bar_buffer_count = _barBuffer.Count,
                         time_until_slot_seconds = (SlotTimeUtc - utcNow).TotalSeconds
+                    }));
+
+                var barSourceStr = isHistorical ? "BARSREQUEST" : "LIVE";
+                var comparisonResult = barChicagoTime >= RangeStartChicagoTime && barChicagoTime <= SlotTimeChicagoTime;
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "BAR_ADMISSION_PROOF", State.ToString(),
+                    new
+                    {
+                        stream_id = Stream,
+                        canonical_instrument = CanonicalInstrument,
+                        instrument = Instrument,
+                        bar_time_raw_utc = barUtc.ToString("o"),
+                        bar_time_raw_kind = barUtc.DateTime.Kind.ToString(),
+                        bar_time_chicago = barChicagoTime.ToString("o"),
+                        range_start_chicago = RangeStartChicagoTime.ToString("o"),
+                        slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
+                        comparison_result = comparisonResult,
+                        comparison_detail = comparisonResult
+                            ? $"bar_chicago ({barChicagoTime:HH:mm:ss}) >= range_start ({RangeStartChicagoTime:HH:mm:ss}) AND bar_chicago <= slot_time ({SlotTimeChicagoTime:HH:mm:ss})"
+                            : $"bar_chicago ({barChicagoTime:HH:mm:ss}) NOT in [range_start ({RangeStartChicagoTime:HH:mm:ss}), slot_time ({SlotTimeChicagoTime:HH:mm:ss})]",
+                        bar_source = barSourceStr,
+                        note = "Diagnostic proof log (gated + rate-limited with BAR_RECEIVED_DIAGNOSTIC)"
                     }));
             }
         }
@@ -2931,37 +3263,29 @@ public sealed class StreamStateMachine
         // Update last bar received timestamp for data feed health monitoring
         _lastBarReceivedUtc = utcNow;
         _lastBarTimestampUtc = barUtc;
+
+        // Post-slot OHLC envelope (all states): feeds pre-submit breakout scan; journal flags are optional memory.
+        if (barUtc > SlotTimeUtc && high >= low && close >= low && close <= high)
+        {
+            if (!_postSlotExcursionHasSamples)
+            {
+                _postSlotExcursionHasSamples = true;
+                _postSlotMaxHighSinceSlot = high;
+                _postSlotMinLowSinceSlot = low;
+            }
+            else
+            {
+                if (high > _postSlotMaxHighSinceSlot) _postSlotMaxHighSinceSlot = high;
+                if (low < _postSlotMinLowSinceSlot) _postSlotMinLowSinceSlot = low;
+            }
+        }
         
         // Buffer bars that fall within [range_start, slot_time] using Chicago time comparison
         // Bar timestamps represent OPEN time (converted from NinjaTrader close time for Analyzer parity)
         // Range window is defined in Chicago time to match trading session semantics
         // State-independent buffering: Always buffer bars within range window regardless of state
         // CRITICAL FIX: Include slot_time bar (<= instead of <) so range lock check runs when slot_time bar arrives
-        
-        // DIAGNOSTIC: Proof log for 1-minute boundary investigation
-        // Log every bar admission decision with raw timestamp, Chicago time, comparison result, and source
-        var barSourceStr = isHistorical ? "BARSREQUEST" : "LIVE";
-        var comparisonResult = barChicagoTime >= RangeStartChicagoTime && barChicagoTime <= SlotTimeChicagoTime;
-        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-            "BAR_ADMISSION_PROOF", State.ToString(),
-            new
-            {
-                stream_id = Stream,
-                canonical_instrument = CanonicalInstrument,
-                instrument = Instrument,
-                bar_time_raw_utc = barUtc.ToString("o"),
-                bar_time_raw_kind = barUtc.DateTime.Kind.ToString(),
-                bar_time_chicago = barChicagoTime.ToString("o"),
-                range_start_chicago = RangeStartChicagoTime.ToString("o"),
-                slot_time_chicago = SlotTimeChicagoTime.ToString("o"),
-                comparison_result = comparisonResult,
-                comparison_detail = comparisonResult 
-                    ? $"bar_chicago ({barChicagoTime:HH:mm:ss}) >= range_start ({RangeStartChicagoTime:HH:mm:ss}) AND bar_chicago <= slot_time ({SlotTimeChicagoTime:HH:mm:ss})"
-                    : $"bar_chicago ({barChicagoTime:HH:mm:ss}) NOT in [range_start ({RangeStartChicagoTime:HH:mm:ss}), slot_time ({SlotTimeChicagoTime:HH:mm:ss})]",
-                bar_source = barSourceStr,
-                note = "Diagnostic proof log - bar timestamps represent OPEN time (converted from NinjaTrader close time for Analyzer parity)"
-            }));
-        
+
         if (barChicagoTime >= RangeStartChicagoTime && barChicagoTime <= SlotTimeChicagoTime)
         {
                 // DEFENSIVE: Validate bar data before buffering
@@ -3265,6 +3589,8 @@ public sealed class StreamStateMachine
                     // Always update FreezeClose to latest bar's close (will be last bar before slot_time)
                     FreezeClose = close;
                     FreezeCloseSource = "BAR_CLOSE";
+                    // Persist snapshot for restart recovery (whenever range or bar count changes)
+                    PersistRangeBuildingSnapshot(barUtc);
                 }
         }
         else
@@ -3296,6 +3622,10 @@ public sealed class StreamStateMachine
         // Handle RANGE_LOCKED state separately (bars at/after slot time for breakout detection)
         if (State == StreamState.RANGE_LOCKED)
         {
+            ApplyPostLockBreakoutExcursionFromBar(high, low, barUtc, utcNow);
+            if (_journal.Committed)
+                return;
+
             // DIAGNOSTIC: Log execution gate evaluation (rate-limited, only if diagnostics enabled)
             if (_enableDiagnosticLogs)
             {
@@ -3525,6 +3855,14 @@ public sealed class StreamStateMachine
         { 
             return (false, "NULL_DEPENDENCIES", new { execution_adapter_null = _executionAdapter == null, execution_journal_null = _executionJournal == null, risk_gate_null = _riskGate == null }); 
         }
+
+        if (!_executionAdapter.IsExecutionContextReady)
+        {
+            return (false, "EXECUTION_CONTEXT_NOT_READY", new
+            {
+                note = "NT context not wired or SIM not verified — bracket submission deferred (startup/readiness contract)"
+            });
+        }
         
         if (!_brkLongRounded.HasValue || !_brkShortRounded.HasValue) 
         { 
@@ -3535,8 +3873,160 @@ public sealed class StreamStateMachine
         { 
             return (false, "RANGE_VALUES_MISSING", new { range_high_has_value = RangeHigh.HasValue, range_low_has_value = RangeLow.HasValue }); 
         }
+
+        if (IsPostLockBreakoutSetupExpired())
+        {
+            return (false, "POST_LOCK_BREAKOUT_ALREADY_OCCURRED", new
+            {
+                post_lock_long = _journal.PostLockLongBreakoutTouched,
+                post_lock_short = _journal.PostLockShortBreakoutTouched,
+                breakout_source = "JOURNAL_FLAGS"
+            });
+        }
+
+        var (ohlcL, ohlcS) = GetPostSlotBreakoutTouchFromOhlcEnvelope(_brkLongRounded.Value, _brkShortRounded.Value);
+        if (ohlcL || ohlcS)
+        {
+            return (false, "POST_LOCK_BREAKOUT_ALREADY_OCCURRED", new
+            {
+                post_lock_long = ohlcL || _journal.PostLockLongBreakoutTouched,
+                post_lock_short = ohlcS || _journal.PostLockShortBreakoutTouched,
+                ohlc_long = ohlcL,
+                ohlc_short = ohlcS,
+                max_high_since_slot = _postSlotExcursionHasSamples ? _postSlotMaxHighSinceSlot : (decimal?)null,
+                min_low_since_slot = _postSlotExcursionHasSamples ? _postSlotMinLowSinceSlot : (decimal?)null,
+                breakout_source = "OHLC_ENVELOPE"
+            });
+        }
         
         return (true, "OK", null);
+    }
+
+    /// <summary>
+    /// True after RANGE_LOCK if bar path shows either breakout was touched before entry brackets were armed.
+    /// Strict product rule: touching either side expires the entire setup (no stop-entry brackets on either side).
+    /// </summary>
+    public bool IsPostLockBreakoutSetupExpired()
+        => _journal.PostLockLongBreakoutTouched || _journal.PostLockShortBreakoutTouched;
+
+    /// <summary>
+    /// Primary signal for &quot;breakout already occurred&quot; before first bracket submit: tracked OHLC strictly after SlotTimeUtc.
+    /// </summary>
+    private (bool longTouched, bool shortTouched) GetPostSlotBreakoutTouchFromOhlcEnvelope(decimal brkLong, decimal brkShort)
+    {
+        if (!_postSlotExcursionHasSamples) return (false, false);
+        return (_postSlotMaxHighSinceSlot >= brkLong, _postSlotMinLowSinceSlot <= brkShort);
+    }
+
+    /// <summary>
+    /// If OHLC since slot or persisted journal shows post-lock excursion, commit NO_TRADE and return true.
+    /// Call before initial SubmitStopEntryBracketsAtLock from TryLockRange Phase B.
+    /// </summary>
+    private bool TryCommitNoTradeIfPostLockBreakoutDetected(DateTimeOffset utcNow, string detectionPath)
+    {
+        if (_journal.Committed) return false;
+        if (!_brkLongRounded.HasValue || !_brkShortRounded.HasValue) return false;
+
+        var brkL = _brkLongRounded.Value;
+        var brkS = _brkShortRounded.Value;
+        var (ohlcL, ohlcS) = GetPostSlotBreakoutTouchFromOhlcEnvelope(brkL, brkS);
+        var journalL = _journal.PostLockLongBreakoutTouched;
+        var journalS = _journal.PostLockShortBreakoutTouched;
+        if (!ohlcL && !ohlcS && !journalL && !journalS)
+            return false;
+
+        if (ohlcL) _journal.PostLockLongBreakoutTouched = true;
+        if (ohlcS) _journal.PostLockShortBreakoutTouched = true;
+        _journals.Save(_journal);
+
+        var source = (ohlcL || ohlcS) && (journalL || journalS)
+            ? "OHLC_AND_JOURNAL"
+            : (ohlcL || ohlcS ? "OHLC_ENVELOPE" : "JOURNAL_FLAGS_ONLY");
+
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "INITIAL_SUBMISSION_BLOCKED_POST_LOCK_EXCURSION", State.ToString(),
+            new
+            {
+                stream_id = Stream,
+                trading_date = TradingDate,
+                detection_path = detectionPath,
+                source,
+                ohlc_long = ohlcL,
+                ohlc_short = ohlcS,
+                post_lock_long = _journal.PostLockLongBreakoutTouched,
+                post_lock_short = _journal.PostLockShortBreakoutTouched,
+                max_high_since_slot = _postSlotExcursionHasSamples ? _postSlotMaxHighSinceSlot : (decimal?)null,
+                min_low_since_slot = _postSlotExcursionHasSamples ? _postSlotMinLowSinceSlot : (decimal?)null,
+                breakout_long = brkL,
+                breakout_short = brkS,
+                note = "Post-slot OHLC envelope or journal memory — no stop-entry brackets (strict product rule)"
+            }));
+
+        Commit(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", "NO_TRADE_BREAKOUT_ALREADY_OCCURRED");
+        return true;
+    }
+
+    private void SyncJournalPostLockFlagsFromOhlcEnvelopeIfTouched()
+    {
+        if (!_brkLongRounded.HasValue || !_brkShortRounded.HasValue) return;
+        var (l, s) = GetPostSlotBreakoutTouchFromOhlcEnvelope(_brkLongRounded.Value, _brkShortRounded.Value);
+        if (!l && !s) return;
+        if (l) _journal.PostLockLongBreakoutTouched = true;
+        if (s) _journal.PostLockShortBreakoutTouched = true;
+        _journals.Save(_journal);
+    }
+
+    /// <summary>
+    /// Deterministic post-lock excursion: bar must be strictly after slot end; uses bar high/low vs rounded breakout stops.
+    /// On first touch, persists journal flags, emits audit event, and commits NO_TRADE_BREAKOUT_ALREADY_OCCURRED.
+    /// </summary>
+    private void ApplyPostLockBreakoutExcursionFromBar(decimal high, decimal low, DateTimeOffset barUtc, DateTimeOffset utcNow)
+    {
+        if (!_rangeLocked || State != StreamState.RANGE_LOCKED) return;
+        if (_journal.Committed) return;
+        if (_stopBracketsSubmittedAtLock || _journal.StopBracketsSubmittedAtLock) return;
+        if (!_brkLongRounded.HasValue || !_brkShortRounded.HasValue) return;
+        if (barUtc <= SlotTimeUtc) return;
+
+        var brkL = _brkLongRounded.Value;
+        var brkS = _brkShortRounded.Value;
+        var longTouch = high >= brkL;
+        var shortTouch = low <= brkS;
+        if (!longTouch && !shortTouch) return;
+
+        var priorL = _journal.PostLockLongBreakoutTouched;
+        var priorS = _journal.PostLockShortBreakoutTouched;
+        if (longTouch) _journal.PostLockLongBreakoutTouched = true;
+        if (shortTouch) _journal.PostLockShortBreakoutTouched = true;
+        _journals.Save(_journal);
+
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "ENTRY_INVALIDATED_POST_LOCK_EXCURSION", State.ToString(),
+            new
+            {
+                stream_id = Stream,
+                trading_date = TradingDate,
+                bar_utc = barUtc.ToString("o"),
+                breakout_long = brkL,
+                breakout_short = brkS,
+                bar_high = high,
+                bar_low = low,
+                long_touched = longTouch || priorL,
+                short_touched = shortTouch || priorS,
+                note = "Breakout touched on post-lock bar path before entry brackets armed — setup expired (strict)"
+            }));
+
+        Commit(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", "NO_TRADE_BREAKOUT_ALREADY_OCCURRED");
+    }
+
+    /// <summary>
+    /// Restart safety: journal persisted excursion flags but commit did not complete (e.g. crash). Finish NO_TRADE.
+    /// </summary>
+    private void EnsureCommittedForPostLockExcursion(DateTimeOffset utcNow)
+    {
+        if (_journal.Committed || State != StreamState.RANGE_LOCKED) return;
+        if (!IsPostLockBreakoutSetupExpired()) return;
+        Commit(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", "NO_TRADE_BREAKOUT_ALREADY_OCCURRED");
     }
 
     /// <summary>
@@ -3570,6 +4060,11 @@ public sealed class StreamStateMachine
         var canSubmitResult = CanSubmitStopBrackets(utcNow);
         if (!canSubmitResult.CanSubmit)
         {
+            if (canSubmitResult.Reason == "POST_LOCK_BREAKOUT_ALREADY_OCCURRED")
+            {
+                SyncJournalPostLockFlagsFromOhlcEnvelopeIfTouched();
+                Commit(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", "NO_TRADE_BREAKOUT_ALREADY_OCCURRED");
+            }
             _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                 "STOP_BRACKETS_EARLY_RETURN", State.ToString(),
                 new { reason = canSubmitResult.Reason, details = canSubmitResult.Details }));
@@ -3668,6 +4163,7 @@ public sealed class StreamStateMachine
             TradingDate,
             Stream,
             Instrument,
+            ExecutionInstrument,
             Session,
             SlotTimeChicago,
             "Long",
@@ -3682,6 +4178,7 @@ public sealed class StreamStateMachine
             TradingDate,
             Stream,
             Instrument,
+            ExecutionInstrument,
             Session,
             SlotTimeChicago,
             "Short",
@@ -3695,8 +4192,8 @@ public sealed class StreamStateMachine
         var longIntentId = longIntent.ComputeIntentId();
         var shortIntentId = shortIntent.ComputeIntentId();
 
-        // Already submitted? then treat as done. Bypass when reconciliation requested resubmit (broker/journal diverge).
-        if (!_reconciliationRequestedResubmit && _executionJournal != null &&
+        // Already submitted? then treat as done. Bypass when recovery action requires resubmit (broker/journal diverge).
+        if (!_entryOrderRecoveryState.IsPending && _executionJournal != null &&
             (_executionJournal.IsIntentSubmitted(longIntentId, TradingDate, Stream) ||
              _executionJournal.IsIntentSubmitted(shortIntentId, TradingDate, Stream)))
         {
@@ -3707,7 +4204,8 @@ public sealed class StreamStateMachine
         }
 
         // CRITICAL: Position check before resubmit - prevent double exposure.
-        if (_reconciliationRequestedResubmit && _executionAdapter != null)
+        // Reconciliation may have run when flat, but a fill could have occurred before this tick.
+        if (_entryOrderRecoveryState.IsPending && _executionAdapter != null)
         {
             try
             {
@@ -3715,7 +4213,7 @@ public sealed class StreamStateMachine
                 var posQty = snap.Positions?.Where(p => IsSameInstrument(p.Instrument)).Sum(p => p.Quantity) ?? 0;
                 if (posQty != 0)
                 {
-                    _reconciliationRequestedResubmit = false;
+                    ClearRecoveryAction(utcNow);
                     _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                         "ENTRY_ORDERS_RESUBMIT_BLOCKED_POSITION_NOT_FLAT", State.ToString(),
                         new
@@ -3734,13 +4232,6 @@ public sealed class StreamStateMachine
                 _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                     "ENTRY_ORDERS_RESUBMIT_POSITION_CHECK_ERROR", State.ToString(),
                     new { error = ex.Message, note = "Position check failed - blocking resubmit for safety" }));
-                return;
-            }
-
-            if (!LogAndEvaluateUnifiedBreakoutEntryValidity(utcNow, "RECOVERY", failClosedOnMissingQuotes: true))
-            {
-                _reconciliationRequestedResubmit = false;
-                Commit(utcNow, "NO_TRADE_RECOVERY_BREAKOUT_ALREADY_TRIGGERED", "NO_TRADE_RECOVERY_BREAKOUT_ALREADY_TRIGGERED");
                 return;
             }
         }
@@ -3809,9 +4300,6 @@ public sealed class StreamStateMachine
                 "ENTRY_ORDER_TYPE_DECISION", State.ToString(),
                 new { stream = Stream, side = "SHORT", decision = shortDecision, bid, ask, brk_long = brkLong, brk_short = brkShort, price_distance_ticks = shortPriceDistTicks }));
 
-            // PHASE 2: Use ExecutionInstrument for order placement (not canonical Instrument)
-            // PHASE 3: Use ExecutionInstrument for order placement (explicit, not ambiguous Instrument property)
-            // PHASE 3.2: Use code-controlled order quantity (Chart Trader quantity ignored)
             OrderSubmissionResult longRes;
             OrderSubmissionResult shortRes;
             if (longCrossed)
@@ -3857,9 +4345,9 @@ public sealed class StreamStateMachine
                 _journal.StopBracketsSubmittedAtLock = true;
                 _journals.Save(_journal);
                 
-                if (_reconciliationRequestedResubmit)
+                if (_entryOrderRecoveryState.IsPending)
                 {
-                    _reconciliationRequestedResubmit = false;
+                    ClearRecoveryAction(utcNow);
                     _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                         "ENTRY_ORDERS_RESUBMITTED", State.ToString(),
                         new
@@ -3888,6 +4376,18 @@ public sealed class StreamStateMachine
                     persisted_to_journal = true,
                     note = "Stop entry brackets submitted; breakout fill should not require additional submission"
                 }));
+                
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "BRACKET_SUBMIT_OUTCOME", State.ToString(),
+                    new
+                    {
+                        outcome = "submitted_both",
+                        stream_id = Stream,
+                        trading_date = TradingDate,
+                        slot_time_chicago = SlotTimeChicago,
+                        note = "Post-submit truth: both stop entry brackets accepted by adapter"
+                    }));
+                LogSlotEndSummary(utcNow, "RANGE_VALID", true, false, "Range locked; stop brackets submitted, awaiting fill");
             }
             else
             {
@@ -3903,6 +4403,28 @@ public sealed class StreamStateMachine
                     short_error = shortRes.ErrorMessage,
                     note = "Failed to submit one or both stop entry brackets"
                 }));
+                var bothRejected = !longRes.Success && !shortRes.Success;
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "BRACKET_SUBMIT_OUTCOME", State.ToString(),
+                    new
+                    {
+                        outcome = bothRejected ? "rejected_both" : "rejected_partial",
+                        stream_id = Stream,
+                        trading_date = TradingDate,
+                        slot_time_chicago = SlotTimeChicago,
+                        long_success = longRes.Success,
+                        short_success = shortRes.Success,
+                        note = "Post-submit truth: stop entry bracket submission did not succeed for both sides"
+                    }));
+                LogSlotEndSummary(utcNow, "RANGE_VALID", true, false,
+                    bothRejected
+                        ? "Range locked; stop bracket submission failed (both sides) — no working entry orders"
+                        : "Range locked; stop bracket submission incomplete (one side) — review adapter errors");
+                if (bothRejected)
+                {
+                    // Terminal NO_TRADE: avoid substring FAILED in commit reason (classified as FAILED_RUNTIME elsewhere)
+                    Commit(utcNow, "NO_TRADE_ENTRY_BRACKETS_AT_LOCK_REJECTED", "NO_TRADE_ENTRY_BRACKETS_AT_LOCK_REJECTED");
+                }
             }
         }
         catch (Exception ex)
@@ -4907,8 +5429,8 @@ public sealed class StreamStateMachine
             // 1. EmitRangeLockedEvents
             EmitRangeLockedEvents(utcNow, rangeResult);
             
-            // 2. LogSlotEndSummary
-            LogSlotEndSummary(utcNow, "RANGE_VALID", true, false, "Range locked, awaiting signal");
+            // 2. SLOT_END_SUMMARY is emitted from SubmitStopEntryBracketsAtLock after submit (truth-bearing:
+            //    brackets submitted vs failed). Pre-submit "awaiting signal" was misleading when submit failed.
             
             // SIMPLIFICATION: Removed immediate entry path - always use stop brackets
             // Stop brackets handle all entry scenarios:
@@ -4934,6 +5456,7 @@ public sealed class StreamStateMachine
                     new
                     {
                         stream_id = Stream,
+                        metric_type = "blocked_freshness",
                         delay_from_slot_minutes = Math.Round(delayFromSlotMinutes, 2),
                         freshness_window_minutes = freshnessMinutes,
                         slot_time_utc = SlotTimeUtc.ToString("o"),
@@ -4943,12 +5466,8 @@ public sealed class StreamStateMachine
             }
             else if (utcNow < MarketCloseUtc && !_breakoutLevelsMissing && _brkLongRounded.HasValue && _brkShortRounded.HasValue)
             {
-                // P2.10: unified breakout validity (breakout_validity_tolerance_ticks only; fail-open if quotes missing).
-                if (!LogAndEvaluateUnifiedBreakoutEntryValidity(utcNow, "FIRST_LOCK", failClosedOnMissingQuotes: false))
-                {
-                    Commit(utcNow, "NO_TRADE_UNIFIED_BREAKOUT_INVALID", "NO_TRADE_UNIFIED_BREAKOUT_INVALID");
-                }
-                else
+                // Pre-submit: OHLC strictly after slot is authoritative; journal flags are optional memory (e.g. restart).
+                if (!TryCommitNoTradeIfPostLockBreakoutDetected(utcNow, "TRY_LOCK_RANGE_PHASE_B"))
                 {
                     var (bid, ask) = _executionAdapter?.GetCurrentMarketPrice(ExecutionInstrument, utcNow) ?? (null, null);
                     var brkLong = _brkLongRounded.Value;
@@ -5349,6 +5868,11 @@ public sealed class StreamStateMachine
                 
                 // Restore locked state from canonical hydration log (extract from data dictionary)
                 _rangeLocked = true;
+                // CRITICAL: Broker orders are lost on process restart. Force resubmit of stop-entry brackets.
+                _stopBracketsSubmittedAtLock = false;
+                LogHealth("INFO", "RANGE_LOCKED_RESTORE_RESUBMIT_BRACKETS",
+                    "Reset StopBracketsSubmittedAtLock for resubmit - broker orders lost on restart",
+                    new { trading_day = tradingDay, stream_id = streamId });
                 RangeHigh = ExtractDecimal(latestHydrationData, "range_high");
                 RangeLow = ExtractDecimal(latestHydrationData, "range_low");
                 FreezeClose = ExtractDecimal(latestHydrationData, "freeze_close");
@@ -5393,6 +5917,11 @@ public sealed class StreamStateMachine
             {
                 // Restore locked state from canonical ranges log
                 _rangeLocked = true;
+                // CRITICAL: Broker orders are lost on process restart. Force resubmit of stop-entry brackets.
+                _stopBracketsSubmittedAtLock = false;
+                LogHealth("INFO", "RANGE_LOCKED_RESTORE_RESUBMIT_BRACKETS",
+                    "Reset StopBracketsSubmittedAtLock for resubmit - broker orders lost on restart",
+                    new { trading_day = tradingDay, stream_id = streamId });
                 RangeHigh = latestRangeEvt.range_high;
                 RangeLow = latestRangeEvt.range_low;
                 FreezeClose = latestRangeEvt.freeze_close;
@@ -5462,6 +5991,375 @@ public sealed class StreamStateMachine
                     note = "Will proceed without restoration" 
                 });
         }
+    }
+
+    /// <summary>
+    /// Restore partial RANGE_BUILDING state from persisted snapshot.
+    /// Called when previous state was RANGE_BUILDING and RANGE_LOCKED restore did not apply.
+    /// </summary>
+    private void RestoreRangeBuildingFromSnapshot(string tradingDay, string streamId)
+    {
+        var utcNow = DateTimeOffset.UtcNow;
+        if (_rangeBuildingSnapshotPersister == null)
+        {
+            LogHealth("CRITICAL", "RANGE_BUILDING_RESTORE_FALLBACK_TO_EMPTY",
+                "RANGE_BUILDING snapshot restore skipped - persister not available",
+                new { stream_id = streamId, trading_date = tradingDay, reason = "PERSISTER_NULL" });
+            FallbackToRebuild(tradingDay, streamId, utcNow, "PERSISTER_NULL", null);
+            return;
+        }
+
+        // Log path info at read time (detect NT vs module path mismatch)
+        var pathInfo = _rangeBuildingSnapshotPersister.GetPathInfo(tradingDay);
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "RANGE_BUILDING_SNAPSHOT_PATH_INFO", "RESTORE_READ",
+            new
+            {
+                resolved_project_root = pathInfo.resolved_project_root,
+                absolute_snapshot_path = pathInfo.absolute_snapshot_path,
+                note = "read_time"
+            }));
+
+        var snapshot = _rangeBuildingSnapshotPersister.LoadLatest(tradingDay, streamId);
+        if (snapshot == null)
+        {
+            var diag = _rangeBuildingSnapshotPersister.GetRestoreDiagnostics(tradingDay, streamId);
+            var failureReason = !diag.file_exists ? "FILE_NOT_FOUND"
+                : diag.total_lines == 0 ? "EMPTY_FILE"
+                : diag.stream_line_count == 0 ? "STREAM_NOT_FOUND"
+                : "PARSE_ERROR";
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "RANGE_BUILDING_SNAPSHOT_RESTORE_FAILED_DIAGNOSTIC", "RESTORE_FAILED",
+                new
+                {
+                    stream = streamId,
+                    trading_date = tradingDay,
+                    snapshot_file_path = diag.file_path,
+                    project_root = pathInfo.resolved_project_root,
+                    file_exists = diag.file_exists,
+                    total_lines_in_file = diag.total_lines,
+                    matching_lines_for_stream = diag.stream_line_count,
+                    failure_reason = failureReason
+                }));
+            LogHealth("CRITICAL", "RANGE_BUILDING_SNAPSHOT_RESTORE_FAILED",
+                "Previous state was RANGE_BUILDING but no valid snapshot found - falling back to rebuild",
+                new
+                {
+                    stream_id = streamId,
+                    trading_date = tradingDay,
+                    slot_time = SlotTimeChicago,
+                    reason = failureReason,
+                    snapshot_file_path_read = diag.file_path,
+                    file_exists_at_restart = diag.file_exists,
+                    total_lines_in_file = diag.total_lines,
+                    stream_line_count = diag.stream_line_count,
+                    bar_count = 0,
+                    range_high = (decimal?)null,
+                    range_low = (decimal?)null,
+                    last_processed_bar_time = (string?)null
+                });
+            FallbackToRebuild(tradingDay, streamId, utcNow, failureReason, diag);
+            return;
+        }
+
+        // Relaxed identity: only require stream, instrument, trading_date. Do NOT invalidate for slot_time/session.
+        var coreMatch = snapshot.trading_date == tradingDay &&
+            snapshot.stream_id == streamId &&
+            string.Equals(snapshot.instrument ?? "", CanonicalInstrument ?? "", StringComparison.OrdinalIgnoreCase);
+        if (!coreMatch)
+        {
+            var diag = _rangeBuildingSnapshotPersister.GetRestoreDiagnostics(tradingDay, streamId);
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "RANGE_BUILDING_SNAPSHOT_RESTORE_FAILED_DIAGNOSTIC", "RESTORE_FAILED",
+                new
+                {
+                    stream = streamId,
+                    trading_date = tradingDay,
+                    snapshot_file_path = diag.file_path,
+                    project_root = pathInfo.resolved_project_root,
+                    file_exists = diag.file_exists,
+                    total_lines_in_file = diag.total_lines,
+                    matching_lines_for_stream = diag.stream_line_count,
+                    failure_reason = "IDENTITY_MISMATCH"
+                }));
+            LogHealth("CRITICAL", "RANGE_BUILDING_RESTORE_IDENTITY_MISMATCH",
+                "RANGE_BUILDING snapshot identity does not match (stream/instrument/date) - rejecting restore",
+                new
+                {
+                    stream_id = streamId,
+                    trading_date = tradingDay,
+                    slot_time = SlotTimeChicago,
+                    reason = "IDENTITY_MISMATCH",
+                    snapshot_file_path_read = diag.file_path,
+                    file_exists_at_restart = diag.file_exists,
+                    total_lines_in_file = diag.total_lines,
+                    stream_line_count = diag.stream_line_count,
+                    snapshot_trading_date = snapshot.trading_date,
+                    snapshot_stream_id = snapshot.stream_id,
+                    snapshot_instrument = snapshot.instrument,
+                    snapshot_session = snapshot.session,
+                    snapshot_slot_time = snapshot.slot_time,
+                    current_instrument = CanonicalInstrument,
+                    current_session = Session,
+                    bar_count = snapshot.bar_count,
+                    range_high = snapshot.range_high,
+                    range_low = snapshot.range_low
+                });
+            FallbackToRebuild(tradingDay, streamId, utcNow, "IDENTITY_MISMATCH", diag);
+            return;
+        }
+
+        // Log soft mismatch if session/slot changed (we still restore)
+        if (snapshot.session != Session || snapshot.slot_time != SlotTimeChicago)
+        {
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "RANGE_BUILDING_RESTORE_IDENTITY_SOFT_MISMATCH", State.ToString(),
+                new
+                {
+                    stream_id = streamId,
+                    trading_date = tradingDay,
+                    snapshot_session = snapshot.session,
+                    snapshot_slot_time = snapshot.slot_time,
+                    current_session = Session,
+                    current_slot_time = SlotTimeChicago,
+                    note = "Restoring anyway - slot_time/session change does not invalidate"
+                }));
+        }
+
+        // Validate timestamp sanity
+        if (!DateTimeOffset.TryParse(snapshot.last_processed_bar_time_utc, out var lastBarUtc))
+        {
+            var diag = _rangeBuildingSnapshotPersister.GetRestoreDiagnostics(tradingDay, streamId);
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "RANGE_BUILDING_SNAPSHOT_RESTORE_FAILED_DIAGNOSTIC", "RESTORE_FAILED",
+                new
+                {
+                    stream = streamId,
+                    trading_date = tradingDay,
+                    snapshot_file_path = diag.file_path,
+                    project_root = pathInfo.resolved_project_root,
+                    file_exists = diag.file_exists,
+                    total_lines_in_file = diag.total_lines,
+                    matching_lines_for_stream = diag.stream_line_count,
+                    failure_reason = "PARSE_ERROR"
+                }));
+            LogHealth("CRITICAL", "RANGE_BUILDING_SNAPSHOT_RESTORE_FAILED",
+                "Snapshot last_processed_bar_time invalid - rejecting restore",
+                new
+                {
+                    stream_id = streamId,
+                    trading_date = tradingDay,
+                    reason = "INVALID_LAST_BAR_TIME",
+                    snapshot_file_path_read = diag.file_path,
+                    file_exists_at_restart = diag.file_exists,
+                    total_lines_in_file = diag.total_lines,
+                    stream_line_count = diag.stream_line_count
+                });
+            FallbackToRebuild(tradingDay, streamId, utcNow, "PARSE_ERROR", diag);
+            return;
+        }
+
+        if (lastBarUtc > utcNow)
+        {
+            var diag = _rangeBuildingSnapshotPersister.GetRestoreDiagnostics(tradingDay, streamId);
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "RANGE_BUILDING_SNAPSHOT_RESTORE_FAILED_DIAGNOSTIC", "RESTORE_FAILED",
+                new
+                {
+                    stream = streamId,
+                    trading_date = tradingDay,
+                    snapshot_file_path = diag.file_path,
+                    project_root = pathInfo.resolved_project_root,
+                    file_exists = diag.file_exists,
+                    total_lines_in_file = diag.total_lines,
+                    matching_lines_for_stream = diag.stream_line_count,
+                    failure_reason = "PARSE_ERROR"
+                }));
+            LogHealth("CRITICAL", "RANGE_BUILDING_SNAPSHOT_RESTORE_FAILED",
+                "Snapshot last_processed_bar_time is in the future - rejecting restore",
+                new
+                {
+                    stream_id = streamId,
+                    trading_date = tradingDay,
+                    reason = "LAST_BAR_IN_FUTURE",
+                    snapshot_file_path_read = diag.file_path,
+                    file_exists_at_restart = diag.file_exists,
+                    total_lines_in_file = diag.total_lines,
+                    stream_line_count = diag.stream_line_count
+                });
+            FallbackToRebuild(tradingDay, streamId, utcNow, "LAST_BAR_IN_FUTURE", diag);
+            return;
+        }
+
+        // Restore succeeded - bars into buffer
+        lock (_barBufferLock)
+        {
+            _barBuffer.Clear();
+            DateTimeOffset? lastBarChicago = null;
+            foreach (var b in snapshot.bars ?? new List<RangeBuildingSnapshotBar>())
+            {
+                if (string.IsNullOrEmpty(b.timestamp_utc) || !DateTimeOffset.TryParse(b.timestamp_utc, out var barUtc))
+                    continue;
+                _barBuffer.Add(new Bar(barUtc, b.open, b.high, b.low, b.close, null));
+                lastBarChicago = _time.ConvertUtcToChicago(barUtc);
+            }
+            _barBuffer.Sort((a, b) => a.TimestampUtc.CompareTo(b.TimestampUtc));
+            if (lastBarChicago.HasValue)
+                _lastBarOpenChicago = lastBarChicago;
+        }
+
+        // Restore range state
+        RangeHigh = snapshot.range_high;
+        RangeLow = snapshot.range_low;
+        FreezeClose = snapshot.freeze_close;
+        FreezeCloseSource = snapshot.freeze_close_source ?? "RESTORED";
+        _lastProcessedBarTimeUtc = lastBarUtc;
+        _restoredFromRangeBuildingSnapshot = true;
+
+        State = StreamState.RANGE_BUILDING;
+        _preHydrationComplete = true;
+
+        LogHealth("INFO", "RANGE_BUILDING_SNAPSHOT_RESTORED",
+            "RANGE_BUILDING state restored from snapshot - resuming from partial state",
+            new
+            {
+                stream_id = streamId,
+                trading_date = tradingDay,
+                slot_time = SlotTimeChicago,
+                bar_count = snapshot.bar_count,
+                range_high = snapshot.range_high,
+                range_low = snapshot.range_low,
+                last_processed_bar_time = snapshot.last_processed_bar_time_utc,
+                note = "Will continue building; bars with timestamp <= last_processed_bar_time will be deduplicated"
+            });
+
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "RANGE_BUILDING_SNAPSHOT_RESTORED", State.ToString(),
+            new
+            {
+                stream_id = streamId,
+                trading_date = tradingDay,
+                slot_time = SlotTimeChicago,
+                bar_count = snapshot.bar_count,
+                range_high = snapshot.range_high,
+                range_low = snapshot.range_low,
+                last_processed_bar_time = snapshot.last_processed_bar_time_utc
+            }));
+
+        // Slot-time-passed: attempt immediate lock
+        if (utcNow >= SlotTimeUtc)
+        {
+            LogHealth("INFO", "RANGE_BUILDING_RESTORE_SLOT_PASSED_LOCK_ATTEMPT",
+                "Slot time already passed - attempting immediate lock from restored state",
+                new
+                {
+                    stream_id = streamId,
+                    trading_date = tradingDay,
+                    slot_time = SlotTimeChicago,
+                    bar_count = snapshot.bar_count,
+                    range_high = snapshot.range_high,
+                    range_low = snapshot.range_low
+                });
+
+            if (TryLockRange(utcNow))
+            {
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// When RANGE_BUILDING restore fails: transition to PRE_HYDRATION so BarsRequest triggers rebuild.
+    /// No silent fallback to ARMED - deterministic rebuild from historical bars.
+    /// </summary>
+    private void FallbackToRebuild(string tradingDay, string streamId, DateTimeOffset utcNow, string failureReason, RestoreDiagnostics? diag)
+    {
+        State = StreamState.PRE_HYDRATION;
+        _preHydrationComplete = false; // Wait for BarsRequest bars
+
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "RANGE_BUILDING_RESTORE_FALLBACK_REBUILD", State.ToString(),
+            new
+            {
+                stream = streamId,
+                trading_date = tradingDay,
+                failure_reason = failureReason,
+                snapshot_file_path = diag?.file_path,
+                file_exists = diag?.file_exists,
+                total_lines_in_file = diag?.total_lines ?? 0,
+                matching_lines_for_stream = diag?.stream_line_count ?? 0,
+                note = "BarsRequest will be triggered for deterministic rebuild"
+            }));
+    }
+
+    /// <summary>
+    /// Persist RANGE_BUILDING snapshot for restart recovery.
+    /// Call when entering RANGE_BUILDING and when range_high/range_low changes.
+    /// </summary>
+    private void PersistRangeBuildingSnapshot(DateTimeOffset lastBarUtc)
+    {
+        if (_rangeBuildingSnapshotPersister == null || State != StreamState.RANGE_BUILDING || _rangeLocked)
+            return;
+
+        var bars = GetBarBufferSnapshot();
+        var snapshotBars = new List<RangeBuildingSnapshotBar>();
+        foreach (var b in bars)
+        {
+            snapshotBars.Add(new RangeBuildingSnapshotBar
+            {
+                timestamp_utc = b.TimestampUtc.ToString("o"),
+                open = b.Open,
+                high = b.High,
+                low = b.Low,
+                close = b.Close
+            });
+        }
+
+        var snapshot = new RangeBuildingSnapshot
+        {
+            source = RangeBuildingSnapshot.SourceMarker,
+            trading_date = TradingDate ?? "",
+            stream_id = Stream ?? "",
+            instrument = CanonicalInstrument ?? "",
+            session = Session ?? "",
+            slot_time = SlotTimeChicago ?? "",
+            range_start_chicago = RangeStartChicagoTime.ToString("o"),
+            range_start_utc = RangeStartUtc.ToString("o"),
+            last_processed_bar_time_utc = lastBarUtc.ToString("o"),
+            bar_count = bars.Count,
+            range_high = RangeHigh,
+            range_low = RangeLow,
+            freeze_close = FreezeClose,
+            freeze_close_source = FreezeCloseSource ?? "",
+            tick_size = _tickSize,
+            snapshot_timestamp_utc = DateTimeOffset.UtcNow.ToString("o"),
+            bars = snapshotBars
+        };
+
+        _rangeBuildingSnapshotPersister.Persist(snapshot);
+
+        var pathInfo = _rangeBuildingSnapshotPersister.GetPathInfo(TradingDate ?? "");
+        _log.Write(RobotEvents.Base(_time, DateTimeOffset.UtcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "RANGE_BUILDING_SNAPSHOT_PATH_INFO", State.ToString(),
+            new
+            {
+                resolved_project_root = pathInfo.resolved_project_root,
+                absolute_snapshot_path = pathInfo.absolute_snapshot_path,
+                note = "write_time"
+            }));
+        _log.Write(RobotEvents.Base(_time, DateTimeOffset.UtcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "RANGE_BUILDING_SNAPSHOT_WRITTEN", State.ToString(),
+            new
+            {
+                stream_id = Stream,
+                trading_date = TradingDate,
+                slot_time = SlotTimeChicago,
+                bar_count = snapshot.bar_count,
+                range_high = snapshot.range_high,
+                range_low = snapshot.range_low,
+                last_processed_bar_time = snapshot.last_processed_bar_time_utc,
+                snapshot_file_path = pathInfo.absolute_snapshot_path
+            }));
     }
 
     private void Commit(DateTimeOffset utcNow, string commitReason, string eventType)
@@ -5943,6 +6841,10 @@ public sealed class StreamStateMachine
         _lastBarOpenChicago = null;
         _rangeInvalidated = false;
         _rangeInvalidatedNotified = false;
+
+        _postSlotExcursionHasSamples = false;
+        _postSlotMaxHighSinceSlot = decimal.MinValue;
+        _postSlotMinLowSinceSlot = decimal.MaxValue;
         
         // Logging state
         _slotEndSummaryLogged = false;
@@ -6436,6 +7338,8 @@ public sealed class StreamStateMachine
     
     /// <summary>
     /// Handle slot expiry (next slot time reached).
+    /// Only flattens positions that are still open. If ExecutionInterruptedByClose, original position
+    /// was already flattened at FlattenTriggerUtc; only reentry position (if filled) may need flatten.
     /// </summary>
     private void HandleSlotExpiry(DateTimeOffset utcNow)
     {
@@ -6445,11 +7349,12 @@ public sealed class StreamStateMachine
         }
         
         // Exit position at market if open (via execution adapter)
-        // Handle both original entry and re-entry positions
+        // Original entry: only flatten if NOT already closed by forced flatten (ExecutionInterruptedByClose)
+        // Reentry: always flatten if reentry filled (reentry position may still be open at slot expiry)
         if (_executionAdapter != null)
         {
-            // Flatten original entry position if OriginalIntentId exists
-            if (!string.IsNullOrWhiteSpace(_journal.OriginalIntentId))
+            // Flatten original entry only if it was NOT already flattened by HandleForcedFlatten
+            if (!string.IsNullOrWhiteSpace(_journal.OriginalIntentId) && !_journal.ExecutionInterruptedByClose)
             {
                 try
                 {
@@ -6461,7 +7366,7 @@ public sealed class StreamStateMachine
                 }
             }
             
-            // Flatten re-entry position if re-entry happened
+            // Flatten re-entry position if re-entry happened (reentry is never flattened at session close)
             if (_journal.ReentryFilled && !string.IsNullOrWhiteSpace(_journal.ReentryIntentId))
             {
                 try
@@ -6475,39 +7380,26 @@ public sealed class StreamStateMachine
             }
         }
         
-        // Cancel orders for both intents
-        if (_executionAdapter != null)
+        // Cancel orders for both intents (idempotent - orders may already be cancelled)
+        if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
         {
-            // Cancel original entry orders
             if (!string.IsNullOrWhiteSpace(_journal.OriginalIntentId))
             {
-                try
-                {
-                    if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
-                    {
-                        simAdapter.CancelIntentOrders(_journal.OriginalIntentId, utcNow);
-                    }
-                }
-                catch
-                {
-                    // Log error but continue with expiry
-                }
+                try { simAdapter.CancelIntentOrders(_journal.OriginalIntentId, utcNow); }
+                catch { /* Log error but continue */ }
             }
-            
-            // Cancel re-entry orders if re-entry happened
+            else if (_brkLongRounded.HasValue && _brkShortRounded.HasValue)
+            {
+                // Pre-entry: cancel long/short entry bracket intents (OriginalIntentId empty when no fill)
+                var longIntentId = ComputeIntentId("Long", _brkLongRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_LONG");
+                var shortIntentId = ComputeIntentId("Short", _brkShortRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_SHORT");
+                try { simAdapter.CancelIntentOrders(longIntentId, utcNow); } catch { /* Log error but continue */ }
+                try { simAdapter.CancelIntentOrders(shortIntentId, utcNow); } catch { /* Log error but continue */ }
+            }
             if (_journal.ReentryFilled && !string.IsNullOrWhiteSpace(_journal.ReentryIntentId))
             {
-                try
-                {
-                    if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
-                    {
-                        simAdapter.CancelIntentOrders(_journal.ReentryIntentId, utcNow);
-                    }
-                }
-                catch
-                {
-                    // Log error but continue with expiry
-                }
+                try { simAdapter.CancelIntentOrders(_journal.ReentryIntentId, utcNow); }
+                catch { /* Log error but continue */ }
             }
         }
         
@@ -6585,6 +7477,24 @@ public sealed class StreamStateMachine
         if (_journal.NextSlotTimeUtc.HasValue && utcNow >= _journal.NextSlotTimeUtc.Value)
         {
             return; // Slot expired, no re-entry
+        }
+        
+        // Block checks: instrument blocked or IEA queue unhealthy - do not enqueue reentry
+        var execInst = ExecutionInstrument ?? Instrument ?? "";
+        if (!string.IsNullOrEmpty(execInst))
+        {
+            if (_isInstrumentBlockedForReentry?.Invoke(execInst) == true)
+            {
+                LogSessionReentryBlocked(utcNow, "INSTRUMENT_BLOCKED",
+                    "Instrument blocked or frozen for reentry (reconciliation / flatten latch)");
+                return;
+            }
+            if (_isIeaQueueHealthyForInstrument?.Invoke(execInst) == false)
+            {
+                LogSessionReentryBlocked(utcNow, "IEA_QUEUE_UNHEALTHY",
+                    "IE execution adapter queue unhealthy or poison — reentry not allowed");
+                return;
+            }
         }
         
         // Load bracket levels from ExecutionJournalEntry via OriginalIntentId (canonical source)
@@ -6720,7 +7630,7 @@ public sealed class StreamStateMachine
             ["reentry_intent_id"] = _journal.ReentryIntentId ?? "",
             ["reason"] = "MARKET_OPEN_GATES_PASSED"
         });
-
+        
         // Mark re-entry as submitted (idempotency)
         _journal.ReentrySubmitted = true;
         _journals.Save(_journal);
@@ -6755,7 +7665,7 @@ public sealed class StreamStateMachine
             ["command_id"] = cmd.CommandId,
             ["reason"] = "REENTRY_COMMAND_ENQUEUED"
         });
-
+        
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
             "REENTRY_SUBMITTED", State.ToString(),
             new
@@ -6781,10 +7691,10 @@ public sealed class StreamStateMachine
         {
             return; // Not our re-entry or already filled
         }
-
+        
         _journal.ReentryFilled = true;
         _journals.Save(_journal);
-
+        
         // Load bracket levels from OriginalIntentId
         if (string.IsNullOrWhiteSpace(_journal.OriginalIntentId) || _executionJournal == null)
         {
@@ -6808,7 +7718,7 @@ public sealed class StreamStateMachine
                 new { original_intent_id = _journal.OriginalIntentId });
             return;
         }
-
+        
         // Resolve original trading date and stream from PriorJournalKey
         string? originalTradingDate = null;
         string? originalStream = null;
@@ -6820,7 +7730,7 @@ public sealed class StreamStateMachine
         }
         if (string.IsNullOrEmpty(originalTradingDate)) originalTradingDate = TradingDate;
         if (string.IsNullOrEmpty(originalStream)) originalStream = Stream;
-
+        
         var originalEntry = _executionJournal.GetEntry(_journal.OriginalIntentId, originalTradingDate, originalStream);
         if (originalEntry == null || !originalEntry.StopPrice.HasValue || !originalEntry.TargetPrice.HasValue)
         {
@@ -6830,16 +7740,16 @@ public sealed class StreamStateMachine
                 new { original_intent_id = _journal.OriginalIntentId });
             return;
         }
-
+        
         var stopPrice = originalEntry.StopPrice.Value;
         var targetPrice = originalEntry.TargetPrice.Value;
         var direction = originalEntry.Direction ?? "Long";
         var quantity = originalEntry.EntryFilledQuantityTotal;
         if (quantity <= 0) quantity = 1;
-
+        
         _journal.ProtectionSubmitted = true;
         _journals.Save(_journal);
-
+        
         // Submit protective bracket via execution adapter
         if (_executionAdapter != null)
         {
@@ -6856,7 +7766,7 @@ public sealed class StreamStateMachine
                     target_price = targetPrice
                 }));
         }
-
+        
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
             "REENTRY_FILLED", State.ToString(),
             new
@@ -6866,7 +7776,7 @@ public sealed class StreamStateMachine
                 note = "Re-entry filled - protective bracket submitted"
             }));
     }
-
+    
     /// <summary>
     /// Handle re-entry protection acceptance (called by execution adapter when protective orders accepted).
     /// </summary>
@@ -6882,11 +7792,11 @@ public sealed class StreamStateMachine
         {
             return; // Not our reentry intent
         }
-
+        
         _journal.ProtectionAccepted = true;
         _journal.ExecutionInterruptedByClose = false; // Clear interruption flag after protection confirmed
         _journals.Save(_journal);
-
+        
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
             "REENTRY_PROTECTION_ACCEPTED", State.ToString(),
             new
@@ -6914,6 +7824,13 @@ public sealed class StreamStateMachine
     /// <param name="source">Bar source (LIVE, BARSREQUEST, or CSV)</param>
     private void AddBarToBuffer(Bar bar, BarSource source)
     {
+        // RANGE_BUILDING restore deduplication: skip bars already in snapshot
+        if (_restoredFromRangeBuildingSnapshot && _lastProcessedBarTimeUtc.HasValue &&
+            bar.TimestampUtc <= _lastProcessedBarTimeUtc.Value)
+        {
+            return; // Bar already captured in restored snapshot - do not double-count
+        }
+
         lock (_barBufferLock)
         {
             var utcNow = DateTimeOffset.UtcNow;

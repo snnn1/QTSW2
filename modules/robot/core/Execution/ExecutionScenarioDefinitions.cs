@@ -266,7 +266,7 @@ public static class ExecutionScenarioDefinitions
             Name = SCENARIO_PERSISTENT_MISMATCH,
             EventSteps = new List<EventStep>
             {
-                new() { Type = ExecutionEventTypes.MISMATCH_DETECTED, Instrument = "ES", Payload = new { broker_qty = 2, local_qty = 0, mismatch_type = "POSITION_QTY_MISMATCH" } },
+                new() { Type = ExecutionEventTypes.MISMATCH_DETECTED, Instrument = "ES", Payload = new { broker_qty = 2, local_qty = 0, mismatch_type = "NET_POSITION_MISMATCH" } },
                 new() { Type = ExecutionEventTypes.MISMATCH_PERSISTENT, Instrument = "ES", Payload = new { } },
                 new() { Type = ExecutionEventTypes.MISMATCH_FAIL_CLOSED, Instrument = "ES", Payload = new { } },
                 new() { Type = ExecutionEventTypes.POSITION_FLATTENED, Instrument = "ES", Payload = new { } }

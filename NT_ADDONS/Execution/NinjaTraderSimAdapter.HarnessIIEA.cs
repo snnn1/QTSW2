@@ -81,6 +81,19 @@ public sealed partial class NinjaTraderSimAdapter
     (string JournalDir, int FileCount, bool DirectoryExists) IIEAOrderExecutor.GetJournalDiagnostics(string? executionInstrument) =>
         _harnessIiea.GetJournalDiagnostics(executionInstrument);
 
+    void IIEAOrderExecutor.EmitRecoveryAdoptionZeroDeltaDiagnostics(
+        string executionInstrumentKey,
+        string adoptionScanEpisodeId,
+        int adoptedDelta,
+        bool isRecoveryAdoptionScan,
+        IReadOnlyCollection<string>? registryMismatchTrustedIntentIds) =>
+        _harnessIiea.EmitRecoveryAdoptionZeroDeltaDiagnostics(
+            executionInstrumentKey,
+            adoptionScanEpisodeId,
+            adoptedDelta,
+            isRecoveryAdoptionScan,
+            registryMismatchTrustedIntentIds);
+
     void IIEAOrderExecutor.EvaluateBreakEvenCore(decimal tickPrice, DateTimeOffset eventTime, string executionInstrument) =>
         _harnessIiea.EvaluateBreakEvenCore(tickPrice, eventTime, executionInstrument);
 

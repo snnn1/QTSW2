@@ -33,6 +33,9 @@ public sealed class MismatchEscalationCoordinator
     private readonly Action<string, ReconciliationForcedConvergenceContext, ReconciliationForcedConvergenceResult>?
         _onForcedConvergenceFailure;
     private readonly Func<long>? _getExecutionActivityGeneration;
+    private readonly Action<string, DateTimeOffset>? _onHedgedNetFlatPersistentEscalation;
+    /// <summary>One-shot hedged convergence escalation per instrument per gate episode.</summary>
+    private readonly ConcurrentDictionary<string, byte> _hedgedNetFlatEscalationInvoked = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _auditRunLock = new();
     private long _scheduleFingerprintPrev = long.MinValue;
     private long _scheduleActivityGenPrev = long.MinValue;
@@ -65,7 +68,10 @@ public sealed class MismatchEscalationCoordinator
     private int _mismatchClearedCount;
     private int _mismatchBrokerAheadCount;
     private int _mismatchJournalAheadCount;
-    private int _mismatchPositionQtyCount;
+    private int _mismatchNetPositionCount;
+    private int _mismatchGrossDivergenceCount;
+    private int _mismatchStructuralMultiIntentCount;
+    private int _mismatchHedgedNetFlatCount;
     private int _mismatchRegistryMissingCount;
     private int _mismatchProtectiveDivergenceCount;
 
@@ -99,7 +105,8 @@ public sealed class MismatchEscalationCoordinator
         Func<ReconciliationForcedConvergenceContext, ReconciliationForcedConvergenceResult>? runForcedBrokerAlignment = null,
         Action<string, ReconciliationForcedConvergenceContext, ReconciliationForcedConvergenceResult>? onForcedConvergenceFailure =
             null,
-        Func<long>? getExecutionActivityGeneration = null)
+        Func<long>? getExecutionActivityGeneration = null,
+        Action<string, DateTimeOffset>? onHedgedNetFlatPersistentEscalation = null)
     {
         _getSnapshot = getSnapshot ?? throw new ArgumentNullException(nameof(getSnapshot));
         _getActiveInstruments = getActiveInstruments ?? (() => Array.Empty<string>());
@@ -115,6 +122,7 @@ public sealed class MismatchEscalationCoordinator
         _runForcedBrokerAlignment = runForcedBrokerAlignment;
         _onForcedConvergenceFailure = onForcedConvergenceFailure;
         _getExecutionActivityGeneration = getExecutionActivityGeneration;
+        _onHedgedNetFlatPersistentEscalation = onHedgedNetFlatPersistentEscalation;
         _stableWindowMs = stateConsistencyStableWindowMs > 0
             ? stateConsistencyStableWindowMs
             : MismatchEscalationPolicy.STATE_CONSISTENCY_STABLE_WINDOW_MS_LIVE;
@@ -519,6 +527,8 @@ public sealed class MismatchEscalationCoordinator
         state.LastDetectedUtc = utcNow;
         state.PersistenceMs = (long)(utcNow - state.FirstDetectedUtc).TotalMilliseconds;
 
+        TryHedgedNetFlatPersistentEscalation(inst, obs, utcNow, state);
+
         if (state.EscalationState == MismatchEscalationState.DETECTED)
         {
             if (state.PersistenceMs >= MismatchEscalationPolicy.MISMATCH_PERSISTENT_THRESHOLD_MS)
@@ -541,8 +551,10 @@ public sealed class MismatchEscalationCoordinator
         if (state.EscalationState == MismatchEscalationState.PERSISTENT_MISMATCH)
         {
             state.PersistenceMs = (long)(utcNow - state.FirstDetectedUtc).TotalMilliseconds;
-            if (state.PersistenceMs >= MismatchEscalationPolicy.MISMATCH_FAIL_CLOSED_THRESHOLD_MS ||
-                state.RetryCount >= MismatchEscalationPolicy.MISMATCH_MAX_RETRIES)
+            var failClosedEligible = obs.MismatchType == MismatchType.NET_POSITION_MISMATCH;
+            if (failClosedEligible &&
+                (state.PersistenceMs >= MismatchEscalationPolicy.MISMATCH_FAIL_CLOSED_THRESHOLD_MS ||
+                 state.RetryCount >= MismatchEscalationPolicy.MISMATCH_MAX_RETRIES))
             {
                 state.EscalationState = MismatchEscalationState.FAIL_CLOSED;
                 state.GateLifecyclePhase = GateLifecyclePhase.FailClosed;
@@ -554,6 +566,32 @@ public sealed class MismatchEscalationCoordinator
                 EmitCanonical(inst, "STATE_CONSISTENCY_GATE_RECOVERY_FAILED", utcNow, failClosedPayload, "CRITICAL");
             }
         }
+    }
+
+    /// <summary>
+    /// Hedged net-flat / gross-open is not fail-closed, but persistent state must converge — escalate monitoring + optional gate recovery.
+    /// </summary>
+    private void TryHedgedNetFlatPersistentEscalation(string inst, MismatchObservation obs, DateTimeOffset utcNow,
+        MismatchInstrumentState state)
+    {
+        if (obs.MismatchType != MismatchType.HEDGED_NET_FLAT_GROSS_OPEN) return;
+        if (_onHedgedNetFlatPersistentEscalation == null) return;
+        if (state.PersistenceMs < MismatchEscalationPolicy.HEDGED_NET_FLAT_CONVERGENCE_ESCALATION_MS) return;
+        if (!_hedgedNetFlatEscalationInvoked.TryAdd(inst, 0)) return;
+
+        var payload = new
+        {
+            instrument = inst,
+            persistence_ms = state.PersistenceMs,
+            threshold_ms = MismatchEscalationPolicy.HEDGED_NET_FLAT_CONVERGENCE_ESCALATION_MS,
+            gross_journal_qty = obs.LocalQty,
+            net_broker_qty = obs.NetBrokerQty,
+            net_journal_qty = obs.NetJournalQty,
+            note = "Hedged structural net-flat gross-open persisted — invoke convergence hook (not fail-closed)"
+        };
+        _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "HEDGED_NET_FLAT_GROSS_OPEN_CONVERGENCE_ESCALATION", payload));
+        EmitCanonical(inst, "HEDGED_NET_FLAT_GROSS_OPEN_CONVERGENCE_ESCALATION", utcNow, payload, "WARN");
+        _onHedgedNetFlatPersistentEscalation(inst, utcNow);
     }
 
     private static bool IsStallLikeSkipReason(string? skipReason) =>
@@ -1050,20 +1088,6 @@ public sealed class MismatchEscalationCoordinator
                                       IsStallLikeSkipReason(skipReason) && state.FirstConsistentUtc != default;
             if (!preserveStableClock)
                 state.FirstConsistentUtc = utcNow;
-            if (preserveStableClock)
-            {
-                var clkDbg = new
-                {
-                    timestamp_utc = utcNow.ToString("o"),
-                    instrument = inst,
-                    first_consistent_utc = state.FirstConsistentUtc.ToString("o"),
-                    skip_reason = skipReason,
-                    external_fingerprint = fpNow,
-                    note = "TEMP_DEBUG: stable window timer not reset on unchanged stall eval; remove when stable"
-                };
-                _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "GATE_STABLE_CLOCK_PRESERVED", clkDbg));
-                EmitCanonical(inst, "GATE_STABLE_CLOCK_PRESERVED", utcNow, clkDbg, "INFO");
-            }
             if (!preserveStableClock)
             {
                 var spPayload = ToGatePayload(state, inst, utcNow, obsForSig, recon, readiness);
@@ -1101,6 +1125,7 @@ public sealed class MismatchEscalationCoordinator
         state.PostForcedConvergenceFingerprint = 0;
         state.ForcedConvergenceSucceeded = false;
         _mismatchClearedCount++;
+        _hedgedNetFlatEscalationInvoked.TryRemove(inst, out _);
 
         var releasedPayload = new
         {
@@ -1619,7 +1644,10 @@ public sealed class MismatchEscalationCoordinator
         {
             case MismatchType.BROKER_AHEAD: _mismatchBrokerAheadCount++; break;
             case MismatchType.JOURNAL_AHEAD: _mismatchJournalAheadCount++; break;
-            case MismatchType.POSITION_QTY_MISMATCH: _mismatchPositionQtyCount++; break;
+            case MismatchType.NET_POSITION_MISMATCH: _mismatchNetPositionCount++; break;
+            case MismatchType.GROSS_POSITION_DIVERGENCE: _mismatchGrossDivergenceCount++; break;
+            case MismatchType.STRUCTURAL_MULTI_INTENT: _mismatchStructuralMultiIntentCount++; break;
+            case MismatchType.HEDGED_NET_FLAT_GROSS_OPEN: _mismatchHedgedNetFlatCount++; break;
             case MismatchType.ORDER_REGISTRY_MISSING: _mismatchRegistryMissingCount++; break;
             case MismatchType.PROTECTIVE_STATE_DIVERGENCE: _mismatchProtectiveDivergenceCount++; break;
         }
@@ -1686,7 +1714,10 @@ public sealed class MismatchEscalationCoordinator
                 mismatch_cleared_count = _mismatchClearedCount,
                 mismatch_broker_ahead_count = _mismatchBrokerAheadCount,
                 mismatch_journal_ahead_count = _mismatchJournalAheadCount,
-                mismatch_position_qty_count = _mismatchPositionQtyCount,
+                mismatch_net_position_count = _mismatchNetPositionCount,
+                mismatch_gross_divergence_count = _mismatchGrossDivergenceCount,
+                mismatch_structural_multi_intent_count = _mismatchStructuralMultiIntentCount,
+                mismatch_hedged_net_flat_gross_open_count = _mismatchHedgedNetFlatCount,
                 mismatch_registry_missing_count = _mismatchRegistryMissingCount,
                 mismatch_protective_divergence_count = _mismatchProtectiveDivergenceCount,
                 last_audit_utc = _lastAuditUtc != DateTimeOffset.MinValue ? _lastAuditUtc.ToString("o") : null,

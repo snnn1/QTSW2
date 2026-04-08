@@ -56,7 +56,9 @@ if (argsList.Contains("--help") || argsList.Contains("-h"))
 // --test BROKER_POSITION_IDENTITY: canonical broker bucket alignment (reconciliation / flatten)
 // --test FLATTEN_COORDINATION_TRACKER: cross-chart flatten owner + verify debounce coordinator
 // --test MISMATCH_ESCALATION: run Gap 4 mismatch escalation tests
+// --test STRUCTURAL_AUTO_OFFSET: shared-instrument long+short, auto_offset policy, journal vs broker aggregation probe
 // --test STATE_CONSISTENCY_GATE: run P1.5 closed-loop state-consistency gate tests
+// --test JOURNAL_INTEGRITY_GUARANTEE: authoritative parity classification + bounded orphan escalation
 // --test RELEASE_BLOCKING_ADOPTION: stale journal rows vs live tag/registry release-blocking policy
 // --test JOURNAL_REOPEN_EXPOSURE_REHYDRATE: tagged broker journal reopen normalization + exposure rehydration
 // --test EXECUTION_EVENT_REPLAY: run Gap 5 canonical event replay tests
@@ -283,16 +285,40 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
         Console.WriteLine(pass ? "PASS: Mismatch escalation tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
+    else if (testName.Equals("STRUCTURAL_AUTO_OFFSET", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = StructuralMultiIntentAutoOffsetTests.RunAll();
+        Console.WriteLine(pass ? "PASS: Structural multi-intent auto_offset probe" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
     else if (testName.Equals("STATE_CONSISTENCY_GATE", StringComparison.OrdinalIgnoreCase))
     {
         var (pass, err) = StateConsistencyGateTests.RunStateConsistencyGateTests();
         Console.WriteLine(pass ? "PASS: State consistency gate tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
+    else if (testName.Equals("JOURNAL_INTEGRITY_GUARANTEE", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = JournalIntegrityGuaranteeTests.RunAll();
+        Console.WriteLine(pass ? "PASS: Journal integrity guarantee tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
     else if (testName.Equals("RELEASE_BLOCKING_ADOPTION", StringComparison.OrdinalIgnoreCase))
     {
         var (pass, err) = ReleaseBlockingAdoptionTests.RunReleaseBlockingAdoptionTests();
         Console.WriteLine(pass ? "PASS: Release-blocking adoption candidate tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("RELEASE_ADOPTION_REMEDIATION", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = ReleaseAdoptionRemediationTests.RunReleaseAdoptionRemediationTests();
+        Console.WriteLine(pass ? "PASS: Release/adoption remediation contract tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("RECONCILIATION_CONTRACT_REFACTOR", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = ReconciliationContractRefactorTests.RunAll();
+        Console.WriteLine(pass ? "PASS: Reconciliation contract refactor tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
     else if (testName.Equals("JOURNAL_REOPEN_EXPOSURE_REHYDRATE", StringComparison.OrdinalIgnoreCase))
