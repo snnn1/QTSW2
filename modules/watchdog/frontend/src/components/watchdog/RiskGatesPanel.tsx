@@ -10,6 +10,8 @@ interface RiskGatesPanelProps {
   gates: RiskGateStatus | null
   loading: boolean
   overallExecution: OverallExecutionDerived
+  /** Canonical overlay tradability from GET /status (must match overallExecution.tradable). */
+  tradable?: boolean
 }
 
 function executionRowTextClass(sev: OverallExecutionDerived['overall_execution_severity']): string {
@@ -25,7 +27,7 @@ function executionRowTextClass(sev: OverallExecutionDerived['overall_execution_s
   }
 }
 
-export function RiskGatesPanel({ gates, loading, overallExecution }: RiskGatesPanelProps) {
+export function RiskGatesPanel({ gates, loading, overallExecution, tradable }: RiskGatesPanelProps) {
   if (loading && !gates) {
     return (
       <div className="bg-gray-800 rounded-lg p-4">
@@ -45,7 +47,9 @@ export function RiskGatesPanel({ gates, loading, overallExecution }: RiskGatesPa
   }
 
   const executionSafe =
-    gates.execution_safe ?? (gates.recovery_state_allowed && gates.kill_switch_allowed)
+    typeof tradable === 'boolean'
+      ? tradable
+      : gates.execution_safe ?? (gates.recovery_state_allowed && gates.kill_switch_allowed)
   const reasonMsg = overallExecutionOperatorMessage(overallExecution)
   const rowClass = executionRowTextClass(overallExecution.overall_execution_severity)
 
@@ -67,8 +71,8 @@ export function RiskGatesPanel({ gates, loading, overallExecution }: RiskGatesPa
         </div>
         <div className="flex flex-col gap-1 border-t border-gray-700/50 pt-2 mt-1">
           <div className="flex items-center justify-between">
-            <span className="font-medium" title={reasonMsg}>
-              Execution safe
+            <span className="font-medium" title="Canonical: GET /status execution_safe (overlay tradability)">
+              Overlay tradable
             </span>
             <span className={executionSafe ? 'text-green-500' : 'text-red-500'}>
               {executionSafe ? '✅' : '❌'}

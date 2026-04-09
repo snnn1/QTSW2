@@ -34,6 +34,7 @@ namespace QTSW2.Robot.Core.Execution;
 /// </summary>
 public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrderExecutor, INtActionExecutor, IIntentRegistrationAdapter
 {
+    /// <summary>At most one delayed critical flatten re-enqueue per (account, canonical) until the retry fires (stale-owner takeover window).</summary>
     private readonly ConcurrentDictionary<string, byte> _criticalFlattenCoordinationRetryInflight = new(StringComparer.OrdinalIgnoreCase);
 
     private static int _adapterInstanceCounter;
@@ -185,7 +186,10 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     // PHASE 2: Callback to check if execution is allowed (recovery state guard)
     private Func<bool>? _isExecutionAllowedCallback;
 
-    /// <summary>Authoritative engine session day (RobotEngine.TradingDateString). When null, session-identity gate is skipped (harness/tests).</summary>
+    /// <summary>Optional: per-instrument journal integrity / reconciliation repair in progress (execution safety gate).</summary>
+    private Func<string, bool>? _journalIntegrityRepairActiveForInstrumentCallback;
+
+    /// <summary>Authoritative engine session day (<see cref="RobotEngine.TradingDateString"/>). When null, session-identity gate is skipped (harness/tests).</summary>
     private Func<string?>? _getActiveTradingDateString;
 
     /// <summary>Global (adapter-wide) latch — session mismatch is systemic; one flag blocks all instruments until restart.</summary>
@@ -196,6 +200,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
 
     /// <summary>Monotonic count of session-identity rejections (mismatch + post-latch fast-fail). For metrics / alerting.</summary>
     private long _sessionIdentityBlockCount;
+
+    /// <summary>Dedup CRITICAL_UNSAFE_STATE_DETECTED per (instrument, reason) for the process.</summary>
+    private readonly ConcurrentDictionary<string, string> _criticalUnsafeStateEmittedOnce = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Gap 5: Callback when IEA EnqueueAndWait fails (timeout/overflow). Engine blocks instrument and stands down streams.</summary>
     private Action<string, DateTimeOffset, string>? _blockInstrumentCallback;
@@ -250,9 +257,6 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
 
     /// <summary>Stable executor id for investigation logs (matches flatten coordination prefix).</summary>
     public int InvestigationAdapterInstanceId => _adapterInstanceId;
-
-    /// <inheritdoc />
-    public bool IsExecutionContextReady => _ntContextSet && _simAccountVerified;
 
     /// <summary>Set strategy instance id for RUNTIME_FINGERPRINT / EXECUTOR_REBOUND correlation. Call before SetNTContext.</summary>
     public void SetInvestigationRuntimeContext(string? strategyInstanceId) =>
@@ -661,6 +665,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     bool IIEAOrderExecutor.EnqueueNtAction(INtAction action)
     {
         if (_ntActionQueue == null) return false;
+        if (action is NtFlattenInstrumentCommand fSafety && !TryExecutionSafetyFlattenGuard(fSafety.Instrument ?? "", fSafety.IntentId, fSafety.UtcNow, "IEA_ENQUEUE_FLATTEN", fSafety.CorrelationId, out _))
+            return false;
         if (action is NtFlattenInstrumentCommand fCmd && !TryCoordinationGateFlattenEnqueue(fCmd, out _))
             return false;
         if (string.Equals(action.ActionType, "SUBMIT_PROTECTIVES", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(action.IntentId))
@@ -843,6 +849,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
 
     private void EnqueueNtActionInternal(INtAction action)
     {
+        if (action is NtFlattenInstrumentCommand flatCmd && !TryExecutionSafetyGateFlattenEnqueue(flatCmd, flatCmd.UtcNow))
+            return;
         if (action is NtFlattenInstrumentCommand fCmd && !TryCoordinationGateFlattenEnqueue(fCmd, out _))
             return;
         if (_ntActionQueue != null)
@@ -891,7 +899,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         Action<string, DateTimeOffset>? onReentryProtectionAcceptedCallback = null,
         Func<string, string, (bool ShouldCancel, string? Reason)>? shouldCancelEntryOrdersForStreamCallback = null,
         Func<string, bool>? hasSlotJournalWithEntryStopsForInstrumentCallback = null,
-        Func<string?>? getActiveTradingDateString = null)
+        Func<string?>? getActiveTradingDateString = null,
+        Func<string, bool>? journalIntegrityRepairActiveForInstrumentCallback = null)
     {
         _standDownStreamCallback = standDownStreamCallback;
         _getNotificationServiceCallback = getNotificationServiceCallback;
@@ -903,6 +912,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         _shouldCancelEntryOrdersForStreamCallback = shouldCancelEntryOrdersForStreamCallback;
         _hasSlotJournalWithEntryStopsForInstrumentCallback = hasSlotJournalWithEntryStopsForInstrumentCallback;
         _getActiveTradingDateString = getActiveTradingDateString;
+        _journalIntegrityRepairActiveForInstrumentCallback = journalIntegrityRepairActiveForInstrumentCallback;
     }
 
     /// <summary>True after any session identity mismatch (until process restart). No automatic reset.</summary>
@@ -1412,8 +1422,25 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     public void RequestRecoveryForInstrument(string instrument, string reason, object context, DateTimeOffset utcNow)
     {
         if (string.IsNullOrEmpty(_ieaAccountName)) return;
+        var instTrim = (instrument ?? "").Trim();
         var execKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(_ieaAccountName, instrument, null);
-        if (string.IsNullOrEmpty(execKey)) execKey = (instrument ?? "").Trim().ToUpperInvariant();
+        if (string.IsNullOrEmpty(execKey)) execKey = instTrim.ToUpperInvariant();
+        if (!string.IsNullOrEmpty(instTrim) &&
+            (ExecutionSafetyGate.IsInstrumentUnsafeLocked(instTrim) ||
+             HardFailClosedExecutionModel.IsHardExecutionLocked(instTrim) ||
+             !string.IsNullOrEmpty(execKey) && (ExecutionSafetyGate.IsInstrumentUnsafeLocked(execKey) ||
+                                                HardFailClosedExecutionModel.IsHardExecutionLocked(execKey))))
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, "", "RECOVERY_BLOCKED_INSTRUMENT_LOCKED", "ENGINE",
+                new
+                {
+                    instrument = instTrim,
+                    execution_instrument_key = execKey,
+                    reason,
+                    note = "Unmapped-fill hard lock active — use UnlockInstrument after operator review"
+                }));
+            return;
+        }
         if (InstrumentExecutionAuthorityRegistry.TryGet(_ieaAccountName, execKey, out var iea))
             iea.RequestRecovery(instrument, reason, context, utcNow);
     }
@@ -1490,12 +1517,14 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         EnqueueNtActionInternal(cmd);
     }
 
+    /// <inheritdoc />
     public bool TryEnqueueEmergencyFlattenProtective(string instrument, DateTimeOffset utcNow)
     {
         EnqueueEmergencyFlattenProtective(instrument, utcNow);
         return true;
     }
 
+    /// <summary>One best-effort re-enqueue after stale-owner TTL so takeover can admit a critical flatten.</summary>
     private void ScheduleCriticalFlattenCoordinationRetryIfNeeded(NtFlattenInstrumentCommand skippedCmd, string gateContext)
     {
         if (!IsCriticalFlattenCommand(skippedCmd)) return;
@@ -1549,14 +1578,12 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         }, CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
     }
 
-#if !NINJATRADER
-    /// <summary>Core/harness build (NT partial excluded): emergency flatten via enqueue-only path.</summary>
+    /// <summary>Emergency flatten: enqueue-only (strategy thread must drain). Core build has no NT partial.</summary>
     public FlattenResult FlattenEmergency(string instrument, DateTimeOffset utcNow)
     {
         EnqueueEmergencyFlattenProtective(instrument, utcNow);
         return FlattenResult.FailureResult("Enqueued for strategy thread", utcNow);
     }
-#endif
 
     private static bool IsCriticalFlattenCommand(NtFlattenInstrumentCommand cmd)
     {
@@ -1713,6 +1740,446 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         VerifySimAccountReal();
     }
 
+    private int GetIeaOwnedPlusAdoptedWorkingForParity()
+    {
+        if (!_useInstrumentExecutionAuthority || _iea == null) return 0;
+        return _iea.GetMismatchTrustedWorkingCount();
+    }
+
+    private string ResolveCanonicalInstrumentForExecutionSafety(string instrument, string? intentId)
+    {
+        var trimmed = instrument?.Trim() ?? "";
+        if (!string.IsNullOrEmpty(intentId) && IntentPolicy.TryGetValue(intentId, out var pol) &&
+            !string.IsNullOrWhiteSpace(pol.CanonicalInstrument))
+            return pol.CanonicalInstrument.Trim();
+        var nk = BrokerPositionResolver.NormalizeCanonicalKey(trimmed);
+        return string.IsNullOrEmpty(nk) ? trimmed : nk;
+    }
+
+    private ExecutionSafetyEvaluationRequest BuildExecutionSafetyEvaluationRequest(string instrument, string? intentId, DateTimeOffset utcNow)
+    {
+        var trimmed = instrument?.Trim() ?? "";
+        AccountSnapshot? snap = null;
+        try
+        {
+            snap = GetAccountSnapshot(utcNow);
+        }
+        catch
+        {
+            snap = null;
+        }
+
+        var repair = _journalIntegrityRepairActiveForInstrumentCallback?.Invoke(trimmed) == true;
+        return new ExecutionSafetyEvaluationRequest
+        {
+            Instrument = trimmed,
+            CanonicalInstrument = ResolveCanonicalInstrumentForExecutionSafety(trimmed, intentId),
+            ExecutionInstrumentKey = _iea?.ExecutionInstrumentKey,
+            AccountSnapshot = snap,
+            SnapshotTakenUtc = snap?.CapturedAtUtc ?? utcNow,
+            UtcNow = utcNow,
+            Journal = _executionJournal,
+            UseInstrumentExecutionAuthority = _useInstrumentExecutionAuthority,
+            IeaOwnedPlusAdoptedWorking = GetIeaOwnedPlusAdoptedWorkingForParity(),
+            Coordinator = _coordinator,
+            RecoveryExecutionDisallowed = _isExecutionAllowedCallback != null && !_isExecutionAllowedCallback(),
+            JournalIntegrityOrReconciliationRepairActive = repair
+        };
+    }
+
+    private void EmitPositionAuthorityEvaluated(ExecutionSafetyEvaluationRequest req, DateTimeOffset utcNow)
+    {
+        var a = PositionAuthorityInstrumentEvaluator.BuildEvaluatedArgs(
+            req.AccountSnapshot,
+            req.Journal,
+            req.Instrument,
+            req.CanonicalInstrument);
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "POSITION_AUTHORITY_EVALUATED", state: "ENGINE",
+            new
+            {
+                instrument = a.Instrument,
+                broker_qty = a.BrokerQty,
+                real_open_qty = a.RealOpenQty,
+                recovery_open_qty = a.RecoveryOpenQty,
+                journal_open_qty = a.JournalOpenQty,
+                authority_state = a.AuthorityState
+            }));
+    }
+
+    private static string MapGateReasonToCriticalCategory(string gateReason)
+    {
+        return gateReason switch
+        {
+            "repair_active" or "recovery_active" => "repair / recovery active",
+            "parity_not_ok" => "parity not ok",
+            "no_active_exposures_with_broker_position" or "no_exposure_broker_position" => "no exposure + broker position",
+            "unsafe_locked_kill_switch" => "unmapped fill",
+            "mismatch" or "insufficient_data" or "unmapped_or_external_orders" or "working_order_mismatch" or "authority_not_real_dominant" =>
+                "mismatch",
+            "authority_unknown" or "authority_recovery" or "authority_not_real" or "position_authority_not_real" => "position authority",
+            _ => string.IsNullOrEmpty(gateReason) ? "mismatch" : gateReason
+        };
+    }
+
+    private void TryEmitCriticalUnsafeStateDetected(string instrument, string gateReason, DateTimeOffset utcNow)
+    {
+        var k = instrument?.Trim() ?? "";
+        if (string.IsNullOrEmpty(k)) return;
+        var cat = MapGateReasonToCriticalCategory(gateReason);
+        if (_criticalUnsafeStateEmittedOnce.TryGetValue(k, out var prev) && string.Equals(prev, cat, StringComparison.OrdinalIgnoreCase))
+            return;
+        _criticalUnsafeStateEmittedOnce[k] = cat;
+        _log.Write(RobotEvents.ExecutionBase(utcNow, "", k, "CRITICAL_UNSAFE_STATE_DETECTED",
+            new { instrument = k, reason = cat }));
+    }
+
+    private void EmitExecutionBlockedUnsafeState(string blockedWhat, string? intentId, ExecutionSafetySnapshot snap, DateTimeOffset utcNow)
+    {
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId ?? "", snap.Instrument, "EXECUTION_BLOCKED_UNSAFE_STATE",
+            new
+            {
+                instrument = snap.Instrument,
+                broker_qty = snap.BrokerQty,
+                journal_qty = snap.JournalQty,
+                journal_open_qty = snap.JournalOpenQty != 0 ? snap.JournalOpenQty : snap.RealOpenQty + snap.RecoveredOpenQty,
+                real_open_qty = snap.RealOpenQty,
+                recovered_open_qty = snap.RecoveredOpenQty,
+                parity_status = snap.ParityStatus,
+                structural_repair_active = snap.StructuralRepairActive,
+                no_active_exposures_with_broker_position = snap.NoActiveExposuresWithBrokerPosition,
+                authority_state = snap.AuthorityState,
+                reason = snap.Reason,
+                detail = snap.Detail,
+                blocked_what = blockedWhat,
+                instrument_state = snap.InstrumentOperationalState
+            }));
+    }
+
+    private void EmitExecutionBlockedPositionAuthority(string blockedWhat, string? intentId, ExecutionSafetySnapshot snap, DateTimeOffset utcNow)
+    {
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId ?? "", snap.Instrument, "EXECUTION_BLOCKED_POSITION_AUTHORITY",
+            new
+            {
+                instrument = snap.Instrument,
+                broker_qty = snap.BrokerQty,
+                real_open_qty = snap.RealOpenQty,
+                recovery_open_qty = snap.RecoveredOpenQty,
+                journal_open_qty = snap.JournalOpenQty != 0 ? snap.JournalOpenQty : snap.RealOpenQty + snap.RecoveredOpenQty,
+                authority_state = snap.AuthorityState,
+                reason = snap.Reason,
+                blocked_what = blockedWhat
+            }));
+    }
+
+    private void EmitExecutionBlockedOverlay(
+        string blockedWhat,
+        string? intentId,
+        string instrument,
+        ExecutionOverlayBlockReason blockReason,
+        string? detail,
+        DateTimeOffset utcNow,
+        string? correlationId = null)
+    {
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId ?? "", instrument, "EXECUTION_BLOCKED_OVERLAY",
+            new
+            {
+                instrument,
+                block_reason = blockReason.ToString(),
+                detail,
+                blocked_what = blockedWhat,
+                correlation_id = correlationId
+            }));
+    }
+
+    private static bool IsAuthorityLayerStructuralDenial(string? reason) =>
+        reason is "authority_unknown" or "authority_recovery" or "authority_not_real";
+
+    private bool TryExecutionSafetyGateForOrderSubmit(string intentId, string instrument, string blockedWhat, DateTimeOffset utcNow,
+        out OrderSubmissionResult? failure)
+    {
+        failure = null;
+#if !NINJATRADER
+        return true;
+#else
+        ExecutionSafetyEvaluationRequest req;
+        try
+        {
+            req = BuildExecutionSafetyEvaluationRequest(instrument, intentId, utcNow);
+        }
+        catch
+        {
+            TryEmitCriticalUnsafeStateDetected(instrument, "mismatch", utcNow);
+            var bad = new ExecutionSafetySnapshot
+            {
+                Instrument = instrument?.Trim() ?? "",
+                Reason = "account_snapshot_failed",
+                InstrumentOperationalState = "ACCOUNT_SNAPSHOT_UNAVAILABLE"
+            };
+            EmitExecutionBlockedUnsafeState(blockedWhat, intentId, bad, utcNow);
+            failure = OrderSubmissionResult.FailureResult("EXECUTION_BLOCKED_UNSAFE_STATE:account_snapshot_failed", utcNow);
+            return false;
+        }
+
+        EmitPositionAuthorityEvaluated(req, utcNow);
+
+        if (!ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, blockedWhat, flattenAuthorityBypass: false, out var structSnap))
+        {
+            if (IsAuthorityLayerStructuralDenial(structSnap.Reason))
+            {
+                EmitExecutionBlockedPositionAuthority(blockedWhat, intentId, structSnap, utcNow);
+                failure = OrderSubmissionResult.FailureResult($"EXECUTION_BLOCKED_POSITION_AUTHORITY:{structSnap.AuthorityState}", utcNow);
+                return false;
+            }
+
+            if (!string.Equals(structSnap.Reason, ExecutionStructuralLayer.StructuralBlocker.RepairActive, StringComparison.Ordinal))
+                TryEmitCriticalUnsafeStateDetected(instrument, structSnap.Reason ?? "", utcNow);
+            EmitExecutionBlockedUnsafeState(blockedWhat, intentId, structSnap, utcNow);
+            failure = OrderSubmissionResult.FailureResult($"EXECUTION_BLOCKED_UNSAFE_STATE:{structSnap.Reason}", utcNow);
+            return false;
+        }
+
+        if (!ExecutionSafetyGate.TryEvaluateExecutionOverlay(req, out var overlay) || overlay.IsBlocked)
+        {
+            EmitExecutionBlockedOverlay(blockedWhat, intentId, structSnap.Instrument, overlay.BlockReason, overlay.Detail, utcNow);
+            failure = OrderSubmissionResult.FailureResult($"EXECUTION_BLOCKED_OVERLAY:{overlay.BlockReason}", utcNow);
+            return false;
+        }
+
+        return true;
+#endif
+    }
+
+    /// <summary>Unmapped fill / ghost path: hard kill-switch + critical alert (called from NT execution ingress).</summary>
+    public void ApplyUnmappedExecutionKillSwitchAndAlert(string instrument, string unmappedReason, DateTimeOffset utcNow)
+    {
+        ExecutionSafetyGate.ApplyUnmappedExecutionKillSwitch(instrument, unmappedReason, utcNow);
+        TryEmitCriticalUnsafeStateDetected(instrument, "unsafe_locked_kill_switch", utcNow);
+    }
+
+    /// <summary>
+    /// REAL authority + structural order-submit path (parity, repair, exposure). Does not evaluate overlay; unsafe lock may still be set (manual unlock).
+    /// Shared by <see cref="TryValidateExplicitUnfreezeConditions"/> and <see cref="TryManualClearExecutionSafetyUnsafeLock"/>.
+    /// </summary>
+    private bool TryValidateStructuralExecutionSafetyBaseline(ExecutionSafetyEvaluationRequest req, out string denyReason,
+        out ExecutionSafetySnapshot structuralSnapshot)
+    {
+        structuralSnapshot = new ExecutionSafetySnapshot();
+        denyReason = "";
+        var inst = req.Instrument?.Trim() ?? "";
+        if (string.IsNullOrEmpty(inst))
+        {
+            denyReason = "missing_instrument";
+            return false;
+        }
+
+        var canonical = ResolveCanonicalInstrumentForExecutionSafety(inst, null);
+        var auth = PositionAuthorityInstrumentEvaluator.Derive(req.AccountSnapshot, req.Journal, inst, canonical);
+        if (auth != DerivedPositionAuthority.REAL)
+        {
+            denyReason = "authority_not_real";
+            return false;
+        }
+
+        if (!ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_PROTECTIVE_STOP", flattenAuthorityBypass: false,
+                out structuralSnapshot))
+        {
+            denyReason = string.IsNullOrEmpty(structuralSnapshot.Reason) ? "structural_block" : structuralSnapshot.Reason;
+            if (!string.IsNullOrEmpty(structuralSnapshot.Detail))
+                denyReason = denyReason + ":" + structuralSnapshot.Detail;
+            return false;
+        }
+
+        if (!string.IsNullOrEmpty(structuralSnapshot.Reason))
+        {
+            denyReason = structuralSnapshot.Reason;
+            return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Manual operator reset for <see cref="ExecutionSafetyGate.InstrumentStateUnsafeLocked"/>.
+    /// Requires the same structural baseline as explicit unfreeze (REAL + structural layer), hard-flatten lock clear, then fresh snapshot per <see cref="ExecutionSafetyGate.TryManualClearUnsafeLockWhenOverlayAllows"/>.
+    /// </summary>
+    public bool TryManualClearExecutionSafetyUnsafeLock(string instrument, DateTimeOffset utcNow, out string denyReason)
+    {
+        denyReason = "";
+        var inst = instrument?.Trim() ?? "";
+        if (string.IsNullOrEmpty(inst))
+        {
+            denyReason = "missing_instrument";
+            return false;
+        }
+
+        ExecutionSafetyEvaluationRequest req;
+        try
+        {
+            req = BuildExecutionSafetyEvaluationRequest(inst, null, utcNow);
+        }
+        catch
+        {
+            denyReason = "account_snapshot_failed";
+            _log.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "EXECUTION_SAFETY_MANUAL_UNLOCK_DENIED",
+                new { instrument = inst, deny_reason = denyReason }));
+            return false;
+        }
+
+        if (!TryValidateStructuralExecutionSafetyBaseline(req, out var structuralDeny, out _))
+        {
+            denyReason = structuralDeny;
+            _log.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "EXECUTION_SAFETY_MANUAL_UNLOCK_DENIED",
+                new { instrument = inst, deny_reason = denyReason, gate = "structural_baseline" }));
+            return false;
+        }
+
+        if (HardFailClosedExecutionModel.IsHardExecutionLocked(inst))
+        {
+            denyReason = "hard_execution_lock";
+            _log.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "EXECUTION_SAFETY_MANUAL_UNLOCK_DENIED",
+                new { instrument = inst, deny_reason = denyReason, gate = "hard_flatten_model" }));
+            return false;
+        }
+
+        if (!ExecutionSafetyGate.TryManualClearUnsafeLockWhenOverlayAllows(req, out var unlockDenyReason))
+        {
+            denyReason = unlockDenyReason;
+            _log.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "EXECUTION_SAFETY_MANUAL_UNLOCK_DENIED",
+                new { instrument = inst, deny_reason = unlockDenyReason }));
+            return false;
+        }
+
+        HardFailClosedExecutionModel.ClearInstrumentHardState(inst);
+        _log.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "EXECUTION_SAFETY_MANUAL_UNLOCK", new { instrument = inst }));
+        return true;
+    }
+
+    /// <summary>Same as overload with <c>out denyReason</c>; discards denial reason.</summary>
+    public bool TryManualClearExecutionSafetyUnsafeLock(string instrument, DateTimeOffset utcNow) =>
+        TryManualClearExecutionSafetyUnsafeLock(instrument, utcNow, out _);
+
+    /// <summary>Manual unlock after operator review — alias for <see cref="TryManualClearExecutionSafetyUnsafeLock"/> (structurally safe only).</summary>
+    public bool UnlockInstrument(string instrument, DateTimeOffset utcNow, out string denyReason) =>
+        TryManualClearExecutionSafetyUnsafeLock(instrument, utcNow, out denyReason);
+
+    /// <inheritdoc cref="UnlockInstrument(string, DateTimeOffset, out string)"/>
+    public bool UnlockInstrument(string instrument, DateTimeOffset utcNow) =>
+        TryManualClearExecutionSafetyUnsafeLock(instrument, utcNow);
+
+    /// <summary>
+    /// Validates explicit unfreeze preconditions for <see cref="RobotEngine.TryUnfreezeInstrument"/>:
+    /// position authority REAL, structural layer clear (non-directional submit path), overlay clear, fresh snapshot via overlay rules.
+    /// Does not clear engine freeze or risk latch.
+    /// </summary>
+    public bool TryValidateExplicitUnfreezeConditions(string instrument, DateTimeOffset utcNow, out string denyReason)
+    {
+        denyReason = "";
+#if !NINJATRADER
+        return true;
+#else
+        var inst = instrument?.Trim() ?? "";
+        if (string.IsNullOrEmpty(inst))
+        {
+            denyReason = "missing_instrument";
+            return false;
+        }
+
+        ExecutionSafetyEvaluationRequest req;
+        try
+        {
+            req = BuildExecutionSafetyEvaluationRequest(inst, null, utcNow);
+        }
+        catch
+        {
+            denyReason = "account_snapshot_failed";
+            return false;
+        }
+
+        if (!TryValidateStructuralExecutionSafetyBaseline(req, out denyReason, out _))
+            return false;
+
+        if (!ExecutionSafetyGate.TryEvaluateExecutionOverlay(req, out var ov) || ov.IsBlocked)
+        {
+            denyReason = "overlay:" + ov.BlockReason;
+            if (!string.IsNullOrEmpty(ov.Detail))
+                denyReason = denyReason + ":" + ov.Detail;
+            return false;
+        }
+
+        return true;
+#endif
+    }
+
+    /// <summary>Shared flatten guard (enqueue + execute + emergency). Fail-closed.</summary>
+    public bool TryExecutionSafetyFlattenGuard(
+        string instrument,
+        string? intentId,
+        DateTimeOffset utcNow,
+        string blockedWhat,
+        string? correlationId,
+        out ExecutionSafetySnapshot snap)
+    {
+        snap = new ExecutionSafetySnapshot();
+#if !NINJATRADER
+        return true;
+#else
+        var inst = instrument?.Trim() ?? "";
+        if (string.IsNullOrEmpty(inst)) return true;
+        ExecutionSafetyEvaluationRequest req;
+        try
+        {
+            req = BuildExecutionSafetyEvaluationRequest(inst, intentId, utcNow);
+        }
+        catch
+        {
+            snap = new ExecutionSafetySnapshot { Instrument = inst, Reason = "account_snapshot_failed" };
+            EmitExecutionBlockedUnsafeState(blockedWhat, intentId, snap, utcNow);
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId ?? "", inst, "FLATTEN_BLOCKED_UNSAFE_STATE",
+                new { instrument = inst, reason = "account_snapshot_failed", correlation_id }));
+            return false;
+        }
+
+        EmitPositionAuthorityEvaluated(req, utcNow);
+
+        if (!ExecutionStructuralLayer.TryEvaluateFlattenStructure(req, out snap, out var flatReason))
+        {
+            TryEmitCriticalUnsafeStateDetected(inst, snap.Reason ?? flatReason, utcNow);
+            EmitExecutionBlockedUnsafeState(blockedWhat, intentId, snap, utcNow);
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId ?? "", inst, "FLATTEN_BLOCKED_UNSAFE_STATE",
+                new
+                {
+                    instrument = inst,
+                    reason = string.IsNullOrEmpty(flatReason) ? snap.Reason : flatReason,
+                    correlation_id,
+                    broker_qty = snap.BrokerQty,
+                    journal_qty = snap.JournalQty,
+                    authority_state = snap.AuthorityState
+                }));
+            return false;
+        }
+
+        if (!ExecutionSafetyGate.TryEvaluateExecutionOverlay(req, out var overlay) || overlay.IsBlocked)
+        {
+            EmitExecutionBlockedOverlay(blockedWhat, intentId, inst, overlay.BlockReason, overlay.Detail, utcNow, correlationId);
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId ?? "", inst, "FLATTEN_BLOCKED_OVERLAY",
+                new
+                {
+                    instrument = inst,
+                    block_reason = overlay.BlockReason.ToString(),
+                    detail = overlay.Detail,
+                    correlation_id = correlationId
+                }));
+            return false;
+        }
+
+        return true;
+#endif
+    }
+
+    private bool TryExecutionSafetyGateFlattenEnqueue(NtFlattenInstrumentCommand cmd, DateTimeOffset utcNow) =>
+        TryExecutionSafetyFlattenGuard(cmd.Instrument ?? "", cmd.IntentId, utcNow, "FLATTEN_ENQUEUE", cmd.CorrelationId,
+            out _);
+
     /// <summary>
     /// STEP 2: Implement Entry Order Submission (REAL NT API)
     /// </summary>
@@ -1786,6 +2253,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
                 new { intent_id = intentId, instrument, reason = "IEA_ENABLED_BUT_NOT_BOUND", error }));
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
+
+        if (!TryExecutionSafetyGateForOrderSubmit(intentId, instrument, "SUBMIT_ENTRY", utcNow, out var safetyFailEntry))
+            return safetyFailEntry!;
 
         try
         {
@@ -1892,6 +2362,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
                 new { intent_id = intentId, instrument, reason = "IEA_ENABLED_BUT_NOT_BOUND", error }));
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
+
+        if (!TryExecutionSafetyGateForOrderSubmit(intentId, instrument, "SUBMIT_ENTRY_STOP", utcNow, out var safetyFailStop))
+            return safetyFailStop!;
 
         try
         {
@@ -2597,6 +3070,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 
+        if (!TryExecutionSafetyGateForOrderSubmit(intentId, instrument, "SUBMIT_PROTECTIVE_STOP", utcNow, out var safetyFailProt))
+            return safetyFailProt!;
+
         try
         {
             return SubmitProtectiveStopReal(intentId, instrument, direction, stopPrice, quantity, ocoGroup, utcNow);
@@ -2681,6 +3157,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             }));
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
+
+        if (!TryExecutionSafetyGateForOrderSubmit(intentId, instrument, "SUBMIT_TARGET", utcNow, out var safetyFailTgt2))
+            return safetyFailTgt2!;
 
         try
         {

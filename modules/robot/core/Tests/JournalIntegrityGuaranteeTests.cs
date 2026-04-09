@@ -13,43 +13,61 @@ public static class JournalIntegrityGuaranteeTests
 {
     public static (bool Pass, string? Error) RunAll()
     {
-        JournalIntegrityGuarantee.ResetAttemptsForTests();
-        var e = Case_ParityOk_Classification();
-        if (e != null) return (false, e);
-        JournalIntegrityGuarantee.ResetAttemptsForTests();
-        e = Case_InsufficientData_NullSnapshot();
-        if (e != null) return (false, e);
-        JournalIntegrityGuarantee.ResetAttemptsForTests();
-        e = Case_UnknownOrder_UntaggedWorking();
-        if (e != null) return (false, e);
-        JournalIntegrityGuarantee.ResetAttemptsForTests();
-        e = Case_PositionMismatch();
-        if (e != null) return (false, e);
-        JournalIntegrityGuarantee.ResetAttemptsForTests();
-        e = Case_WorkingMismatch_NoIea();
-        if (e != null) return (false, e);
-        JournalIntegrityGuarantee.ResetAttemptsForTests();
-        e = Case_OrphanEscalation_BoundedAttempts();
-        if (e != null) return (false, e);
-        JournalIntegrityGuarantee.ResetAttemptsForTests();
-        e = Case_RecoveredIntent_BrokerOpenEmptyJournal_ReachesParity();
-        if (e != null) return (false, e);
-        JournalIntegrityGuarantee.ResetAttemptsForTests();
-        e = Case_RecoveredIntent_TwoContracts();
-        if (e != null) return (false, e);
-        JournalIntegrityGuarantee.ResetAttemptsForTests();
-        e = Case_RecoveredIntent_SecondPassNoDuplicateRow();
-        if (e != null) return (false, e);
-        JournalIntegrityGuarantee.ResetAttemptsForTests();
-        e = Case_RecoveredIntent_MixedNonRecoveredPlusDeficit();
-        if (e != null) return (false, e);
-        JournalIntegrityGuarantee.ResetAttemptsForTests();
-        e = Case_RecoveredIntent_StructuralOpenQtyMatchesBroker();
-        if (e != null) return (false, e);
-        JournalIntegrityGuarantee.ResetAttemptsForTests();
-        e = Case_RecoveredIntent_HedgedBrokerConflict_FailClosed();
-        if (e != null) return (false, e);
-        return (true, null);
+        var prevHard = FeatureFlags.EnableHardFailClosedJournalIntegrity;
+        FeatureFlags.EnableHardFailClosedJournalIntegrity = false;
+        try
+        {
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            var e = Case_ParityOk_Classification();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_InsufficientData_NullSnapshot();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_UnknownOrder_UntaggedWorking();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_PositionMismatch();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_WorkingMismatch_NoIea();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_OrphanEscalation_BoundedAttempts();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_RecoveredIntent_BrokerOpenEmptyJournal_ReachesParity();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_RecoveredIntent_TwoContracts();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_RecoveredIntent_SecondPassNoDuplicateRow();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_RecoveredIntent_MixedNonRecoveredPlusDeficit();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_RecoveredIntent_StructuralOpenQtyMatchesBroker();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_RecoveredIntent_HedgedBrokerConflict_FailClosed();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_RecoveredSupersededBy_RealStrategyMatchesBroker();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_RecoveredSupersededBy_NoClose_OnlyRecovered();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_RecoveredSupersededBy_NoClose_PartialNonRecovered();
+            if (e != null) return (false, e);
+            return (true, null);
+        }
+        finally
+        {
+            FeatureFlags.EnableHardFailClosedJournalIntegrity = prevHard;
+        }
     }
 
     private static string? Case_ParityOk_Classification()
@@ -299,6 +317,83 @@ public static class JournalIntegrityGuaranteeTests
             !logEvts.Contains("RECONCILIATION_RECOVERED_INTENT_FAILED"))
             return "hedged_conflict: expected fail-closed with RECONCILIATION_RECOVERED_INTENT_FAILED";
         return null;
+    }
+
+    private static string? Case_RecoveredSupersededBy_RealStrategyMatchesBroker()
+    {
+        var utc = DateTimeOffset.Parse("2099-01-16T12:00:00Z");
+        var td = "2099-01-16";
+        using var tmp = NewTempJournal();
+        WriteMinimalRecoveredOpenRow(tmp.ProjectRoot, td, "RECOVERED-ES", "ES", 2, 1, "Long");
+        WriteMinimalNonRecoveredOpenRow(tmp.ProjectRoot, td, "TEST", "seed-real-es", "ES", 2, "Long");
+        var snap = new AccountSnapshot
+        {
+            Positions = new List<PositionSnapshot> { new() { Instrument = "ES", Quantity = 2 } },
+            WorkingOrders = new List<WorkingOrderSnapshot>()
+        };
+        var reg = new TestRegistryView(false, 0);
+        var res = JournalIntegrityGuarantee.EnsureJournalIntegrity("ES", snap, tmp.Journal, reg,
+            "ES", "ES", Array.Empty<string>(), null, null, utc,
+            (_, _, _) => { }, allowReconstruction: true, tradingDateForJournal: td);
+        if (!res.InitialCheck.IsOk || res.Outcome != JournalIntegrityPhaseOutcome.Ok)
+            return "superseded_match: expected PARITY_OK after closing redundant recovered row";
+        var (sum, _) = tmp.Journal.GetOpenJournalStructuralStateForInstrument("ES", "ES");
+        if (sum != 2)
+            return "superseded_match: structural open sum should be 2 (strategy only)";
+        var jdir = Path.Combine(tmp.ProjectRoot, "data", "execution_journals");
+        var recPath = Path.Combine(jdir, $"{td}_{ExecutionJournal.RecoveredIntentStream}_RECOVERED-ES.json");
+        if (!File.Exists(recPath)) return "superseded_match: expected recovered journal file";
+        var json = File.ReadAllText(recPath);
+        if (!json.Contains("\"TradeCompleted\":true", StringComparison.OrdinalIgnoreCase) ||
+            !json.Contains(CompletionReasons.RECONCILIATION_RECOVERED_SUPERSEDED_BY_REAL, StringComparison.Ordinal))
+            return "superseded_match: recovered row should be completed with RECONCILIATION_RECOVERED_SUPERSEDED_BY_REAL";
+        return null;
+    }
+
+    private static string? Case_RecoveredSupersededBy_NoClose_OnlyRecovered()
+    {
+        var utc = DateTimeOffset.Parse("2099-01-16T13:00:00Z");
+        var td = "2099-01-17";
+        using var tmp = NewTempJournal();
+        WriteMinimalRecoveredOpenRow(tmp.ProjectRoot, td, "RECOVERED-ES", "ES", 2, 0, "Long");
+        var n = tmp.Journal.CloseRecoveredRowsSupersededByRealExposure("ES", "ES", 2, utc);
+        if (n != 0)
+            return "superseded_only_recovered: should not close when non-recovered open sum is 0 and broker is 2";
+        var json = File.ReadAllText(Path.Combine(tmp.ProjectRoot, "data", "execution_journals",
+            $"{td}_{ExecutionJournal.RecoveredIntentStream}_RECOVERED-ES.json"));
+        if (json.Contains("\"TradeCompleted\":true", StringComparison.OrdinalIgnoreCase))
+            return "superseded_only_recovered: recovered row must remain open";
+        return null;
+    }
+
+    private static string? Case_RecoveredSupersededBy_NoClose_PartialNonRecovered()
+    {
+        var utc = DateTimeOffset.Parse("2099-01-16T14:00:00Z");
+        var td = "2099-01-18";
+        using var tmp = NewTempJournal();
+        WriteMinimalRecoveredOpenRow(tmp.ProjectRoot, td, "RECOVERED-ES", "ES", 2, 0, "Long");
+        WriteMinimalNonRecoveredOpenRow(tmp.ProjectRoot, td, "TEST", "seed-partial", "ES", 1, "Long");
+        var n = tmp.Journal.CloseRecoveredRowsSupersededByRealExposure("ES", "ES", 2, utc);
+        if (n != 0)
+            return "superseded_partial: non-recovered 1 != broker 2, no close";
+        return null;
+    }
+
+    private static void WriteMinimalRecoveredOpenRow(string projectRoot, string tradingDate, string intentId, string instrument,
+        int entryFilledQty, int exitFilledQty, string direction)
+    {
+        var jdir = Path.Combine(projectRoot, "data", "execution_journals");
+        Directory.CreateDirectory(jdir);
+        var stream = ExecutionJournal.RecoveredIntentStream;
+        var path = Path.Combine(jdir, $"{tradingDate}_{stream}_{intentId}.json");
+        var json =
+            $"{{\"IntentId\":\"{intentId}\",\"TradingDate\":\"{tradingDate}\",\"Stream\":\"{stream}\",\"Instrument\":\"{instrument}\"," +
+            "\"IntentType\":\"RECOVERED\",\"IsRecovered\":true," +
+            "\"EntryFilled\":true,\"EntryFilledQuantityTotal\":" + entryFilledQty +
+            ",\"ExitFilledQuantityTotal\":" + exitFilledQty +
+            ",\"TradeCompleted\":false,\"Direction\":\"" + direction +
+            "\",\"EntryFilledAtUtc\":\"2099-01-16T12:00:00Z\"}";
+        File.WriteAllText(path, json);
     }
 
     private static void WriteMinimalNonRecoveredOpenRow(string projectRoot, string tradingDate, string stream, string intentId,

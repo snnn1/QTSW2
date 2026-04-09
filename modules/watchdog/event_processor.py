@@ -1506,6 +1506,18 @@ class EventProcessor:
             logger.debug(
                 f"TIMETABLE_VALIDATED event received (ignored - validation based on timetable_current.json polling)"
             )
+
+        elif event_type == "POSITION_AUTHORITY_EVALUATED":
+            # Read-only observability — mirror robot payload; no Watchdog gating.
+            pa = {
+                "instrument": data.get("instrument") if data.get("instrument") is not None else event.get("instrument"),
+                "broker_qty": data.get("broker_qty"),
+                "real_open_qty": data.get("real_open_qty"),
+                "recovery_open_qty": data.get("recovery_open_qty"),
+                "journal_open_qty": data.get("journal_open_qty"),
+                "authority_state": data.get("authority_state"),
+            }
+            self._state_manager.record_position_authority_evaluated(pa, timestamp_utc)
     
     def get_last_processed_seq(self, run_id: str) -> int:
         """Get last processed event_seq for a run_id."""

@@ -8,6 +8,9 @@ const baseExec = (over: Partial<OverallExecutionDerived> = {}): OverallExecution
   overall_execution_severity: 'SAFE',
   overall_execution_reason: 'SAFE',
   execution_blocked: false,
+  tradable: true,
+  authority_aggregate: 'NONE',
+  reconciliation_gate_diagnostic: 'Reconciliation gate: OK',
   ...over,
 })
 
@@ -58,13 +61,16 @@ describe('WatchdogHeader', () => {
     expect(badge.getAttribute('title') || '').toContain('Robot is running')
   })
 
-  it('renders WARNING execution badge when overallExecution is WARNING', () => {
+  it('renders OVERLAY TRADABLE when WARNING and execution not blocked (e.g. gate ENGAGED); detail in tooltip', () => {
     const overallExecution = baseExec({
       overall_execution_severity: 'WARNING',
       overall_execution_reason: 'RECONCILIATION_GATE_ENGAGED',
-      execution_blocked: true,
+      execution_blocked: false,
+      tradable: true,
     })
     render(<WatchdogHeader {...minimalHeaderProps} overallExecution={overallExecution} />)
-    expect(screen.getByTestId('execution-severity-badge').textContent).toContain('WARNING')
+    const badge = screen.getByTestId('execution-severity-badge')
+    expect(badge.textContent).toContain('OVERLAY TRADABLE')
+    expect(badge.getAttribute('title')).toContain('ENGAGED')
   })
 })

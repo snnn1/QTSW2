@@ -122,14 +122,23 @@ export function WatchdogHeader({
   const getExecutionSeverityBadge = () => {
     const msg = overallExecutionOperatorMessage(overallExecution)
     const sev = overallExecution.overall_execution_severity
-    if (sev === 'SAFE') {
+    /** ENGAGED is WARNING + not blocked — same tradability as SAFE; gate line lives under SYSTEM STATUS. */
+    const tradableNotBlockedWarning =
+      sev === 'WARNING' && overallExecution.execution_blocked === false
+    if (sev === 'SAFE' || tradableNotBlockedWarning) {
+      const title =
+        tradableNotBlockedWarning &&
+        overallExecution.overall_execution_reason === 'RECONCILIATION_GATE_ENGAGED'
+          ? 'Overlay tradable. Reconciliation gate ENGAGED — see SYSTEM STATUS diagnostic (non-blocking). ' +
+            (msg || '')
+          : msg
       return (
         <span
           data-testid="execution-severity-badge"
           className="px-3 py-1.5 bg-emerald-700 text-white rounded-full font-semibold text-sm whitespace-nowrap"
-          title={msg}
+          title={title}
         >
-          EXECUTION SAFE
+          OVERLAY TRADABLE
         </span>
       )
     }
@@ -140,7 +149,7 @@ export function WatchdogHeader({
           className="px-3 py-1.5 bg-amber-500 text-black rounded-full font-semibold text-sm whitespace-nowrap"
           title={msg}
         >
-          EXECUTION WARNING
+          OVERLAY BLOCKED
         </span>
       )
     }

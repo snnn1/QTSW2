@@ -87,6 +87,7 @@ def normalize_robot_engine_line(obj: Dict[str, Any]) -> Dict[str, Any]:
         "reason",
         "session_close_forced_flatten",
         "failure_phase",
+        "stream",
     ):
         if k not in out or out.get(k) in (None, ""):
             v = data.get(k)

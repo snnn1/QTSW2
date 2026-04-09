@@ -3,7 +3,7 @@ import { render, screen } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import type { WatchdogStatus } from './types/watchdog'
 import { OperatorConsolePage } from './OperatorConsolePage'
-import { executionReasonToOperatorMessage } from './utils/executionSeverity'
+import { deriveOverallExecutionStatus, overallExecutionOperatorMessage } from './utils/executionSeverity'
 
 function mockWatchdogStatus(partial: Partial<WatchdogStatus>): WatchdogStatus {
   return {
@@ -60,7 +60,7 @@ describe('OperatorConsolePage', () => {
     mockUseWatchdogStatus.mockReturnValue({
       status: mockWatchdogStatus({
         reconciliation_gate_state: 'ENGAGED',
-        execution_safe: false,
+        execution_safe: true,
       }),
       loading: false,
       error: null,
@@ -76,7 +76,15 @@ describe('OperatorConsolePage', () => {
     )
     expect(screen.getByTestId('operator-execution-severity').textContent).toBe('WARNING')
     expect(screen.getByTestId('operator-execution-message').textContent).toBe(
-      executionReasonToOperatorMessage('RECONCILIATION_GATE_ENGAGED')
+      overallExecutionOperatorMessage(
+        deriveOverallExecutionStatus(
+          mockWatchdogStatus({
+            reconciliation_gate_state: 'ENGAGED',
+            execution_safe: true,
+          }),
+          null
+        )
+      )
     )
   })
 })

@@ -328,5 +328,8 @@ public static class StartupExecutionContextRaceScenarioTests
 
         public FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow) =>
             _inner.RequestSessionCloseFlattenImmediate(intentId, instrument, utcNow);
+
+        public bool TryTriggerHardFlatten(string instrument, string reason, DateTimeOffset utcNow) =>
+            _inner.TryTriggerHardFlatten(instrument, reason, utcNow);
     }
 }

@@ -59,6 +59,7 @@ if (argsList.Contains("--help") || argsList.Contains("-h"))
 // --test STRUCTURAL_AUTO_OFFSET: shared-instrument long+short, auto_offset policy, journal vs broker aggregation probe
 // --test STATE_CONSISTENCY_GATE: run P1.5 closed-loop state-consistency gate tests
 // --test JOURNAL_INTEGRITY_GUARANTEE: authoritative parity classification + bounded orphan escalation
+// --test EXECUTION_SAFETY_GATE: kill-switch, snapshot freshness, recovery block, manual unlock policy
 // --test RELEASE_BLOCKING_ADOPTION: stale journal rows vs live tag/registry release-blocking policy
 // --test JOURNAL_REOPEN_EXPOSURE_REHYDRATE: tagged broker journal reopen normalization + exposure rehydration
 // --test EXECUTION_EVENT_REPLAY: run Gap 5 canonical event replay tests
@@ -301,6 +302,19 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
     {
         var (pass, err) = JournalIntegrityGuaranteeTests.RunAll();
         Console.WriteLine(pass ? "PASS: Journal integrity guarantee tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("EXECUTION_SAFETY_GATE", StringComparison.OrdinalIgnoreCase))
+    {
+        var (paPass, paErr) = PositionAuthorityDerivationTests.RunAll();
+        if (!paPass)
+        {
+            Console.WriteLine("POSITION_AUTHORITY_DERIVATION: FAIL " + paErr);
+            return 1;
+        }
+
+        var (pass, err) = ExecutionSafetyGateTests.RunAll();
+        Console.WriteLine(pass ? "PASS: Execution safety gate tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
     else if (testName.Equals("RELEASE_BLOCKING_ADOPTION", StringComparison.OrdinalIgnoreCase))

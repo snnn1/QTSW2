@@ -98,6 +98,16 @@ def _latest_prior_watchdog_info_for_stream(
     return latest_info
 
 
+def _attach_position_authority_to_stream_row(state_manager: WatchdogStateManager, row: Dict[str, Any]) -> None:
+    """Additive read-only mirror of last POSITION_AUTHORITY_EVALUATED per instrument (no gate/stall side effects)."""
+    pa = state_manager.resolve_position_authority_for_stream_row(
+        row.get("execution_instrument"),
+        row.get("instrument"),
+    )
+    if pa:
+        row["position_authority"] = pa
+
+
 def _slot_end_no_trade_expectation_gap(
     watchdog_info: Any,
     current_trading_date: str,
@@ -2734,6 +2744,7 @@ class WatchdogAggregator:
             _ens = self._state_manager.get_enabled_streams()
             status["enabled_streams_unknown"] = _esu
             status["timetable_unavailable"] = bool(_esu or _ens is None)
+            status["position_authority_by_instrument"] = self._state_manager.get_position_authority_snapshots()
             return status
         except Exception as e:
             logger.error(f"Error computing watchdog status: {e}", exc_info=True)
@@ -3025,7 +3036,7 @@ class WatchdogAggregator:
                         state_entry_time_utc = getattr(watchdog_info, 'state_entry_time_utc', datetime.now(timezone.utc))
                         canonical = getattr(watchdog_info, 'instrument', None) or instrument
                         exec_instr = _get_execution_instrument_for_canonical(canonical) or getattr(watchdog_info, 'execution_instrument', None)
-                        streams.append({
+                        _row = {
                             "trading_date": current_trading_date,
                             "stream": stream_id,
                             "instrument": canonical,
@@ -3054,7 +3065,9 @@ class WatchdogAggregator:
                             "trade_executed": getattr(watchdog_info, 'trade_executed', None),
                             "slot_reason": getattr(watchdog_info, 'slot_reason', None),
                             **flatten_fields,
-                        })
+                        }
+                        _attach_position_authority_to_stream_row(self._state_manager, _row)
+                        streams.append(_row)
                         gap_v1 = _slot_end_no_trade_expectation_gap(
                             watchdog_info,
                             current_trading_date,
@@ -3077,7 +3090,7 @@ class WatchdogAggregator:
                                 execution_expectation_gaps.append(gap_v2)
                     else:
                         exec_instr = _get_execution_instrument_for_canonical(instrument)
-                        streams.append({
+                        _row2 = {
                             "trading_date": current_trading_date,
                             "stream": stream_id,
                             "instrument": instrument,
@@ -3098,7 +3111,9 @@ class WatchdogAggregator:
                             "range_locked_time_utc": None,
                             "range_locked_time_chicago": None,
                             **flatten_fields,
-                        })
+                        }
+                        _attach_position_authority_to_stream_row(self._state_manager, _row2)
+                        streams.append(_row2)
 
                 _streams_before_td_filter = len(streams)
                 streams = [

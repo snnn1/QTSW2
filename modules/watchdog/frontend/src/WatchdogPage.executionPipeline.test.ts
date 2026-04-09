@@ -3,7 +3,11 @@
  * stays aligned with severity rules — same sequence as useMemo in WatchdogPage.
  */
 import { describe, it, expect } from 'vitest'
-import { deriveOverallExecutionStatus, executionSeverityAlert } from './utils/executionSeverity'
+import {
+  deriveOverallExecutionStatus,
+  executionSeverityAlert,
+  overallExecutionOperatorMessage,
+} from './utils/executionSeverity'
 
 describe('WatchdogPage execution alert pipeline', () => {
   it('prepends canonical operator message for gate fail-closed', () => {
@@ -19,6 +23,6 @@ describe('WatchdogPage execution alert pipeline', () => {
     )
     const alert = executionSeverityAlert(overall)
     expect(alert?.type).toBe('critical')
-    expect(alert?.message).toBe('Reconciliation gate fail-closed — execution blocked')
+    expect(alert?.message).toBe(overallExecutionOperatorMessage(overall))
   })
 })

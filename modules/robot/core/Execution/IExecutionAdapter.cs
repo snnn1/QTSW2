@@ -247,6 +247,9 @@ public class AccountSnapshot
 {
     public List<PositionSnapshot>? Positions { get; set; }
     public List<WorkingOrderSnapshot>? WorkingOrders { get; set; }
+
+    /// <summary>Wall-clock UTC when positions/orders were read from the broker (execution safety gate freshness).</summary>
+    public DateTimeOffset? CapturedAtUtc { get; set; }
 }
 
 /// <summary>

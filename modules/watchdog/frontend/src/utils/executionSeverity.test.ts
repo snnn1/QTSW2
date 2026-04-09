@@ -4,6 +4,7 @@ import {
   deriveOverallExecutionStatus,
   deriveOperatorSystemStatus,
   EXECUTION_REASON_OPERATOR_MESSAGES,
+  formatOverlayBlockedByLine,
 } from './executionSeverity'
 
 function baseStatus(over: Partial<WatchdogStatus> = {}): WatchdogStatus {
@@ -81,7 +82,7 @@ describe('deriveOverallExecutionStatus', () => {
     expect(d.overall_execution_reason).toBe('KILL_SWITCH')
   })
 
-  it('gate fail-closed → CRITICAL / RECONCILIATION_GATE_FAIL_CLOSED', () => {
+  it('gate fail-closed → CRITICAL / RECONCILIATION_GATE_FAIL_CLOSED (single path; execution_safe false)', () => {
     const d = deriveOverallExecutionStatus(
       {
         kill_switch_active: false,
@@ -94,6 +95,8 @@ describe('deriveOverallExecutionStatus', () => {
     )
     expect(d.overall_execution_severity).toBe('CRITICAL')
     expect(d.overall_execution_reason).toBe('RECONCILIATION_GATE_FAIL_CLOSED')
+    expect(d.tradable).toBe(false)
+    expect(d.execution_blocked).toBe(true)
   })
 
   it('disconnect fail-closed → CRITICAL / DISCONNECT_FAIL_CLOSED', () => {
@@ -126,11 +129,11 @@ describe('deriveOverallExecutionStatus', () => {
     expect(d.overall_execution_reason).toBe('ADOPTION_GRACE_EXPIRED')
   })
 
-  it('gate engaged → WARNING / RECONCILIATION_GATE_ENGAGED', () => {
+  it('gate engaged + execution_safe true → WARNING diagnostic; not an overlay blocker', () => {
     const d = deriveOverallExecutionStatus(
       {
         kill_switch_active: false,
-        execution_safe: false,
+        execution_safe: true,
         reconciliation_gate_state: 'ENGAGED',
         recovery_state: 'CONNECTED_OK',
         adoption_grace_expired_active: false,
@@ -139,6 +142,8 @@ describe('deriveOverallExecutionStatus', () => {
     )
     expect(d.overall_execution_severity).toBe('WARNING')
     expect(d.overall_execution_reason).toBe('RECONCILIATION_GATE_ENGAGED')
+    expect(d.tradable).toBe(true)
+    expect(d.execution_blocked).toBe(false)
   })
 
   it('execution_safe false + recovery running → WARNING / RECOVERY_NOT_CLEAR (deterministic)', () => {
@@ -240,14 +245,29 @@ describe('deriveOverallExecutionStatus', () => {
       null
     )
     expect(d.overall_execution_reason).toBe('EXECUTION_UNSAFE')
-    expect(d.operator_message).toContain('execution_safe=false')
-    expect(d.operator_message).toContain('CONNECTED_OK')
+    expect(d.operator_message).toContain('Overlay blocked')
+  })
+
+  it('formatOverlayBlockedByLine shows code and hint when not tradable', () => {
+    const d = deriveOverallExecutionStatus(
+      {
+        kill_switch_active: false,
+        execution_safe: false,
+        reconciliation_gate_state: 'OK',
+        recovery_state: 'CONNECTED_OK',
+        adoption_grace_expired_active: false,
+        engine_alive: false,
+      },
+      null
+    )
+    expect(formatOverlayBlockedByLine(d)).toContain('ENGINE_NOT_ALIVE')
+    expect(formatOverlayBlockedByLine(d)).toContain('Engine not alive')
   })
 
   it('stable operator messages for reasons', () => {
     expect(EXECUTION_REASON_OPERATOR_MESSAGES.KILL_SWITCH).toContain('Kill switch')
     expect(EXECUTION_REASON_OPERATOR_MESSAGES.TIMETABLE_DRIFT).toContain('different timetable')
-    expect(EXECUTION_REASON_OPERATOR_MESSAGES.SAFE).toBe('Execution safe')
+    expect(EXECUTION_REASON_OPERATOR_MESSAGES.SAFE).toContain('Overlay tradable')
   })
 })
 

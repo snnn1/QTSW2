@@ -7,10 +7,8 @@ using QTSW2.Robot.Core.Diagnostics;
 namespace QTSW2.Robot.Core.Execution;
 
 /// <summary>
-/// Reconciles orphaned execution journals when broker position is flat.
-/// Run on Realtime start and periodically (throttled) to close journals
-/// for trades closed externally (e.g. strategy stop before slot expiry).
-/// Also performs quantity reconciliation: account vs journal.
+/// State-producing reconciliation: reads broker quantities, compares to journal, optionally repairs journal rows and closes
+/// orphans when broker is flat. Emits diagnostics; does not decide execution readiness (position authority / structural gates do).
 /// </summary>
 public sealed class ReconciliationRunner
 {
@@ -24,7 +22,6 @@ public sealed class ReconciliationRunner
     private readonly ReconciliationStateTracker? _reconciliationTracker;
     private readonly TimeSpan _reconciliationDebounceWindow;
     private readonly RuntimeAuditHub? _runtimeAudit;
-    private readonly ReconciliationConvergenceTracker? _convergenceTracker;
     private readonly ReleaseReconciliationRedundancySuppression? _redundancySuppression;
     /// <summary>Maps execution root (e.g. MES) to canonical (e.g. ES) for journal open-qty aggregation; when null, only literal execution key matches.</summary>
     private readonly Func<string, string?>? _getCanonicalInstrumentForJournalAggregation;
@@ -49,12 +46,6 @@ public sealed class ReconciliationRunner
 
     private static readonly TimeSpan SecondarySkipLogCoalesce = TimeSpan.FromSeconds(60);
 
-    private readonly Dictionary<string, (int AccountQty, int JournalQty, long ActivityGen, DateTimeOffset LastSampleUtc)>
-        _nonOwnerConvergenceThrottle = new(StringComparer.OrdinalIgnoreCase);
-
-    /// <summary>Consecutive reconciliation passes observing broker abs qty == 0 (and no working orders) for a product family before RECONCILIATION_BROKER_FLAT journal completion.</summary>
-    private readonly Dictionary<string, int> _brokerFlatConfirmStreakByFamily = new(StringComparer.OrdinalIgnoreCase);
-
     public ReconciliationRunner(IExecutionAdapter adapter, ExecutionJournal journal, RobotLogger log,
         Action<string, DateTimeOffset, string, int, int>? onQuantityMismatch = null,
         Action<Dictionary<string, (int AccountQty, int JournalQty)>>? onReconciliationPassComplete = null,
@@ -77,7 +68,7 @@ public sealed class ReconciliationRunner
         _reconciliationTracker = reconciliationTracker;
         _reconciliationDebounceWindow = reconciliationDebounceWindow ?? ReconciliationStateTracker.DefaultDebounceWindow;
         _runtimeAudit = runtimeAudit;
-        _convergenceTracker = convergenceTracker;
+        _ = convergenceTracker;
         _redundancySuppression = redundancySuppression;
         _getCanonicalInstrumentForJournalAggregation = getCanonicalInstrumentForJournalAggregation;
     }
@@ -441,9 +432,6 @@ public sealed class ReconciliationRunner
 
         if (instrumentsChecked == 0)
         {
-            _log.Write(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_PASS_SUMMARY", "ENGINE",
-                new { instruments_checked = 0, journals_reconciled = 0, note = "No open journals to reconcile" }));
-            EmitConvergenceSamples(utcNow, workingOrders, accountQtyByInstrument, openByInstrument);
             if (cpuStart != 0) _runtimeAudit?.CpuEnd(cpuStart, RuntimeAuditSubsystem.Reconciliation);
             if (_redundancySuppression != null && !gateMode)
                 _redundancySuppression.NotifyPeriodicReconciliationPassCompleted(passSignature, _redundancySuppression.ExecutionActivityGeneration, utcNow);
@@ -457,23 +445,12 @@ public sealed class ReconciliationRunner
                 familyKeys.Add(BrokerFlatFamilyKey(k));
         }
 
-        var familyClosureReadiness = new Dictionary<string, (int BrokerAbs, bool HasWorking, int Streak)>(StringComparer.OrdinalIgnoreCase);
+        var familyClosureReadiness = new Dictionary<string, (int BrokerAbs, bool HasWorking)>(StringComparer.OrdinalIgnoreCase);
         foreach (var familyKey in familyKeys)
         {
             var brokerAbs = SumBrokerAbsForCanonicalFamily(familyKey, positions);
             var hasWorkingOrdersScoped = HasWorkingOrdersForCanonicalFamily(familyKey, workingOrders);
-
-            if (brokerAbs > 0 || hasWorkingOrdersScoped)
-                _brokerFlatConfirmStreakByFamily[familyKey] = 0;
-            else
-            {
-                if (!_brokerFlatConfirmStreakByFamily.TryGetValue(familyKey, out var streak))
-                    streak = 0;
-                _brokerFlatConfirmStreakByFamily[familyKey] = Math.Min(streak + 1, 1_000_000);
-            }
-
-            familyClosureReadiness[familyKey] = (brokerAbs, hasWorkingOrdersScoped,
-                _brokerFlatConfirmStreakByFamily[familyKey]);
+            familyClosureReadiness[familyKey] = (brokerAbs, hasWorkingOrdersScoped);
         }
 
         foreach (var kvp in openByInstrument)
@@ -517,23 +494,6 @@ public sealed class ReconciliationRunner
                 continue;
             }
 
-            if (fr.Streak < 2)
-            {
-                _log.Write(RobotEvents.EngineBase(utcNow, entries[0].TradingDate, "JOURNAL_COMPLETION_BLOCKED_BROKER_NOT_FLAT", "ENGINE",
-                    new
-                    {
-                        broker_position_qty = 0,
-                        intent_id = entries[0].IntentId,
-                        journal_instrument_bucket = instrument,
-                        broker_flat_family_key = familyKey,
-                        consecutive_broker_flat_passes = fr.Streak,
-                        reason =
-                            "awaiting_second_consecutive_reconciliation_pass_with_stable_broker_flat (transient snapshot guard)",
-                        open_journal_row_count = entries.Count
-                    }));
-                continue;
-            }
-
             foreach (var (tradingDate, stream, intentId, entry) in entries)
             {
                 var journalOpenBefore = ExecutionJournal.GetEntryRemainingOpenQuantity(entry);
@@ -551,7 +511,7 @@ public sealed class ReconciliationRunner
                             instrument,
                             trading_date = tradingDate,
                             completion_reason = CompletionReasons.RECONCILIATION_BROKER_FLAT,
-                            note = "Orphaned journal closed; broker position flat (scoped + stable confirmation)"
+                            note = "Orphaned journal closed; broker position flat (scoped, single-pass)"
                         }));
                 }
             }
@@ -569,84 +529,12 @@ public sealed class ReconciliationRunner
                 }));
         }
 
-        _log.Write(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_PASS_SUMMARY", "ENGINE",
-            new
-            {
-                instruments_checked = instrumentsChecked,
-                journals_reconciled = journalsReconciled,
-                note = "Reconciliation pass complete"
-            }));
-
-        EmitConvergenceSamples(utcNow, workingOrders, accountQtyByInstrument, openByInstrument);
-
         // Notify engine of qty by instrument (for unfreezing when mismatch resolved)
         _onReconciliationPassComplete?.Invoke(BuildQtyByInstrument(accountQtyByInstrument));
 
         if (cpuStart != 0) _runtimeAudit?.CpuEnd(cpuStart, RuntimeAuditSubsystem.Reconciliation);
         if (_redundancySuppression != null && !gateMode)
             _redundancySuppression.NotifyPeriodicReconciliationPassCompleted(passSignature, _redundancySuppression.ExecutionActivityGeneration, utcNow);
-    }
-
-    private void EmitConvergenceSamples(
-        DateTimeOffset utcNow,
-        List<WorkingOrderSnapshot> workingOrders,
-        Dictionary<string, int> accountQtyByInstrument,
-        Dictionary<string, List<(string TradingDate, string Stream, string IntentId, ExecutionJournalEntry Entry)>> openByInstrument)
-    {
-        if (_convergenceTracker == null) return;
-
-        var acct = _reconciliationAccountName?.Invoke();
-        var instanceId = _reconciliationInstanceId?.Invoke() ?? "";
-        var actGen = _redundancySuppression?.ExecutionActivityGeneration ?? 0;
-
-        var instSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var k in accountQtyByInstrument.Keys)
-            if (!string.IsNullOrWhiteSpace(k)) instSet.Add(k.Trim());
-        foreach (var k in openByInstrument.Keys)
-            if (!string.IsNullOrWhiteSpace(k)) instSet.Add(k.Trim());
-
-        foreach (var inst in instSet)
-        {
-            var accountQty = accountQtyByInstrument.TryGetValue(inst, out var aq) ? aq : 0;
-            var instRoot = BrokerPositionResolver.NormalizeCanonicalKey(inst);
-            if (string.IsNullOrEmpty(instRoot)) continue;
-            var canonicalForJournal = CanonicalInstrumentForJournal(instRoot) ?? instRoot;
-            var journalQty = _journal.GetOpenJournalQuantitySumForInstrumentFromMap(openByInstrument, instRoot, canonicalForJournal);
-            var openOrders = CountWorkingForInstrument(workingOrders, inst);
-            var intentCount = ExecutionJournal.CountOpenJournalRowsMatchingInstrumentScope(openByInstrument, instRoot, canonicalForJournal);
-            var hasMismatch = accountQty != journalQty;
-            var nonOwnerConv = hasMismatch && _reconciliationTracker != null &&
-                _reconciliationTracker.TryPeekNonOwnerWithStableQtyMismatchEpisode(acct, inst, instanceId, accountQty,
-                    journalQty, out _);
-            if (nonOwnerConv)
-            {
-                if (_nonOwnerConvergenceThrottle.TryGetValue(inst, out var throttle) &&
-                    throttle.AccountQty == accountQty && throttle.JournalQty == journalQty &&
-                    throttle.ActivityGen == actGen &&
-                    (utcNow - throttle.LastSampleUtc).TotalSeconds <
-                    ReconciliationStateTracker.DefaultDebounceWindow.TotalSeconds)
-                    continue;
-            }
-
-            _convergenceTracker.OnInstrumentReconciliationSample(utcNow, inst, accountQty, journalQty, openOrders, intentCount, hasMismatch, accountQty - journalQty);
-
-            if (nonOwnerConv)
-                _nonOwnerConvergenceThrottle[inst] = (accountQty, journalQty, actGen, utcNow);
-            else
-                _nonOwnerConvergenceThrottle.Remove(inst);
-        }
-    }
-
-    private static int CountWorkingForInstrument(List<WorkingOrderSnapshot> workingOrders, string instrument)
-    {
-        var n = 0;
-        foreach (var w in workingOrders)
-        {
-            if (string.IsNullOrWhiteSpace(w.Instrument)) continue;
-            if (string.Equals(w.Instrument.Trim(), instrument, StringComparison.OrdinalIgnoreCase))
-                n++;
-        }
-        return n;
     }
 
     private Dictionary<string, (int AccountQty, int JournalQty)> BuildQtyByInstrument(Dictionary<string, int> accountQtyByInstrument)

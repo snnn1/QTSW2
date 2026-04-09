@@ -51,6 +51,16 @@ SLOT_ENDS = {
 CHICAGO_TZ = pytz.timezone("America/Chicago")
 
 
+def _normalize_position_authority_key(instrument: Optional[str]) -> str:
+    """Map execution instrument strings to snapshot keys (e.g. ``MES 03-26`` -> ``MES``). Read-only matching only."""
+    if not instrument:
+        return ""
+    s = str(instrument).strip().upper()
+    if not s:
+        return ""
+    return s.split()[0] if " " in s else s
+
+
 def _normalize_timetable_hash_compare(value: Optional[str]) -> Optional[str]:
     """Lowercase stripped hash for drift comparison (hex case-insensitive)."""
     if value is None:
@@ -177,6 +187,8 @@ class WatchdogStateManager:
         
         # Stream states: (trading_date, stream) -> StreamStateInfo
         self._stream_states: Dict[tuple, 'StreamStateInfo'] = {}
+        # POSITION_AUTHORITY_EVALUATED: normalized instrument -> last payload (observability only; never gates execution)
+        self._position_authority_by_instrument: Dict[str, Dict[str, Any]] = {}
         
         # Intent exposures: intent_id -> IntentExposureInfo
         self._intent_exposures: Dict[str, 'IntentExposureInfo'] = {}
@@ -294,6 +306,87 @@ class WatchdogStateManager:
     def get_intent_exposures(self) -> Dict[str, Any]:
         """Live intent_id -> IntentExposureInfo map; same object identity as internal store."""
         return self._intent_exposures
+
+    def get_position_authority_snapshots(self) -> Dict[str, Dict[str, Any]]:
+        """Read-only last POSITION_AUTHORITY_EVALUATED payloads keyed by normalized instrument (MES, MYM, …)."""
+        return dict(self._position_authority_by_instrument)
+
+    def record_position_authority_evaluated(self, payload: Dict[str, Any], timestamp_utc: datetime) -> None:
+        """
+        Ingest robot POSITION_AUTHORITY_EVALUATED — mirror payload only; does not affect execution_safe, gate, or stalls.
+        """
+        inst_raw = payload.get("instrument")
+        if inst_raw is None or str(inst_raw).strip() == "":
+            return
+        key = _normalize_position_authority_key(str(inst_raw))
+        if not key:
+            return
+        ts_iso = timestamp_utc.isoformat().replace("+00:00", "Z")
+        self._position_authority_by_instrument[key] = {
+            "instrument": str(inst_raw).strip(),
+            "authority_state": payload.get("authority_state"),
+            "broker_qty": payload.get("broker_qty"),
+            "real_open_qty": payload.get("real_open_qty"),
+            "recovery_open_qty": payload.get("recovery_open_qty"),
+            "journal_open_qty": payload.get("journal_open_qty"),
+            "last_authority_ts_utc": ts_iso,
+        }
+
+    def resolve_position_authority_for_stream_row(
+        self,
+        execution_instrument: Optional[str],
+        canonical_instrument: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Match timetable row to last authority snapshot by execution instrument (preferred) then canonical / policy mapping.
+        Returns a shallow copy for API serialization.
+        """
+        candidates: List[str] = []
+        if execution_instrument:
+            candidates.append(str(execution_instrument).strip())
+        if canonical_instrument:
+            c = str(canonical_instrument).strip()
+            candidates.append(c)
+            mapped = _get_execution_instrument_for_canonical(c)
+            if mapped:
+                candidates.append(mapped)
+        def _row_identity_keys(
+            exec_i: Optional[str], canon_i: Optional[str]
+        ) -> Set[str]:
+            keys: Set[str] = set()
+            if exec_i:
+                ek = _normalize_position_authority_key(str(exec_i).strip())
+                if ek:
+                    keys.add(ek)
+            if canon_i:
+                c = str(canon_i).strip()
+                ck = _normalize_position_authority_key(c)
+                if ck:
+                    keys.add(ck)
+                mapped = _get_execution_instrument_for_canonical(c)
+                if mapped:
+                    mk = _normalize_position_authority_key(mapped)
+                    if mk:
+                        keys.add(mk)
+            return keys
+
+        seen: Set[str] = set()
+        for cand in candidates:
+            k = _normalize_position_authority_key(cand)
+            if not k or k in seen:
+                continue
+            seen.add(k)
+            snap = self._position_authority_by_instrument.get(k)
+            if snap:
+                snap_out = dict(snap)
+                snap_key = _normalize_position_authority_key(snap.get("instrument"))
+                id_keys = _row_identity_keys(execution_instrument, canonical_instrument)
+                if id_keys and snap_key and snap_key not in id_keys:
+                    snap_out["attachment_status"] = "UNVERIFIED"
+                else:
+                    snap_out["attachment_status"] = "MATCHED"
+                return snap_out
+        return None
 
     def get_last_engine_tick_utc(self) -> Optional[datetime]:
         return self._last_engine_tick_utc
@@ -1404,7 +1497,26 @@ class WatchdogStateManager:
     def _timetable_blocks_execution(self) -> bool:
         """True when timetable_current.json has not produced a validated execution snapshot."""
         return bool(self._enabled_streams_unknown or not self._timetable_validated)
-    
+
+    def _compute_execution_safe(self) -> bool:
+        """
+        Single source for execution_safe (overlay tradability) used by compute_watchdog_status
+        and compute_risk_gate_status.
+
+        Only FAIL_CLOSED blocks; ENGAGED is diagnostic (robot may still be validating).
+        """
+        engine_alive = self.compute_engine_alive()
+        timetable_drift = self.compute_timetable_drift()
+        return bool(
+            not self._timetable_blocks_execution()
+            and engine_alive
+            and self._recovery_state in ("CONNECTED_OK", "RECOVERY_COMPLETE")
+            and self._reconciliation_gate_state != "FAIL_CLOSED"
+            and not self._adoption_grace_expired_active
+            and not self._kill_switch_active
+            and not timetable_drift
+        )
+
     def get_timetable_source(self) -> Optional[str]:
         """Last known timetable_current.json ``source`` from poller, if any."""
         return self._timetable_file_source
@@ -1735,24 +1847,15 @@ class WatchdogStateManager:
     def compute_risk_gate_status(self) -> Dict:
         """Compute risk gate status derived field."""
         engine_alive = self.compute_engine_alive()
-        gate_blocks = self._reconciliation_gate_state in ("ENGAGED", "FAIL_CLOSED")
+        gate_hard = self._reconciliation_gate_state == "FAIL_CLOSED"
         recovery_state_allowed = (
             self._recovery_state in ("CONNECTED_OK", "RECOVERY_COMPLETE")
-            and not gate_blocks
+            and not gate_hard
             and not self._adoption_grace_expired_active
         )
         kill_switch_allowed = not self._kill_switch_active
-        # Engine must be alive: recovery/gate/kill-switch can read "OK" from stale auto-cleared state
-        # while ticks are dead — without this, execution_safe contradictions ENGINE_STALLED / stream table.
-        timetable_ok = not self._timetable_blocks_execution()
-        timetable_drift = self.compute_timetable_drift()
-        execution_safe = bool(
-            timetable_ok
-            and engine_alive
-            and recovery_state_allowed
-            and kill_switch_allowed
-            and not timetable_drift
-        )
+        # Canonical execution_safe: same boolean as compute_watchdog_status (single source).
+        execution_safe = self._compute_execution_safe()
 
         # Only include streams for current trading date (exclude past dates from slot journal hydration)
         current_td = self.get_trading_date()
@@ -2684,15 +2787,7 @@ class WatchdogStateManager:
                 if self._latest_robot_hash_timestamp
                 else None
             ),
-            "execution_safe": (
-                not self._timetable_blocks_execution()
-                and engine_alive
-                and self._recovery_state in ("CONNECTED_OK", "RECOVERY_COMPLETE")
-                and self._reconciliation_gate_state not in ("ENGAGED", "FAIL_CLOSED")
-                and not self._adoption_grace_expired_active
-                and not self._kill_switch_active
-                and not timetable_drift
-            ),
+            "execution_safe": self._compute_execution_safe(),
             "kill_switch_active": self._kill_switch_active,
             "connection_status": connection_status,
             "derived_connection_state": derived_connection_state,

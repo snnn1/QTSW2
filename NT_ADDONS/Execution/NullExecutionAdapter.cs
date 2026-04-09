@@ -181,4 +181,12 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
                 note = "DRYRUN mode - would cancel robot-owned orders but not executing"
             }));
     }
+
+    /// <inheritdoc />
+    public bool TryTriggerHardFlatten(string instrument, string reason, DateTimeOffset utcNow)
+    {
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "HARD_FLATTEN_DRYRUN", state: "ENGINE",
+            new { instrument, reason, note = "DRYRUN — no broker flatten" }));
+        return false;
+    }
 }

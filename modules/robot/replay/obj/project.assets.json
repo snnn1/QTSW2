@@ -182,11 +182,11 @@
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\replay\\Robot.Replay.csproj",
+      "projectUniqueName": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\replay\\Robot.Replay.csproj",
       "projectName": "Robot.Replay",
-      "projectPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\replay\\Robot.Replay.csproj",
+      "projectPath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\replay\\Robot.Replay.csproj",
       "packagesPath": "C:\\Users\\jakej\\.nuget\\packages\\",
-      "outputPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\replay\\obj\\",
+      "outputPath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\replay\\obj\\",
       "projectStyle": "PackageReference",
       "configFilePaths": [
         "C:\\Users\\jakej\\AppData\\Roaming\\NuGet\\NuGet.Config"
@@ -201,8 +201,8 @@
         "net8.0": {
           "targetAlias": "net8.0",
           "projectReferences": {
-            "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj": {
-              "projectPath": "C:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj"
+            "c:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj": {
+              "projectPath": "c:\\Users\\jakej\\QTSW2\\modules\\robot\\contracts\\Robot.Contracts.csproj"
             }
           }
         }

@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Threading;
 using QTSW2.Robot.Core;
 
@@ -579,6 +580,14 @@ public sealed class ReconciliationConvergenceTracker
         public long OscillationSignals;
     }
 
+    /// <summary>Per-instrument stable qty convergence (broker vs journal), for diagnostics only — not used for gating.</summary>
+    public readonly struct StableConvergenceInfo
+    {
+        public bool IsConverged { get; init; }
+        public DateTimeOffset? LastConvergedAtUtc { get; init; }
+        public int ConsecutiveNoMismatchCount { get; init; }
+    }
+
     private static long _sessionConverged;
     private static long _sessionStuck;
     private static long _sessionOscillation;
@@ -591,6 +600,8 @@ public sealed class ReconciliationConvergenceTracker
     };
 
     private const int StuckThresholdPasses = 5;
+    /// <summary>Consecutive identical reconciliation samples with no qty mismatch (same signature hash as STUCK path).</summary>
+    private const int StableConvergenceThresholdPasses = 3;
     private static readonly TimeSpan StuckLogResurfaceInterval = TimeSpan.FromSeconds(60);
     private const int StuckLogMilestoneIncrement = 10;
 
@@ -607,18 +618,65 @@ public sealed class ReconciliationConvergenceTracker
         public int ConsecutiveSameHash;
         public int OscillationCount;
         public bool HadMismatch;
+        /// <summary>
+        /// Latched when this instrument has been in qty mismatch; cleared only on <c>RECONCILIATION_CONVERGED</c> emission.
+        /// Per-sample <see cref="HadMismatch"/> is insufficient — it is false on the stabilizing no-mismatch rows.
+        /// </summary>
+        public bool HadMismatchEpisode;
         public int HashPrev2;
         public int HashPrev1;
         public int HashCurr;
         public DateTimeOffset? FirstMismatchUtc;
         public DateTimeOffset? LastStuckLogUtc;
         public int LastStuckLogAtConsecutive;
+        /// <summary>Signature hash when last sample had accountQty == journalQty; null if never seen.</summary>
+        public int? LastNoMismatchHash;
+        public int ConsecutiveNoMismatchCount;
+        public bool IsConverged;
+        public DateTimeOffset? LastConvergedAtUtc;
     }
 
     public ReconciliationConvergenceTracker(RobotLogger log, Func<string?> getRunId)
     {
         _log = log ?? throw new ArgumentNullException(nameof(log));
         _getRunId = getRunId ?? (() => null);
+    }
+
+    /// <summary>Read stable convergence flags (diagnostics / higher layers; not used for execution gating).</summary>
+    public bool TryGetStableConvergence(string instrument, out StableConvergenceInfo info)
+    {
+        info = default;
+        if (string.IsNullOrWhiteSpace(instrument)) return false;
+        var inst = instrument.Trim();
+        lock (_lock)
+        {
+            if (!_byInstrument.TryGetValue(inst, out var st))
+                return false;
+            info = new StableConvergenceInfo
+            {
+                IsConverged = st.IsConverged,
+                LastConvergedAtUtc = st.LastConvergedAtUtc,
+                ConsecutiveNoMismatchCount = st.ConsecutiveNoMismatchCount
+            };
+            return true;
+        }
+    }
+
+    /// <summary>Snapshot of all instruments with any convergence sample state (diagnostics).</summary>
+    public IReadOnlyList<(string Instrument, StableConvergenceInfo Info)> GetStableConvergenceDiagnosticsSnapshot()
+    {
+        lock (_lock)
+        {
+            return _byInstrument
+                .Select(kvp => (kvp.Key,
+                    new StableConvergenceInfo
+                    {
+                        IsConverged = kvp.Value.IsConverged,
+                        LastConvergedAtUtc = kvp.Value.LastConvergedAtUtc,
+                        ConsecutiveNoMismatchCount = kvp.Value.ConsecutiveNoMismatchCount
+                    }))
+                .ToList();
+        }
     }
 
     public void OnInstrumentReconciliationSample(
@@ -705,6 +763,48 @@ public sealed class ReconciliationConvergenceTracker
                     }
                 }
 
+                // Stable qty convergence (broker vs journal): same hash inputs as STUCK; requires 3 consecutive matching samples.
+                var noMismatch = !hasMismatch;
+                if (!noMismatch)
+                {
+                    st.ConsecutiveNoMismatchCount = 0;
+                    st.LastNoMismatchHash = null;
+                    st.IsConverged = false;
+                    st.HadMismatchEpisode = true;
+                }
+                else
+                {
+                    if (st.LastNoMismatchHash.HasValue && hash == st.LastNoMismatchHash.Value)
+                        st.ConsecutiveNoMismatchCount++;
+                    else
+                    {
+                        st.ConsecutiveNoMismatchCount = 1;
+                        st.LastNoMismatchHash = hash;
+                    }
+
+                    // CONVERGED only after a real mismatch episode (not clean startup / always-flat).
+                    if (st.ConsecutiveNoMismatchCount >= StableConvergenceThresholdPasses && !st.IsConverged &&
+                        st.HadMismatchEpisode)
+                    {
+                        st.IsConverged = true;
+                        st.LastConvergedAtUtc = utcNow;
+                        st.HadMismatchEpisode = false;
+                        Interlocked.Increment(ref _sessionConverged);
+                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECONCILIATION_CONVERGED", state: "ENGINE",
+                            new
+                            {
+                                instrument = inst,
+                                account_qty = accountQty,
+                                journal_qty = journalQty,
+                                open_orders_count = openOrdersCount,
+                                intent_count = intentCount,
+                                consecutive_no_mismatch_count = st.ConsecutiveNoMismatchCount,
+                                note = "Broker and journal quantities converged and stable",
+                                run_id = _getRunId()
+                            }));
+                    }
+                }
+
                 if (hasMismatch && st.HashPrev2 != 0 && st.HashCurr == st.HashPrev2 && st.HashPrev1 != 0 && st.HashCurr != st.HashPrev1)
                 {
                     st.OscillationCount++;
@@ -722,34 +822,7 @@ public sealed class ReconciliationConvergenceTracker
                         }));
                 }
 
-                if (st.HadMismatch && !hasMismatch)
-                {
-                    long? ttc = null;
-                    if (st.FirstMismatchUtc.HasValue)
-                        ttc = (long)(utcNow - st.FirstMismatchUtc.Value).TotalMilliseconds;
-                    Interlocked.Increment(ref _sessionConverged);
-                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECONCILIATION_CONVERGED", state: "ENGINE",
-                        new
-                        {
-                            instrument = inst,
-                            signature_name = "reconciliation_pass",
-                            account_qty = accountQty,
-                            journal_qty = journalQty,
-                            first_mismatch_ts = st.FirstMismatchUtc?.ToString("o"),
-                            converged_ts = utcNow.ToString("o"),
-                            time_to_converge_ms = ttc,
-                            run_id = _getRunId()
-                        }));
-                    st.HadMismatch = false;
-                    st.ConsecutiveSameHash = 0;
-                    st.OscillationCount = 0;
-                    st.HashPrev2 = st.HashPrev1 = st.HashCurr = 0;
-                    st.FirstMismatchUtc = null;
-                    st.LastStuckLogUtc = null;
-                    st.LastStuckLogAtConsecutive = 0;
-                }
-                else if (hasMismatch)
-                    st.HadMismatch = true;
+                st.HadMismatch = hasMismatch;
             }
         }
     }

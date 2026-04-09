@@ -286,6 +286,11 @@ public sealed class StreamStateMachine
     private decimal? _intendedTargetPrice;
     private decimal? _intendedBeTrigger;
 
+    /// <summary>Stop-entry at RANGE_LOCKED deferred until position authority becomes REAL (RECOVERY → REAL).</summary>
+    private bool _deferredBracketTradePending;
+    private DateTimeOffset? _deferredBracketTradeExpiryUtc;
+    private bool _loggedTradeExecutedFromDeferred;
+
     public StreamStateMachine(
         TimeService time,
         ParitySpec spec,
@@ -1034,6 +1039,8 @@ public sealed class StreamStateMachine
             HandleSlotExpiry(utcNow);
             return;
         }
+
+        TryProcessDeferredBracketTradeAuthority(utcNow);
         
         // SLOT PERSISTENCE: Check for market open re-entry (time-based, not bar-based)
         if (_journal.SlotStatus == SlotStatus.ACTIVE && _journal.ExecutionInterruptedByClose && !_journal.ReentrySubmitted)
@@ -4029,11 +4036,108 @@ public sealed class StreamStateMachine
         Commit(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", "NO_TRADE_BREAKOUT_ALREADY_OCCURRED");
     }
 
+    private DerivedPositionAuthority TryDerivedPositionAuthorityForStream(DateTimeOffset utcNow)
+    {
+        if (_executionAdapter == null || _executionJournal == null)
+            return DerivedPositionAuthority.UNKNOWN;
+        try
+        {
+            var snap = _executionAdapter.GetAccountSnapshot(utcNow);
+            return PositionAuthorityInstrumentEvaluator.Derive(snap, _executionJournal, ExecutionInstrument, CanonicalInstrument);
+        }
+        catch
+        {
+            return DerivedPositionAuthority.UNKNOWN;
+        }
+    }
+
+    private DateTimeOffset ResolveDeferredBracketExpiryUtc(DateTimeOffset utcNow)
+    {
+        if (_journal.NextSlotTimeUtc.HasValue && _journal.NextSlotTimeUtc.Value > utcNow)
+            return _journal.NextSlotTimeUtc.Value;
+        if (MarketCloseUtc > utcNow)
+            return MarketCloseUtc;
+        return utcNow.AddMinutes(15);
+    }
+
+    private void ClearDeferredBracketTrade()
+    {
+        _deferredBracketTradePending = false;
+        _deferredBracketTradeExpiryUtc = null;
+        _loggedTradeExecutedFromDeferred = false;
+    }
+
+    private void TryProcessDeferredBracketTradeAuthority(DateTimeOffset utcNow)
+    {
+        if (!_deferredBracketTradePending) return;
+        if (State != StreamState.RANGE_LOCKED || _journal.Committed)
+        {
+            ClearDeferredBracketTrade();
+            return;
+        }
+
+        if (_deferredBracketTradeExpiryUtc.HasValue && utcNow > _deferredBracketTradeExpiryUtc.Value)
+        {
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "TRADE_EXPIRED", State.ToString(),
+                new
+                {
+                    stream_id = Stream,
+                    trading_date = TradingDate,
+                    execution_instrument = ExecutionInstrument,
+                    authority_deferred_expiry_utc = _deferredBracketTradeExpiryUtc.Value.ToString("o"),
+                    note = "Deferred stop-entry bracket submit expired before REAL authority"
+                }));
+            ClearDeferredBracketTrade();
+            return;
+        }
+
+        var auth = TryDerivedPositionAuthorityForStream(utcNow);
+        if (auth == DerivedPositionAuthority.UNKNOWN)
+        {
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "TRADE_CANCELLED_UNKNOWN_STATE", State.ToString(),
+                new
+                {
+                    stream_id = Stream,
+                    trading_date = TradingDate,
+                    execution_instrument = ExecutionInstrument,
+                    authority_state = auth.ToString(),
+                    reason = "authority_unknown",
+                    note = "Deferred bracket submit cancelled — position authority UNKNOWN"
+                }));
+            ClearDeferredBracketTrade();
+            return;
+        }
+
+        if (auth != DerivedPositionAuthority.REAL)
+            return;
+
+        if (!_loggedTradeExecutedFromDeferred)
+        {
+            _loggedTradeExecutedFromDeferred = true;
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "TRADE_EXECUTED_FROM_DEFERRED", State.ToString(),
+                new
+                {
+                    stream_id = Stream,
+                    trading_date = TradingDate,
+                    execution_instrument = ExecutionInstrument,
+                    authority_state = auth.ToString(),
+                    note = "Executing deferred stop-entry brackets now that authority is REAL"
+                }));
+        }
+
+        SubmitStopEntryBracketsAtLock(utcNow, fromDeferredAuthorityExecution: true);
+        if (_stopBracketsSubmittedAtLock || _journal.StopBracketsSubmittedAtLock)
+            ClearDeferredBracketTrade();
+    }
+
     /// <summary>
     /// Submit paired stop-market entry orders (long + short) immediately after RANGE_LOCKED.
     /// These are linked via OCO so only one side can fill.
     /// </summary>
-    private void SubmitStopEntryBracketsAtLock(DateTimeOffset utcNow)
+    private void SubmitStopEntryBracketsAtLock(DateTimeOffset utcNow, bool fromDeferredAuthorityExecution = false)
     {
         // DIAGNOSTIC: Log entry into function
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
@@ -4141,6 +4245,58 @@ public sealed class StreamStateMachine
                     stream_armed = streamArmed
                 }));
             return;
+        }
+
+        if (!fromDeferredAuthorityExecution)
+        {
+            var posAuth = TryDerivedPositionAuthorityForStream(utcNow);
+            _log.Write(RobotEvents.EngineBase(utcNow, TradingDate, "POSITION_AUTHORITY_EVALUATED", "ENGINE",
+                new
+                {
+                    stream_id = Stream,
+                    instrument = ExecutionInstrument,
+                    canonical_instrument = CanonicalInstrument,
+                    authority_state = posAuth.ToString(),
+                    context = "timetable_stop_brackets_at_lock"
+                }));
+            if (posAuth == DerivedPositionAuthority.UNKNOWN)
+            {
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "TRADE_BLOCKED_UNKNOWN_STATE", State.ToString(),
+                    new
+                    {
+                        stream_id = Stream,
+                        trading_date = TradingDate,
+                        execution_instrument = ExecutionInstrument,
+                        authority_state = posAuth.ToString(),
+                        blocked_what = "STOP_ENTRY_BRACKETS",
+                        reason = "authority_unknown",
+                        note = "No pending trade created — position authority UNKNOWN"
+                    }));
+                return;
+            }
+
+            if (posAuth == DerivedPositionAuthority.RECOVERY)
+            {
+                if (_deferredBracketTradePending)
+                    return;
+                _deferredBracketTradePending = true;
+                _deferredBracketTradeExpiryUtc = ResolveDeferredBracketExpiryUtc(utcNow);
+                _loggedTradeExecutedFromDeferred = false;
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "TRADE_DEFERRED_POSITION_AUTHORITY", State.ToString(),
+                    new
+                    {
+                        stream_id = Stream,
+                        trading_date = TradingDate,
+                        execution_instrument = ExecutionInstrument,
+                        authority_state = posAuth.ToString(),
+                        deferred_expiry_utc = _deferredBracketTradeExpiryUtc?.ToString("o"),
+                        blocked_what = "STOP_ENTRY_BRACKETS",
+                        note = "Bracket submit deferred until authority is REAL"
+                    }));
+                return;
+            }
         }
 
         var brkLong = _brkLongRounded.Value;

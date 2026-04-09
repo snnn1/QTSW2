@@ -234,6 +234,12 @@ public interface IExecutionAdapter
     /// Returns null if not supported (caller should use Flatten fallback + broker wait).
     /// </summary>
     FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow);
+
+    /// <summary>
+    /// Hard fail-closed: broker <c>Account.Flatten</c> once per instrument (no IEA queue, no leg orders).
+    /// Returns true if one-shot satisfied or already consumed; false if NT context missing.
+    /// </summary>
+    bool TryTriggerHardFlatten(string instrument, string reason, DateTimeOffset utcNow);
 }
 
 /// <summary>
@@ -243,6 +249,9 @@ public class AccountSnapshot
 {
     public List<PositionSnapshot>? Positions { get; set; }
     public List<WorkingOrderSnapshot>? WorkingOrders { get; set; }
+
+    /// <summary>Wall-clock UTC when positions/orders were read from the broker (execution safety gate freshness).</summary>
+    public DateTimeOffset? CapturedAtUtc { get; set; }
 }
 
 /// <summary>

@@ -21,6 +21,7 @@ import { ReliabilityPanel } from './components/watchdog/ReliabilityPanel'
 import { InstrumentHealthPanel } from './components/watchdog/InstrumentHealthPanel'
 import { MetricsHistoryPanel } from './components/watchdog/MetricsHistoryPanel'
 import { StreamDetailDrawer } from './components/watchdog/StreamDetailDrawer'
+import { SystemAuthorityStatusBar } from './components/watchdog/SystemAuthorityStatusBar'
 import { useWatchdogLiveSnapshot } from './hooks/useWatchdogLiveSnapshot'
 import { useWatchdogEvents } from './hooks/useWatchdogEvents'
 import { useRiskGates } from './hooks/useRiskGates'
@@ -371,6 +372,13 @@ export function WatchdogPage() {
       )}
       
       <div className="container mx-auto px-4 pt-4 pb-8 mt-16">
+        <div className="mb-4">
+          <SystemAuthorityStatusBar
+            byInstrument={status?.position_authority_by_instrument}
+            overallExecution={overallExecution}
+            reconciliationGateState={status?.reconciliation_gate_state}
+          />
+        </div>
         <div className="grid grid-cols-10 gap-4">
           {/* Left Column (70%) */}
           <div className="col-span-7 space-y-4">
@@ -449,7 +457,12 @@ export function WatchdogPage() {
             <FillHealthCard fillHealth={status?.fill_health} />
 
             <div id="risk-gates-panel">
-              <RiskGatesPanel gates={gates} loading={!gates} overallExecution={overallExecution} />
+              <RiskGatesPanel
+              gates={gates}
+              loading={!gates}
+              overallExecution={overallExecution}
+              tradable={status?.execution_safe}
+            />
             </div>
             
             <ActiveIntentPanel

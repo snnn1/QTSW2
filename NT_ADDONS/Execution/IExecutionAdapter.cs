@@ -145,6 +145,11 @@ public interface IExecutionAdapter
     void CancelRobotOwnedWorkingOrders(AccountSnapshot snap, DateTimeOffset utcNow);
 
     /// <summary>
+    /// Hard fail-closed: broker Account.Flatten once per instrument (no IEA queue, no leg orders).
+    /// </summary>
+    bool TryTriggerHardFlatten(string instrument, string reason, DateTimeOffset utcNow);
+
+    /// <summary>
     /// True when the adapter is safe to drive real or simulated submission paths (NT context wired; SIM verified when applicable).
     /// Used to gate pre-hydration and bracket submission during startup before DataLoaded wiring completes.
     /// </summary>
@@ -158,6 +163,9 @@ public class AccountSnapshot
 {
     public List<PositionSnapshot>? Positions { get; set; }
     public List<WorkingOrderSnapshot>? WorkingOrders { get; set; }
+
+    /// <summary>Wall-clock UTC when positions/orders were read from the broker (execution safety gate freshness).</summary>
+    public DateTimeOffset? CapturedAtUtc { get; set; }
 }
 
 /// <summary>

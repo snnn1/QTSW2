@@ -284,6 +284,19 @@ public sealed partial class NinjaTraderSimAdapter
             brokerSigned,
             robotTags,
             registryMismatchTrustedIntentIds);
+        var rows = new object[diagnostics.Count];
+        for (var i = 0; i < diagnostics.Count; i++)
+        {
+            var d = diagnostics[i];
+            rows[i] = new
+            {
+                intent_id = d.IntentId,
+                category = d.Category.ToString(),
+                disposition = d.Disposition.ToString(),
+                d.RecoveryAdoptionShouldConsume,
+                non_adoption_reason = d.NonAdoptionReason
+            };
+        }
         _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "RECOVERY_ADOPTION_ZERO_DELTA_BLOCKERS", state: "ENGINE",
             new
             {
@@ -292,7 +305,7 @@ public sealed partial class NinjaTraderSimAdapter
                 broker_position_qty_abs = brokerAbs,
                 broker_position_qty_signed = brokerSigned,
                 blocking_candidates = diagnostics.Count,
-                candidates = diagnostics
+                candidates = rows
             }));
     }
 
@@ -397,6 +410,8 @@ public sealed partial class NinjaTraderSimAdapter
     {
         if (!TrySessionIdentityGateDestructiveFlatten(instrument, utcNow, out var sessionFailFlatten))
             return sessionFailFlatten!;
+        if (!TryExecutionSafetyFlattenGuard(instrument, null, utcNow, "SUBMIT_FLATTEN_ORDER", snapshot.LatchRequestId, out _))
+            return OrderSubmissionResult.FailureResult("EXECUTION_BLOCKED_UNSAFE_STATE", utcNow);
         var account = _ntAccount as Account;
         var ntInstrument = (nativeInstrumentForBrokerOrder ?? (object?)_ntInstrument) as Instrument;
         if (account == null || ntInstrument == null)
@@ -443,6 +458,61 @@ public sealed partial class NinjaTraderSimAdapter
         }
     }
 
+    /// <inheritdoc cref="IExecutionAdapter.TryTriggerHardFlatten"/>
+    public bool TryTriggerHardFlatten(string instrument, string reason, DateTimeOffset utcNow)
+    {
+        var inst = instrument?.Trim() ?? "";
+        if (string.IsNullOrEmpty(inst)) return false;
+        if (!HardFailClosedExecutionModel.TryArmOneShotBrokerFlatten(inst))
+            return true;
+
+        _log.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "CRITICAL_UNSAFE_STATE_DETECTED",
+            new { instrument = inst, reason, model = "hard_fail_closed" }));
+        _log.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "HARD_FLATTEN_TRIGGERED",
+            new { instrument = inst, reason, path = "account_flatten_broker_only" }));
+
+        var account = _ntAccount as Account;
+        Instrument? ntInst = _ntInstrument as Instrument;
+        if (ntInst != null &&
+            !string.Equals(ntInst.MasterInstrument?.Name?.Trim() ?? "", inst, StringComparison.OrdinalIgnoreCase))
+        {
+            try { ntInst = Instrument.GetInstrument(inst); }
+            catch { ntInst = _ntInstrument as Instrument; }
+        }
+        else if (ntInst == null)
+        {
+            try { ntInst = Instrument.GetInstrument(inst); }
+            catch { ntInst = null; }
+        }
+
+        if (account == null || ntInst == null)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, "", "HARD_FLATTEN_BROKER_CONTEXT_MISSING", "ENGINE",
+                new { instrument = inst, reason }));
+            ExecutionSafetyGate.ApplyUnmappedExecutionKillSwitch(inst, reason ?? "hard_flatten_no_context", utcNow);
+            HardFailClosedExecutionModel.MarkExecutionLocked(inst);
+            _log.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "EXECUTION_LOCKED_UNSAFE_STATE",
+                new { instrument = inst, reason = "lock_without_broker_flatten", broker_context_missing = true }));
+            return false;
+        }
+
+        try
+        {
+            account.Flatten(new List<Instrument> { ntInst });
+        }
+        catch (Exception ex)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, "", "HARD_FLATTEN_BROKER_FAILED", "ENGINE",
+                new { instrument = inst, error = ex.Message, exception_type = ex.GetType().Name }));
+        }
+
+        ExecutionSafetyGate.ApplyUnmappedExecutionKillSwitch(inst, reason ?? "hard_fail_closed_flatten", utcNow);
+        HardFailClosedExecutionModel.MarkExecutionLocked(inst);
+        _log.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "EXECUTION_LOCKED_UNSAFE_STATE",
+            new { instrument = inst, reason }));
+        return true;
+    }
+
     /// <summary>
     /// P2.6.7: Emergency flatten — still bypasses IEA queue but is constrained: strategy thread only + explicit policy classification before submit.
     /// </summary>
@@ -466,6 +536,9 @@ public sealed partial class NinjaTraderSimAdapter
             RecordSessionIdentityBlockAttempt();
             return FlattenResult.FailureResult("SESSION_IDENTITY_LATCHED", utcNow);
         }
+
+        if (!TryExecutionSafetyFlattenGuard(instrument, null, utcNow, "EMERGENCY_FLATTEN_DIRECT", null, out _))
+            return FlattenResult.FailureResult("EXECUTION_BLOCKED_UNSAFE_STATE", utcNow);
 
         var exposure = ((IIEAOrderExecutor)this).GetBrokerCanonicalExposure(instrument);
         if (exposure.ReconciliationAbsQuantityTotal == 0)
@@ -923,7 +996,25 @@ public sealed partial class NinjaTraderSimAdapter
     private void OnRecoveryRequested(string instrument, string reason, object context, DateTimeOffset utcNow)
     {
         if (_iea == null) return;
+        var instTrim = (instrument ?? "").Trim();
         var execInst = _iea.ExecutionInstrumentKey;
+        if (!string.IsNullOrEmpty(instTrim) &&
+            (ExecutionSafetyGate.IsInstrumentUnsafeLocked(instTrim) ||
+             HardFailClosedExecutionModel.IsHardExecutionLocked(instTrim) ||
+             !string.IsNullOrEmpty(execInst) && (ExecutionSafetyGate.IsInstrumentUnsafeLocked(execInst) ||
+                                                 HardFailClosedExecutionModel.IsHardExecutionLocked(execInst))))
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, "", "RECOVERY_BLOCKED_INSTRUMENT_LOCKED", "ENGINE",
+                new
+                {
+                    instrument = instTrim,
+                    execution_instrument_key = execInst,
+                    reason,
+                    phase = "on_recovery_requested",
+                    note = "Unmapped-fill hard lock active — use UnlockInstrument after operator review"
+                }));
+            return;
+        }
         int brokerQty = 0, brokerWorkingCount = 0;
         try
         {
@@ -1149,6 +1240,13 @@ public sealed partial class NinjaTraderSimAdapter
             return;
         }
 
+        if (!TryExecutionSafetyFlattenGuard(cmd.Instrument ?? "", cmd.IntentId, utcNow, "EXECUTE_FLATTEN_INSTRUMENT",
+                cmd.CorrelationId, out _))
+        {
+            FlattenCoordinationTracker.Shared.NotifyFlattenAborted(coordAcct, cmd.Instrument ?? "", coordInst, utcNow);
+            return;
+        }
+
         var preTrigger = DestructiveTriggerParser.Resolve(cmd.ExplicitPolicyTrigger, cmd.Reason);
         _log.Write(RobotEvents.EngineBase(utcNow, "", cmd.Instrument, "DESTRUCTIVE_ACTION_REQUESTED", new
         {
@@ -1261,6 +1359,7 @@ public sealed partial class NinjaTraderSimAdapter
                 }));
             FlattenCoordinationTracker.Shared.NotifyFlattenSubmitted(coordAcct, cmd.Instrument, coordInst, cmd.UtcNow);
             RegisterPendingFlattenVerification(cmd.Instrument, cmd.CorrelationId, cmd.UtcNow);
+            ExecutionSafetyGate.RecordFlattenSubmitted(cmd.Instrument ?? "", brokerQty, cmd.UtcNow);
         }
         catch
         {
@@ -4886,6 +4985,23 @@ public sealed partial class NinjaTraderSimAdapter
         string? tag = null,
         string? ocoId = null)
     {
+        // Race mitigation: latch kill-switch before any logging / secondary work so no submit can slip past.
+        ExecutionSafetyGate.ApplyUnmappedExecutionKillSwitch(instrument, unmappedReason, utcNow);
+        var instKey = (instrument ?? "").Trim();
+        if (!string.IsNullOrEmpty(instKey))
+        {
+            _blockInstrumentCallback?.Invoke(instKey, utcNow, "UNMAPPED_FILL_HARD_STOP");
+            _log.Write(RobotEvents.ExecutionBase(utcNow, "", instKey, "CRITICAL_UNMAPPED_FILL_DETECTED",
+                new
+                {
+                    instrument = instKey,
+                    instrument_state = "LOCKED",
+                    unmapped_reason = unmappedReason,
+                    trading_disabled = true,
+                    note = "Hard stop: all entries, exits, flatten, and recovery blocked until UnlockInstrument after operator review"
+                }));
+        }
+
         var execInstKey = _iea?.ExecutionInstrumentKey ?? (order != null ? ExecutionUpdateRouter.GetExecutionInstrumentKeyFromOrder(order.Instrument) : "");
         var accountName = _iea?.AccountName ?? (order != null ? ExecutionUpdateRouter.GetAccountNameFromOrder(order) : "");
         var brokerOrderId = orderId?.ToString() ?? "";
@@ -4943,6 +5059,7 @@ public sealed partial class NinjaTraderSimAdapter
                 stream_key = (string?)null,
                 intent_id = (string?)null
             }));
+        TryEmitCriticalUnsafeStateDetected(instrument, "unsafe_locked_kill_switch", utcNow);
     }
 
     /// <summary>
@@ -6363,7 +6480,8 @@ public sealed partial class NinjaTraderSimAdapter
             return new AccountSnapshot
             {
                 Positions = new List<PositionSnapshot>(),
-                WorkingOrders = new List<WorkingOrderSnapshot>()
+                WorkingOrders = new List<WorkingOrderSnapshot>(),
+                CapturedAtUtc = utcNow
             };
         }
         
@@ -6373,7 +6491,8 @@ public sealed partial class NinjaTraderSimAdapter
             return new AccountSnapshot
             {
                 Positions = new List<PositionSnapshot>(),
-                WorkingOrders = new List<WorkingOrderSnapshot>()
+                WorkingOrders = new List<WorkingOrderSnapshot>(),
+                CapturedAtUtc = utcNow
             };
         }
         
@@ -6430,7 +6549,8 @@ public sealed partial class NinjaTraderSimAdapter
         return new AccountSnapshot
         {
             Positions = positions,
-            WorkingOrders = workingOrders
+            WorkingOrders = workingOrders,
+            CapturedAtUtc = utcNow
         };
     }
     
@@ -6758,6 +6878,13 @@ public sealed partial class NinjaTraderSimAdapter
             var error = "NT context type mismatch";
             return FlattenResult.FailureResult(error, utcNow);
         }
+
+        var flattenIntentIdForGate = string.Equals(intentId, "NT_FLATTEN", StringComparison.OrdinalIgnoreCase) ||
+                                     string.Equals(intentId, "EMERGENCY_BLOCK", StringComparison.OrdinalIgnoreCase)
+            ? null
+            : intentId;
+        if (!TryExecutionSafetyFlattenGuard(instrument, flattenIntentIdForGate, utcNow, "FLATTEN_INTENT_REAL", null, out _))
+            return FlattenResult.FailureResult("EXECUTION_BLOCKED_UNSAFE_STATE", utcNow);
         
         try
         {

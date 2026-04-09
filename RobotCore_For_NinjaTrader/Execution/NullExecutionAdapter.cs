@@ -202,6 +202,14 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
         return FlattenResult.SuccessResult(utcNow);
     }
 
+    /// <inheritdoc />
+    public bool TryTriggerHardFlatten(string instrument, string reason, DateTimeOffset utcNow)
+    {
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "HARD_FLATTEN_DRYRUN", state: "ENGINE",
+            new { instrument, reason, note = "DRYRUN — no broker flatten" }));
+        return false;
+    }
+
     public IReadOnlyCollection<string> GetActiveIntentIdsForProtectiveAudit(string instrument)
     {
         return Array.Empty<string>();

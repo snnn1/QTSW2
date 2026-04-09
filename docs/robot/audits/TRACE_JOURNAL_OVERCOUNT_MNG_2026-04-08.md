@@ -1,0 +1,477 @@
+# Trace: journal overcount (+1 vs broker) — MNG samples
+
+- **log_dir:** `C:\Users\jakej\QTSW2\logs\robot`
+- **trading_date:** `2026-04-08`
+- **Selection:** `instrument=MNG`, `delta=-1` (journal = account+1), `classification=PERSISTENT_MISMATCH_JOURNAL_HIGH`, **5** episodes.
+- **Back-window:** up to **100** log lines immediately **before** first mismatch timestamp.
+
+## Method (log-backed limits)
+
+- **Broker vs journal counts:** derived from mismatch row `account_qty` / `journal_qty` only; full fill ledger reconciliation requires order/fill exports outside this JSONL.
+- **Fill signal:** lines whose `event` contains fill-related tokens (see per-case histogram).
+- **Duplication:** repeated `execution_id` / `fill_key` / `intent_id` substrings in the same back-window.
+
+## Case 1
+
+- **instrument:** `MNG`
+- **run_id:** `49a42fcce41446c684890cf97d07f49b`
+- **first mismatch (episode):** `2026-04-08T17:02:44.868916+00:00`
+- **snapshot at mismatch:** account_qty=2 journal_qty=3 delta=-1 outcome=STUCK class=PERSISTENT_MISMATCH_JOURNAL_HIGH
+
+### Back-window summary
+
+- **lines in window:** 100 (requested max 100)
+- **fill-like event lines (heuristic):** 0
+- **lines mentioning journal keywords:** 79
+- **exit/flatten-like event lines (heuristic):** 0
+
+**Top event types in window:**
+
+- `RELEASE_BLOCKING_CANDIDATE_EXCLUDED`: 59
+- `ENGINE_TIMER_HEARTBEAT`: 6
+- `JOURNAL_COMPLETION_BLOCKED_ALIGNMENT_INVALID`: 5
+- `RECONCILIATION_RECOVERED_INTENT_FAILED`: 5
+- `JOURNAL_INTEGRITY_INVARIANT_CYCLE`: 5
+- `ENGINE_CPU_PROFILE`: 5
+- `IEA_QUEUE_PRESSURE`: 5
+- `IEA_EXPENSIVE_PATH_THREAD`: 2
+- `RECONCILIATION_ASSEMBLE_MISMATCH_DIAG`: 2
+- `RECONCILIATION_CYCLE_STATE`: 2
+- `RELEASE_BLOCKING_CANDIDATE_AUDIT`: 1
+- `RELEASE_READINESS_INPUT_AUDIT`: 1
+- `JOURNAL_COMPLETION_BLOCKED_BROKER_NOT_FLAT`: 1
+- `RECONCILIATION_PASS_SUMMARY`: 1
+
+**Duplicate id hints (same id appears ≥2× in window):**
+
+- `intent_id:b40c59acd3f8cb21`: **7**
+- `intent_id:5d6dca26d3f62005`: **7**
+- `intent_id:17909aa549a5632c`: **7**
+- `intent_id:cef6b767b7a307c1`: **7**
+- `intent_id:1077f94037412b4f`: **7**
+- `intent_id:bf0372011dfa1e68`: **7**
+- `intent_id:c4de8f79e367926a`: **6**
+- `intent_id:RECOVERED-MNG`: **6**
+- `intent_id:9c7d06f806d69778`: **6**
+- `intent_id:f1551e84e6999b0f`: **5**
+
+### Sections 3–6 (answers)
+
+- **Expected broker position (from mismatch row):** **2** contracts (abs total in reconciliation snapshot).
+- **Journal open qty (from mismatch row):** **3** → **+1** vs broker in this row.
+- **Did journal record one extra fill?** Cannot prove from qty fields alone; window shows fill-related activity counts above. If `duplicate id hints` is non-empty, investigate those ids for double-processing.
+- **Exit/reduction gap:** If broker closed a lot but journal stayed high, look for missing `INTENT_EXIT_FILL` / flatten resolution in the window; heuristics counted exit-like lines above.
+- **Discrepancy explanation (evidence-only):** Journal **3** vs account **2** at mismatch time; causal root requires correlating fills with journal writes (not fully present in sampled ENGINE lines).
+
+<details><summary>Raw back-window event sequence (newest last)</summary>
+
+- `2026-04-08T17:02:44.088893+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.088893+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.094041+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.094041+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.095212+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.098222+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.100508+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.100508+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.104012+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.111139+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.121123+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.124435+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.132805+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.258530+00:00` **ENGINE_CPU_PROFILE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.258530+00:00` **ENGINE_CPU_PROFILE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.258530+00:00` **ENGINE_CPU_PROFILE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.258530+00:00` **IEA_QUEUE_PRESSURE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.258530+00:00` **IEA_QUEUE_PRESSURE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.258530+00:00` **ENGINE_TIMER_HEARTBEAT** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.258530+00:00` **ENGINE_CPU_PROFILE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.258530+00:00` **IEA_QUEUE_PRESSURE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.258530+00:00` **ENGINE_CPU_PROFILE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.258530+00:00` **IEA_QUEUE_PRESSURE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.258530+00:00` **IEA_QUEUE_PRESSURE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.593793+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.595795+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.598798+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.604145+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.607180+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.610505+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.614757+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.617925+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.621929+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.840855+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.845370+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.847373+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.855183+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.858201+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.861819+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:02:44.866901+00:00` **RELEASE_BLOCKING_CANDIDATE_EXCLUDED** `robot_ENGINE_20260408_185043.jsonl`
+- … **60** more lines
+
+</details>
+
+## Case 2
+
+- **instrument:** `MNG`
+- **run_id:** `3fb902688d504716a89c09edd5d645a5`
+- **first mismatch (episode):** `2026-04-08T17:48:00.478268+00:00`
+- **snapshot at mismatch:** account_qty=2 journal_qty=3 delta=-1 outcome=STUCK class=PERSISTENT_MISMATCH_JOURNAL_HIGH
+
+### Back-window summary
+
+- **lines in window:** 100 (requested max 100)
+- **fill-like event lines (heuristic):** 0
+- **lines mentioning journal keywords:** 8
+- **exit/flatten-like event lines (heuristic):** 0
+
+**Top event types in window:**
+
+- `ENGINE_TIMER_HEARTBEAT`: 21
+- `RECONCILIATION_ASSEMBLE_MISMATCH_DIAG`: 18
+- `IEA_QUEUE_PRESSURE`: 15
+- `ENGINE_CPU_PROFILE`: 14
+- `PROTECTIVE_AUDIT_METRICS`: 8
+- `RECONCILIATION_MISMATCH_METRICS`: 8
+- `IEA_EXPENSIVE_PATH_THREAD`: 4
+- `BE_GATE_BLOCKED`: 3
+- `ENGINE_ALIVE`: 2
+- `LOG_PIPELINE_METRIC`: 1
+- `ONMARKETDATA_LAST_DIAG`: 1
+- `BE_INTENT_RESOLUTION_INPUT`: 1
+- `BE_PATH_ACTIVE`: 1
+- `ONBARUPDATE_CALLED`: 1
+- `ENGINE_TICK_CALLSITE`: 1
+- `ENGINE_CPU_PROFILE_LOCK_SLICES`: 1
+
+**Duplicate id hints (same id appears ≥2× in window):**
+
+- *(none in window)*
+
+### Sections 3–6 (answers)
+
+- **Expected broker position (from mismatch row):** **2** contracts (abs total in reconciliation snapshot).
+- **Journal open qty (from mismatch row):** **3** → **+1** vs broker in this row.
+- **Did journal record one extra fill?** Cannot prove from qty fields alone; window shows fill-related activity counts above. If `duplicate id hints` is non-empty, investigate those ids for double-processing.
+- **Exit/reduction gap:** If broker closed a lot but journal stayed high, look for missing `INTENT_EXIT_FILL` / flatten resolution in the window; heuristics counted exit-like lines above.
+- **Discrepancy explanation (evidence-only):** Journal **3** vs account **2** at mismatch time; causal root requires correlating fills with journal writes (not fully present in sampled ENGINE lines).
+
+<details><summary>Raw back-window event sequence (newest last)</summary>
+
+- `2026-04-08T17:47:56.788238+00:00` **IEA_QUEUE_PRESSURE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:47:56.788238+00:00` **IEA_QUEUE_PRESSURE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:47:56.788238+00:00` **ENGINE_TIMER_HEARTBEAT** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:47:56.788238+00:00` **ENGINE_CPU_PROFILE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:47:56.788238+00:00` **ENGINE_CPU_PROFILE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:47:56.788238+00:00` **IEA_QUEUE_PRESSURE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:47:56.788238+00:00` **IEA_QUEUE_PRESSURE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:47:57.023690+00:00` **RECONCILIATION_ASSEMBLE_MISMATCH_DIAG** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:47:57.836087+00:00` **IEA_EXPENSIVE_PATH_THREAD** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:47:57.836087+00:00` **RECONCILIATION_ASSEMBLE_MISMATCH_DIAG** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:47:58.068331+00:00` **RECONCILIATION_ASSEMBLE_MISMATCH_DIAG** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:47:58.762439+00:00` **RECONCILIATION_ASSEMBLE_MISMATCH_DIAG** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:47:58.806288+00:00` **ENGINE_TIMER_HEARTBEAT** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:47:58.806288+00:00` **ENGINE_TIMER_HEARTBEAT** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:47:58.806288+00:00` **ENGINE_TIMER_HEARTBEAT** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:47:58.806288+00:00` **ENGINE_TIMER_HEARTBEAT** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:47:58.806288+00:00` **ENGINE_TIMER_HEARTBEAT** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:47:58.989992+00:00` **RECONCILIATION_ASSEMBLE_MISMATCH_DIAG** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:47:59.807483+00:00` **ENGINE_TIMER_HEARTBEAT** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:48:00+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE.jsonl`
+- `2026-04-08T17:48:00+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE.jsonl`
+- `2026-04-08T17:48:00+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE.jsonl`
+- `2026-04-08T17:48:00+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE.jsonl`
+- `2026-04-08T17:48:00+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE.jsonl`
+- `2026-04-08T17:48:00+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE.jsonl`
+- `2026-04-08T17:48:00+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T17:48:00+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T17:48:00+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T17:48:00+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T17:48:00+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T17:48:00+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T17:48:00+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T17:48:00+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T17:48:00.477261+00:00` **ONBARUPDATE_CALLED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:48:00.477261+00:00` **ENGINE_ALIVE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:48:00.477261+00:00` **ENGINE_ALIVE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:48:00.477261+00:00` **ENGINE_TICK_CALLSITE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:48:00.477261+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:48:00.477261+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T17:48:00.477261+00:00` **ENGINE_CPU_PROFILE_LOCK_SLICES** `robot_ENGINE_20260408_185043.jsonl`
+- … **60** more lines
+
+</details>
+
+## Case 3
+
+- **instrument:** `MNG`
+- **run_id:** `bcee97bebfd24ae69f8226a5dda8c027`
+- **first mismatch (episode):** `2026-04-08T18:26:00.449447+00:00`
+- **snapshot at mismatch:** account_qty=2 journal_qty=3 delta=-1 outcome=STUCK class=PERSISTENT_MISMATCH_JOURNAL_HIGH
+
+### Back-window summary
+
+- **lines in window:** 100 (requested max 100)
+- **fill-like event lines (heuristic):** 0
+- **lines mentioning journal keywords:** 8
+- **exit/flatten-like event lines (heuristic):** 0
+
+**Top event types in window:**
+
+- `IEA_QUEUE_PRESSURE`: 21
+- `RECONCILIATION_ASSEMBLE_MISMATCH_DIAG`: 20
+- `ENGINE_CPU_PROFILE`: 20
+- `ENGINE_TIMER_HEARTBEAT`: 18
+- `PROTECTIVE_AUDIT_METRICS`: 7
+- `RECONCILIATION_MISMATCH_METRICS`: 7
+- `BE_GATE_BLOCKED`: 2
+- `IEA_EXPENSIVE_PATH_THREAD`: 1
+- `LOG_PIPELINE_METRIC`: 1
+- `RECONCILIATION_ORDER_SOURCE_BREAKDOWN`: 1
+- `ONBARUPDATE_CALLED`: 1
+- `ENGINE_ALIVE`: 1
+
+**Duplicate id hints (same id appears ≥2× in window):**
+
+- *(none in window)*
+
+### Sections 3–6 (answers)
+
+- **Expected broker position (from mismatch row):** **2** contracts (abs total in reconciliation snapshot).
+- **Journal open qty (from mismatch row):** **3** → **+1** vs broker in this row.
+- **Did journal record one extra fill?** Cannot prove from qty fields alone; window shows fill-related activity counts above. If `duplicate id hints` is non-empty, investigate those ids for double-processing.
+- **Exit/reduction gap:** If broker closed a lot but journal stayed high, look for missing `INTENT_EXIT_FILL` / flatten resolution in the window; heuristics counted exit-like lines above.
+- **Discrepancy explanation (evidence-only):** Journal **3** vs account **2** at mismatch time; causal root requires correlating fills with journal writes (not fully present in sampled ENGINE lines).
+
+<details><summary>Raw back-window event sequence (newest last)</summary>
+
+- `2026-04-08T18:25:55.833781+00:00` **ENGINE_TIMER_HEARTBEAT** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:25:55.833781+00:00` **ENGINE_TIMER_HEARTBEAT** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:25:56.161956+00:00` **BE_GATE_BLOCKED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:25:56.474767+00:00` **RECONCILIATION_ASSEMBLE_MISMATCH_DIAG** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:25:56.724362+00:00` **RECONCILIATION_ASSEMBLE_MISMATCH_DIAG** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:25:56.837895+00:00` **ENGINE_TIMER_HEARTBEAT** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:25:57.645670+00:00` **RECONCILIATION_ASSEMBLE_MISMATCH_DIAG** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:25:58.510762+00:00` **RECONCILIATION_ASSEMBLE_MISMATCH_DIAG** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:25:58.710768+00:00` **RECONCILIATION_ASSEMBLE_MISMATCH_DIAG** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:25:58.715840+00:00` **ENGINE_CPU_PROFILE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:25:58.715840+00:00` **IEA_QUEUE_PRESSURE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:25:58.852044+00:00` **ENGINE_TIMER_HEARTBEAT** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:25:58.852044+00:00` **ENGINE_CPU_PROFILE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:25:58.852044+00:00` **ENGINE_CPU_PROFILE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:25:58.852044+00:00` **ENGINE_CPU_PROFILE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:25:58.852044+00:00` **IEA_QUEUE_PRESSURE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:25:58.852044+00:00` **IEA_QUEUE_PRESSURE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:25:58.852044+00:00` **IEA_QUEUE_PRESSURE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:25:58.852044+00:00` **ENGINE_CPU_PROFILE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:25:58.852044+00:00` **ENGINE_CPU_PROFILE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:25:58.852044+00:00` **IEA_QUEUE_PRESSURE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:25:58.852044+00:00` **IEA_QUEUE_PRESSURE** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:26:00+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE.jsonl`
+- `2026-04-08T18:26:00+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE.jsonl`
+- `2026-04-08T18:26:00+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE.jsonl`
+- `2026-04-08T18:26:00+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE.jsonl`
+- `2026-04-08T18:26:00+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE.jsonl`
+- `2026-04-08T18:26:00+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE.jsonl`
+- `2026-04-08T18:26:00+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T18:26:00+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T18:26:00+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T18:26:00+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T18:26:00+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T18:26:00+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T18:26:00+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T18:26:00+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T18:26:00.334999+00:00` **RECONCILIATION_ORDER_SOURCE_BREAKDOWN** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:26:00.334999+00:00` **RECONCILIATION_ASSEMBLE_MISMATCH_DIAG** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:26:00.448446+00:00` **ONBARUPDATE_CALLED** `robot_ENGINE_20260408_185043.jsonl`
+- `2026-04-08T18:26:00.448446+00:00` **ENGINE_ALIVE** `robot_ENGINE_20260408_185043.jsonl`
+- … **60** more lines
+
+</details>
+
+## Case 4
+
+- **instrument:** `MNG`
+- **run_id:** `d5f1301efc7f4c40b3c6fde30e87e003`
+- **first mismatch (episode):** `2026-04-08T19:09:00.479082+00:00`
+- **snapshot at mismatch:** account_qty=2 journal_qty=3 delta=-1 outcome=STUCK class=PERSISTENT_MISMATCH_JOURNAL_HIGH
+
+### Back-window summary
+
+- **lines in window:** 100 (requested max 100)
+- **fill-like event lines (heuristic):** 0
+- **lines mentioning journal keywords:** 12
+- **exit/flatten-like event lines (heuristic):** 0
+
+**Top event types in window:**
+
+- `IEA_QUEUE_PRESSURE`: 21
+- `ENGINE_CPU_PROFILE`: 18
+- `RECONCILIATION_ASSEMBLE_MISMATCH_DIAG`: 16
+- `ENGINE_TIMER_HEARTBEAT`: 15
+- `PROTECTIVE_AUDIT_METRICS`: 8
+- `RECONCILIATION_MISMATCH_METRICS`: 8
+- `ONBARUPDATE_CALLED`: 2
+- `ENGINE_ALIVE`: 2
+- `IEA_EXPENSIVE_PATH_THREAD`: 1
+- `LOG_PIPELINE_METRIC`: 1
+- `BE_GATE_BLOCKED`: 1
+- `BAR_RECEIVED_NO_STREAMS`: 1
+- `ENGINE_TICK_CALLSITE`: 1
+- `RECONCILIATION_SECONDARY_INSTANCE_SKIPPED`: 1
+- `JOURNAL_COMPLETION_BLOCKED_BROKER_NOT_FLAT`: 1
+- `RECONCILIATION_PASS_SUMMARY`: 1
+- `RECONCILIATION_STUCK`: 1
+- `ENGINE_CPU_PROFILE_LOCK_SLICES`: 1
+
+**Duplicate id hints (same id appears ≥2× in window):**
+
+- *(none in window)*
+
+### Sections 3–6 (answers)
+
+- **Expected broker position (from mismatch row):** **2** contracts (abs total in reconciliation snapshot).
+- **Journal open qty (from mismatch row):** **3** → **+1** vs broker in this row.
+- **Did journal record one extra fill?** Cannot prove from qty fields alone; window shows fill-related activity counts above. If `duplicate id hints` is non-empty, investigate those ids for double-processing.
+- **Exit/reduction gap:** If broker closed a lot but journal stayed high, look for missing `INTENT_EXIT_FILL` / flatten resolution in the window; heuristics counted exit-like lines above.
+- **Discrepancy explanation (evidence-only):** Journal **3** vs account **2** at mismatch time; causal root requires correlating fills with journal writes (not fully present in sampled ENGINE lines).
+
+<details><summary>Raw back-window event sequence (newest last)</summary>
+
+- `2026-04-08T19:08:58.559929+00:00` **IEA_QUEUE_PRESSURE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:08:58.559929+00:00` **ENGINE_CPU_PROFILE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:08:58.559929+00:00` **ENGINE_CPU_PROFILE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:08:58.559929+00:00` **IEA_QUEUE_PRESSURE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:08:58.559929+00:00` **ENGINE_CPU_PROFILE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:08:58.559929+00:00` **IEA_QUEUE_PRESSURE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:08:58.559929+00:00` **IEA_QUEUE_PRESSURE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:08:58.559929+00:00` **ENGINE_CPU_PROFILE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:08:58.559929+00:00` **IEA_QUEUE_PRESSURE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:08:58.868237+00:00` **RECONCILIATION_ASSEMBLE_MISMATCH_DIAG** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:08:59.165051+00:00` **RECONCILIATION_ASSEMBLE_MISMATCH_DIAG** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:08:59.399784+00:00` **RECONCILIATION_ASSEMBLE_MISMATCH_DIAG** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:08:59.570670+00:00` **ENGINE_TIMER_HEARTBEAT** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:09:00+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE.jsonl`
+- `2026-04-08T19:09:00+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE.jsonl`
+- `2026-04-08T19:09:00+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE.jsonl`
+- `2026-04-08T19:09:00+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE.jsonl`
+- `2026-04-08T19:09:00+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE.jsonl`
+- `2026-04-08T19:09:00+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE.jsonl`
+- `2026-04-08T19:09:00+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:09:00+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:09:00+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:09:00+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:09:00+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:09:00+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:09:00+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:09:00+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:09:00.478078+00:00` **ONBARUPDATE_CALLED** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:09:00.478078+00:00` **ENGINE_ALIVE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:09:00.478078+00:00` **ONBARUPDATE_CALLED** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:09:00.478078+00:00` **ENGINE_ALIVE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:09:00.478078+00:00` **BAR_RECEIVED_NO_STREAMS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:09:00.478078+00:00` **ENGINE_TICK_CALLSITE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:09:00.478078+00:00` **RECONCILIATION_SECONDARY_INSTANCE_SKIPPED** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:09:00.478078+00:00` **JOURNAL_COMPLETION_BLOCKED_BROKER_NOT_FLAT** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:09:00.478078+00:00` **RECONCILIATION_PASS_SUMMARY** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:09:00.478078+00:00` **RECONCILIATION_STUCK** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:09:00.478078+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:09:00.478078+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:09:00.478078+00:00` **ENGINE_CPU_PROFILE_LOCK_SLICES** `robot_ENGINE_20260408_201325.jsonl`
+- … **60** more lines
+
+</details>
+
+## Case 5
+
+- **instrument:** `MNG`
+- **run_id:** `d5f1301efc7f4c40b3c6fde30e87e003`
+- **first mismatch (episode):** `2026-04-08T19:53:00.486585+00:00`
+- **snapshot at mismatch:** account_qty=2 journal_qty=3 delta=-1 outcome=STUCK class=PERSISTENT_MISMATCH_JOURNAL_HIGH
+
+### Back-window summary
+
+- **lines in window:** 100 (requested max 100)
+- **fill-like event lines (heuristic):** 0
+- **lines mentioning journal keywords:** 24
+- **exit/flatten-like event lines (heuristic):** 0
+
+**Top event types in window:**
+
+- `PROTECTIVE_AUDIT_METRICS`: 12
+- `RECONCILIATION_MISMATCH_METRICS`: 12
+- `IEA_QUEUE_PRESSURE`: 9
+- `RECONCILIATION_ASSEMBLE_MISMATCH_DIAG`: 7
+- `ENGINE_TIMER_HEARTBEAT`: 7
+- `ENGINE_CPU_PROFILE`: 7
+- `ENGINE_ALIVE`: 6
+- `ONBARUPDATE_CALLED`: 5
+- `ENGINE_TICK_CALLSITE`: 5
+- `ENGINE_CPU_PROFILE_LOCK_SLICES`: 5
+- `RECONCILIATION_SECONDARY_INSTANCE_SKIPPED`: 3
+- `JOURNAL_COMPLETION_BLOCKED_BROKER_NOT_FLAT`: 3
+- `RECONCILIATION_PASS_SUMMARY`: 3
+- `RECONCILIATION_STUCK`: 3
+- `TICK_TIME_SOURCE`: 2
+- `TIMETABLE_CACHE_HIT`: 2
+- `BAR_RECEIVED_NO_STREAMS`: 2
+- `LOG_PIPELINE_METRIC`: 1
+- `BE_TICK_STALE_WARNING`: 1
+- `TIMETABLE_POLL_STALL_RECOVERED`: 1
+
+**Duplicate id hints (same id appears ≥2× in window):**
+
+- `intent_id:RECOVERED-MNG`: **3**
+
+### Sections 3–6 (answers)
+
+- **Expected broker position (from mismatch row):** **2** contracts (abs total in reconciliation snapshot).
+- **Journal open qty (from mismatch row):** **3** → **+1** vs broker in this row.
+- **Did journal record one extra fill?** Cannot prove from qty fields alone; window shows fill-related activity counts above. If `duplicate id hints` is non-empty, investigate those ids for double-processing.
+- **Exit/reduction gap:** If broker closed a lot but journal stayed high, look for missing `INTENT_EXIT_FILL` / flatten resolution in the window; heuristics counted exit-like lines above.
+- **Discrepancy explanation (evidence-only):** Journal **3** vs account **2** at mismatch time; causal root requires correlating fills with journal writes (not fully present in sampled ENGINE lines).
+
+<details><summary>Raw back-window event sequence (newest last)</summary>
+
+- `2026-04-08T19:53:00.303957+00:00` **IEA_QUEUE_PRESSURE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.303957+00:00` **IEA_QUEUE_PRESSURE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.418738+00:00` **ONBARUPDATE_CALLED** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.418738+00:00` **ENGINE_ALIVE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.418738+00:00` **ENGINE_ALIVE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.418738+00:00` **BAR_RECEIVED_NO_STREAMS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.418738+00:00` **BAR_REJECTION_SUMMARY** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.418738+00:00` **TICK_TIME_SOURCE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.418738+00:00` **ENGINE_TICK_CALLSITE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.418738+00:00` **ENGINE_TICK_CALLSITE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.418738+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.418738+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.418738+00:00` **ENGINE_CPU_PROFILE_LOCK_SLICES** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.418738+00:00` **RECONCILIATION_SECONDARY_INSTANCE_SKIPPED** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.418738+00:00` **JOURNAL_COMPLETION_BLOCKED_BROKER_NOT_FLAT** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.418738+00:00` **RECONCILIATION_PASS_SUMMARY** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.418738+00:00` **RECONCILIATION_STUCK** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.418738+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.418738+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.418738+00:00` **ENGINE_CPU_PROFILE_LOCK_SLICES** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.419887+00:00` **TIMETABLE_CACHE_HIT** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.442116+00:00` **ENGINE_ALIVE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.442116+00:00` **ENGINE_TICK_CALLSITE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.442116+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.442116+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.442116+00:00` **ENGINE_CPU_PROFILE_LOCK_SLICES** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.485582+00:00` **ONBARUPDATE_CALLED** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.485582+00:00` **ENGINE_ALIVE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.485582+00:00` **BAR_RECEIVED_NO_STREAMS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.485582+00:00` **ONBARUPDATE_CALLED** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.485582+00:00` **ENGINE_ALIVE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.485582+00:00` **ONBARUPDATE_CALLED** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.485582+00:00` **ENGINE_TICK_CALLSITE** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.485582+00:00` **RECONCILIATION_SECONDARY_INSTANCE_SKIPPED** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.485582+00:00` **JOURNAL_COMPLETION_BLOCKED_BROKER_NOT_FLAT** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.485582+00:00` **RECONCILIATION_PASS_SUMMARY** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.485582+00:00` **RECONCILIATION_STUCK** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.485582+00:00` **PROTECTIVE_AUDIT_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.485582+00:00` **RECONCILIATION_MISMATCH_METRICS** `robot_ENGINE_20260408_201325.jsonl`
+- `2026-04-08T19:53:00.485582+00:00` **ENGINE_CPU_PROFILE_LOCK_SLICES** `robot_ENGINE_20260408_201325.jsonl`
+- … **60** more lines
+
+</details>
+

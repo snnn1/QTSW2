@@ -11,7 +11,7 @@ export interface WatchdogStatus {
   last_engine_tick_chicago: string | null;
   engine_tick_stall_detected: boolean;
   recovery_state: string;
-  /** Composite: recovery path clear, gate/adoption clear, kill switch off (matches backend) */
+  /** Overlay tradable: canonical GET /status field (_compute_execution_safe). ENGAGED gate does not clear this; FAIL_CLOSED does. */
   execution_safe?: boolean;
   /** Robot ENGINE_TIMER_HEARTBEAT timetable identity ≠ system timetable_current.json identity */
   timetable_drift?: boolean;
@@ -67,8 +67,23 @@ export interface WatchdogStatus {
   enabled_streams_unknown?: boolean;
   /** Alias for enabled_streams_unknown — no reliable timetable-derived stream list. */
   timetable_unavailable?: boolean;
+  /** Last POSITION_AUTHORITY_EVALUATED per normalized instrument key (MES, MYM, …) — observability only. */
+  position_authority_by_instrument?: Record<string, PositionAuthoritySnapshot>;
   // Phase 1: Active push alerts (process stopped, heartbeat lost, etc.)
   active_alerts?: ActiveAlert[];
+}
+
+/** Read-only mirror of robot POSITION_AUTHORITY_EVALUATED (no Watchdog derivation). */
+export interface PositionAuthoritySnapshot {
+  instrument?: string;
+  authority_state?: string;
+  broker_qty?: number | null;
+  real_open_qty?: number | null;
+  recovery_open_qty?: number | null;
+  journal_open_qty?: number | null;
+  last_authority_ts_utc?: string;
+  /** Stream row: snapshot instrument aligned with timetable execution/canonical keys. */
+  attachment_status?: 'MATCHED' | 'UNVERIFIED';
 }
 
 export interface ActiveAlert {
@@ -184,6 +199,8 @@ export interface StreamState {
   confirmed?: boolean;
   /** How flatten lookup resolved (stream_session_flatten_fields); always set by current API */
   flatten_lookup_reason?: string;
+  /** Last authority snapshot matched to this row by execution/canonical instrument — observability only. */
+  position_authority?: PositionAuthoritySnapshot | null;
   /** @deprecated Execution feed no longer carries prior-session flags */
   carried_over_from_prior_date?: boolean;
   /** @deprecated */

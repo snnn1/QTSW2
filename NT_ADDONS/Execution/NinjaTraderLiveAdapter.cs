@@ -306,4 +306,12 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
         if (value == null) return null;
         try { return Convert.ToDouble(value); } catch { return null; }
     }
+
+    /// <inheritdoc />
+    public bool TryTriggerHardFlatten(string instrument, string reason, DateTimeOffset utcNow)
+    {
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "HARD_FLATTEN_LIVE_STUB", state: "ENGINE",
+            new { instrument, reason, note = "NT_ADDONS stub — use Robot.Core LIVE build for Account.Flatten" }));
+        return false;
+    }
 }

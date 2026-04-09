@@ -17,7 +17,7 @@ _CASES = Path(__file__).resolve().parent / "session_flatten_cases.jsonl"
 
 
 def _row(tracker, trading_date: str, session_class: str = "S1"):
-    key = (trading_date, session_class, "__engine__", "__engine__")
+    key = (trading_date, session_class, "ES", "ES1")
     return tracker._rows.get(key)
 
 

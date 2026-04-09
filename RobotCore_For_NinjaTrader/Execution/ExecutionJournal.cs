@@ -1799,6 +1799,48 @@ public sealed class ExecutionJournal
                           string.Equals(entry.Stream, RecoveredIntentStream, StringComparison.OrdinalIgnoreCase) ||
                           string.Equals(entry.IntentType, IntentTypeRecovered, StringComparison.OrdinalIgnoreCase));
 
+    /// <summary>
+    /// Position-authority taxonomy (<c>POSITION_AUTHORITY_*</c> logs): <see cref="IntentTypeRecovered"/> or <c>RECOVERED-</c> intent id prefix.
+    /// </summary>
+    private static bool IsRecoveredRowForPositionAuthority(ExecutionJournalEntry entry, string intentId) =>
+        (!string.IsNullOrEmpty(intentId) && intentId.StartsWith("RECOVERED-", StringComparison.OrdinalIgnoreCase)) ||
+        string.Equals(entry.IntentType, IntentTypeRecovered, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Sums open quantities from journal rows for one execution instrument (split real vs recovered for authority logging).
+    /// Open qty = max(0, entry filled − exit), same as <see cref="GetEntryRemainingOpenQuantity"/>.
+    /// </summary>
+    public (int RealOpenQty, int RecoveredOpenQty, int OpenJournalRowCount) GetPositionAuthorityOpenQuantitiesForInstrument(
+        string executionInstrumentPrimary,
+        string? canonicalInstrument)
+    {
+        var exec = executionInstrumentPrimary.Trim();
+        var canon = string.IsNullOrWhiteSpace(canonicalInstrument) ? exec : canonicalInstrument.Trim();
+        lock (_lock)
+        {
+            var openMap = GetOpenJournalEntriesByInstrument();
+            var real = 0;
+            var recovered = 0;
+            var rows = 0;
+            foreach (var kvp in openMap)
+            {
+                if (!OpenJournalMapBucketMatches(kvp.Key, exec, canon)) continue;
+                foreach (var (_, _, iid, entry) in kvp.Value)
+                {
+                    var rem = GetEntryRemainingOpenQuantity(entry);
+                    if (rem <= 0) continue;
+                    rows++;
+                    if (IsRecoveredRowForPositionAuthority(entry, iid))
+                        recovered += rem;
+                    else
+                        real += rem;
+                }
+            }
+
+            return (real, recovered, rows);
+        }
+    }
+
     private static bool IsAdoptionCandidateJournalEntry(ExecutionJournalEntry? entry)
         => entry != null && entry.EntrySubmitted && !entry.TradeCompleted && !IsUntrackedFillRecoveryMarker(entry) &&
            !IsRecoveredIntegrityJournalEntry(entry);
@@ -3275,6 +3317,80 @@ public sealed class ExecutionJournal
         }
     }
 
+    /// <summary>
+    /// When non-recovered open quantity equals broker abs exposure and at least one integrity-recovered row is still open,
+    /// fully close all recovered rows for the instrument (superseded by real strategy journal rows).
+    /// Does not run when <paramref name="brokerPositionQtyAbs"/> is 0 (broker-flat paths use existing logic).
+    /// </summary>
+    /// <returns>Number of recovered journal rows written as completed.</returns>
+    public int CloseRecoveredRowsSupersededByRealExposure(
+        string executionInstrumentPrimary,
+        string? canonicalInstrument,
+        int brokerPositionQtyAbs,
+        DateTimeOffset utcNow)
+    {
+        if (brokerPositionQtyAbs <= 0)
+            return 0;
+
+        var exec = executionInstrumentPrimary.Trim();
+        var canon = string.IsNullOrWhiteSpace(canonicalInstrument) ? exec : canonicalInstrument.Trim();
+        var uIso = utcNow.ToString("o");
+        lock (_lock)
+        {
+            var openMap = GetOpenJournalEntriesByInstrument();
+            var nonRecoveredOpenSum = 0;
+            var recoveredOpen = new List<(string Td, string St, string Iid, ExecutionJournalEntry Entry)>();
+            foreach (var kvp in openMap)
+            {
+                if (!OpenJournalMapBucketMatches(kvp.Key, exec, canon)) continue;
+                foreach (var (td, st, iid, entry) in kvp.Value)
+                {
+                    var rem = GetEntryRemainingOpenQuantity(entry);
+                    if (rem <= 0) continue;
+                    if (IsRecoveredIntegrityJournalEntry(entry))
+                        recoveredOpen.Add((td, st, iid, entry));
+                    else
+                        nonRecoveredOpenSum += rem;
+                }
+            }
+
+            if (recoveredOpen.Count == 0)
+                return 0;
+            if (nonRecoveredOpenSum != brokerPositionQtyAbs)
+                return 0;
+
+            var writes = 0;
+            string? logTd = null;
+            foreach (var (td, st, iid, entry) in recoveredOpen)
+            {
+                logTd ??= td;
+                var pth = GetJournalPath(td, st, iid);
+                entry.ExitFilledQuantityTotal = entry.EntryFilledQuantityTotal;
+                entry.ExitFilledAtUtc = uIso;
+                entry.ExitOrderType = CompletionReasons.RECONCILIATION_RECOVERED_SUPERSEDED_BY_REAL;
+                entry.TradeCompleted = true;
+                entry.CompletionReason = CompletionReasons.RECONCILIATION_RECOVERED_SUPERSEDED_BY_REAL;
+                entry.CompletedAtUtc = uIso;
+                _cache[$"{td}_{st}_{iid}"] = entry;
+                SaveJournal(pth, entry);
+                SyncAdoptionCandidateIndexForIntentLocked(iid, entry);
+                writes++;
+                BumpReleaseSuppressionActivity();
+            }
+
+            _log.Write(RobotEvents.EngineBase(utcNow, logTd ?? "", "RECONCILIATION_RECOVERED_ROW_CLOSED_SUPERSEDED", "ENGINE",
+                new
+                {
+                    instrument = exec,
+                    broker_qty = brokerPositionQtyAbs,
+                    non_recovered_open_qty = nonRecoveredOpenSum,
+                    recovered_rows_closed_count = writes,
+                    note = "Recovered rows closed because real strategy exposure matches broker"
+                }));
+            return writes;
+        }
+    }
+
     private RecoveredIntentUpsertResult CloseRecoveredIntegrityRowsWhenBrokerFlat(
         string executionInstrumentPrimary,
         string? canonicalInstrument,
@@ -4358,6 +4474,9 @@ public static class CompletionReasons
 
     /// <summary>Virtual alignment trimmed exit qty but row cannot be marked complete (broker exposure, tags, or clock).</summary>
     public const string RECONCILIATION_ALIGNMENT_PENDING = "RECONCILIATION_ALIGNMENT_PENDING";
+
+    /// <summary>Integrity recovered row closed: non-recovered journal open qty fully explains broker; synthetic row superseded.</summary>
+    public const string RECONCILIATION_RECOVERED_SUPERSEDED_BY_REAL = "RECONCILIATION_RECOVERED_SUPERSEDED_BY_REAL";
 
     /// <summary>Journal row requires recovery path; do not treat as flat-completed.</summary>
     public const string RECOVERY_REQUIRED = "RECOVERY_REQUIRED";

@@ -295,13 +295,42 @@ class SessionFlattenStateTracker:
         return self._rows.get(key)
 
     def _key(self, event: Dict[str, Any]) -> Optional[Tuple[str, str, str, str]]:
+        et = str(event.get("event_type") or "").strip()
         p = _merged_payload(event)
         td = str(p.get("trading_date") or "").strip()
         sc = str(p.get("session_class") or p.get("session") or "").strip()
         inst = str(p.get("instrument") or "").strip()
-        sk = str(p.get("stream") or "").strip() or "__engine__"
+        sk_raw = str(p.get("stream") or "").strip()
+        sk = sk_raw or "__engine__"
         if not td or not sc:
+            if et == "FLATTEN_TRIGGER_SET":
+                logger.critical(
+                    "FLATTEN_EVENT_MISSING_KEY_FIELDS missing=trading_date_or_session "
+                    "event_type=%s trading_date=%r session_class_or_session=%r instrument=%r stream=%r",
+                    et,
+                    td,
+                    sc,
+                    inst,
+                    sk_raw,
+                )
             return None
+        if et == "FLATTEN_TRIGGER_SET":
+            missing_parts: List[str] = []
+            if not inst:
+                missing_parts.append("instrument")
+            if not sk_raw or sk == "__engine__":
+                missing_parts.append("stream")
+            if missing_parts:
+                logger.critical(
+                    "FLATTEN_EVENT_MISSING_KEY_FIELDS missing=%s event_type=%s trading_date=%s "
+                    "session=%s instrument=%r stream=%r",
+                    ",".join(missing_parts),
+                    et,
+                    td,
+                    sc,
+                    inst,
+                    sk_raw,
+                )
         return (td, sc, inst or "__engine__", sk)
 
     def _get_or_create(self, key: Tuple[str, str, str, str]) -> SessionFlattenRow:
@@ -357,7 +386,8 @@ class SessionFlattenStateTracker:
 
         key = self._key(event)
         if key is None:
-            logger.debug("session_flatten_state: missing trading_date/session for %s", et)
+            if et != "FLATTEN_TRIGGER_SET":
+                logger.debug("session_flatten_state: missing trading_date/session for %s", et)
             return
         row = self._get_or_create(key)
         p = _merged_payload(event)

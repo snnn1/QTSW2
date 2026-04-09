@@ -11,6 +11,7 @@ import type {
   OutOfTimetableActiveStream,
   StreamState,
 } from '../../types/watchdog'
+import { PositionAuthorityBadge } from './PositionAuthorityBadge.tsx'
 
 interface StreamStatusTableProps {
   streams: StreamState[]
@@ -164,6 +165,12 @@ export function StreamStatusTable({
               <th className="px-2 py-1 text-left whitespace-nowrap min-w-[5rem]">Date</th>
               <th className="px-2 py-1 text-left">Stream</th>
               <th className="px-2 py-1 text-left">Instr</th>
+              <th
+                className="px-2 py-1 text-left whitespace-nowrap"
+                title="Position authority (robot POSITION_AUTHORITY_EVALUATED) — observability only"
+              >
+                Auth
+              </th>
               <th className="px-2 py-1 text-left">State</th>
               <th className="px-2 py-1 text-left" title="Time in State">TIS</th>
               <th className="px-2 py-1 text-left">Slot</th>
@@ -218,6 +225,9 @@ export function StreamStatusTable({
                   </td>
                   <td className="px-2 py-1 font-mono">{stream.stream}</td>
                   <td className="px-2 py-1">{stream.execution_instrument || stream.instrument || '-'}</td>
+                  <td className="px-2 py-1 align-top">
+                    <PositionAuthorityBadge snapshot={stream.position_authority} />
+                  </td>
                   <td className="px-2 py-1">
                     {stream.state ? (
                       <span className={`px-2 py-0.5 rounded text-xs ${getStateBadgeColor(stream.state)}`}>

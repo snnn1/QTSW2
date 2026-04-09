@@ -5,7 +5,6 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
-
 namespace QTSW2.Robot.Core.Execution;
 
 /// <summary>Canonical journal/broker parity status for <see cref="JournalParityChecker.CheckJournalParity"/>.</summary>
@@ -65,6 +64,14 @@ public enum JournalIntegrityPhaseOutcome
     DeferredInsufficientData,
     Repaired,
     EscalatedUnrecoverable
+}
+
+/// <summary>Broker vs journal decomposition for <c>POSITION_AUTHORITY_*</c> logs (real strategy rows vs recovered-only open).</summary>
+public enum PositionAuthorityState
+{
+    REAL_DOMINANT,
+    RECOVERY_REQUIRED,
+    CONFLICT
 }
 
 /// <summary>Result of <see cref="JournalIntegrityGuarantee.EnsureJournalIntegrity"/>.</summary>
@@ -305,6 +312,25 @@ public static class JournalIntegrityGuarantee
     private static readonly ConcurrentDictionary<string, int> AttemptByInstrument =
         new(StringComparer.OrdinalIgnoreCase);
 
+    private static long _positionAuthorityRealDominantEvalCount;
+    private static long _positionAuthorityRecoveryRequiredEvalCount;
+    private static long _positionAuthorityConflictEvalCount;
+    private static DateTimeOffset _positionAuthoritySummaryWindowStartUtc = DateTimeOffset.MinValue;
+    private static readonly object PositionAuthoritySummaryLock = new();
+
+    /// <summary>
+    /// <paramref name="brokerQtyAbs"/> = abs broker position; <paramref name="realOpen"/> / <paramref name="recoveredOpen"/> from journal rows only.
+    /// </summary>
+    public static PositionAuthorityState EvaluatePositionAuthorityState(int brokerQtyAbs, int realOpen, int recoveredOpen)
+    {
+        var b = Math.Abs(brokerQtyAbs);
+        if (realOpen == b && recoveredOpen == 0)
+            return PositionAuthorityState.REAL_DOMINANT;
+        if (realOpen < b)
+            return PositionAuthorityState.RECOVERY_REQUIRED;
+        return PositionAuthorityState.CONFLICT;
+    }
+
     /// <summary>
     /// Ensure journal integrity: check → repair (when safe) → re-check → escalate fail-closed if still broken.
     /// </summary>
@@ -336,6 +362,76 @@ public static class JournalIntegrityGuarantee
             orphans = initial.OrphanOrdersDetected,
             snapshot_age_ms = initial.SnapshotAgeMs
         });
+
+        var (realOpenQty, recoveredOpenQty, openJournalRowCount) =
+            journal.GetPositionAuthorityOpenQuantitiesForInstrument(executionInstrumentPrimary, canonicalInstrument);
+        var brokerQtyAbsForAuthority = initial.BrokerPositionQty;
+        var journalOpenQtyForAuthority = realOpenQty + recoveredOpenQty;
+        var positionAuthority = EvaluatePositionAuthorityState(brokerQtyAbsForAuthority, realOpenQty, recoveredOpenQty);
+        logEngine?.Invoke("POSITION_AUTHORITY_EVALUATED", "ENGINE", new
+        {
+            instrument = inst,
+            broker_qty = brokerQtyAbsForAuthority,
+            real_open_qty = realOpenQty,
+            recovered_open_qty = recoveredOpenQty,
+            journal_open_qty = journalOpenQtyForAuthority,
+            authority_state = positionAuthority.ToString(),
+            open_journal_row_count = openJournalRowCount,
+            note = $"parity_check_status={initial.Status}"
+        });
+        RecordPositionAuthorityCountersAndMaybeEmitSummary(positionAuthority, logEngine, utcNow);
+
+        if (FeatureFlags.EnableHardFailClosedJournalIntegrity &&
+            HardFailClosedExecutionModel.IsJournalRepairUnsafe(initial, positionAuthority))
+        {
+            logEngine?.Invoke("JOURNAL_INTEGRITY_REPAIR_SUPPRESSED_HARD_FAIL_CLOSED", "ENGINE", new
+            {
+                instrument = inst,
+                parity_status = initial.Status.ToString(),
+                authority_state = positionAuthority.ToString(),
+                broker_qty = initial.BrokerPositionQty,
+                journal_qty = initial.JournalOpenQty,
+                note = "no_alignment_no_recovered_upsert_while_unsafe"
+            });
+            return new JournalIntegrityEnsureResult
+            {
+                InitialCheck = initial,
+                Outcome = JournalIntegrityPhaseOutcome.EscalatedUnrecoverable,
+                EscalationEmitted = true
+            };
+        }
+
+        // Feature-flagged second line of defense: same closure as the always-on path below when real already matches broker
+        // but recovered rows still show open qty. (Spec text "REAL_DOMINANT && recovered_open_qty > 0" is unreachable by definition.)
+        if (FeatureFlags.EnablePositionAuthorityEnforcement &&
+            realOpenQty == brokerQtyAbsForAuthority &&
+            recoveredOpenQty > 0 &&
+            brokerQtyAbsForAuthority > 0)
+        {
+            journal.CloseRecoveredRowsSupersededByRealExposure(
+                executionInstrumentPrimary, canonicalInstrument, brokerQtyAbsForAuthority, utcNow);
+        }
+
+        if (snapshot != null && initial.BrokerPositionQty > 0 &&
+            initial.Status != JournalParityStatus.INSUFFICIENT_DATA &&
+            initial.Status != JournalParityStatus.UNKNOWN_ORDER_PRESENT)
+        {
+            var supersededClosed = journal.CloseRecoveredRowsSupersededByRealExposure(
+                executionInstrumentPrimary, canonicalInstrument, initial.BrokerPositionQty, utcNow);
+            if (supersededClosed > 0)
+            {
+                initial = JournalParityChecker.CheckJournalParity(inst, snapshot, journal, registry, canonicalInstrument, utcNow);
+                if (initial.IsOk)
+                {
+                    AttemptByInstrument.TryRemove(inst, out _);
+                    return new JournalIntegrityEnsureResult
+                    {
+                        InitialCheck = initial,
+                        Outcome = JournalIntegrityPhaseOutcome.Ok
+                    };
+                }
+            }
+        }
 
         if (initial.IsOk)
         {
@@ -438,9 +534,11 @@ public static class JournalIntegrityGuarantee
             : tradingDateForJournal.Trim();
 
         RecoveredIntentUpsertResult recov = default;
+        var (realOpenForRecovery, _, _) = journal.GetPositionAuthorityOpenQuantitiesForInstrument(inst, canonicalInstrument);
         if (allowReconstruction && snapshot != null &&
             mid.Status == JournalParityStatus.POSITION_MISMATCH &&
             mid.BrokerPositionQty > 0 &&
+            realOpenForRecovery == 0 &&
             mid.OrphanOrdersDetected == 0)
         {
             recov = journal.UpsertRecoveredIntentForBrokerIntegrity(
@@ -523,6 +621,46 @@ public static class JournalIntegrityGuarantee
         };
     }
 
+    private static void RecordPositionAuthorityCountersAndMaybeEmitSummary(
+        PositionAuthorityState state,
+        Action<string, string, object?>? logEngine,
+        DateTimeOffset utcNow)
+    {
+        lock (PositionAuthoritySummaryLock)
+        {
+            switch (state)
+            {
+                case PositionAuthorityState.REAL_DOMINANT:
+                    _positionAuthorityRealDominantEvalCount++;
+                    break;
+                case PositionAuthorityState.RECOVERY_REQUIRED:
+                    _positionAuthorityRecoveryRequiredEvalCount++;
+                    break;
+                default:
+                    _positionAuthorityConflictEvalCount++;
+                    break;
+            }
+
+            if (_positionAuthoritySummaryWindowStartUtc == DateTimeOffset.MinValue)
+                _positionAuthoritySummaryWindowStartUtc = utcNow;
+
+            if ((utcNow - _positionAuthoritySummaryWindowStartUtc).TotalSeconds < 60)
+                return;
+
+            logEngine?.Invoke("POSITION_AUTHORITY_SUMMARY", "ENGINE", new
+            {
+                authority_real_count = _positionAuthorityRealDominantEvalCount,
+                authority_recovery_count = _positionAuthorityRecoveryRequiredEvalCount,
+                authority_conflict_count = _positionAuthorityConflictEvalCount,
+                note = "window_approximately_60s_elapsed_since_first_eval_or_last_summary"
+            });
+            _positionAuthorityRealDominantEvalCount = 0;
+            _positionAuthorityRecoveryRequiredEvalCount = 0;
+            _positionAuthorityConflictEvalCount = 0;
+            _positionAuthoritySummaryWindowStartUtc = utcNow;
+        }
+    }
+
     private static bool EmitEscalationIfNeeded(string inst, int attempt, JournalParityResult initial, JournalParityResult? post,
         Action<string, string, object?>? logEngine, string note)
     {
@@ -538,5 +676,15 @@ public static class JournalIntegrityGuarantee
         return true;
     }
 
-    public static void ResetAttemptsForTests() => AttemptByInstrument.Clear();
+    public static void ResetAttemptsForTests()
+    {
+        AttemptByInstrument.Clear();
+        lock (PositionAuthoritySummaryLock)
+        {
+            _positionAuthorityRealDominantEvalCount = 0;
+            _positionAuthorityRecoveryRequiredEvalCount = 0;
+            _positionAuthorityConflictEvalCount = 0;
+            _positionAuthoritySummaryWindowStartUtc = DateTimeOffset.MinValue;
+        }
+    }
 }

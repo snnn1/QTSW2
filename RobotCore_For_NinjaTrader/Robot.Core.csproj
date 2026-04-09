@@ -47,6 +47,12 @@
     <Compile Include="..\modules\robot\core\Execution\ReconciliationBlockerModels.cs" Link="Execution\ReconciliationBlockerModels.cs" />
     <Compile Include="..\modules\robot\core\Execution\StateConsistencyGateModels.cs" Link="Execution\StateConsistencyGateModels.cs" />
     <Compile Include="..\modules\robot\core\Execution\JournalIntegrityGuarantee.cs" Link="Execution\JournalIntegrityGuarantee.cs" />
+    <Compile Include="..\modules\robot\core\Execution\ExecutionSafetyGate.cs" Link="Execution\ExecutionSafetyGate.cs" />
+    <Compile Include="..\modules\robot\core\Execution\ExecutionStructuralLayer.cs" Link="Execution\ExecutionStructuralLayer.cs" />
+    <Compile Include="..\modules\robot\core\Execution\PositionAuthorityDerivation.cs" Link="Execution\PositionAuthorityDerivation.cs" />
+    <Compile Include="..\modules\robot\core\Execution\PositionAuthorityInstrumentEvaluator.cs" Link="Execution\PositionAuthorityInstrumentEvaluator.cs" />
+    <Compile Include="..\modules\robot\core\Execution\HardFailClosedExecutionModel.cs" Link="Execution\HardFailClosedExecutionModel.cs" />
+    <Compile Include="..\modules\robot\core\Execution\FeatureFlags.cs" Link="Execution\FeatureFlags.cs" />
     <Compile Include="..\modules\robot\core\Execution\Qtsw2OrderUpdateHydrationPolicy.cs" Link="Execution\Qtsw2OrderUpdateHydrationPolicy.cs" />
     <Compile Include="..\modules\robot\core\Execution\ReconciliationDeferPolicy.cs" Link="Execution\ReconciliationDeferPolicy.cs" />
     <Compile Include="..\modules\robot\core\Execution\FlattenCoordinationTracker.cs" Link="Execution\FlattenCoordinationTracker.cs" />

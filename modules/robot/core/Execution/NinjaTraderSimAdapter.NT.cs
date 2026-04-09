@@ -3313,7 +3313,8 @@ public sealed partial class NinjaTraderSimAdapter
             return new AccountSnapshot
             {
                 Positions = new List<PositionSnapshot>(),
-                WorkingOrders = new List<WorkingOrderSnapshot>()
+                WorkingOrders = new List<WorkingOrderSnapshot>(),
+                CapturedAtUtc = utcNow
             };
         }
         
@@ -3323,7 +3324,8 @@ public sealed partial class NinjaTraderSimAdapter
             return new AccountSnapshot
             {
                 Positions = new List<PositionSnapshot>(),
-                WorkingOrders = new List<WorkingOrderSnapshot>()
+                WorkingOrders = new List<WorkingOrderSnapshot>(),
+                CapturedAtUtc = utcNow
             };
         }
         
@@ -3379,7 +3381,8 @@ public sealed partial class NinjaTraderSimAdapter
         return new AccountSnapshot
         {
             Positions = positions,
-            WorkingOrders = workingOrders
+            WorkingOrders = workingOrders,
+            CapturedAtUtc = utcNow
         };
     }
     
@@ -3692,6 +3695,13 @@ public sealed partial class NinjaTraderSimAdapter
             var error = "NT context type mismatch";
             return FlattenResult.FailureResult(error, utcNow);
         }
+
+        var flattenIntentIdForGate = string.Equals(intentId, "NT_FLATTEN", StringComparison.OrdinalIgnoreCase) ||
+                                     string.Equals(intentId, "EMERGENCY_BLOCK", StringComparison.OrdinalIgnoreCase)
+            ? null
+            : intentId;
+        if (!TryExecutionSafetyFlattenGuard(instrument, flattenIntentIdForGate, utcNow, "FLATTEN_INTENT_REAL", null, out _))
+            return FlattenResult.FailureResult("EXECUTION_BLOCKED_UNSAFE_STATE", utcNow);
         
         try
         {

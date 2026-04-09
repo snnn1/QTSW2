@@ -134,6 +134,19 @@ def test_disconnect_recovery_legacy_complete():
     assert sm._recovery_state == "RECOVERY_COMPLETE"
 
 
+def test_gate_engaged_does_not_block_execution_safe_when_otherwise_ok():
+    sm = WatchdogStateManager()
+    _prime_engine_alive(sm)
+    _prime_timetable_ok(sm)
+    sm._recovery_state = "CONNECTED_OK"
+    sm._reconciliation_gate_state = "ENGAGED"
+    assert sm.compute_watchdog_status()["execution_safe"] is True
+    assert sm._compute_execution_safe() is True
+    rg = sm.compute_risk_gate_status()
+    assert rg["execution_safe"] is True
+    assert rg["recovery_state_allowed"] is True
+
+
 def test_disconnect_recovery_iea_resolved_event_maps_to_complete():
     sm = WatchdogStateManager()
     ep = EventProcessor(sm)
