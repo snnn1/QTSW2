@@ -111,6 +111,7 @@ def _supervisor_cycle(project_root: Path) -> None:
         return
 
     if isinstance(doc, dict):
+        # LEGACY: manual publish marker — skip drift noise; not used for matrix selection.
         if doc.get("manual_session") is True:
             return
         _src = doc.get("source")

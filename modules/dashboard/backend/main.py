@@ -24,6 +24,7 @@ Domain logic belongs in:
 """
 
 import os
+import re
 import sys
 import json
 import subprocess
@@ -31,7 +32,7 @@ import asyncio
 import threading
 import time
 from pathlib import Path
-from typing import Optional, Dict, List, Any, Tuple
+from typing import Optional, Dict, List, Any, Tuple, Literal
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 import uuid
@@ -805,6 +806,9 @@ async def start_sequential_app():
 
 class TimetableRequest(BaseModel):
     date: Optional[str] = None
+    #: Explicit matrix row selection: ``live`` (latest per stream) or ``historical`` (as-of session day).
+    #: When omitted: explicit ``date`` defaults to ``historical``; no explicit ``date`` defaults to ``live``.
+    mode: Optional[Literal["live", "historical"]] = None
     scf_threshold: float = 0.5
     analyzer_runs_dir: str = "data/analyzed"
     output_dir: str = "data/timetable"
@@ -821,13 +825,22 @@ class ExecutionTimetableStream(BaseModel):
 class ExecutionTimetableRequest(BaseModel):
     """Trigger publish from on-disk master matrix. Client ``streams`` / per-row enabled flags are ignored."""
 
-    trading_date: Optional[str] = None  # required when replay=True
+    trading_date: Optional[str] = None  # required: explicit YYYY-MM-DD session calendar date (no SessionAuthority read)
+    mode: Literal["live", "historical"]
     streams: List[ExecutionTimetableStream] = Field(default_factory=list)  # ignored; kept for API compatibility
     replay: bool = False
     reason: Optional[str] = None
     source: Optional[str] = None
     #: Merged with ``configs/stream_filters.json`` (same shape as matrix build). Strongly recommended for
     #: manual publish when the JSON file is missing or stale so calendar gating matches the Matrix UI.
+    stream_filters: Optional[Dict[str, Any]] = None
+
+
+class TimetablePreviewRequest(BaseModel):
+    """Preview streams for a session date without writing ``timetable_current.json`` or history."""
+
+    trading_date: str = Field(..., min_length=10, description="Session calendar date YYYY-MM-DD")
+    mode: Literal["live", "historical"]
     stream_filters: Optional[Dict[str, Any]] = None
 
 
@@ -915,6 +928,7 @@ async def generate_timetable(request: TimetableRequest):
                             raise RuntimeError(str(e)) from e
                         session_td = auth.session_trading_date
 
+                    # LEGACY: manual_session is supervisor/UI lineage only — matrix rows use ``mode`` only.
                     _gen_pub = {
                         "source": "manual" if explicit_date else "auto",
                         "manual_session": explicit_date,
@@ -922,17 +936,29 @@ async def generate_timetable(request: TimetableRequest):
                         "caller": "POST /api/timetable/generate",
                         "matrix_source": "in_memory",
                     }
+                    gen_mode = (
+                        request.mode
+                        if request.mode is not None
+                        else ("historical" if explicit_date else "live")
+                    )
+                    logging.info(
+                        "TIMETABLE_MODE_SELECTED mode=%s date=%s endpoint=POST /api/timetable/generate",
+                        gen_mode,
+                        session_td,
+                    )
                     engine.write_execution_timetable_from_master_matrix(
                         matrix_df,
                         trade_date=session_td,
                         execution_mode=True,
                         publish_context=_gen_pub,
+                        mode=gen_mode,
                     )
                     return engine.build_timetable_dataframe_from_master_matrix(
                         matrix_df,
                         trade_date=session_td,
                         execution_mode=True,
                         publish_context=_gen_pub,
+                        mode=gen_mode,
                     )
                 raise ValueError(
                     "Master matrix is empty in memory — build or reload the matrix in this server, then try again."
@@ -991,11 +1017,31 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
         "REQUEST_BODY",
         request.model_dump() if hasattr(request, "model_dump") else request.dict(),
     )
+    td_req = (request.trading_date or "").strip()
+    if not td_req:
+        logging.error(
+            "TIMETABLE_EXECUTION_REJECTED_MISSING_DATE replay=%s explicit_trading_date_required=true",
+            request.replay,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "trading_date (YYYY-MM-DD) is required for execution publish. "
+                "SessionAuthority is not read for this endpoint — pass the session calendar date explicitly."
+            ),
+        )
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", td_req):
+        logging.error("TIMETABLE_EXECUTION_REJECTED_MISSING_DATE invalid_format=%r", td_req)
+        raise HTTPException(
+            status_code=400,
+            detail="trading_date must be YYYY-MM-DD",
+        )
     try:
         sys.path.insert(0, str(QTSW2_ROOT))
         from modules.matrix.file_manager import get_current_master_matrix_df
         from modules.timetable.timetable_engine import (
             TimetableEngine,
+            TimetablePublishResult,
             TimetableWriteBlockedCmeMismatch,
         )
         from modules.timetable.timetable_supervisor import timetable_publish_blocking
@@ -1028,14 +1074,17 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
             "caller": "POST /api/timetable/execution",
             "matrix_source": "in_memory",
         }
+        logging.info(
+            "TIMETABLE_MODE_SELECTED mode=%s date=%s endpoint=POST /api/timetable/execution",
+            request.mode,
+            td_req,
+        )
 
         def _publish_sync():
             from datetime import datetime, timezone
 
             from modules.session_authority.models import SessionAuthorityState
             from modules.session_authority.store import (
-                SessionAuthorityRequiredError,
-                load_persisted_strict,
                 read_next_version,
                 save_authority,
             )
@@ -1056,10 +1105,8 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
                     analyzer_runs_dir=str(QTSW2_ROOT / "data" / "analyzed"),
                     project_root=str(QTSW2_ROOT),
                 )
+                td = td_req
                 if request.replay:
-                    td = (request.trading_date or "").strip()
-                    if not td:
-                        raise ValueError("replay=True requires trading_date (YYYY-MM-DD)")
                     st = SessionAuthorityState(
                         mode="replay",
                         session_trading_date=td,
@@ -1071,27 +1118,21 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
                         version=read_next_version(QTSW2_ROOT),
                     )
                     save_authority(QTSW2_ROOT, st)
-                    return engine.write_execution_timetable_from_master_matrix(
-                        matrix_df,
-                        trade_date=td,
-                        execution_mode=True,
-                        replay=True,
-                        stream_filters=request.stream_filters,
-                        publish_context=pub_ctx,
-                    )
-                try:
-                    auth = load_persisted_strict(QTSW2_ROOT)
-                except SessionAuthorityRequiredError as e:
-                    raise RuntimeError(str(e)) from e
-                session_td = auth.session_trading_date
-                pub_live = dict(pub_ctx)
-                pub_live["authority_mode"] = auth.mode
+                logging.info(
+                    "TIMETABLE_EXECUTION_PUBLISH explicit_trading_date=%s request.replay=%s mode=%s",
+                    td,
+                    request.replay,
+                    request.mode,
+                )
+                # Matrix row selection and metadata.replay follow ``mode`` only (engine; no fallback).
                 return engine.write_execution_timetable_from_master_matrix(
                     matrix_df,
-                    trade_date=session_td,
+                    trade_date=td,
                     execution_mode=True,
+                    replay=request.replay,
                     stream_filters=request.stream_filters,
-                    publish_context=pub_live,
+                    publish_context=pub_ctx,
+                    mode=request.mode,
                 )
 
         try:
@@ -1106,8 +1147,6 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
             if "TIMETABLE_NO_IN_MEMORY_MATRIX" in str(e):
                 logging.error("TIMETABLE_EXECUTION_NO_IN_MEMORY_MATRIX: %s", e)
                 raise HTTPException(status_code=400, detail=str(e)) from e
-            if "SESSION_AUTHORITY_REQUIRED" in str(e):
-                raise HTTPException(status_code=400, detail=str(e)) from e
             raise
         except ValueError as e:
             logging.error("TIMETABLE_EXECUTION_SAVE_REJECTED: %s", e)
@@ -1119,6 +1158,11 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
             raise HTTPException(
                 status_code=500,
                 detail="Execution timetable publish produced no result (empty streams?)",
+            )
+        if not isinstance(pub_res, TimetablePublishResult):
+            raise HTTPException(
+                status_code=500,
+                detail="Internal error: execution publish returned unexpected result type",
             )
         st = "published" if pub_res.changed else "unchanged"
         logging.info(
@@ -1142,6 +1186,85 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save execution timetable: {str(e)}")
+
+
+@app.post("/api/timetable/preview")
+async def timetable_preview(request: TimetablePreviewRequest):
+    """Preview execution streams for a session date (replay semantics). Does not write ``timetable_current.json`` or history."""
+    td = (request.trading_date or "").strip()
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", td):
+        raise HTTPException(
+            status_code=400,
+            detail="trading_date must be YYYY-MM-DD",
+        )
+    logging.info(
+        "TIMETABLE_PREVIEW_REQUESTED date=%s mode=%s endpoint=POST /api/timetable/preview",
+        td,
+        request.mode,
+    )
+    logging.info("TIMETABLE_MODE_SELECTED mode=%s date=%s endpoint=POST /api/timetable/preview", request.mode, td)
+    try:
+        sys.path.insert(0, str(QTSW2_ROOT))
+        from modules.matrix.file_manager import get_current_master_matrix_df
+        from modules.timetable.timetable_engine import (
+            TimetableEngine,
+            TimetableExecutionPreviewResult,
+        )
+
+        def _preview_sync():
+            matrix_df = get_current_master_matrix_df()
+            if matrix_df is None:
+                raise RuntimeError(
+                    "TIMETABLE_NO_IN_MEMORY_MATRIX: No in-memory master matrix available. "
+                    "Save or rebuild the matrix in this server process before preview."
+                )
+            if matrix_df.empty:
+                raise ValueError("Master matrix is empty in memory — build or reload the matrix before preview.")
+            engine = TimetableEngine(
+                master_matrix_dir=str(QTSW2_ROOT / "data" / "master_matrix"),
+                analyzer_runs_dir=str(QTSW2_ROOT / "data" / "analyzed"),
+                project_root=str(QTSW2_ROOT),
+            )
+            return engine.write_execution_timetable_from_master_matrix(
+                matrix_df,
+                trade_date=td,
+                execution_mode=True,
+                replay=False,
+                preview_only=True,
+                stream_filters=request.stream_filters,
+                publish_context={
+                    "source": "preview",
+                    "reason": "api",
+                    "caller": "POST /api/timetable/preview",
+                    "matrix_source": "in_memory",
+                },
+                mode=request.mode,
+            )
+
+        out = await asyncio.to_thread(_preview_sync)
+    except RuntimeError as e:
+        if "TIMETABLE_NO_IN_MEMORY_MATRIX" in str(e):
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Timetable preview failed: {str(e)}") from e
+
+    if out is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Preview produced no streams (empty matrix rows for execution?)",
+        )
+    if not isinstance(out, TimetableExecutionPreviewResult):
+        raise HTTPException(status_code=500, detail="Internal error: unexpected preview result type")
+
+    return {
+        "preview": True,
+        "session_trading_date": out.session_trading_date,
+        "timetable_hash": out.timetable_hash,
+        "streams": out.streams,
+    }
 
 
 @app.post("/api/timetable/content_hash")

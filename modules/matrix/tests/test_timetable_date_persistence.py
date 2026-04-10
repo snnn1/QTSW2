@@ -95,6 +95,7 @@ def generate_timetable_like_api(date_yyyy_mm_dd: str, matrix_df: pd.DataFrame, s
             matrix_df,
             trade_date=session_td,
             execution_mode=True,
+            mode="historical",
             stream_filters=stream_filters,
             publish_context={
                 "source": "manual",
@@ -200,6 +201,7 @@ def test_no_explicit_date_defaults_to_cme_session_string():
                 matrix_df,
                 trade_date=expected,
                 execution_mode=True,
+                mode="live",
                 stream_filters=sf,
                 publish_context={
                     "source": "manual",

@@ -82,7 +82,7 @@ def test_publish_timetable_writes_without_eligibility_file(tmp_path, monkeypatch
         ]
     )
     eng.write_execution_timetable_from_master_matrix(
-        df, trade_date="2026-04-01", execution_mode=True
+        df, trade_date="2026-04-01", execution_mode=True, mode="live"
     )
     cur = tmp_path / "data" / "timetable" / "timetable_current.json"
     assert cur.exists()
@@ -111,7 +111,7 @@ def test_publish_succeeds_live_cme(tmp_path, monkeypatch):
         ]
     )
     eng.write_execution_timetable_from_master_matrix(
-        df, trade_date="2026-04-02", execution_mode=True
+        df, trade_date="2026-04-02", execution_mode=True, mode="live"
     )
     cur = tdir / "timetable_current.json"
     assert cur.exists()
@@ -171,9 +171,7 @@ def test_publish_session_date_not_cme_fails_before_write(tmp_path, monkeypatch):
             }
         ]
     )
-    streams = eng.build_streams_from_master_matrix(
-        df, "2026-04-02", None, True, execution_replay=True
-    )
+    streams = eng.build_streams_from_master_matrix(df, "2026-04-02", None, True)
     with pytest.raises(TimetableWriteBlockedCmeMismatch):
         eng._write_execution_timetable_file(
             streams,

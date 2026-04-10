@@ -8,9 +8,51 @@
 import { devLog } from '../utils/logger'
 
 // Default: same-origin `/api` so Vite dev proxy can forward to FastAPI. Override with VITE_API_BASE (e.g. absolute URL ending in /api) for production split-host.
-const API_PORT = import.meta.env.VITE_API_PORT || '8000'
-const API_BASE =
+export const API_PORT = import.meta.env.VITE_API_PORT || '8000'
+export const API_BASE =
   (import.meta.env.VITE_API_BASE && String(import.meta.env.VITE_API_BASE).trim()) || '/api'
+
+/**
+ * Parse JSON after reading body as text so empty responses (wrong proxy/port) fail with a clear message
+ * instead of `JSON.parse: unexpected end of data`.
+ */
+async function readResponseJson(response) {
+  const text = await response.text()
+  if (text == null || String(text).trim() === '') {
+    throw new Error(
+      `Empty HTTP response (${response.status} ${response.statusText || ''}). ` +
+        'The FastAPI process may have crashed during the request (check the backend terminal), or something other than the dashboard is bound to the API port. ' +
+        'Confirm Vite proxies /api to the dashboard (vite.config.js; default backend :8000) and that only one backend listens on that port.'
+    )
+  }
+  try {
+    return JSON.parse(text)
+  } catch (e) {
+    const snippet = String(text).replace(/\s+/g, ' ').slice(0, 200)
+    throw new Error(
+      `Response was not JSON (${response.status}): ${snippet}${text.length > 200 ? '…' : ''}`
+    )
+  }
+}
+
+function errorMessageFromPayload(data) {
+  if (data == null || typeof data !== 'object') return null
+  const d = data.detail ?? data.error ?? data.message
+  if (d == null) return null
+  if (typeof d === 'string') return d
+  if (Array.isArray(d)) {
+    return d.map((x) => (x && typeof x === 'object' && x.msg != null ? x.msg : JSON.stringify(x))).join('; ')
+  }
+  return String(d)
+}
+
+/**
+ * URL that must reach FastAPI (under /api), not the Vite dev root.
+ * Dev: `/api/matrix/test` is proxied (vite.config.js → :8000). Absolute: `http://host:port/api/matrix/test`.
+ */
+export function getBackendProbeUrl() {
+  return `${String(API_BASE).replace(/\/$/, '')}/matrix/test`
+}
 
 /**
  * Check if backend is reachable
@@ -19,25 +61,30 @@ export async function checkBackendHealth(timeoutMs = 3000) {
   try {
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
-    const healthUrl = API_BASE.startsWith('http')
-      ? `${new URL(API_BASE).origin}/`
-      : '/'
-    await fetch(healthUrl, {
+    const probeUrl = getBackendProbeUrl()
+    const response = await fetch(probeUrl, {
       method: 'GET',
       signal: controller.signal,
     })
     clearTimeout(timeoutId)
+    if (!response.ok) {
+      const snippet = (await response.text()).replace(/\s+/g, ' ').slice(0, 400)
+      return {
+        success: false,
+        error: `Backend responded ${response.status} at ${probeUrl}${snippet ? `: ${snippet}` : ''}`,
+      }
+    }
     return { success: true }
   } catch (error) {
     if (error.name === 'AbortError') {
       return {
         success: false,
-        error: `Backend connection timeout. Make sure the dashboard backend is running on http://localhost:${API_PORT}`
+        error: `Backend connection timeout (${getBackendProbeUrl()}). Is the dashboard API on http://localhost:${API_PORT}?`,
       }
     }
     return {
       success: false,
-      error: `Backend not running. Please start the dashboard backend on port ${API_PORT}. Error: ${error.message}`
+      error: `Backend not reachable (${getBackendProbeUrl()}): ${error.message}`,
     }
   }
 }
@@ -77,12 +124,11 @@ export async function buildMatrix({ streamFilters = {}, visibleYears = [], rebui
     body: JSON.stringify(buildBody)
   })
 
+  const payload = await readResponseJson(response)
   if (!response.ok) {
-    const errorData = await response.json()
-    throw new Error(errorData.detail || 'Failed to build master matrix')
+    throw new Error(errorMessageFromPayload(payload) || 'Failed to build master matrix')
   }
-
-  return await response.json()
+  return payload
 }
 
 
@@ -122,13 +168,11 @@ export async function getMatrixData({
   if (nocache) params.append('nocache', 'true')
 
   const response = await fetch(`${API_BASE}/matrix/data?${params}`)
-
+  const payload = await readResponseJson(response)
   if (!response.ok) {
-    const errorData = await response.json()
-    throw new Error(errorData.detail || 'Failed to load matrix data')
+    throw new Error(errorMessageFromPayload(payload) || 'Failed to load matrix data')
   }
-
-  return await response.json()
+  return payload
 }
 
 /**
@@ -195,6 +239,7 @@ export async function getProfitBreakdown({
  */
 export async function generateTimetable({
   date,
+  mode,
   analyzer_runs_dir,
   scf_threshold,
   analyzerRunsDir,
@@ -208,6 +253,9 @@ export async function generateTimetable({
   }
   if (date != null && String(date).trim() !== '') {
     payload.date = String(date).trim()
+  }
+  if (mode === 'live' || mode === 'historical') {
+    payload.mode = mode
   }
   // TEMP audit (remove after debugging)
   console.log('API_REQUEST', '/api/timetable/generate', payload)
@@ -335,9 +383,11 @@ export function streamFiltersForExecutionApi(streamFilters = {}) {
  * Trigger execution timetable publish from on-disk master matrix (server-side).
  * Optional `tradingDate` only when `replay` is true.
  * Pass `streamFilters` (Matrix UI state) so calendar rules match background publish when configs/stream_filters.json is missing.
+ * `mode` is required by the API: `live` (latest matrix row per stream) or `historical` (as-of session day).
  */
 export async function saveExecutionTimetable({
   tradingDate,
+  mode = 'live',
   replay = false,
   reason,
   source,
@@ -345,6 +395,7 @@ export async function saveExecutionTimetable({
 } = {}) {
   const payload = {
     trading_date: tradingDate ?? null,
+    mode: mode === 'historical' ? 'historical' : 'live',
     replay,
     reason: reason ?? null,
     source: source ?? null
@@ -365,12 +416,26 @@ export async function saveExecutionTimetable({
     body: JSON.stringify(payload)
   })
 
+  const payloadText = await response.text()
   if (!response.ok) {
-    const errorText = await response.text()
-    throw new Error(`Failed to save execution timetable: ${errorText}`)
+    let detail = payloadText
+    try {
+      const j = JSON.parse(payloadText)
+      detail = errorMessageFromPayload(j) || payloadText
+    } catch {
+      /* use raw */
+    }
+    throw new Error(
+      detail
+        ? `Failed to save execution timetable: ${detail}`
+        : `Failed to save execution timetable (${response.status}). Empty body — see backend logs.`
+    )
   }
 
-  return await response.json()
+  if (!payloadText.trim()) {
+    throw new Error('Execution timetable: success response had empty body')
+  }
+  return JSON.parse(payloadText)
 }
 
 /**

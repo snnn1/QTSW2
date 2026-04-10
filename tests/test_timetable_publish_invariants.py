@@ -72,7 +72,7 @@ def test_live_publish_final_allowed_false_disables_all_streams(tmp_path, monkeyp
         )
     df = pd.DataFrame(rows)
     eng.write_execution_timetable_from_master_matrix(
-        df, trade_date="2026-04-02", execution_mode=True
+        df, trade_date="2026-04-02", execution_mode=True, mode="live"
     )
     doc = json.loads(
         (tmp_path / "data" / "timetable" / "timetable_current.json").read_text(encoding="utf-8")
@@ -84,3 +84,41 @@ def test_live_publish_final_allowed_false_disables_all_streams(tmp_path, monkeyp
         assert s.get("enabled") is False, s
         br = s.get("block_reason") or ""
         assert br.startswith("matrix_filter_blocked:"), s
+
+
+def test_dataframe_scf_matches_as_of_matrix_row_not_session_day_only(tmp_path, monkeypatch):
+    """Display dataframe scf columns use the same as-of row as execution streams (not only session-day rows)."""
+    monkeypatch.chdir(tmp_path)
+    install_min_stream_filters(tmp_path)
+    eng = TimetableEngine(project_root=str(tmp_path))
+    d_prev = pd.Timestamp("2026-04-01")
+    slot = matrix_time_valid_for_execution(eng, "ES1")
+    df = pd.DataFrame(
+        [
+            {
+                "Stream": "ES1",
+                "trade_date": d_prev,
+                "Time": slot,
+                "Time Change": "",
+                "Session": "S1",
+                "final_allowed": True,
+                "scf_s1": 1.23,
+                "scf_s2": 4.56,
+                "filter_reasons": "",
+            }
+        ]
+    )
+    out = eng.build_timetable_dataframe_from_master_matrix(
+        df,
+        trade_date="2026-04-02",
+        execution_mode=True,
+        publish_context={
+            "source": "test",
+            "reason": "test",
+        },
+        mode="historical",
+    )
+    es1 = out[out["stream_id"] == "ES1"]
+    assert len(es1) == 1
+    assert float(es1.iloc[0]["scf_s1"]) == 1.23
+    assert float(es1.iloc[0]["scf_s2"]) == 4.56

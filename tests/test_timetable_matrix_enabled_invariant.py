@@ -11,10 +11,7 @@ QTSW2_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(QTSW2_ROOT))
 
 from modules.matrix.config import SCF_THRESHOLD
-from modules.timetable.timetable_engine import (
-    TimetableEngine,
-    _resolve_execution_matrix_as_of_session,
-)
+from modules.timetable.timetable_engine import TimetableEngine
 from tests.stream_filters_fixtures import install_min_stream_filters
 from tests.timetable_matrix_test_utils import matrix_time_valid_for_execution
 
@@ -54,7 +51,7 @@ def test_timetable_execution_streams_matrix_final_allowed_full_write(tmp_path, m
         )
     df = pd.DataFrame(rows)
     eng.write_execution_timetable_from_master_matrix(
-        df, trade_date="2026-04-02", execution_mode=True
+        df, trade_date="2026-04-02", execution_mode=True, mode="live"
     )
     doc = json.loads(
         (tmp_path / "data" / "timetable" / "timetable_current.json").read_text(encoding="utf-8")
@@ -260,15 +257,6 @@ def test_execution_mode_as_of_no_prior_row_uses_existing_disable_path():
     assert by_s["ES1"]["enabled"] is False
     br = by_s["ES1"].get("block_reason") or ""
     assert "no_valid_execution_slot" in br or br.startswith("matrix_filter_blocked:"), br
-
-
-def test_resolve_execution_matrix_as_of_from_context():
-    assert _resolve_execution_matrix_as_of_session(True, None, {}) is True
-    assert _resolve_execution_matrix_as_of_session(False, None, {"manual_session": True}) is True
-    assert _resolve_execution_matrix_as_of_session(False, None, {"source": "manual"}) is True
-    assert _resolve_execution_matrix_as_of_session(False, None, {"authority_mode": "manual"}) is True
-    assert _resolve_execution_matrix_as_of_session(False, None, {"authority_mode": "auto"}) is False
-    assert _resolve_execution_matrix_as_of_session(False, False, {"authority_mode": "manual"}) is False
 
 
 def test_execution_mode_friday_row_dow_only_does_not_veto_monday_session():

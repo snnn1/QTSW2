@@ -28,11 +28,10 @@ import { ErrorBoundary } from './components/ErrorBoundary'
 import StatsContent from './components/StatsContent'
 import MatrixMetricsDashboard from './components/MatrixMetricsDashboard'
 import * as matrixApi from './api/matrixApi'
+import { API_BASE, getBackendProbeUrl } from './api/matrixApi'
 import { getChicagoDateYMD, getCmeMarketState } from './utils/cmeMarketState'
 
-// API base URL - can be overridden via environment variable
-const API_PORT = import.meta.env.VITE_API_PORT || '8000'
-const API_BASE = `http://localhost:${API_PORT}/api`
+// API base: shared with matrixApi.js (VITE_API_BASE or same-origin /api for Vite proxy)
 /** Poll Watchdog-backed market state (dev: Vite proxies /api/watchdog → :8002). */
 const WATCHDOG_MARKET_POLL_MS = 30000
 
@@ -63,9 +62,14 @@ function timetableApiDocToSourceMeta(tt) {
   const ao = tt.as_of != null ? String(tt.as_of).trim() : ''
   const et =
     tt.eligibility_trade_date != null ? String(tt.eligibility_trade_date).split('T')[0].trim() : ''
+  const eff =
+    tt.effective_session_trading_date != null
+      ? String(tt.effective_session_trading_date).split('T')[0].trim()
+      : ''
   return {
     session_trading_date: st || null,
     trading_date: td || null,
+    effective_session_trading_date: eff || null,
     as_of: ao || null,
     eligibility_trade_date: et || null,
   }
@@ -172,8 +176,13 @@ function AppContent() {
   /** Manual POST /api/timetable/execution feedback. */
   const [timetableManualPublishLoading, setTimetableManualPublishLoading] = useState(false)
   const [timetableManualPublishBanner, setTimetableManualPublishBanner] = useState(null)
-  /** Optional YYYY-MM-DD for POST /api/timetable/generate (request.date). Empty = existing publish path. */
+  /** Historical mode only: explicit session calendar date for POST /api/timetable/execution. */
   const [timetableGenerateDate, setTimetableGenerateDate] = useState('')
+  /** Timetable publish mode: live = latest matrix row + current effective session; historical = as-of + explicit date. */
+  const [timetableMode, setTimetableMode] = useState(() => {
+    const saved = localStorage.getItem('matrix_timetable_mode')
+    return saved === 'historical' ? 'historical' : 'live'
+  })
   /** GET /api/timetable/current only — Trading Timetable grid has no worker/matrix fallback. */
   const [timetableApiStatus, setTimetableApiStatus] = useState({ loading: false, error: null })
   /** From GET /api/watchdog/market-state; null → use getCmeMarketState fallback. */
@@ -249,23 +258,36 @@ function AppContent() {
     setTimetableManualPublishBanner(null)
     setTimetableManualPublishLoading(true)
     try {
-      const sessionDate = timetableGenerateDate.trim()
-      // TEMP audit: timetable publish endpoint + date (remove after debugging)
-      console.log('TIMETABLE_PUBLISH_CLICK', {
-        sessionDate: timetableGenerateDate,
-        usingGenerate: !!timetableGenerateDate.trim(),
-      })
       let res
-      if (sessionDate) {
-        const genPayload = {
-          date: sessionDate,
-          analyzer_runs_dir: 'data/analyzed',
-          scf_threshold: 0.5,
+      if (timetableMode === 'historical') {
+        const d = timetableGenerateDate.trim()
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) {
+          throw new Error('Historical mode requires a valid session date (YYYY-MM-DD).')
         }
-        console.log('CALLING_ENDPOINT', '/api/timetable/generate', genPayload)
-        res = await matrixApi.generateTimetable(genPayload)
-      } else {
         const execPayload = {
+          tradingDate: d,
+          mode: 'historical',
+          reason: 'manual_ui',
+          source: 'matrix_ui',
+          streamFilters,
+        }
+        console.log('CALLING_ENDPOINT', '/api/timetable/execution', execPayload)
+        res = await matrixApi.saveExecutionTimetable(execPayload)
+      } else {
+        const cur = await matrixApi.getCurrentTimetable()
+        const tdRaw =
+          cur?.effective_session_trading_date ??
+          cur?.session_trading_date ??
+          cur?.trading_date
+        const td = tdRaw != null ? String(tdRaw).split('T')[0].trim() : ''
+        if (!td) {
+          throw new Error(
+            'No effective session date from GET /api/timetable/current — ensure the timetable exists on the server.'
+          )
+        }
+        const execPayload = {
+          tradingDate: td,
+          mode: 'live',
           reason: 'manual_ui',
           source: 'matrix_ui',
           streamFilters,
@@ -277,20 +299,12 @@ function AppContent() {
       setTimetableSourceMeta(timetableApiDocToSourceMeta(tt))
       workerApplyExecutionTimetableFromApi(tt)
       setTimetableApiStatus({ loading: false, error: null })
-      if (sessionDate) {
-        const entries = res?.total_entries ?? res?.entries?.length
-        setTimetableManualPublishBanner({
-          type: 'ok',
-          text: `Timetable generated${entries != null ? ` (${entries} rows)` : ''}.`,
-        })
-      } else {
-        const st = res.status === 'published' ? 'Published' : 'Unchanged'
-        const h = res.hash ? `${String(res.hash).slice(0, 16)}…` : '—'
-        setTimetableManualPublishBanner({
-          type: 'ok',
-          text: `${st}. Content hash prefix: ${h}`,
-        })
-      }
+      const st = res.status === 'published' ? 'Published' : 'Unchanged'
+      const h = res.hash ? `${String(res.hash).slice(0, 16)}…` : '—'
+      setTimetableManualPublishBanner({
+        type: 'ok',
+        text: `${st} (${timetableMode} mode). Content hash prefix: ${h}`,
+      })
     } catch (e) {
       setTimetableManualPublishBanner({
         type: 'err',
@@ -299,7 +313,7 @@ function AppContent() {
     } finally {
       setTimetableManualPublishLoading(false)
     }
-  }, [streamFilters, workerApplyExecutionTimetableFromApi, timetableGenerateDate])
+  }, [streamFilters, workerApplyExecutionTimetableFromApi, timetableGenerateDate, timetableMode])
 
   /** Timetable tab: rows only from GET /api/timetable/current (via workerExecutionTimetable). No worker merge. */
   const timetableRowsForDisplay = useMemo(() => {
@@ -346,6 +360,10 @@ function AppContent() {
   useEffect(() => {
     localStorage.setItem('matrix_show_blocked_timetable', String(showBlockedTimetableRows))
   }, [showBlockedTimetableRows])
+
+  useEffect(() => {
+    localStorage.setItem('matrix_timetable_mode', timetableMode)
+  }, [timetableMode])
   
   // Stats visibility per stream
   // Full-dataset stats from backend (calculated from all rows, not just loaded subset)
@@ -488,9 +506,8 @@ function AppContent() {
         const controller = new AbortController()
         const requestTimeout = setTimeout(() => controller.abort(), 2000) // 2s timeout per request
         
-        // Try /health endpoint first (more reliable), fallback to /api/matrix/test
-        const baseUrl = API_BASE.replace('/api', '')
-        const response = await fetch(`${baseUrl}/health`, {
+        // Must hit FastAPI via /api/... (Vite proxies /api → :8000). Do not use /health on the dev server root.
+        const response = await fetch(getBackendProbeUrl(), {
           method: 'GET',
           signal: controller.signal
         })
@@ -539,8 +556,11 @@ function AppContent() {
     timeoutId = setTimeout(() => {
       if (!isCancelled && !isReady) {
         setBackendConnecting(false)
-        const baseUrl = API_BASE.replace('/api', '')
-        setBackendConnectionError(`Backend did not respond within 30 seconds. Please check if the backend is running on ${baseUrl}. Make sure you started the backend using RUN_MASTER_MATRIX.bat`)
+        const hint =
+          API_BASE.startsWith('http') ? API_BASE : `same-origin ${API_BASE} (proxied to dashboard)`
+        setBackendConnectionError(
+          `Backend did not respond within 30 seconds (${getBackendProbeUrl()}). Check the dashboard API is running (${hint}). See RUN_MASTER_MATRIX.bat or your FastAPI start script.`
+        )
         if (pollInterval) {
           clearInterval(pollInterval)
           pollInterval = null
@@ -3254,34 +3274,119 @@ function AppContent() {
             )}
             <div className="bg-gray-900 rounded-lg p-6">
               <div className="flex items-center justify-between mb-6">
-                <div className="flex items-center gap-3 flex-wrap">
-                  <h2 className="text-xl font-semibold">Trading Timetable</h2>
-                  <button
-                    onClick={() => setShowBlockedTimetableRows(!showBlockedTimetableRows)}
-                    className="px-4 py-2 rounded font-medium text-sm bg-gray-800 hover:bg-gray-700"
-                    title={showBlockedTimetableRows ? 'Hide blocked rows' : 'Show blocked rows'}
+                <div className="flex flex-col gap-2 flex-1 min-w-0 max-w-[58%]">
+                  <div className="flex items-center gap-3 flex-wrap">
+                    <h2 className="text-xl font-semibold">Trading Timetable</h2>
+                    <span className="text-xs text-gray-500 uppercase tracking-wide">Mode</span>
+                    <div
+                      className="inline-flex rounded-md border border-gray-600 overflow-hidden text-xs"
+                      role="group"
+                      aria-label="Timetable mode"
+                    >
+                      <button
+                        type="button"
+                        onClick={() => setTimetableMode('live')}
+                        className={`px-3 py-1.5 font-medium ${
+                          timetableMode === 'live'
+                            ? 'bg-emerald-800 text-white'
+                            : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                        }`}
+                      >
+                        Live
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setTimetableMode('historical')}
+                        className={`px-3 py-1.5 font-medium border-l border-gray-600 ${
+                          timetableMode === 'historical'
+                            ? 'bg-amber-800 text-white'
+                            : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                        }`}
+                      >
+                        Historical
+                      </button>
+                    </div>
+                    <button
+                      onClick={() => setShowBlockedTimetableRows(!showBlockedTimetableRows)}
+                      className="px-4 py-2 rounded font-medium text-sm bg-gray-800 hover:bg-gray-700"
+                      title={showBlockedTimetableRows ? 'Hide blocked rows' : 'Show blocked rows'}
+                    >
+                      {showBlockedTimetableRows ? '✓' : ''} Blocked
+                    </button>
+                    <label
+                      className={`flex items-center gap-2 text-xs ${
+                        timetableMode === 'live' ? 'text-gray-500' : 'text-gray-400'
+                      }`}
+                    >
+                      <span>Session date</span>
+                      <input
+                        type="date"
+                        value={timetableGenerateDate}
+                        onChange={(e) => setTimetableGenerateDate(e.target.value)}
+                        disabled={timetableMode === 'live'}
+                        className={`bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm text-gray-200 ${
+                          timetableMode === 'live' ? 'opacity-45 cursor-not-allowed' : ''
+                        }`}
+                        title={
+                          timetableMode === 'live'
+                            ? 'Disabled in Live mode — publish uses effective_session_trading_date from GET /api/timetable/current.'
+                            : 'Required for Historical mode — POST /api/timetable/execution with mode historical.'
+                        }
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      onClick={handleManualPublishExecutionTimetable}
+                      disabled={
+                        timetableManualPublishLoading ||
+                        masterLoading ||
+                        (timetableMode === 'historical' &&
+                          !/^\d{4}-\d{2}-\d{2}$/.test(timetableGenerateDate.trim()))
+                      }
+                      className="px-4 py-2 rounded font-medium text-sm bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                      title="Always POST /api/timetable/execution — Live uses current effective session; Historical uses the date above."
+                    >
+                      {timetableManualPublishLoading ? 'Publishing…' : 'Publish timetable'}
+                    </button>
+                  </div>
+                  <div
+                    className="mt-1 px-3 py-2 rounded border border-dashed border-gray-600 bg-gray-950/90 font-mono text-[11px] sm:text-xs text-gray-300 leading-snug"
+                    title="Publish path: Live = latest matrix row for current session; Historical = matrix row as-of the chosen session date."
                   >
-                    {showBlockedTimetableRows ? '✓' : ''} Blocked
-                  </button>
-                  <label className="flex items-center gap-2 text-xs text-gray-400">
-                    <span>Session date</span>
-                    <input
-                      type="date"
-                      value={timetableGenerateDate}
-                      onChange={(e) => setTimetableGenerateDate(e.target.value)}
-                      className="bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm text-gray-200"
-                      title="Optional. If set, calls POST /api/timetable/generate with request.date. If empty, POST /api/timetable/execution (stream filters)."
-                    />
-                  </label>
-                  <button
-                    type="button"
-                    onClick={handleManualPublishExecutionTimetable}
-                    disabled={timetableManualPublishLoading || masterLoading}
-                    className="px-4 py-2 rounded font-medium text-sm bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed"
-                    title="If session date is set: POST /api/timetable/generate. Otherwise: rebuild via POST /api/timetable/execution from on-disk master matrix."
-                  >
-                    {timetableManualPublishLoading ? 'Publishing…' : 'Publish live timetable'}
-                  </button>
+                    <div>
+                      <span className="text-gray-500">Mode:</span>{' '}
+                      <span
+                        className={
+                          timetableMode === 'live' ? 'text-emerald-400 font-semibold' : 'text-amber-400 font-semibold'
+                        }
+                      >
+                        {timetableMode === 'live' ? 'LIVE' : 'HISTORICAL'}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-gray-500">Session:</span>{' '}
+                      <span className="text-gray-100">
+                        {timetableMode === 'live'
+                          ? timetableSourceMeta?.effective_session_trading_date ||
+                            timetableSourceMeta?.session_trading_date ||
+                            timetableSourceMeta?.trading_date ||
+                            '—'
+                          : /^\d{4}-\d{2}-\d{2}$/.test(timetableGenerateDate.trim())
+                            ? timetableGenerateDate.trim()
+                            : '—'}
+                      </span>
+                    </div>
+                    <div>
+                      <span className="text-gray-500">Matrix row source:</span>{' '}
+                      <span
+                        className={
+                          timetableMode === 'live' ? 'text-emerald-400 font-semibold' : 'text-amber-400 font-semibold'
+                        }
+                      >
+                        {timetableMode === 'live' ? 'LATEST' : 'AS-OF'}
+                      </span>
+                    </div>
+                  </div>
                 </div>
                 <div className="text-center">
                   <div className="text-lg font-semibold text-gray-300">
@@ -3346,9 +3451,13 @@ function AppContent() {
               <div className="mb-4 px-4 py-2 rounded bg-gray-800 text-sm text-gray-300">
                 Live <code className="text-gray-400">timetable_current.json</code> is written by the dashboard from the on-disk{' '}
                 <span className="font-semibold text-green-400">master matrix</span>. Use{' '}
-                <span className="font-semibold text-emerald-400">Publish live timetable</span> above to rebuild it (
+                <span className="font-semibold text-emerald-400">Publish timetable</span> above (
                 <code className="text-gray-400">POST /api/timetable/execution</code>
-                ). The grid below is read-only from <code className="text-gray-400">GET /api/timetable/current</code> — no client-side recomputation.
+                ): <span className="text-emerald-400/90">Live</span> uses{' '}
+                <code className="text-gray-400">effective_session_trading_date</code> from{' '}
+                <code className="text-gray-400">GET /api/timetable/current</code>;{' '}
+                <span className="text-amber-400/90">Historical</span> uses the session date you pick. The grid below is read-only from{' '}
+                <code className="text-gray-400">GET /api/timetable/current</code> — no client-side recomputation.
               </div>
               {timetableManualPublishBanner ? (
                 <div

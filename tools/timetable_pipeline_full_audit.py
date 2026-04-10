@@ -128,7 +128,7 @@ def main() -> int:
             matrix_df,
             trade_date=session_pin,
             execution_mode=True,
-            execution_replay=True,
+            matrix_as_of_session=True,
         )
         merged_filters = _merge_stream_filters_for_execution(root, None)
 

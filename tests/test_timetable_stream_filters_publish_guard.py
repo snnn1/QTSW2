@@ -45,7 +45,11 @@ def test_execution_publish_blocked_when_no_stream_filters_merged(tmp_path, monke
     df = _minimal_matrix_df(eng, pd.Timestamp("2026-04-02"))
     with pytest.raises(RuntimeError, match="TIMETABLE_PUBLISH_BLOCKED"):
         eng.write_execution_timetable_from_master_matrix(
-            df, trade_date="2026-04-02", execution_mode=True, stream_filters=None
+            df,
+            trade_date="2026-04-02",
+            execution_mode=True,
+            mode="live",
+            stream_filters=None,
         )
 
 
@@ -60,7 +64,7 @@ def test_execution_publish_ok_with_min_config_on_disk(tmp_path, monkeypatch):
     eng = TimetableEngine(project_root=str(tmp_path))
     df = _minimal_matrix_df(eng, pd.Timestamp("2026-04-02"))
     eng.write_execution_timetable_from_master_matrix(
-        df, trade_date="2026-04-02", execution_mode=True, stream_filters=None
+        df, trade_date="2026-04-02", execution_mode=True, mode="live", stream_filters=None
     )
     cur = tmp_path / "data" / "timetable" / "timetable_current.json"
     assert cur.is_file()
@@ -86,7 +90,7 @@ def test_execution_publish_ok_with_payload_only_no_disk_file(tmp_path, monkeypat
         }
     }
     eng.write_execution_timetable_from_master_matrix(
-        df, trade_date="2026-04-02", execution_mode=True, stream_filters=sf
+        df, trade_date="2026-04-02", execution_mode=True, mode="live", stream_filters=sf
     )
     doc = json.loads(
         (tmp_path / "data" / "timetable" / "timetable_current.json").read_text(

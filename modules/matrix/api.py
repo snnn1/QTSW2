@@ -14,6 +14,7 @@ from typing import Optional, List, Dict, Any, Tuple
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
@@ -673,13 +674,11 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
             "returned_max_trade_date": str(returned_max_trade_date) if returned_max_trade_date is not None else None
         }
         
-        # Use orjson for faster JSON serialization if available
-        try:
-            import orjson
-            return JSONResponse(content=response_data, media_type="application/json")
-        except ImportError:
-            import json
-            return JSONResponse(content=response_data, media_type="application/json")
+        # jsonable_encoder: numpy/datetime in stats_full / records must not break Starlette json.dumps (allow_nan=False).
+        return JSONResponse(
+            content=jsonable_encoder(response_data),
+            media_type="application/json",
+        )
     except Exception as e:
         import traceback
         error_detail = str(e)

@@ -351,11 +351,13 @@ def save_master_matrix(
                     trade_date=session_td,
                     stream_filters=stream_filters,
                     execution_mode=True,
+                    mode="live",
                     publish_context={
                         "source": "matrix",
                         "reason": "publish",
                         "caller": "matrix.file_manager.save_master_matrix:background_thread",
                         "matrix_source": "in_memory",
+                        # LEGACY audit only — matrix row selection is mode=live only here.
                         "authority_mode": auth.mode,
                     },
                 )
