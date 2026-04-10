@@ -2440,6 +2440,19 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
                 _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "IEA_EXEC_UPDATE_ROUTED", state: "ENGINE",
                     new { account_name = _iea.AccountName, execution_instrument_key = _iea.ExecutionInstrumentKey, iea_instance_id = _iea.InstanceId }));
             }
+            var fillQtyEnqueue = 0;
+            try
+            {
+                dynamic ex = execution;
+                fillQtyEnqueue = (int)(ex.Quantity ?? 0);
+            }
+            catch
+            {
+                /* ignore */
+            }
+
+            IeExecutionLatencyTrace.Write("ADAPTER_EXEC_ENQUEUE", order, execution, _iea.ExecutionInstrumentKey,
+                _iea.InstanceId.ToString(), fillQtyEnqueue);
             _iea.EnqueueExecutionUpdate(execution, order);
         }
         else
@@ -3498,15 +3511,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         throw new InvalidOperationException(error);
 #endif
 
-        if (!_ntContextSet)
-        {
-            var error = "CRITICAL: NT context is not set. " +
-                       "SetNTContext() must be called by RobotSimStrategy before orders can be placed. " +
-                       "Mock mode has been removed - only real NT API execution is supported.";
-            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
-                new { reason = "NT_CONTEXT_NOT_SET", error }));
-            throw new InvalidOperationException(error);
-        }
+        if (!IsExecutionContextReady)
+            return 0;
 
         return GetCurrentPositionReal(instrument);
     }
@@ -3522,14 +3528,13 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         throw new InvalidOperationException(error);
 #endif
 
-        if (!_ntContextSet)
+        if (!IsExecutionContextReady)
         {
-            var error = "CRITICAL: NT context is not set. " +
-                       "SetNTContext() must be called by RobotSimStrategy before orders can be placed. " +
-                       "Mock mode has been removed - only real NT API execution is supported.";
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
-                new { reason = "NT_CONTEXT_NOT_SET", error }));
-            throw new InvalidOperationException(error);
+            return new AccountSnapshot
+            {
+                Positions = new List<PositionSnapshot>(),
+                WorkingOrders = new List<WorkingOrderSnapshot>()
+            };
         }
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -3590,15 +3595,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         throw new InvalidOperationException(error);
 #endif
 
-        if (!_ntContextSet)
-        {
-            var error = "CRITICAL: NT context is not set. " +
-                       "SetNTContext() must be called by RobotSimStrategy before orders can be placed. " +
-                       "Mock mode has been removed - only real NT API execution is supported.";
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
-                new { reason = "NT_CONTEXT_NOT_SET", error }));
-            throw new InvalidOperationException(error);
-        }
+        if (!IsExecutionContextReady)
+            return;
 
         CancelRobotOwnedWorkingOrdersReal(snap, utcNow, instrumentRootForScope: null, explicitBrokerOrderIds: null, allowAccountWideCancelFallback: false, correlationId: null);
     }

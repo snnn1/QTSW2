@@ -35,6 +35,11 @@ _api_cache_misses: int = 0
 _last_matrix_row_count: Optional[int] = None
 
 
+def _matrix_data_error_response(status_code: int, message: str) -> JSONResponse:
+    """Stable JSON body for matrix /data failures (avoids empty or detail-only clients)."""
+    return JSONResponse(status_code=status_code, content={"error": message})
+
+
 def _invalidate_matrix_cache():
     """Clear matrix data cache and MatrixState (call after build/resequence)."""
     global _matrix_data_cache, _breakdown_cache, _stream_stats_cache, _api_cache_hits, _api_cache_misses
@@ -382,19 +387,24 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
         root_matrix_dir = QTSW2_ROOT / "data" / "master_matrix"
         
         if not root_matrix_dir.exists():
-            raise HTTPException(status_code=404, detail=f"Master matrix directory not found: {root_matrix_dir}")
-        
+            return _matrix_data_error_response(
+                404, f"Master matrix directory not found: {root_matrix_dir}"
+            )
+
         if file_path:
             # Use specified file
             file_to_load = Path(file_path)
             if not file_to_load.exists():
-                raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
+                return _matrix_data_error_response(404, f"File not found: {file_path}")
         else:
             # Prefer fullest file (most rows) so truncated resequences don't replace full rebuilds
             from modules.matrix.file_manager import get_best_matrix_file
             file_to_load = get_best_matrix_file(str(root_matrix_dir))
             if file_to_load is None:
-                raise HTTPException(status_code=404, detail=f"No master matrix files found. Checked: {root_matrix_dir}. Build the matrix first.")
+                return _matrix_data_error_response(
+                    404,
+                    f"No master matrix files found. Checked: {root_matrix_dir}. Build the matrix first.",
+                )
             logger.info(f"Selected fullest file: {file_to_load.name}")
         
         file_mtime = file_to_load.stat().st_mtime
@@ -421,22 +431,31 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
             from modules.matrix.matrix_state import get_matrix_state
             t_load = time.perf_counter()
             # MatrixState: use in-process df when file unchanged; else load in thread (populates state)
-            df_from_state, path_used, from_cache = await asyncio.to_thread(
-                get_matrix_state, str(root_matrix_dir), file_to_load
-            )
+            try:
+                df_from_state, path_used, from_cache = await asyncio.to_thread(
+                    get_matrix_state, str(root_matrix_dir), file_to_load
+                )
+            except Exception as e:
+                return _matrix_data_error_response(
+                    500, f"Failed to read matrix state: {str(e)}"
+                )
             if df_from_state is not None:
                 df = df_from_state.copy()
             else:
+                from modules.matrix.file_manager import read_parquet_matrix_file
+
                 def _load_parquet_sync():
-                    import pandas as pd
-                    return pd.read_parquet(file_to_load)
+                    return read_parquet_matrix_file(file_to_load)
+
                 try:
                     df = await asyncio.to_thread(_load_parquet_sync)
                 except Exception as e:
-                    raise HTTPException(status_code=500, detail=f"Failed to read file {file_to_load.name}: {str(e)}")
-            
+                    return _matrix_data_error_response(
+                        500, f"Failed to read file {file_to_load.name}: {str(e)}"
+                    )
+
             if df.empty:
-                raise HTTPException(status_code=404, detail=f"File {file_to_load.name} is empty")
+                return _matrix_data_error_response(404, f"File {file_to_load.name} is empty")
             
             df_full = df.copy()
 
@@ -667,7 +686,9 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
         error_traceback = traceback.format_exc()
         logger.error(f"Failed to load matrix data: {error_detail}")
         logger.error(f"Traceback: {error_traceback}")
-        raise HTTPException(status_code=500, detail=f"Failed to load matrix data: {error_detail}")
+        return _matrix_data_error_response(
+            500, f"Failed to load matrix data: {error_detail}"
+        )
 
 
 @router.post("/breakdown")

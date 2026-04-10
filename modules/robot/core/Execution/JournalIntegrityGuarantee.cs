@@ -11,6 +11,7 @@ namespace QTSW2.Robot.Core.Execution;
 public enum JournalParityStatus
 {
     PARITY_OK,
+    PARITY_PENDING_ALIGNMENT,
     POSITION_MISMATCH,
     WORKING_ORDER_MISMATCH,
     UNKNOWN_ORDER_PRESENT,
@@ -38,6 +39,12 @@ public sealed class JournalParityResult
     public bool IeaUnavailableWhenRequired { get; init; }
 
     public bool IsOk => Status == JournalParityStatus.PARITY_OK;
+
+    public bool IsPendingAlignment => Status == JournalParityStatus.PARITY_PENDING_ALIGNMENT;
+
+    /// <summary>Live paths treat pending alignment like OK for flatten / structural submit gates (not for strict post-audit PARITY_OK).</summary>
+    public bool IsOkOrPendingAlignment =>
+        Status == JournalParityStatus.PARITY_OK || Status == JournalParityStatus.PARITY_PENDING_ALIGNMENT;
 }
 
 public enum JournalReconstructionReasonCode
@@ -164,14 +171,31 @@ public static class JournalParityChecker
             };
         }
 
-        if (posDiff > 0)
+        var openByInstrument = journal.GetOpenJournalEntriesByInstrument();
+        var signedBroker = ExecutionJournal.SumNetBrokerPositionSignedForInstrument(snapshot, inst);
+        var signedJournal =
+            journal.GetOpenJournalSignedNetForInstrumentFromMap(openByInstrument, inst, canonical);
+        var signedDelta = signedBroker - signedJournal;
+
+        if (posDiff > 0 || signedDelta != 0)
         {
+            var brokerHedgedSameInstrument = Math.Abs(signedBroker) != brokerPos;
+            var journalOpposingIntents =
+                journal.HasOpposingDirectionOpenIntentsFromMap(openByInstrument, inst, canonical);
+            var structuralMatchesSignedMagnitude =
+                posDiff == Math.Abs(signedDelta);
+
+            if (!brokerHedgedSameInstrument && !journalOpposingIntents && structuralMatchesSignedMagnitude &&
+                TryClassifyPendingAlignment(inst, journal, signedDelta, brokerPos, journalOpen, ageMs,
+                    unexplainedW, out var pendingResult))
+                return pendingResult;
+
             return new JournalParityResult
             {
                 Status = JournalParityStatus.POSITION_MISMATCH,
                 BrokerPositionQty = brokerPos,
                 JournalOpenQty = journalOpen,
-                UnexplainedPositionQty = posDiff,
+                UnexplainedPositionQty = posDiff > 0 ? posDiff : Math.Abs(signedDelta),
                 UnexplainedWorkingOrders = unexplainedW,
                 OrphanOrdersDetected = 0,
                 SnapshotAgeMs = ageMs
@@ -202,6 +226,52 @@ public static class JournalParityChecker
             OrphanOrdersDetected = 0,
             SnapshotAgeMs = ageMs
         };
+    }
+
+    /// <summary>I1–I5 + prune over-explain; only called when structural abs delta matches signed magnitude.</summary>
+    private static bool TryClassifyPendingAlignment(
+        string instrument,
+        ExecutionJournal journal,
+        int signedDelta,
+        int brokerAbs,
+        int journalStructural,
+        long? ageMs,
+        int unexplainedW,
+        out JournalParityResult result)
+    {
+        result = null!;
+        if (signedDelta == 0) return false;
+
+        var entries = JournalParityPendingLedger.SnapshotOrdered(instrument)
+            .Where(e => !journal.IsParityPendingFillKeyApplied(e.ExecutionDedupeKey))
+            .ToList();
+
+        while (entries.Count > 0)
+        {
+            var sumS = entries.Sum(x => x.SignedQuantity);
+            var sumAbs = entries.Sum(x => Math.Abs(x.SignedQuantity));
+            if (sumS == signedDelta && sumAbs == Math.Abs(signedDelta))
+            {
+                result = new JournalParityResult
+                {
+                    Status = JournalParityStatus.PARITY_PENDING_ALIGNMENT,
+                    BrokerPositionQty = brokerAbs,
+                    JournalOpenQty = journalStructural,
+                    UnexplainedPositionQty = 0,
+                    UnexplainedWorkingOrders = unexplainedW,
+                    OrphanOrdersDetected = 0,
+                    SnapshotAgeMs = ageMs
+                };
+                return true;
+            }
+
+            if (Math.Abs(sumS) < Math.Abs(signedDelta) || sumAbs < Math.Abs(signedDelta))
+                return false;
+
+            entries.RemoveAt(0);
+        }
+
+        return false;
     }
 
     private static int SumAbsBrokerPosition(AccountSnapshot snap, string inst)
@@ -381,6 +451,16 @@ public static class JournalIntegrityGuarantee
         });
         RecordPositionAuthorityCountersAndMaybeEmitSummary(positionAuthority, logEngine, utcNow);
 
+        if (initial.Status == JournalParityStatus.PARITY_PENDING_ALIGNMENT)
+        {
+            AttemptByInstrument.TryRemove(inst, out _);
+            return new JournalIntegrityEnsureResult
+            {
+                InitialCheck = initial,
+                Outcome = JournalIntegrityPhaseOutcome.Ok
+            };
+        }
+
         if (FeatureFlags.EnableHardFailClosedJournalIntegrity &&
             HardFailClosedExecutionModel.IsJournalRepairUnsafe(initial, positionAuthority))
         {
@@ -414,7 +494,8 @@ public static class JournalIntegrityGuarantee
 
         if (snapshot != null && initial.BrokerPositionQty > 0 &&
             initial.Status != JournalParityStatus.INSUFFICIENT_DATA &&
-            initial.Status != JournalParityStatus.UNKNOWN_ORDER_PRESENT)
+            initial.Status != JournalParityStatus.UNKNOWN_ORDER_PRESENT &&
+            initial.Status != JournalParityStatus.PARITY_PENDING_ALIGNMENT)
         {
             var supersededClosed = journal.CloseRecoveredRowsSupersededByRealExposure(
                 executionInstrumentPrimary, canonicalInstrument, initial.BrokerPositionQty, utcNow);
@@ -503,7 +584,7 @@ public static class JournalIntegrityGuarantee
             ? JournalParityChecker.CheckJournalParity(inst, snapshot, journal, registry, canonicalInstrument, utcNow)
             : initial;
 
-        if (mid.IsOk)
+        if (mid.IsOk || mid.IsPendingAlignment)
         {
             AttemptByInstrument.TryRemove(inst, out _);
             if (recon?.AnyMutation == true)
@@ -573,7 +654,7 @@ public static class JournalIntegrityGuarantee
             ? JournalParityChecker.CheckJournalParity(inst, snapshot, journal, registry, canonicalInstrument, utcNow)
             : mid;
 
-        if ((recon?.AnyMutation == true || recov.Writes > 0) && post.IsOk)
+        if ((recon?.AnyMutation == true || recov.Writes > 0) && post.IsOkOrPendingAlignment)
         {
             AttemptByInstrument.TryRemove(inst, out _);
             logEngine?.Invoke("JOURNAL_INTEGRITY_RECOVERED", "ENGINE", new
@@ -598,7 +679,7 @@ public static class JournalIntegrityGuarantee
         var attempt = AttemptByInstrument.AddOrUpdate(inst, 1, (_, c) => c + 1);
         var escalated = EmitEscalationIfNeeded(inst, attempt, initial, post, logEngine, "parity_not_restored_after_repair");
 
-        if (!post.IsOk)
+        if (!post.IsOkOrPendingAlignment)
         {
             logEngine?.Invoke("JOURNAL_INTEGRITY_FAILED", "WARN", new
             {

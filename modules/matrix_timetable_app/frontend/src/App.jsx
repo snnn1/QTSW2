@@ -172,6 +172,8 @@ function AppContent() {
   /** Manual POST /api/timetable/execution feedback. */
   const [timetableManualPublishLoading, setTimetableManualPublishLoading] = useState(false)
   const [timetableManualPublishBanner, setTimetableManualPublishBanner] = useState(null)
+  /** Optional YYYY-MM-DD for POST /api/timetable/generate (request.date). Empty = existing publish path. */
+  const [timetableGenerateDate, setTimetableGenerateDate] = useState('')
   /** GET /api/timetable/current only — Trading Timetable grid has no worker/matrix fallback. */
   const [timetableApiStatus, setTimetableApiStatus] = useState({ loading: false, error: null })
   /** From GET /api/watchdog/market-state; null → use getCmeMarketState fallback. */
@@ -247,21 +249,48 @@ function AppContent() {
     setTimetableManualPublishBanner(null)
     setTimetableManualPublishLoading(true)
     try {
-      const res = await matrixApi.saveExecutionTimetable({
-        reason: 'manual_ui',
-        source: 'matrix_ui',
-        streamFilters,
+      const sessionDate = timetableGenerateDate.trim()
+      // TEMP audit: timetable publish endpoint + date (remove after debugging)
+      console.log('TIMETABLE_PUBLISH_CLICK', {
+        sessionDate: timetableGenerateDate,
+        usingGenerate: !!timetableGenerateDate.trim(),
       })
+      let res
+      if (sessionDate) {
+        const genPayload = {
+          date: sessionDate,
+          analyzer_runs_dir: 'data/analyzed',
+          scf_threshold: 0.5,
+        }
+        console.log('CALLING_ENDPOINT', '/api/timetable/generate', genPayload)
+        res = await matrixApi.generateTimetable(genPayload)
+      } else {
+        const execPayload = {
+          reason: 'manual_ui',
+          source: 'matrix_ui',
+          streamFilters,
+        }
+        console.log('CALLING_ENDPOINT', '/api/timetable/execution', execPayload)
+        res = await matrixApi.saveExecutionTimetable(execPayload)
+      }
       const tt = await matrixApi.getCurrentTimetable()
       setTimetableSourceMeta(timetableApiDocToSourceMeta(tt))
       workerApplyExecutionTimetableFromApi(tt)
       setTimetableApiStatus({ loading: false, error: null })
-      const st = res.status === 'published' ? 'Published' : 'Unchanged'
-      const h = res.hash ? `${String(res.hash).slice(0, 16)}…` : '—'
-      setTimetableManualPublishBanner({
-        type: 'ok',
-        text: `${st}. Content hash prefix: ${h}`,
-      })
+      if (sessionDate) {
+        const entries = res?.total_entries ?? res?.entries?.length
+        setTimetableManualPublishBanner({
+          type: 'ok',
+          text: `Timetable generated${entries != null ? ` (${entries} rows)` : ''}.`,
+        })
+      } else {
+        const st = res.status === 'published' ? 'Published' : 'Unchanged'
+        const h = res.hash ? `${String(res.hash).slice(0, 16)}…` : '—'
+        setTimetableManualPublishBanner({
+          type: 'ok',
+          text: `${st}. Content hash prefix: ${h}`,
+        })
+      }
     } catch (e) {
       setTimetableManualPublishBanner({
         type: 'err',
@@ -270,7 +299,7 @@ function AppContent() {
     } finally {
       setTimetableManualPublishLoading(false)
     }
-  }, [streamFilters, workerApplyExecutionTimetableFromApi])
+  }, [streamFilters, workerApplyExecutionTimetableFromApi, timetableGenerateDate])
 
   /** Timetable tab: rows only from GET /api/timetable/current (via workerExecutionTimetable). No worker merge. */
   const timetableRowsForDisplay = useMemo(() => {
@@ -3234,12 +3263,22 @@ function AppContent() {
                   >
                     {showBlockedTimetableRows ? '✓' : ''} Blocked
                   </button>
+                  <label className="flex items-center gap-2 text-xs text-gray-400">
+                    <span>Session date</span>
+                    <input
+                      type="date"
+                      value={timetableGenerateDate}
+                      onChange={(e) => setTimetableGenerateDate(e.target.value)}
+                      className="bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm text-gray-200"
+                      title="Optional. If set, calls POST /api/timetable/generate with request.date. If empty, POST /api/timetable/execution (stream filters)."
+                    />
+                  </label>
                   <button
                     type="button"
                     onClick={handleManualPublishExecutionTimetable}
                     disabled={timetableManualPublishLoading || masterLoading}
                     className="px-4 py-2 rounded font-medium text-sm bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed"
-                    title="Rebuild data/timetable/timetable_current.json from the on-disk master matrix (POST /api/timetable/execution). Session must match live CME day."
+                    title="If session date is set: POST /api/timetable/generate. Otherwise: rebuild via POST /api/timetable/execution from on-disk master matrix."
                   >
                     {timetableManualPublishLoading ? 'Publishing…' : 'Publish live timetable'}
                   </button>

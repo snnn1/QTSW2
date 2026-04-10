@@ -58,6 +58,7 @@ if (argsList.Contains("--help") || argsList.Contains("-h"))
 // --test MISMATCH_ESCALATION: run Gap 4 mismatch escalation tests
 // --test STRUCTURAL_AUTO_OFFSET: shared-instrument long+short, auto_offset policy, journal vs broker aggregation probe
 // --test STATE_CONSISTENCY_GATE: run P1.5 closed-loop state-consistency gate tests
+// --test SESSION_AUTHORITY_GATE: SessionAuthority file presence + strict YYYY-MM-DD vs timetable (gate helpers)
 // --test JOURNAL_INTEGRITY_GUARANTEE: authoritative parity classification + bounded orphan escalation
 // --test EXECUTION_SAFETY_GATE: kill-switch, snapshot freshness, recovery block, manual unlock policy
 // --test RELEASE_BLOCKING_ADOPTION: stale journal rows vs live tag/registry release-blocking policy
@@ -296,6 +297,12 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
     {
         var (pass, err) = StateConsistencyGateTests.RunStateConsistencyGateTests();
         Console.WriteLine(pass ? "PASS: State consistency gate tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("SESSION_AUTHORITY_GATE", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = SessionAuthorityTimetableGateTests.RunAll();
+        Console.WriteLine(pass ? "PASS: Session authority timetable gate tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
     else if (testName.Equals("JOURNAL_INTEGRITY_GUARANTEE", StringComparison.OrdinalIgnoreCase))

@@ -561,6 +561,19 @@ public sealed partial class InstrumentExecutionAuthority
             return;
         EnqueueRecoveryEssential(() =>
         {
+            var fillQtyWorker = 0;
+            try
+            {
+                dynamic ex = execution;
+                fillQtyWorker = (int)(ex.Quantity ?? 0);
+            }
+            catch
+            {
+                /* ignore */
+            }
+
+            IeExecutionLatencyTrace.Write("IEA_WORKER_EXEC_BEGIN", order, execution, ExecutionInstrumentKey,
+                InstanceId.ToString(), fillQtyWorker);
             // Phase 4: Critical event during bootstrap marks snapshot stale (fill or order state change)
             if (IsInBootstrap && IsCriticalBootstrapEvent(execution, order))
             {

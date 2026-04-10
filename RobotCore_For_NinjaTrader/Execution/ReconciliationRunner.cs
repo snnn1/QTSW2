@@ -155,6 +155,9 @@ public sealed class ReconciliationRunner
 
     private void RunInternal(DateTimeOffset utcNow, ReconciliationRunOptions? options)
     {
+        if (!_adapter.IsExecutionContextReady)
+            return;
+
         var gateInst = options?.GateRecoveryInstrument?.Trim();
         var gateMode = !string.IsNullOrEmpty(gateInst);
         var bypassRedundancy = options?.BypassRedundancySuppression ?? false;

@@ -129,19 +129,42 @@ Examples:
             from modules.matrix.file_manager import set_current_master_matrix_df
 
             set_current_master_matrix_df(master_df)
+            from modules.session_authority.store import (
+                SessionAuthorityRequiredError,
+                load_persisted_strict,
+            )
+
+            if args.date:
+                td = args.date.strip()
+                auth_mode = None
+            else:
+                try:
+                    _auth = load_persisted_strict(project_root)
+                    td = _auth.session_trading_date
+                    auth_mode = _auth.mode
+                except SessionAuthorityRequiredError:
+                    print(
+                        "ERROR: Session authority required. Create data/session/session_authority.json "
+                        "or run: POST /api/session/authority/initialize_auto",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+            _pub = {
+                "source": "cli",
+                "reason": "run_matrix_and_timetable",
+                "caller": "scripts/maintenance/run_matrix_and_timetable.py",
+                "matrix_source": "in_memory",
+            }
+            if auth_mode is not None:
+                _pub["authority_mode"] = auth_mode
             engine.write_execution_timetable_from_master_matrix(
                 master_df,
-                trade_date=args.date,
+                trade_date=td,
                 execution_mode=True,
-                publish_context={
-                    "source": "cli",
-                    "reason": "run_matrix_and_timetable",
-                    "caller": "scripts/maintenance/run_matrix_and_timetable.py",
-                    "matrix_source": "in_memory",
-                },
+                publish_context=_pub,
             )
             timetable_df = engine.build_timetable_dataframe_from_master_matrix(
-                master_df, trade_date=args.date, execution_mode=True
+                master_df, trade_date=td, execution_mode=True
             )
         elif not run_matrix:
             from modules.matrix.file_manager import load_existing_matrix

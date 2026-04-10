@@ -1032,7 +1032,8 @@ public sealed partial class NinjaTraderSimAdapter
         _onMismatchExecutionTrigger?.Invoke(orderInfo.Instrument.Trim(), utcNow, new MismatchExecutionTriggerDetails
         {
             IntentId = intentId,
-            FillDelta = 0
+            FillDelta = 0,
+            SuppressHardJournalIntegrityActions = orderState == OrderState.Filled
         });
 
         // Update journal based on order state
@@ -1952,7 +1953,8 @@ public sealed partial class NinjaTraderSimAdapter
         _onMismatchExecutionTrigger?.Invoke(instFill, utcNow, new MismatchExecutionTriggerDetails
         {
             IntentId = intentId,
-            FillDelta = fillQuantity
+            FillDelta = fillQuantity,
+            SuppressHardJournalIntegrityActions = true
         });
         _executionTrace?.WriteExecutionTrace(utcNow, "NotifyExecutionTrigger", "after_notify", instFill, intentId, bid,
             brokerExecIdFill ?? "", fillQuantity, order.OrderState.ToString());
@@ -2021,6 +2023,14 @@ public sealed partial class NinjaTraderSimAdapter
             }
 
             // Entry fill
+            var fillGroupId = NinjaTraderSimAdapter.ComputeFillGroupId(brokerExecIdFill, bid,
+                order.OrderId ?? "", utcNow.ToString("o", System.Globalization.CultureInfo.InvariantCulture), fillPrice,
+                fillQuantity);
+            var parityKey = fillGroupId + "|" + intentId.Trim();
+            var entrySign = string.Equals(context.Direction, "Short", StringComparison.OrdinalIgnoreCase) ? -1 : 1;
+            JournalParityPendingLedger.TryRecordTrustedFill(context.ExecutionInstrument.Trim(), parityKey,
+                entrySign * fillQuantity, intentId, utcNow);
+
             _executionJournal.RecordEntryFill(
                 context.IntentId, 
                 context.TradingDate, 
@@ -2031,7 +2041,9 @@ public sealed partial class NinjaTraderSimAdapter
                 context.ContractMultiplier, 
                 context.Direction,
                 context.ExecutionInstrument, 
-                context.CanonicalInstrument);
+                context.CanonicalInstrument,
+                brokerOrderInstrumentKey: null,
+                parityPendingDedupeKey: parityKey);
             
             // Log fill event
             if (filledTotal < orderInfo.Quantity)

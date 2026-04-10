@@ -62,6 +62,27 @@ public static class JournalIntegrityGuaranteeTests
             JournalIntegrityGuarantee.ResetAttemptsForTests();
             e = Case_RecoveredSupersededBy_NoClose_PartialNonRecovered();
             if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_ParityPending_A01_HappyPath();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_ParityPending_A02_CatchUpParityOk();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_ParityPending_D_WrongSignRejected();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_ParityPending_F_StaleAppliedKeyRejected();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_ParityPending_G_TwoFillsAggregated();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_ParityPending_H_ClearLedgerNoExplain();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_ParityPending_EnsureIntegrityNoRepair();
+            if (e != null) return (false, e);
             return (true, null);
         }
         finally
@@ -363,6 +384,136 @@ public static class JournalIntegrityGuaranteeTests
             $"{td}_{ExecutionJournal.RecoveredIntentStream}_RECOVERED-ES.json"));
         if (json.Contains("\"TradeCompleted\":true", StringComparison.OrdinalIgnoreCase))
             return "superseded_only_recovered: recovered row must remain open";
+        return null;
+    }
+
+    private static string? Case_ParityPending_A01_HappyPath()
+    {
+        JournalParityPendingLedger.Clear();
+        var utc = DateTimeOffset.Parse("2099-02-01T12:00:00Z");
+        var snap = new AccountSnapshot
+        {
+            Positions = new List<PositionSnapshot> { new() { Instrument = "ES", Quantity = 1 } },
+            WorkingOrders = new List<WorkingOrderSnapshot>()
+        };
+        using var tmp = NewTempJournal();
+        var reg = new TestRegistryView(false, 0);
+        JournalParityPendingLedger.TryRecordTrustedFill("ES", "k1", 1, "intent-a", utc);
+        var r = JournalParityChecker.CheckJournalParity("ES", snap, tmp.Journal, reg, "ES", utc);
+        if (r.Status != JournalParityStatus.PARITY_PENDING_ALIGNMENT)
+            return "pending_a01: broker 1 journal 0 + trusted pending +1 should be PARITY_PENDING_ALIGNMENT";
+        return null;
+    }
+
+    private static string? Case_ParityPending_A02_CatchUpParityOk()
+    {
+        JournalParityPendingLedger.Clear();
+        var utc = DateTimeOffset.Parse("2099-02-02T12:00:00Z");
+        var td = "2099-02-02";
+        using var tmp = NewTempJournal();
+        WriteMinimalNonRecoveredOpenRow(tmp.ProjectRoot, td, "TEST", "seed-pend-a2", "ES", 1, "Long");
+        var snap = new AccountSnapshot
+        {
+            Positions = new List<PositionSnapshot> { new() { Instrument = "ES", Quantity = 1 } },
+            WorkingOrders = new List<WorkingOrderSnapshot>()
+        };
+        var reg = new TestRegistryView(false, 0);
+        var r = JournalParityChecker.CheckJournalParity("ES", snap, tmp.Journal, reg, "ES", utc);
+        if (r.Status != JournalParityStatus.PARITY_OK)
+            return "pending_a02: broker 1 journal 1 should be PARITY_OK";
+        return null;
+    }
+
+    private static string? Case_ParityPending_D_WrongSignRejected()
+    {
+        JournalParityPendingLedger.Clear();
+        var utc = DateTimeOffset.Parse("2099-02-03T12:00:00Z");
+        var snap = new AccountSnapshot
+        {
+            Positions = new List<PositionSnapshot> { new() { Instrument = "ES", Quantity = 1 } },
+            WorkingOrders = new List<WorkingOrderSnapshot>()
+        };
+        using var tmp = NewTempJournal();
+        var reg = new TestRegistryView(false, 0);
+        JournalParityPendingLedger.TryRecordTrustedFill("ES", "k1", -1, "intent-d", utc);
+        var r = JournalParityChecker.CheckJournalParity("ES", snap, tmp.Journal, reg, "ES", utc);
+        if (r.Status != JournalParityStatus.POSITION_MISMATCH)
+            return "pending_d: wrong-sign pending must not classify as PENDING";
+        return null;
+    }
+
+    private static string? Case_ParityPending_F_StaleAppliedKeyRejected()
+    {
+        JournalParityPendingLedger.Clear();
+        var utc = DateTimeOffset.Parse("2099-02-04T12:00:00Z");
+        var snap = new AccountSnapshot
+        {
+            Positions = new List<PositionSnapshot> { new() { Instrument = "ES", Quantity = 1 } },
+            WorkingOrders = new List<WorkingOrderSnapshot>()
+        };
+        using var tmp = NewTempJournal();
+        var reg = new TestRegistryView(false, 0);
+        JournalParityPendingLedger.TryRecordTrustedFill("ES", "kStale", 1, "intent-f", utc);
+        tmp.Journal.RegisterParityPendingFillPersisted("kStale");
+        var r = JournalParityChecker.CheckJournalParity("ES", snap, tmp.Journal, reg, "ES", utc);
+        if (r.Status != JournalParityStatus.POSITION_MISMATCH)
+            return "pending_f: I5 stale applied key must not recycle pending explanation";
+        return null;
+    }
+
+    private static string? Case_ParityPending_G_TwoFillsAggregated()
+    {
+        JournalParityPendingLedger.Clear();
+        var utc = DateTimeOffset.Parse("2099-02-05T12:00:00Z");
+        var snap = new AccountSnapshot
+        {
+            Positions = new List<PositionSnapshot> { new() { Instrument = "ES", Quantity = 2 } },
+            WorkingOrders = new List<WorkingOrderSnapshot>()
+        };
+        using var tmp = NewTempJournal();
+        var reg = new TestRegistryView(false, 0);
+        JournalParityPendingLedger.TryRecordTrustedFill("ES", "k1", 1, "i1", utc);
+        JournalParityPendingLedger.TryRecordTrustedFill("ES", "k2", 1, "i2", utc);
+        var r = JournalParityChecker.CheckJournalParity("ES", snap, tmp.Journal, reg, "ES", utc);
+        if (r.Status != JournalParityStatus.PARITY_PENDING_ALIGNMENT)
+            return "pending_g: two +1 pending should explain broker +2 journal 0";
+        return null;
+    }
+
+    private static string? Case_ParityPending_H_ClearLedgerNoExplain()
+    {
+        JournalParityPendingLedger.Clear();
+        var utc = DateTimeOffset.Parse("2099-02-06T12:00:00Z");
+        var snap = new AccountSnapshot
+        {
+            Positions = new List<PositionSnapshot> { new() { Instrument = "ES", Quantity = 1 } },
+            WorkingOrders = new List<WorkingOrderSnapshot>()
+        };
+        using var tmp = NewTempJournal();
+        var reg = new TestRegistryView(false, 0);
+        var r = JournalParityChecker.CheckJournalParity("ES", snap, tmp.Journal, reg, "ES", utc);
+        if (r.Status != JournalParityStatus.POSITION_MISMATCH)
+            return "pending_h: empty ledger cannot pending-align";
+        return null;
+    }
+
+    private static string? Case_ParityPending_EnsureIntegrityNoRepair()
+    {
+        JournalParityPendingLedger.Clear();
+        var utc = DateTimeOffset.Parse("2099-02-07T12:00:00Z");
+        var snap = new AccountSnapshot
+        {
+            Positions = new List<PositionSnapshot> { new() { Instrument = "ES", Quantity = 1 } },
+            WorkingOrders = new List<WorkingOrderSnapshot>()
+        };
+        using var tmp = NewTempJournal();
+        var reg = new TestRegistryView(false, 0);
+        JournalParityPendingLedger.TryRecordTrustedFill("ES", "kE", 1, "intent-e", utc);
+        var res = JournalIntegrityGuarantee.EnsureJournalIntegrity("ES", snap, tmp.Journal, reg,
+            "ES", "ES", Array.Empty<string>(), null, null, utc,
+            (_, _, _) => { }, allowReconstruction: true, tradingDateForJournal: "2099-02-07");
+        if (res.Outcome != JournalIntegrityPhaseOutcome.Ok || res.InitialCheck.Status != JournalParityStatus.PARITY_PENDING_ALIGNMENT)
+            return "pending_ensure: PARITY_PENDING_ALIGNMENT must short-circuit integrity repair (Outcome Ok)";
         return null;
     }
 

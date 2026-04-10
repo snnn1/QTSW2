@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -65,6 +66,9 @@ public sealed class ExecutionJournal
     private long _adoptionCandidateIndexLookupIndexHits;
     private long _adoptionCandidateIndexLookupFallbacks;
 
+    /// <summary>In-process: fill dedupe keys persisted via <see cref="RecordEntryFill"/> for I5 stale detection.</summary>
+    private readonly ConcurrentDictionary<string, byte> _parityPendingFillKeysApplied = new(StringComparer.Ordinal);
+
     /// <summary>Journal bucket (trading_date segment) for durable untracked-fill recovery markers.</summary>
     public const string UntrackedFillRecoveryTradingDateBucket = "RECOVERY";
 
@@ -111,6 +115,21 @@ public sealed class ExecutionJournal
 
         return sum;
     }
+
+    /// <summary>Record that a parity pending dedupe key was journaled (I5); in-process only.</summary>
+    public void RegisterParityPendingFillPersisted(string? parityDedupeKey)
+    {
+        if (string.IsNullOrWhiteSpace(parityDedupeKey)) return;
+        _parityPendingFillKeysApplied[parityDedupeKey.Trim()] = 1;
+    }
+
+    /// <summary>True if this fill key was already persisted to the journal (stale pending must not count).</summary>
+    public bool IsParityPendingFillKeyApplied(string? parityDedupeKey) =>
+        !string.IsNullOrWhiteSpace(parityDedupeKey) &&
+        _parityPendingFillKeysApplied.ContainsKey(parityDedupeKey.Trim());
+
+    /// <summary>Test-only: clears applied-key set (new engine session clears via new <see cref="ExecutionJournal"/> instance).</summary>
+    public void ClearParityPendingAppliedKeysForTests() => _parityPendingFillKeysApplied.Clear();
 
     /// <summary>Volume-weighted average price for matching instrument positions (abs qty weights).</summary>
     public static decimal? TryWeightedAveragePriceForInstrument(AccountSnapshot? snap, string instrument)
@@ -646,7 +665,8 @@ public sealed class ExecutionJournal
         string direction,
         string executionInstrument,
         string canonicalInstrument,
-        string? brokerOrderInstrumentKey = null)
+        string? brokerOrderInstrumentKey = null,
+        string? parityPendingDedupeKey = null)
     {
         var cacheHit = false;
         WithLockTiming("RecordEntryFill", tradingDate, () =>
@@ -892,9 +912,14 @@ public sealed class ExecutionJournal
             _cache[key] = entry;
             SaveJournal(journalPath, entry);
             _entryFillByStream[$"{tradingDate}_{stream}"] = true;
+            if (!string.IsNullOrWhiteSpace(parityPendingDedupeKey))
+            {
+                RegisterParityPendingFillPersisted(parityPendingDedupeKey);
+                JournalParityPendingLedger.TryRemove(executionInstrument.Trim(), parityPendingDedupeKey);
+            }
         }, () => new { cache_hit = cacheHit });
     }
-    
+
     /// <summary>
     /// Record exit fill (delta-based, completion-gated).
     /// Accepts delta exitFillQuantity only, NOT cumulative total.

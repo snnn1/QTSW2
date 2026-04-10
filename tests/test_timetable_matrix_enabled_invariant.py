@@ -11,7 +11,10 @@ QTSW2_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(QTSW2_ROOT))
 
 from modules.matrix.config import SCF_THRESHOLD
-from modules.timetable.timetable_engine import TimetableEngine
+from modules.timetable.timetable_engine import (
+    TimetableEngine,
+    _resolve_execution_matrix_as_of_session,
+)
 from tests.stream_filters_fixtures import install_min_stream_filters
 from tests.timetable_matrix_test_utils import matrix_time_valid_for_execution
 
@@ -50,7 +53,9 @@ def test_timetable_execution_streams_matrix_final_allowed_full_write(tmp_path, m
             }
         )
     df = pd.DataFrame(rows)
-    eng.write_execution_timetable_from_master_matrix(df, execution_mode=True)
+    eng.write_execution_timetable_from_master_matrix(
+        df, trade_date="2026-04-02", execution_mode=True
+    )
     doc = json.loads(
         (tmp_path / "data" / "timetable" / "timetable_current.json").read_text(encoding="utf-8")
     )
@@ -145,7 +150,7 @@ def test_execution_mode_calendar_blocked_uses_session_trading_date_dow():
 
 
 def test_execution_mode_final_allowed_from_max_trade_date_per_stream():
-    """latest_final_allowed / filter_reasons come from max(trade_date) row per stream, not session slice only."""
+    """Auto (matrix_as_of_session=False): max(trade_date) row per stream — later row wins over session day."""
     eng = TimetableEngine(project_root=str(QTSW2_ROOT))
     d_session = pd.Timestamp("2026-04-10")
     d_later = pd.Timestamp("2026-04-20")
@@ -177,11 +182,93 @@ def test_execution_mode_final_allowed_from_max_trade_date_per_stream():
                 }
             )
     df = pd.DataFrame(rows)
-    streams = eng._build_streams_execution_mode(df, date_cls(2026, 4, 10), "2026-04-10", {})
+    streams = eng._build_streams_execution_mode(
+        df, date_cls(2026, 4, 10), "2026-04-10", {}, matrix_as_of_session=False
+    )
     by_s = {x["stream"]: x for x in streams}
     assert by_s["ES1"]["enabled"] is False
     assert (by_s["ES1"].get("block_reason") or "").startswith("matrix_filter_blocked:"), by_s["ES1"]
     assert by_s["NQ1"]["enabled"] is True, by_s["NQ1"]
+
+
+def test_execution_mode_as_of_session_ignores_future_trade_date_row():
+    """Manual/replay as-of: use max(trade_date) <= session_trading_date; future-only row ignored for ES1."""
+    eng = TimetableEngine(project_root=str(QTSW2_ROOT))
+    d_session = pd.Timestamp("2026-04-06")
+    d_later = pd.Timestamp("2026-04-09")
+    rows = []
+    for sid in eng.streams:
+        sess = "S1" if sid.endswith("1") else "S2"
+        slot0 = matrix_time_valid_for_execution(eng, sid)
+        rows.append(
+            {
+                "Stream": sid,
+                "trade_date": d_session,
+                "Session": sess,
+                "Time": slot0,
+                "Time Change": "",
+                "final_allowed": True,
+                "filter_reasons": "",
+            }
+        )
+        if sid == "ES1":
+            rows.append(
+                {
+                    "Stream": sid,
+                    "trade_date": d_later,
+                    "Session": sess,
+                    "Time": slot0,
+                    "Time Change": "",
+                    "final_allowed": False,
+                    "filter_reasons": "future_row_should_ignore",
+                }
+            )
+    df = pd.DataFrame(rows)
+    streams = eng._build_streams_execution_mode(
+        df, date_cls(2026, 4, 6), "2026-04-06", {}, matrix_as_of_session=True
+    )
+    by_s = {x["stream"]: x for x in streams}
+    assert by_s["ES1"]["enabled"] is True, by_s["ES1"]
+    assert by_s["ES1"].get("block_reason") is None
+
+
+def test_execution_mode_as_of_no_prior_row_uses_existing_disable_path():
+    """As-of with no row on/before session day → no slot / matrix gate via existing paths."""
+    eng = TimetableEngine(project_root=str(QTSW2_ROOT))
+    d_future = pd.Timestamp("2026-04-10")
+    rows = []
+    for sid in eng.streams:
+        sess = "S1" if sid.endswith("1") else "S2"
+        slot0 = matrix_time_valid_for_execution(eng, sid)
+        td = d_future if sid == "ES1" else pd.Timestamp("2026-04-06")
+        rows.append(
+            {
+                "Stream": sid,
+                "trade_date": td,
+                "Session": sess,
+                "Time": slot0,
+                "Time Change": "",
+                "final_allowed": True,
+                "filter_reasons": "",
+            }
+        )
+    df = pd.DataFrame(rows)
+    streams = eng._build_streams_execution_mode(
+        df, date_cls(2026, 4, 6), "2026-04-06", {}, matrix_as_of_session=True
+    )
+    by_s = {x["stream"]: x for x in streams}
+    assert by_s["ES1"]["enabled"] is False
+    br = by_s["ES1"].get("block_reason") or ""
+    assert "no_valid_execution_slot" in br or br.startswith("matrix_filter_blocked:"), br
+
+
+def test_resolve_execution_matrix_as_of_from_context():
+    assert _resolve_execution_matrix_as_of_session(True, None, {}) is True
+    assert _resolve_execution_matrix_as_of_session(False, None, {"manual_session": True}) is True
+    assert _resolve_execution_matrix_as_of_session(False, None, {"source": "manual"}) is True
+    assert _resolve_execution_matrix_as_of_session(False, None, {"authority_mode": "manual"}) is True
+    assert _resolve_execution_matrix_as_of_session(False, None, {"authority_mode": "auto"}) is False
+    assert _resolve_execution_matrix_as_of_session(False, False, {"authority_mode": "manual"}) is False
 
 
 def test_execution_mode_friday_row_dow_only_does_not_veto_monday_session():

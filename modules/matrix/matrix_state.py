@@ -31,7 +31,7 @@ def get_matrix_state(
     Invalidate when file mtime changes.
     """
     global _matrix_df, _last_path, _last_mtime, _grouped_by_stream, _stats_cache
-    from .file_manager import get_best_matrix_file, load_existing_matrix
+    from .file_manager import get_best_matrix_file, load_existing_matrix, read_parquet_matrix_file
 
     path_to_check = file_path
     if path_to_check is None:
@@ -50,7 +50,7 @@ def get_matrix_state(
         _grouped_by_stream = None
         _stats_cache = None
 
-    df = pd.read_parquet(path_to_check)
+    df = read_parquet_matrix_file(path_to_check)
     with _state_lock:
         _matrix_df = df
         _last_path = path_to_check

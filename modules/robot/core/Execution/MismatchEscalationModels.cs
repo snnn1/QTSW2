@@ -330,13 +330,20 @@ public readonly struct MismatchExecutionTriggerDetails : IEquatable<MismatchExec
     /// <summary>True once when protective stop+target are successfully submitted after an entry fill.</summary>
     public bool EntryToProtectivesTransition { get; init; }
 
+    /// <summary>
+    /// When true, <c>TryEnsureJournalIntegrityAfterExecutionActivity</c> performs parity telemetry only and skips
+    /// <c>TryTriggerHardFlatten</c> and <c>RunEnsureJournalIntegrity</c> on the broken-parity path (pre-journal window).
+    /// </summary>
+    public bool SuppressHardJournalIntegrityActions { get; init; }
+
     public static MismatchExecutionTriggerDetails Default => default;
 
     public bool Equals(MismatchExecutionTriggerDetails other) =>
         IntentId == other.IntentId &&
         FillDelta == other.FillDelta &&
         InstrumentPositionQty == other.InstrumentPositionQty &&
-        EntryToProtectivesTransition == other.EntryToProtectivesTransition;
+        EntryToProtectivesTransition == other.EntryToProtectivesTransition &&
+        SuppressHardJournalIntegrityActions == other.SuppressHardJournalIntegrityActions;
 
     public override bool Equals(object? obj) => obj is MismatchExecutionTriggerDetails o && Equals(o);
 
@@ -348,6 +355,7 @@ public readonly struct MismatchExecutionTriggerDetails : IEquatable<MismatchExec
             h = (h * 397) ^ FillDelta;
             h = (h * 397) ^ (InstrumentPositionQty?.GetHashCode() ?? 0);
             h = (h * 397) ^ (EntryToProtectivesTransition ? 1 : 0);
+            h = (h * 397) ^ (SuppressHardJournalIntegrityActions ? 1 : 0);
             return h;
         }
     }

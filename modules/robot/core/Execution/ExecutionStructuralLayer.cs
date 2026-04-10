@@ -107,7 +107,7 @@ public static class ExecutionStructuralLayer
             return false;
         }
 
-        if (!parity.IsOk)
+        if (!parity.IsOkOrPendingAlignment)
         {
             snapshot.Reason = StructuralBlocker.ParityNotOk;
             snapshot.Detail = parity.Status.ToString();

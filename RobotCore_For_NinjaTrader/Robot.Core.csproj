@@ -47,6 +47,7 @@
     <Compile Include="..\modules\robot\core\Execution\ReconciliationBlockerModels.cs" Link="Execution\ReconciliationBlockerModels.cs" />
     <Compile Include="..\modules\robot\core\Execution\StateConsistencyGateModels.cs" Link="Execution\StateConsistencyGateModels.cs" />
     <Compile Include="..\modules\robot\core\Execution\JournalIntegrityGuarantee.cs" Link="Execution\JournalIntegrityGuarantee.cs" />
+    <Compile Include="..\modules\robot\core\Execution\JournalParityPendingLedger.cs" Link="Execution\JournalParityPendingLedger.cs" />
     <Compile Include="..\modules\robot\core\Execution\ExecutionSafetyGate.cs" Link="Execution\ExecutionSafetyGate.cs" />
     <Compile Include="..\modules\robot\core\Execution\ExecutionStructuralLayer.cs" Link="Execution\ExecutionStructuralLayer.cs" />
     <Compile Include="..\modules\robot\core\Execution\PositionAuthorityDerivation.cs" Link="Execution\PositionAuthorityDerivation.cs" />
@@ -61,6 +62,8 @@
     <Compile Include="..\modules\robot\core\reconciliation\ReconciliationStateTracker.cs" Link="reconciliation\ReconciliationStateTracker.cs" />
     <Compile Include="..\modules\robot\core\Diagnostics\RuntimeAudit.cs" Link="Diagnostics\RuntimeAudit.cs" />
     <Compile Include="..\modules\robot\core\Diagnostics\ExecutionTraceWriter.cs" Link="Diagnostics\ExecutionTraceWriter.cs" />
+    <Compile Include="..\modules\robot\core\Diagnostics\IeExecutionLatencyTrace.cs" Link="Diagnostics\IeExecutionLatencyTrace.cs" />
+    <Compile Include="..\modules\robot\core\Diagnostics\OrderUpdateIntegrityForensicTrace.cs" Link="Diagnostics\OrderUpdateIntegrityForensicTrace.cs" />
     <Compile Include="..\modules\robot\core\Execution\ExecutionReplayReader.cs" Link="Execution\ExecutionReplayReader.cs" />
     <Compile Include="..\modules\robot\core\Execution\ExecutionReplayRebuilder.cs" Link="Execution\ExecutionReplayRebuilder.cs" />
     <Compile Include="..\modules\robot\core\Execution\ExecutionScenarioRunner.cs" Link="Execution\ExecutionScenarioRunner.cs" />

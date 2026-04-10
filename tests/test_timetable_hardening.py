@@ -81,7 +81,9 @@ def test_publish_timetable_writes_without_eligibility_file(tmp_path, monkeypatch
             }
         ]
     )
-    eng.write_execution_timetable_from_master_matrix(df, execution_mode=True)
+    eng.write_execution_timetable_from_master_matrix(
+        df, trade_date="2026-04-01", execution_mode=True
+    )
     cur = tmp_path / "data" / "timetable" / "timetable_current.json"
     assert cur.exists()
 
@@ -108,7 +110,9 @@ def test_publish_succeeds_live_cme(tmp_path, monkeypatch):
             }
         ]
     )
-    eng.write_execution_timetable_from_master_matrix(df, execution_mode=True)
+    eng.write_execution_timetable_from_master_matrix(
+        df, trade_date="2026-04-02", execution_mode=True
+    )
     cur = tdir / "timetable_current.json"
     assert cur.exists()
     doc = json.loads(cur.read_text(encoding="utf-8"))

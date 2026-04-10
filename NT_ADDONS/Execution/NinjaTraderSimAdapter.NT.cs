@@ -700,6 +700,11 @@ public sealed partial class NinjaTraderSimAdapter
                     SetProtectionState(intentId, ProtectionState.Submitted);
                     _iea?.TryTransitionIntentLifecycle(intentId, IntentLifecycleTransition.PROTECTIVES_PLACED, null, cmd.UtcNow);
                 }
+                _onMismatchExecutionTrigger?.Invoke(intent.Instrument!.Trim(), cmd.UtcNow, new MismatchExecutionTriggerDetails
+                {
+                    IntentId = intentId,
+                    EntryToProtectivesTransition = true
+                });
                 return;
             }
         }
@@ -2947,7 +2952,8 @@ public sealed partial class NinjaTraderSimAdapter
         _onMismatchExecutionTrigger?.Invoke(instKey, utcNow, new MismatchExecutionTriggerDetails
         {
             IntentId = intentId,
-            FillDelta = 0
+            FillDelta = 0,
+            SuppressHardJournalIntegrityActions = orderState == OrderState.Filled
         });
         _executionTrace?.WriteExecutionTrace(utcNow, "NotifyExecutionTrigger", "after_notify", instKey, intentId,
             order.OrderId ?? "", "", 0, orderState.ToString());
@@ -3953,6 +3959,18 @@ public sealed partial class NinjaTraderSimAdapter
                 order_role = regEntry.OrderRole.ToString(),
                 ownership_status = regEntry.OwnershipStatus.ToString()
             }));
+            var fillQtyResolved = 0;
+            try
+            {
+                fillQtyResolved = (int)fillQuantity;
+            }
+            catch
+            {
+                /* ignore */
+            }
+
+            IeExecutionLatencyTrace.WriteResolved("ORDER_REGISTRY_EXEC_RESOLVED",
+                order.OrderId?.ToString() ?? "", intentId ?? "", orderInfo.Instrument, _iea?.InstanceId.ToString(), fillQtyResolved);
         }
 
         if (orderInfo == null && !OrderMap.TryGetValue(intentId, out orderInfo))
@@ -4210,7 +4228,8 @@ public sealed partial class NinjaTraderSimAdapter
         _onMismatchExecutionTrigger?.Invoke(instFill, utcNow, new MismatchExecutionTriggerDetails
         {
             IntentId = intentId,
-            FillDelta = fillQuantity
+            FillDelta = fillQuantity,
+            SuppressHardJournalIntegrityActions = true
         });
         _executionTrace?.WriteExecutionTrace(utcNow, "NotifyExecutionTrigger", "after_notify", instFill, intentId,
             brokerOrderId, brokerExecId ?? "", fillQuantity, ordStateFill);

@@ -722,6 +722,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         // NOTE: KillSwitch logs during construction. To ensure ALL logs include run_id,
         // we delay KillSwitch creation until Start() after _runId is set on the logger.
         _executionJournal = new ExecutionJournal(projectRoot, _log);
+        JournalParityPendingLedger.Clear();
         void NotifyReleaseSuppressionActivity()
         {
             _releaseReconRedundancy.NotifyExecutionActivity();
@@ -1314,7 +1315,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     _releaseReconRedundancy.NotifyExecutionActivity();
                     _mismatchCoordinator?.NotifyReconciliationAuditWake();
                     _mismatchCoordinator?.NotifyExecutionTrigger(inst, utc, d);
-                    TryEnsureJournalIntegrityAfterExecutionActivity(inst, utc);
+                    TryEnsureJournalIntegrityAfterExecutionActivity(inst, utc, d);
                 });
                 simP2.SetInstrumentMismatchGateEngagedCallback(inst =>
                     _mismatchCoordinator != null && _mismatchCoordinator.IsInstrumentBlockedByMismatch(inst));
@@ -3933,6 +3934,142 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         return (new FilePollResult(changed, hash, null), timetable, null);
     }
 
+    /// <summary>
+    /// Live timetables require <c>data/session/session_authority.json</c> with strict YYYY-MM-DD <c>session_trading_date</c> matching the timetable (post-clamp).
+    /// Replay timetable: skipped entirely.
+    /// </summary>
+    private bool TryValidateSessionAuthorityMatchesTimetable(DateTimeOffset utcNow, string timetableSessionTradingDate, bool timetableReplay)
+    {
+        if (timetableReplay)
+            return true;
+
+        var authorityPath = Path.Combine(_root, "data", "session", "session_authority.json");
+        var canonicalSession = ComputeCmeTradingDateString(utcNow);
+
+        if (!File.Exists(authorityPath))
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_SESSION_AUTHORITY_INVALID", state: "CRITICAL",
+                new
+                {
+                    reason = "authority_file_missing",
+                    timetable_session = timetableSessionTradingDate,
+                    authority_session = (string?)null,
+                    authority_mode = (string?)null,
+                    canonical_session = canonicalSession,
+                    file_path = authorityPath,
+                    timetable_path = _timetablePath,
+                    note = "Live execution requires persisted session_authority.json"
+                }));
+            StandDown();
+            return false;
+        }
+
+        string json;
+        try
+        {
+            json = File.ReadAllText(authorityPath);
+        }
+        catch (Exception ex)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_SESSION_AUTHORITY_INVALID", state: "CRITICAL",
+                new
+                {
+                    reason = "read_failed",
+                    error = ex.Message,
+                    timetable_session = timetableSessionTradingDate,
+                    authority_session = (string?)null,
+                    authority_mode = (string?)null,
+                    canonical_session = canonicalSession,
+                    file_path = authorityPath,
+                    timetable_path = _timetablePath
+                }));
+            StandDown();
+            return false;
+        }
+
+        SessionAuthorityContract? authority;
+        try
+        {
+            authority = JsonUtil.Deserialize<SessionAuthorityContract>(json);
+        }
+        catch (Exception ex)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_SESSION_AUTHORITY_INVALID", state: "CRITICAL",
+                new
+                {
+                    reason = "parse_failed",
+                    error = ex.Message,
+                    timetable_session = timetableSessionTradingDate,
+                    authority_session = (string?)null,
+                    authority_mode = (string?)null,
+                    canonical_session = canonicalSession,
+                    file_path = authorityPath,
+                    timetable_path = _timetablePath
+                }));
+            StandDown();
+            return false;
+        }
+
+        var authorityMode = string.IsNullOrWhiteSpace(authority?.mode) ? (string?)null : authority!.mode!.Trim();
+
+        var authSession = (authority?.session_trading_date ?? "").Trim();
+        if (string.IsNullOrEmpty(authSession))
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_SESSION_AUTHORITY_INVALID", state: "CRITICAL",
+                new
+                {
+                    reason = "missing_or_empty_authority_session",
+                    timetable_session = timetableSessionTradingDate,
+                    authority_session = "",
+                    authority_mode = authorityMode,
+                    canonical_session = canonicalSession,
+                    file_path = authorityPath,
+                    timetable_path = _timetablePath,
+                    note = "session_authority.json exists but session_trading_date is missing or empty"
+                }));
+            StandDown();
+            return false;
+        }
+
+        if (!SessionAuthorityTimetableGate.IsStrictIsoDate(authSession))
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_SESSION_AUTHORITY_INVALID", state: "CRITICAL",
+                new
+                {
+                    reason = "invalid_format",
+                    timetable_session = timetableSessionTradingDate,
+                    authority_session = authSession,
+                    authority_mode = authorityMode,
+                    canonical_session = canonicalSession,
+                    file_path = authorityPath,
+                    timetable_path = _timetablePath,
+                    note = "session_trading_date must be strict YYYY-MM-DD (zero-padded) and a valid calendar day"
+                }));
+            StandDown();
+            return false;
+        }
+
+        if (!string.Equals(timetableSessionTradingDate, authSession, StringComparison.Ordinal))
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "TIMETABLE_AUTHORITY_SESSION_MISMATCH", state: "CRITICAL",
+                new
+                {
+                    reason = "session_mismatch",
+                    timetable_session = timetableSessionTradingDate,
+                    authority_session = authSession,
+                    authority_mode = authorityMode,
+                    canonical_session = canonicalSession,
+                    file_path = authorityPath,
+                    timetable_path = _timetablePath,
+                    note = "Persisted SessionAuthority session_trading_date does not match timetable after parse/clamp"
+                }));
+            StandDown();
+            return false;
+        }
+
+        return true;
+    }
+
     private void ReloadTimetableIfChanged(
         DateTimeOffset utcNow,
         bool force,
@@ -4028,6 +4165,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 timetableSessionRaw = expectedCmeStrForClamp;
             }
         }
+
+        if (!TryValidateSessionAuthorityMatchesTimetable(utcNow, timetableSessionRaw, timetable.metadata?.replay == true))
+            return;
 
         // Lock trading date if not already set
         bool dateWasLocked = false;
@@ -6098,7 +6238,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     UseInstrumentExecutionAuthority = input.UseInstrumentExecutionAuthority,
                     IeaOwnedPlusAdoptedWorking = input.IeaOwnedPlusAdoptedWorking
                 }, canonicalPost, utcNow);
-            if (!parityPost.IsOk)
+            if (!parityPost.IsOkOrPendingAlignment)
             {
                 LogEvent(RobotEvents.EngineBase(utcNow, "", "JOURNAL_INTEGRITY_INVARIANT_CYCLE", "CRITICAL",
                     new
@@ -6193,7 +6333,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     }
 
     /// <summary>Fast path: only runs full ensure when parity is already broken (avoids log noise on hot execution paths).</summary>
-    private void TryEnsureJournalIntegrityAfterExecutionActivity(string inst, DateTimeOffset utcNow)
+    private void TryEnsureJournalIntegrityAfterExecutionActivity(string inst, DateTimeOffset utcNow,
+        MismatchExecutionTriggerDetails triggerDetails = default)
     {
         if (_executionAdapter == null || string.IsNullOrWhiteSpace(inst)) return;
         AccountSnapshot? snap;
@@ -6222,7 +6363,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         var pre = JournalParityChecker.CheckJournalParity(trimmed, snap, _executionJournal,
             new JournalParityRegistryViewImpl { UseInstrumentExecutionAuthority = useIea, IeaOwnedPlusAdoptedWorking = ieaOwned },
             canonical, utcNow);
-        if (pre.IsOk) return;
+        if (pre.IsOkOrPendingAlignment) return;
+        if (triggerDetails.SuppressHardJournalIntegrityActions)
+            return;
         if (FeatureFlags.EnableHardFailClosedBrokerFlatten)
         {
             try

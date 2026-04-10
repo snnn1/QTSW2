@@ -10,6 +10,7 @@ import logging
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, Tuple, Dict
@@ -49,6 +50,29 @@ def _parse_row_count_from_path(path: Path) -> Optional[int]:
     """Parse row count from filename. Returns None for legacy files without _Nn suffix."""
     m = _ROW_COUNT_RE.search(path.name)
     return int(m.group(1)) if m else None
+
+
+def read_parquet_matrix_file(path, *, retries: int = 5, delay_s: float = 0.05) -> pd.DataFrame:
+    """
+    Load master matrix parquet only after the file exists and has non-zero size.
+    Retries briefly so readers do not observe a partial write (paired with atomic save in save_master_matrix).
+    """
+    p = Path(path).resolve()
+    last_err: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            if not p.is_file():
+                raise FileNotFoundError(str(p))
+            if p.stat().st_size <= 0:
+                last_err = ValueError(f"empty or incomplete file: {p}")
+                time.sleep(delay_s)
+                continue
+            return pd.read_parquet(p)
+        except Exception as e:
+            last_err = e
+            if attempt + 1 < retries:
+                time.sleep(delay_s)
+    raise ValueError(f"Cannot read matrix parquet {p}: {last_err}") from last_err
 
 
 def _get_best_matrix_path_by_row_count(parquet_files: list) -> Optional[Path]:
@@ -193,19 +217,25 @@ def save_master_matrix(
     save_json = specific_date is not None or SAVE_JSON_ON_BUILD
     if save_json:
         df_for_json = df.copy()
+        parquet_tmp = parquet_file.parent / (parquet_file.name + ".tmp")
+        json_tmp = json_file.parent / (json_file.name + ".tmp")
         with ThreadPoolExecutor(max_workers=2) as ex:
             fut_parquet = ex.submit(
-                lambda: df.to_parquet(parquet_file, index=False, compression='snappy')
+                lambda: df.to_parquet(parquet_tmp, index=False, compression='snappy')
             )
             fut_json = ex.submit(
-                lambda: df_for_json.to_json(json_file, orient='records', date_format='iso', indent=2)
+                lambda: df_for_json.to_json(json_tmp, orient='records', date_format='iso', indent=2)
             )
             for fut in as_completed([fut_parquet, fut_json]):
                 fut.result()
+        parquet_tmp.replace(parquet_file)
+        json_tmp.replace(json_file)
         logger.info(f"Saved: {parquet_file} (columns: {list(df.columns)})")
         logger.info(f"Saved: {json_file}")
     else:
-        df.to_parquet(parquet_file, index=False, compression='snappy')
+        parquet_tmp = parquet_file.parent / (parquet_file.name + ".tmp")
+        df.to_parquet(parquet_tmp, index=False, compression='snappy')
+        parquet_tmp.replace(parquet_file)
         logger.info(f"Saved: {parquet_file} (columns: {list(df.columns)})")
     
     duration_ms = int((time.perf_counter() - t_save_start) * 1000)
@@ -252,11 +282,69 @@ def save_master_matrix(
                 if timetable_output_dir
                 else TimetableEngine(project_root=str(root))
             )
-            from modules.timetable.cme_session import get_cme_trading_date
             from modules.timetable.timetable_supervisor import timetable_publish_blocking
+            from .instrumentation import log_timing_event
 
-            # Live execution: CME wall clock only — ignore specific_date / UI / latest matrix date
-            session_td = get_cme_trading_date(datetime.now(timezone.utc))
+            from modules.session_authority.store import (
+                SessionAuthorityRequiredError,
+                load_persisted_strict,
+            )
+
+            try:
+                auth = load_persisted_strict(root)
+            except SessionAuthorityRequiredError as e:
+                duration_ms = int((time.perf_counter() - t_timetable) * 1000)
+                logger.info("TIMETABLE_PERSIST_SKIP: %s", e)
+                journal_event(
+                    event_type="timetable_complete",
+                    mode="from_matrix",
+                    duration_ms=duration_ms,
+                    skipped="no_session_authority",
+                )
+                log_timing_event(
+                    phase="timetable_generation",
+                    duration_ms=duration_ms,
+                    mode="from_matrix_skipped",
+                )
+                return
+
+            if auth.mode in ("replay", "rollback_override"):
+                duration_ms = int((time.perf_counter() - t_timetable) * 1000)
+                logger.info(
+                    "TIMETABLE_PERSIST_SKIP: session authority mode=%s (not matrix auto-sync)",
+                    auth.mode,
+                )
+                journal_event(
+                    event_type="timetable_complete",
+                    mode="from_matrix",
+                    duration_ms=duration_ms,
+                    skipped="authority_mode",
+                )
+                log_timing_event(
+                    phase="timetable_generation",
+                    duration_ms=duration_ms,
+                    mode="from_matrix_skipped",
+                )
+                return
+
+            if auth.mode == "manual" and auth.locked:
+                duration_ms = int((time.perf_counter() - t_timetable) * 1000)
+                logger.info("TIMETABLE_PERSIST_SKIP: manual locked session authority; not overwriting")
+                journal_event(
+                    event_type="timetable_complete",
+                    mode="from_matrix",
+                    duration_ms=duration_ms,
+                    skipped="manual_authority_locked",
+                )
+                log_timing_event(
+                    phase="timetable_generation",
+                    duration_ms=duration_ms,
+                    mode="from_matrix_skipped",
+                )
+                return
+
+            session_td = auth.session_trading_date
+            print("RESEQUENCE_SESSION_DATE_USED", session_td)
             with timetable_publish_blocking():
                 engine.write_execution_timetable_from_master_matrix(
                     df_copy,
@@ -268,11 +356,11 @@ def save_master_matrix(
                         "reason": "publish",
                         "caller": "matrix.file_manager.save_master_matrix:background_thread",
                         "matrix_source": "in_memory",
+                        "authority_mode": auth.mode,
                     },
                 )
             logger.info("Execution timetable persisted from master matrix")
             duration_ms = int((time.perf_counter() - t_timetable) * 1000)
-            from .instrumentation import log_timing_event
             log_timing_event(phase="timetable_generation", duration_ms=duration_ms, mode="from_matrix")
             journal_event(event_type="timetable_complete", mode="from_matrix", duration_ms=duration_ms)
         except Exception as e:
@@ -313,7 +401,7 @@ def load_existing_matrix(output_dir: str) -> pd.DataFrame:
             if best_path is not None:
                 # Fast path: row count in filename, load single file
                 try:
-                    existing_df = pd.read_parquet(best_path)
+                    existing_df = read_parquet_matrix_file(best_path)
                     logger.info(f"Loaded existing master matrix: {len(existing_df)} trades (from {best_path.name})")
                 except Exception as e:
                     logger.debug(f"Could not load {best_path.name}: {e}")
@@ -323,7 +411,7 @@ def load_existing_matrix(output_dir: str) -> pd.DataFrame:
                 best_rows = 0
                 for pf in parquet_files[:10]:
                     try:
-                        df = pd.read_parquet(pf)
+                        df = read_parquet_matrix_file(pf)
                         if len(df) > best_rows:
                             best_rows = len(df)
                             best_df = df
@@ -399,7 +487,7 @@ def get_best_matrix_file(output_dir: str) -> Optional[Path]:
     best_rows = 0
     for pf in parquet_files[:10]:
         try:
-            df = pd.read_parquet(pf)
+            df = read_parquet_matrix_file(pf)
             if len(df) > best_rows:
                 best_rows = len(df)
                 best_path = pf

@@ -60,6 +60,8 @@ public static class HardFailClosedExecutionModel
         if (parity == null) return true;
         if (parity.Status == JournalParityStatus.INSUFFICIENT_DATA)
             return false;
+        if (parity.Status == JournalParityStatus.PARITY_PENDING_ALIGNMENT)
+            return false;
         if (!parity.IsOk) return true;
         return authority != PositionAuthorityState.REAL_DOMINANT;
     }

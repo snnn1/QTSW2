@@ -71,7 +71,9 @@ def test_live_publish_final_allowed_false_disables_all_streams(tmp_path, monkeyp
             }
         )
     df = pd.DataFrame(rows)
-    eng.write_execution_timetable_from_master_matrix(df, execution_mode=True)
+    eng.write_execution_timetable_from_master_matrix(
+        df, trade_date="2026-04-02", execution_mode=True
+    )
     doc = json.loads(
         (tmp_path / "data" / "timetable" / "timetable_current.json").read_text(encoding="utf-8")
     )

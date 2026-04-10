@@ -17,10 +17,17 @@ export default defineConfig({
   server: {
     port: 5174,
     host: true,
+    // NOTE: Restart Vite dev server after changing proxy
     proxy: {
+      // More specific prefix first so /api/watchdog is not swallowed by /api
       '/api/watchdog': {
         target: 'http://127.0.0.1:8002',
         changeOrigin: true,
+      },
+      '/api': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+        secure: false,
       },
     },
     fs: {

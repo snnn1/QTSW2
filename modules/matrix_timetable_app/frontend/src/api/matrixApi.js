@@ -7,9 +7,10 @@
 
 import { devLog } from '../utils/logger'
 
-// API base URL - can be overridden via environment variable
+// Default: same-origin `/api` so Vite dev proxy can forward to FastAPI. Override with VITE_API_BASE (e.g. absolute URL ending in /api) for production split-host.
 const API_PORT = import.meta.env.VITE_API_PORT || '8000'
-const API_BASE = `http://localhost:${API_PORT}/api`
+const API_BASE =
+  (import.meta.env.VITE_API_BASE && String(import.meta.env.VITE_API_BASE).trim()) || '/api'
 
 /**
  * Check if backend is reachable
@@ -18,9 +19,12 @@ export async function checkBackendHealth(timeoutMs = 3000) {
   try {
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
-    await fetch(`${API_BASE.replace('/api', '')}/`, {
+    const healthUrl = API_BASE.startsWith('http')
+      ? `${new URL(API_BASE).origin}/`
+      : '/'
+    await fetch(healthUrl, {
       method: 'GET',
-      signal: controller.signal
+      signal: controller.signal,
     })
     clearTimeout(timeoutId)
     return { success: true }
@@ -187,18 +191,32 @@ export async function getProfitBreakdown({
 
 /**
  * Generate timetable for a trading day (uses RS calculation)
+ * Prefer snake_case keys (matches POST JSON). CamelCase aliases supported for callers.
  */
-export async function generateTimetable({ date, analyzerRunsDir = 'data/analyzed', scfThreshold = 0.5 }) {
+export async function generateTimetable({
+  date,
+  analyzer_runs_dir,
+  scf_threshold,
+  analyzerRunsDir,
+  scfThreshold,
+} = {}) {
+  const runsDir = analyzer_runs_dir ?? analyzerRunsDir ?? 'data/analyzed'
+  const scf = scf_threshold ?? scfThreshold ?? 0.5
+  const payload = {
+    analyzer_runs_dir: runsDir,
+    scf_threshold: scf,
+  }
+  if (date != null && String(date).trim() !== '') {
+    payload.date = String(date).trim()
+  }
+  // TEMP audit (remove after debugging)
+  console.log('API_REQUEST', '/api/timetable/generate', payload)
   const response = await fetch(`${API_BASE}/timetable/generate`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json'
     },
-    body: JSON.stringify({
-      date,
-      analyzer_runs_dir: analyzerRunsDir,
-      scf_threshold: scfThreshold
-    })
+    body: JSON.stringify(payload)
   })
 
   if (!response.ok) {
@@ -337,6 +355,8 @@ export async function saveExecutionTimetable({
       payload.stream_filters = apiFilters
     }
   }
+  // TEMP audit (remove after debugging)
+  console.log('API_REQUEST', '/api/timetable/execution', payload)
   const response = await fetch(`${API_BASE}/timetable/execution`, {
     method: 'POST',
     headers: {

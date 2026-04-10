@@ -24,6 +24,7 @@ using NinjaTrader.Data;
 using NinjaTrader.NinjaScript;
 using NinjaTrader.NinjaScript.Strategies;
 using QTSW2.Robot.Core;
+using QTSW2.Robot.Core.Diagnostics;
 using QTSW2.Robot.Core.Execution;
 using CoreBar = QTSW2.Robot.Core.Bar; // Alias to avoid ambiguity with NinjaTrader.Data.Bar
 
@@ -2252,6 +2253,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                     return;
                 }
+
+                if (IeExecutionLatencyTrace.IsEnabled && e.Order != null &&
+                    e.Order.OrderState == OrderState.Filled)
+                {
+                    var instKeyOu = ExecutionUpdateRouter.GetExecutionInstrumentKeyFromOrder(e.Order.Instrument);
+                    IeExecutionLatencyTrace.Write("STRATEGY_ON_ORDER_UPDATE_FILLED", e.Order, null, instKeyOu, null, 0);
+                }
                 
                 // Update broker sync gate timestamp (before forwarding to adapter)
                 var utcNow = DateTimeOffset.UtcNow;
@@ -2320,6 +2328,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                     });
                     return;
                 }
+
+                var fillQtyStrategy = 0;
+                try
+                {
+                    fillQtyStrategy = (int)e.Execution.Quantity;
+                }
+                catch
+                {
+                    /* ignore */
+                }
+
+                IeExecutionLatencyTrace.Write("STRATEGY_ON_EXECUTION_UPDATE", e.Execution.Order, e.Execution, orderInstrumentKey,
+                    ieaInstanceId: null, fillQtyStrategy);
 
                 // Update broker sync gate timestamp (before forwarding)
                 _engine.OnBrokerExecutionUpdateObserved(DateTimeOffset.UtcNow);

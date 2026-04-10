@@ -461,12 +461,16 @@ public sealed partial class NinjaTraderSimAdapter
     /// <inheritdoc cref="IExecutionAdapter.TryTriggerHardFlatten"/>
     public bool TryTriggerHardFlatten(string instrument, string reason, DateTimeOffset utcNow)
     {
+        var methodSw = Stopwatch.StartNew();
         var inst = instrument?.Trim() ?? "";
-        if (string.IsNullOrEmpty(inst)) return false;
-        if (!HardFailClosedExecutionModel.TryArmOneShotBrokerFlatten(inst))
-            return true;
+        OrderUpdateIntegrityForensicTrace.Step("TRY_TRIGGER_HARD_FLATTEN_ENTER", detail: inst + "|" + (reason ?? ""));
+        try
+        {
+            if (string.IsNullOrEmpty(inst)) return false;
+            if (!HardFailClosedExecutionModel.TryArmOneShotBrokerFlatten(inst))
+                return true;
 
-        _log.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "CRITICAL_UNSAFE_STATE_DETECTED",
+            _log.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "CRITICAL_UNSAFE_STATE_DETECTED",
             new { instrument = inst, reason, model = "hard_fail_closed" }));
         _log.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "HARD_FLATTEN_TRIGGERED",
             new { instrument = inst, reason, path = "account_flatten_broker_only" }));
@@ -496,21 +500,34 @@ public sealed partial class NinjaTraderSimAdapter
             return false;
         }
 
-        try
-        {
-            account.Flatten(new List<Instrument> { ntInst });
-        }
-        catch (Exception ex)
-        {
-            _log.Write(RobotEvents.EngineBase(utcNow, "", "HARD_FLATTEN_BROKER_FAILED", "ENGINE",
-                new { instrument = inst, error = ex.Message, exception_type = ex.GetType().Name }));
-        }
+            var flattenSw = Stopwatch.StartNew();
+            OrderUpdateIntegrityForensicTrace.Step("NT_ACCOUNT_FLATTEN_BEFORE", detail: inst);
+            try
+            {
+                account.Flatten(new List<Instrument> { ntInst });
+            }
+            catch (Exception ex)
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, "", "HARD_FLATTEN_BROKER_FAILED", "ENGINE",
+                    new { instrument = inst, error = ex.Message, exception_type = ex.GetType().Name }));
+            }
+            finally
+            {
+                OrderUpdateIntegrityForensicTrace.Step("NT_ACCOUNT_FLATTEN_AFTER", sectionElapsedMs: flattenSw.ElapsedMilliseconds,
+                    detail: inst);
+            }
 
-        ExecutionSafetyGate.ApplyUnmappedExecutionKillSwitch(inst, reason ?? "hard_fail_closed_flatten", utcNow);
-        HardFailClosedExecutionModel.MarkExecutionLocked(inst);
-        _log.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "EXECUTION_LOCKED_UNSAFE_STATE",
-            new { instrument = inst, reason }));
-        return true;
+            ExecutionSafetyGate.ApplyUnmappedExecutionKillSwitch(inst, reason ?? "hard_fail_closed_flatten", utcNow);
+            HardFailClosedExecutionModel.MarkExecutionLocked(inst);
+            _log.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "EXECUTION_LOCKED_UNSAFE_STATE",
+                new { instrument = inst, reason }));
+            return true;
+        }
+        finally
+        {
+            OrderUpdateIntegrityForensicTrace.Step("TRY_TRIGGER_HARD_FLATTEN_EXIT", sectionElapsedMs: methodSw.ElapsedMilliseconds,
+                detail: inst);
+        }
     }
 
     /// <summary>
@@ -700,6 +717,11 @@ public sealed partial class NinjaTraderSimAdapter
                     SetProtectionState(intentId, ProtectionState.Submitted);
                     _iea?.TryTransitionIntentLifecycle(intentId, IntentLifecycleTransition.PROTECTIVES_PLACED, null, cmd.UtcNow);
                 }
+                _onMismatchExecutionTrigger?.Invoke(intent.Instrument!.Trim(), cmd.UtcNow, new MismatchExecutionTriggerDetails
+                {
+                    IntentId = intentId,
+                    EntryToProtectivesTransition = true
+                });
                 return;
             }
         }
@@ -2763,6 +2785,9 @@ public sealed partial class NinjaTraderSimAdapter
 
         if (string.IsNullOrEmpty(intentId)) return; // strict: non-robot orders ignored
 
+        using var _orderUpdateForensic = OrderUpdateIntegrityForensicTrace.BeginHandleOrderUpdateScope(orderIdTrace, intentId,
+            instrumentTrace, orderState.ToString());
+
         // Pre-ack / post-ack: Sim may report a new OrderId on the Order while registry + OrderMap still key the id from submit.
         TryLinkBrokerOrderIdFromOrderUpdate(order, intentId, encodedTag, parsed.Leg, utcNow);
 
@@ -2944,11 +2969,14 @@ public sealed partial class NinjaTraderSimAdapter
         var instKey = orderInfo.Instrument.Trim();
         _executionTrace?.WriteExecutionTrace(utcNow, "NotifyExecutionTrigger", "before_notify", instKey, intentId,
             order.OrderId ?? "", "", 0, orderState.ToString());
+        OrderUpdateIntegrityForensicTrace.Step("MISMATCH_TRIGGER_BEFORE");
         _onMismatchExecutionTrigger?.Invoke(instKey, utcNow, new MismatchExecutionTriggerDetails
         {
             IntentId = intentId,
-            FillDelta = 0
+            FillDelta = 0,
+            SuppressHardJournalIntegrityActions = orderState == OrderState.Filled
         });
+        OrderUpdateIntegrityForensicTrace.Step("MISMATCH_TRIGGER_AFTER");
         _executionTrace?.WriteExecutionTrace(utcNow, "NotifyExecutionTrigger", "after_notify", instKey, intentId,
             order.OrderId ?? "", "", 0, orderState.ToString());
 
@@ -3953,6 +3981,18 @@ public sealed partial class NinjaTraderSimAdapter
                 order_role = regEntry.OrderRole.ToString(),
                 ownership_status = regEntry.OwnershipStatus.ToString()
             }));
+            var fillQtyResolved = 0;
+            try
+            {
+                fillQtyResolved = (int)fillQuantity;
+            }
+            catch
+            {
+                /* ignore */
+            }
+
+            IeExecutionLatencyTrace.WriteResolved("ORDER_REGISTRY_EXEC_RESOLVED",
+                order.OrderId?.ToString() ?? "", intentId ?? "", orderInfo.Instrument, _iea?.InstanceId.ToString(), fillQtyResolved);
         }
 
         if (orderInfo == null && !OrderMap.TryGetValue(intentId, out orderInfo))
@@ -4054,6 +4094,15 @@ public sealed partial class NinjaTraderSimAdapter
                             ContractMultiplier = contractMultiplier,
                             Tag = encodedTag
                         };
+                        string? brokerExecIdAdopt = null;
+                        try { brokerExecIdAdopt = execution.ExecutionId as string; } catch { }
+                        var fillQtyAdopt = (int)fillQuantity;
+                        var adoptParityBase = ComputeFillGroupId(brokerExecIdAdopt, brokerOrderIdStr, brokerOrderIdStr,
+                            utcNow.ToString("o"), fillPrice, fillQtyAdopt);
+                        var adoptParityKey = adoptParityBase + "|" + context.IntentId;
+                        var adoptSign = string.Equals(context.Direction, "Short", StringComparison.OrdinalIgnoreCase) ? -1 : 1;
+                        JournalParityPendingLedger.TryRecordTrustedFill(context.ExecutionInstrument.Trim(), adoptParityKey,
+                            adoptSign * fillQtyAdopt, context.IntentId, utcNow);
                         _executionJournal.RecordEntryFill(
                             context.IntentId,
                             context.TradingDate,
@@ -4065,7 +4114,8 @@ public sealed partial class NinjaTraderSimAdapter
                             context.Direction,
                             context.ExecutionInstrument,
                             context.CanonicalInstrument,
-                            brokerOrderInstrumentKey: instrumentForResolve);
+                            brokerOrderInstrumentKey: instrumentForResolve,
+                            parityPendingDedupeKey: adoptParityKey);
                         _log.Write(RobotEvents.ExecutionBase(utcNow, adoptedRecord.IntentId, instrumentForResolve, "ADOPTED_ORDER_FILL_JOURNALED", new
                         {
                             broker_order_id = brokerOrderIdStr,
@@ -4210,7 +4260,8 @@ public sealed partial class NinjaTraderSimAdapter
         _onMismatchExecutionTrigger?.Invoke(instFill, utcNow, new MismatchExecutionTriggerDetails
         {
             IntentId = intentId,
-            FillDelta = fillQuantity
+            FillDelta = fillQuantity,
+            SuppressHardJournalIntegrityActions = true
         });
         _executionTrace?.WriteExecutionTrace(utcNow, "NotifyExecutionTrigger", "after_notify", instFill, intentId,
             brokerOrderId, brokerExecId ?? "", fillQuantity, ordStateFill);
@@ -4337,6 +4388,10 @@ public sealed partial class NinjaTraderSimAdapter
                     ContractMultiplier = context.ContractMultiplier,
                     Tag = context.Tag
                 };
+                var parityKeyAlloc = fillGroupId + "|" + allocIntentId;
+                var entrySignAlloc = string.Equals(allocContext.Direction, "Short", StringComparison.OrdinalIgnoreCase) ? -1 : 1;
+                JournalParityPendingLedger.TryRecordTrustedFill(allocContext.ExecutionInstrument.Trim(), parityKeyAlloc,
+                    entrySignAlloc * allocQty, allocIntentId, utcNow);
                 _executionJournal.RecordEntryFill(
                     allocContext.IntentId,
                     allocContext.TradingDate,
@@ -4348,7 +4403,8 @@ public sealed partial class NinjaTraderSimAdapter
                     allocContext.Direction,
                     allocContext.ExecutionInstrument,
                     allocContext.CanonicalInstrument,
-                    brokerOrderInstrumentKey: orderInfo.Instrument);
+                    brokerOrderInstrumentKey: orderInfo.Instrument,
+                    parityPendingDedupeKey: parityKeyAlloc);
                 entryFillJournalRecordedQty += allocQty;
                 var exposureInstrument = allocContext.CanonicalInstrument ?? allocIntent.Instrument ?? allocContext.ExecutionInstrument;
                 _coordinator?.OnEntryFill(allocContext.IntentId, allocQty, allocContext.Stream, exposureInstrument, allocContext.Direction ?? "", utcNow);

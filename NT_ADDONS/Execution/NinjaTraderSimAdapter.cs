@@ -2444,6 +2444,19 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
                 _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "IEA_EXEC_UPDATE_ROUTED", state: "ENGINE",
                     new { account_name = _iea.AccountName, execution_instrument_key = _iea.ExecutionInstrumentKey, iea_instance_id = _iea.InstanceId }));
             }
+            var fillQtyEnqueue = 0;
+            try
+            {
+                dynamic ex = execution;
+                fillQtyEnqueue = (int)(ex.Quantity ?? 0);
+            }
+            catch
+            {
+                /* ignore */
+            }
+
+            IeExecutionLatencyTrace.Write("ADAPTER_EXEC_ENQUEUE", order, execution, _iea.ExecutionInstrumentKey,
+                _iea.InstanceId.ToString(), fillQtyEnqueue);
             _iea.EnqueueExecutionUpdate(execution, order);
         }
         else

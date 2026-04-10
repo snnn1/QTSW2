@@ -853,6 +853,12 @@ class TimetableRollbackRequest(BaseModel):
 @app.post("/api/timetable/generate")
 async def generate_timetable(request: TimetableRequest):
     """Generate timetable for a trading day. Matrix-first: no analyzer reads when matrix exists."""
+    # TEMP audit (remove after debugging)
+    print("BACKEND_ENDPOINT_HIT", "generate")
+    print(
+        "REQUEST_BODY",
+        request.model_dump() if hasattr(request, "model_dump") else request.dict(),
+    )
     try:
         import sys
         sys.path.insert(0, str(QTSW2_ROOT))
@@ -869,7 +875,14 @@ async def generate_timetable(request: TimetableRequest):
         def _generate_timetable_sync():
             """Matrix-first: use matrix when available (no analyzer reads for RS/SCF)"""
             from datetime import datetime, timezone
-            from modules.timetable.cme_session import get_cme_trading_date
+
+            from modules.session_authority.models import SessionAuthorityState
+            from modules.session_authority.store import (
+                SessionAuthorityRequiredError,
+                load_persisted_strict,
+                read_next_version,
+                save_authority,
+            )
             from modules.timetable.timetable_supervisor import timetable_publish_blocking
 
             with timetable_publish_blocking():
@@ -880,20 +893,46 @@ async def generate_timetable(request: TimetableRequest):
                         "Save or rebuild the matrix in this server process before generating the timetable."
                     )
                 if not matrix_df.empty:
-                    session_td = (request.date or "").strip() or get_cme_trading_date(datetime.now(timezone.utc))
+                    explicit_date = bool((request.date or "").strip())
+                    if explicit_date:
+                        d = (request.date or "").strip()
+                        st = SessionAuthorityState(
+                            mode="manual",
+                            session_trading_date=d,
+                            source="user",
+                            locked=True,
+                            set_at_utc=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                            set_by="POST /api/timetable/generate",
+                            reason="manual_generate_request",
+                            version=read_next_version(QTSW2_ROOT),
+                        )
+                        save_authority(QTSW2_ROOT, st)
+                        session_td = d
+                    else:
+                        try:
+                            auth = load_persisted_strict(QTSW2_ROOT)
+                        except SessionAuthorityRequiredError as e:
+                            raise RuntimeError(str(e)) from e
+                        session_td = auth.session_trading_date
+
+                    _gen_pub = {
+                        "source": "manual" if explicit_date else "auto",
+                        "manual_session": explicit_date,
+                        "reason": "publish",
+                        "caller": "POST /api/timetable/generate",
+                        "matrix_source": "in_memory",
+                    }
                     engine.write_execution_timetable_from_master_matrix(
                         matrix_df,
                         trade_date=session_td,
                         execution_mode=True,
-                        publish_context={
-                            "source": "manual",
-                            "reason": "publish",
-                            "caller": "POST /api/timetable/generate",
-                            "matrix_source": "in_memory",
-                        },
+                        publish_context=_gen_pub,
                     )
                     return engine.build_timetable_dataframe_from_master_matrix(
-                        matrix_df, trade_date=session_td, execution_mode=True
+                        matrix_df,
+                        trade_date=session_td,
+                        execution_mode=True,
+                        publish_context=_gen_pub,
                     )
                 raise ValueError(
                     "Master matrix is empty in memory — build or reload the matrix in this server, then try again."
@@ -905,6 +944,8 @@ async def generate_timetable(request: TimetableRequest):
             if "TIMETABLE_PUBLISH_BLOCKED" in str(e):
                 raise HTTPException(status_code=400, detail=str(e)) from e
             if "TIMETABLE_NO_IN_MEMORY_MATRIX" in str(e):
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            if "SESSION_AUTHORITY_REQUIRED" in str(e):
                 raise HTTPException(status_code=400, detail=str(e)) from e
             raise
         except ValueError as ve:
@@ -944,6 +985,12 @@ async def generate_timetable(request: TimetableRequest):
 @app.post("/api/timetable/execution")
 async def save_execution_timetable(request: ExecutionTimetableRequest):
     """Publish execution timetable from in-memory master matrix (same snapshot as save_master_matrix)."""
+    # TEMP audit (remove after debugging)
+    print("BACKEND_ENDPOINT_HIT", "execution")
+    print(
+        "REQUEST_BODY",
+        request.model_dump() if hasattr(request, "model_dump") else request.dict(),
+    )
     try:
         sys.path.insert(0, str(QTSW2_ROOT))
         from modules.matrix.file_manager import get_current_master_matrix_df
@@ -983,6 +1030,16 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
         }
 
         def _publish_sync():
+            from datetime import datetime, timezone
+
+            from modules.session_authority.models import SessionAuthorityState
+            from modules.session_authority.store import (
+                SessionAuthorityRequiredError,
+                load_persisted_strict,
+                read_next_version,
+                save_authority,
+            )
+
             with timetable_publish_blocking():
                 matrix_df = get_current_master_matrix_df()
                 if matrix_df is None:
@@ -1003,6 +1060,17 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
                     td = (request.trading_date or "").strip()
                     if not td:
                         raise ValueError("replay=True requires trading_date (YYYY-MM-DD)")
+                    st = SessionAuthorityState(
+                        mode="replay",
+                        session_trading_date=td,
+                        source="replay",
+                        locked=True,
+                        set_at_utc=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        set_by="POST /api/timetable/execution",
+                        reason="replay_publish",
+                        version=read_next_version(QTSW2_ROOT),
+                    )
+                    save_authority(QTSW2_ROOT, st)
                     return engine.write_execution_timetable_from_master_matrix(
                         matrix_df,
                         trade_date=td,
@@ -1011,11 +1079,19 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
                         stream_filters=request.stream_filters,
                         publish_context=pub_ctx,
                     )
+                try:
+                    auth = load_persisted_strict(QTSW2_ROOT)
+                except SessionAuthorityRequiredError as e:
+                    raise RuntimeError(str(e)) from e
+                session_td = auth.session_trading_date
+                pub_live = dict(pub_ctx)
+                pub_live["authority_mode"] = auth.mode
                 return engine.write_execution_timetable_from_master_matrix(
                     matrix_df,
+                    trade_date=session_td,
                     execution_mode=True,
                     stream_filters=request.stream_filters,
-                    publish_context=pub_ctx,
+                    publish_context=pub_live,
                 )
 
         try:
@@ -1029,6 +1105,8 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
                 raise HTTPException(status_code=400, detail=str(e)) from e
             if "TIMETABLE_NO_IN_MEMORY_MATRIX" in str(e):
                 logging.error("TIMETABLE_EXECUTION_NO_IN_MEMORY_MATRIX: %s", e)
+                raise HTTPException(status_code=400, detail=str(e)) from e
+            if "SESSION_AUTHORITY_REQUIRED" in str(e):
                 raise HTTPException(status_code=400, detail=str(e)) from e
             raise
         except ValueError as e:
@@ -1266,6 +1344,42 @@ def _finalize_current_timetable_api_payload(timetable: dict, utc_now: datetime) 
     out.setdefault("version_timestamp", "")
 
     return out
+
+
+@app.get("/api/session/authority")
+async def get_session_authority():
+    """
+    Read-only SessionAuthority observability (Phase 1).
+
+    Returns persisted ``data/session/session_authority.json`` when present and valid;
+    otherwise a synthetic auto state from canonical CME (not written). Does not change
+    timetable or matrix writers.
+    """
+    try:
+        sys.path.insert(0, str(QTSW2_ROOT))
+        from modules.session_authority import get_session_authority_observation
+
+        obs = get_session_authority_observation(QTSW2_ROOT)
+        return obs.model_dump(mode="json")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Session authority observation failed: {e}") from e
+
+
+@app.post("/api/session/authority/initialize_auto")
+async def post_session_authority_initialize_auto():
+    """
+    Model A: persist auto SessionAuthority from canonical CME (explicit bootstrap).
+
+    Required before live timetable publish when no authority file exists yet.
+    """
+    try:
+        sys.path.insert(0, str(QTSW2_ROOT))
+        from modules.session_authority import initialize_auto_authority
+
+        st = initialize_auto_authority(QTSW2_ROOT)
+        return {"status": "ok", "state": st.model_dump(mode="json")}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Session authority initialize_auto failed: {e}") from e
 
 
 @app.get("/api/timetable/current")

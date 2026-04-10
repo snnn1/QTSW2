@@ -582,6 +582,29 @@ def get_execution_slot_from_latest_row(
     return norm_to_display[picked_norm], True
 
 
+def _resolve_execution_matrix_as_of_session(
+    execution_replay: bool,
+    explicit: Optional[bool],
+    publish_context: Optional[Dict[str, Any]],
+) -> bool:
+    """
+    Manual/replay (and optional explicit override) use matrix rows with trade_date <= session_trading_date.
+    Auto/live uses max(trade_date) per stream (latest row).
+    """
+    if explicit is not None:
+        return explicit
+    if execution_replay:
+        return True
+    pub = publish_context or {}
+    if pub.get("manual_session"):
+        return True
+    if pub.get("source") == "manual":
+        return True
+    if pub.get("authority_mode") in ("manual", "replay"):
+        return True
+    return False
+
+
 def get_execution_stream_enablement(
     master_matrix_df: pd.DataFrame,
     stream_id: str,
@@ -591,6 +614,7 @@ def get_execution_stream_enablement(
     filter_dow_name: str,
     filter_dow: int,
     filter_dom: int,
+    as_of_session_day: Optional[date] = None,
 ) -> Tuple[bool, Optional[str], Dict[str, Any]]:
     """
     Latest-row matrix (non-calendar) gate + session calendar (DOW/DOM) and ``block_reason``.
@@ -603,7 +627,9 @@ def get_execution_stream_enablement(
         m_nc_ok,
         m_fr,
         m_suf,
-    ) = _matrix_latest_row_execution_non_calendar_split(master_matrix_df, stream_id)
+    ) = _matrix_latest_row_execution_non_calendar_split(
+        master_matrix_df, stream_id, as_of_session_day
+    )
 
     calendar_eval = _execution_session_calendar_filters_eval(
         stream_id,
@@ -687,6 +713,7 @@ def _strip_matrix_row_calendar_filter_reason_tokens(filter_reasons: str) -> str:
 def _matrix_latest_row_execution_non_calendar_split(
     master_matrix_df: pd.DataFrame,
     stream_id: str,
+    as_of_session_day: Optional[date] = None,
 ) -> Tuple[bool, bool, str, str]:
     """
     Latest row (max trade_date) split for execution gating.
@@ -699,7 +726,9 @@ def _matrix_latest_row_execution_non_calendar_split(
         matrix_non_calendar_block_suffix: text for ``matrix_filter_blocked:`` only;
             stripped of dow_filter/dom_filter; empty when not blocked on non-calendar causes.
     """
-    raw_ok, fr = _matrix_latest_row_final_allowed_for_stream(master_matrix_df, stream_id)
+    raw_ok, fr = _matrix_latest_row_final_allowed_for_stream(
+        master_matrix_df, stream_id, as_of_session_day
+    )
     fr = fr or ""
     fr_st = fr.strip()
     ncal_only = _strip_matrix_row_calendar_filter_reason_tokens(fr)
@@ -720,33 +749,30 @@ def _matrix_latest_row_execution_non_calendar_split(
 def _matrix_latest_row_final_allowed_for_stream(
     master_matrix_df: pd.DataFrame,
     stream_id: str,
+    as_of_session_day: Optional[date] = None,
 ) -> Tuple[bool, str]:
     """
-    Latest matrix state per stream: row with max ``trade_date`` for that ``stream_id``.
-    Returns ``(final_allowed`` is strictly True, ``filter_reasons`` text).
-
-    Execution publish uses ``_matrix_latest_row_execution_non_calendar_split`` so row ``trade_date``
-    DOW/DOM do not veto a different ``session_trading_date``.
+    Matrix state per stream: max ``trade_date`` row for ``stream_id``, optionally capped at
+    ``as_of_session_day`` (manual/replay execution builds). When ``as_of_session_day`` is None,
+    uses global latest row (auto/live).
     """
-    if master_matrix_df.empty or "Stream" not in master_matrix_df.columns:
+    r = _matrix_latest_row_series_for_stream(
+        master_matrix_df, stream_id, as_of_session_day
+    )
+    if r is None:
         return False, ""
-    sub = master_matrix_df[master_matrix_df["Stream"] == stream_id]
-    if sub.empty:
-        return False, ""
-    if "trade_date" not in master_matrix_df.columns:
-        return _matrix_row_series_to_final_allowed(sub.iloc[0])
-    sub_td = sub.dropna(subset=["trade_date"])
-    if sub_td.empty:
-        return False, ""
-    latest = sub_td.sort_values("trade_date", ascending=False).iloc[0]
-    return _matrix_row_series_to_final_allowed(latest)
+    return _matrix_row_series_to_final_allowed(r)
 
 
 def _matrix_latest_row_series_for_stream(
     master_matrix_df: pd.DataFrame,
     stream_id: str,
+    as_of_session_day: Optional[date] = None,
 ) -> Optional[pd.Series]:
-    """Row with max ``trade_date`` for ``stream_id`` (same row as execution enablement)."""
+    """
+    Row with max ``trade_date`` for ``stream_id`` among rows on/before ``as_of_session_day`` when set;
+    otherwise max ``trade_date`` overall (auto/live).
+    """
     if master_matrix_df.empty or "Stream" not in master_matrix_df.columns:
         return None
     sub = master_matrix_df[master_matrix_df["Stream"] == stream_id]
@@ -757,6 +783,12 @@ def _matrix_latest_row_series_for_stream(
     sub_td = sub.dropna(subset=["trade_date"])
     if sub_td.empty:
         return None
+    if as_of_session_day is not None:
+        td_dates = sub_td["trade_date"].dt.date
+        eligible = sub_td[td_dates <= as_of_session_day]
+        if eligible.empty:
+            return None
+        return eligible.sort_values("trade_date", ascending=False).iloc[0]
     return sub_td.sort_values("trade_date", ascending=False).iloc[0]
 
 
@@ -1297,6 +1329,7 @@ class TimetableEngine:
         execution_mode: bool = False,
         replay: bool = False,
         publish_context: Optional[Dict[str, Any]] = None,
+        execution_matrix_as_of_session: Optional[bool] = None,
     ) -> Optional[TimetablePublishResult]:
         """
         Write execution timetable from master matrix data.
@@ -1314,6 +1347,9 @@ class TimetableEngine:
             execution_mode: If True, matrix-backed execution streams with calendar DOW/DOM from ``stream_filters``.
             replay: If True with execution_mode, ``trade_date`` pins ``session_trading_date`` and CME check is off.
             publish_context: Optional ``{"source": "...", "reason": "..."}`` for audit / history metadata.
+            execution_matrix_as_of_session: Optional override for matrix row selection (see
+                ``_resolve_execution_matrix_as_of_session``). When None, derived from ``replay`` and
+                ``publish_context`` (``manual_session``, ``source``, ``authority_mode``).
         """
         utc_now = datetime.now(timezone.utc)
         if execution_mode:
@@ -1325,7 +1361,14 @@ class TimetableEngine:
                         "requires trade_date (YYYY-MM-DD)"
                     )
             else:
-                session_trading_date = get_cme_trading_date(utc_now)
+                explicit_td = (trade_date or "").strip()
+                if not explicit_td:
+                    raise ValueError(
+                        "write_execution_timetable_from_master_matrix(..., execution_mode=True, replay=False) "
+                        "requires trade_date (YYYY-MM-DD). Session must be supplied by SessionAuthority / caller; "
+                        "the engine does not infer live session from wall clock."
+                    )
+                session_trading_date = explicit_td
         else:
             if not self.timetable_output_dir:
                 raise TimetableLivePublishBlocked(
@@ -1334,15 +1377,23 @@ class TimetableEngine:
                     "Live timetable_current.json requires execution_mode=True (matrix pipeline / CME session)."
                 )
             session_trading_date = (trade_date or "").strip() or get_cme_trading_date(utc_now)
+        resolved_matrix_as_of = _resolve_execution_matrix_as_of_session(
+            replay,
+            execution_matrix_as_of_session,
+            publish_context,
+        )
         streams = self.build_streams_from_master_matrix(
             master_matrix_df,
             session_trading_date,
             stream_filters,
             execution_mode,
             execution_replay=replay,
+            execution_matrix_as_of_session=resolved_matrix_as_of,
         )
         if not streams:
             return None
+        # TEMP audit (remove after debugging)
+        print("WRITING_TIMETABLE_SESSION_DATE", session_trading_date)
         eligibility_trade_date = eligibility_trade_date_ymd_from_matrix_df(master_matrix_df)
         if execution_mode:
             _log_execution_timetable_audit_snapshot(
@@ -1381,13 +1432,15 @@ class TimetableEngine:
                 "matrix_source": pub_out.get("matrix_source", "unknown"),
             }
 
+        # CME equality on disk only when session came from wall-clock default (not caller-provided trade_date).
+        explicit_trade_for_session = bool((trade_date or "").strip()) if execution_mode and not replay else False
         return self._publish_live_execution_timetable_versioned(
             streams,
             session_trading_date,
             execution_document_source=doc_source,
             ledger_writer="matrix",
             ledger_source="master_matrix",
-            enforce_cme_live=execution_mode and not replay,
+            enforce_cme_live=(execution_mode and not replay) and not explicit_trade_for_session,
             publish_context=pub_out,
             eligibility_trade_date=eligibility_trade_date,
         )
@@ -1398,6 +1451,7 @@ class TimetableEngine:
         trade_date: Optional[str] = None,
         stream_filters: Optional[Dict] = None,
         execution_mode: bool = False,
+        publish_context: Optional[Dict[str, Any]] = None,
     ) -> pd.DataFrame:
         """
         Build timetable DataFrame from master matrix (no analyzer reads).
@@ -1407,11 +1461,22 @@ class TimetableEngine:
         """
         utc_now = datetime.now(timezone.utc)
         if execution_mode:
-            eff_trade_date = get_cme_trading_date(utc_now)
+            explicit_td = (trade_date or "").strip()
+            eff_trade_date = explicit_td or get_cme_trading_date(utc_now)
         else:
             eff_trade_date = trade_date
+        resolved_df_as_of = (
+            _resolve_execution_matrix_as_of_session(False, None, publish_context)
+            if execution_mode
+            else False
+        )
         streams = self.build_streams_from_master_matrix(
-            master_matrix_df, eff_trade_date, stream_filters, execution_mode
+            master_matrix_df,
+            eff_trade_date,
+            stream_filters,
+            execution_mode,
+            execution_replay=False,
+            execution_matrix_as_of_session=resolved_df_as_of,
         )
         if not streams:
             return pd.DataFrame()
@@ -1478,6 +1543,7 @@ class TimetableEngine:
         stream_filters: Optional[Dict] = None,
         execution_mode: bool = False,
         execution_replay: bool = False,
+        execution_matrix_as_of_session: bool = False,
     ) -> List[Dict]:
         """
         Build streams list (enabled/block_reason per stream) from master matrix.
@@ -1485,8 +1551,8 @@ class TimetableEngine:
         When execution_mode=True: ``enabled`` requires valid slot, **latest** matrix row ``final_allowed``
         (max ``trade_date`` per stream), and **DOW/DOM** from merged ``stream_filters`` on
         ``session_trading_date`` (exclude_times does not gate ``enabled``). Slot times from matrix Time /
-        Time Change. Live execution ignores ``trade_date`` for session/matrix day:
-        ``get_cme_trading_date(now)`` only.
+        Time Change. Live execution uses non-empty ``trade_date`` as session day; otherwise
+        ``get_cme_trading_date(now)``.
         Use ``execution_replay=True`` and ``trade_date=YYYY-MM-DD`` to pin session (tests / replay writes).
         """
         if master_matrix_df.empty:
@@ -1500,9 +1566,9 @@ class TimetableEngine:
                         )
                     trade_date_obj_empty = pd.to_datetime(pin).date()
                 else:
-                    trade_date_obj_empty = pd.to_datetime(
-                        get_cme_trading_date(datetime.now(timezone.utc))
-                    ).date()
+                    td_pin = (trade_date or "").strip()
+                    session_day = td_pin or get_cme_trading_date(datetime.now(timezone.utc))
+                    trade_date_obj_empty = pd.to_datetime(session_day).date()
                 eff_empty = _merge_stream_filters_for_execution(
                     self._project_root, stream_filters, require_non_empty=False
                 )
@@ -1541,15 +1607,20 @@ class TimetableEngine:
                         "requires trade_date (YYYY-MM-DD)"
                     )
                 session_trading_date_ymd = pd.to_datetime(pin).date().isoformat()
+                session_source = "replay_pin"
             else:
-                session_trading_date_ymd = get_cme_trading_date(datetime.now(timezone.utc))
+                explicit_td = (trade_date or "").strip()
+                session_trading_date_ymd = explicit_td or get_cme_trading_date(
+                    datetime.now(timezone.utc)
+                )
+                session_source = "explicit_trade_date" if explicit_td else "get_cme_trading_date"
             trade_date_obj = pd.to_datetime(session_trading_date_ymd).date()
             logger.info(
                 "PATH_B_EXECUTION_MODE: session_trading_date=%s (%s); "
                 "enabled=matrix(valid_slot+latest_row_final_allowed+DOW/DOM_on_session_day); "
                 "stream_filters merged keys=%s (DOW/DOM gate; exclude_times does not gate)",
                 session_trading_date_ymd,
-                "replay_pin" if execution_replay else "get_cme_trading_date",
+                session_source,
                 len(eff_stream_filters),
             )
             return self._build_streams_execution_mode(
@@ -1557,6 +1628,7 @@ class TimetableEngine:
                 trade_date_obj,
                 session_trading_date_ymd,
                 eff_stream_filters,
+                matrix_as_of_session=execution_matrix_as_of_session,
             )
 
         # Get latest date from master matrix if not provided (non-execution only)
@@ -1854,6 +1926,8 @@ class TimetableEngine:
         trade_date_obj: date,
         session_trading_date: str,
         stream_filters: Dict,
+        *,
+        matrix_as_of_session: bool = False,
     ) -> List[Dict]:
         """
         Live execution: **slot_time** and **non-calendar enablement** both come from the **same** matrix row:
@@ -1868,6 +1942,9 @@ class TimetableEngine:
 
         **Enablement:** ``get_execution_stream_enablement`` → ``has_valid_slot AND matrix_non_calendar_ok AND
         dow_pass AND dom_pass``.
+
+        **Matrix row:** When ``matrix_as_of_session`` is False (auto/live), use max(trade_date) per stream.
+        When True (manual/replay), use max(trade_date) among rows with trade_date <= session_trading_date.
 
         ``trade_date_obj`` is ignored for slot/enabled structure; a warning is logged if it differs from
         ``slot_date_obj`` parsed from ``session_trading_date``.
@@ -1908,11 +1985,19 @@ class TimetableEngine:
                 slot_date_obj.isoformat(),
             )
 
+        as_of_day: Optional[date] = slot_date_obj if matrix_as_of_session else None
+        logger.info(
+            "EXECUTION_MATRIX_ROW_SELECTION as_of_session=%s as_of_day=%s session=%s",
+            matrix_as_of_session,
+            as_of_day.isoformat() if as_of_day else None,
+            session_trading_date,
+        )
+
         streams_dict: Dict[str, Dict[str, Any]] = {}
 
         for stream_id in self.streams:
             session = "S1" if stream_id.endswith("1") else "S2"
-            r = _matrix_latest_row_series_for_stream(master_matrix_df, stream_id)
+            r = _matrix_latest_row_series_for_stream(master_matrix_df, stream_id, as_of_day)
             time, has_valid_slot = get_execution_slot_from_latest_row(
                 r,
                 stream_id,
@@ -1928,6 +2013,7 @@ class TimetableEngine:
                 filter_dow_name,
                 filter_dow,
                 filter_dom,
+                as_of_session_day=as_of_day,
             )
             logger.debug(
                 "STREAM_EXECUTION stream=%s slot_date=%s has_slot=%s m_final_allowed_raw=%s "
@@ -2100,6 +2186,8 @@ class TimetableEngine:
             "source": doc_source,
             "streams": streams_copy,
         }
+        if ctx.get("manual_session") is True:
+            execution_base["manual_session"] = True
         if eligibility_trade_date:
             execution_base["eligibility_trade_date"] = str(eligibility_trade_date).strip()
         full_doc = {
@@ -2135,6 +2223,8 @@ class TimetableEngine:
             "previous_hash": previous_hash or "",
             "version_timestamp": version_ts,
         }
+        if ctx.get("manual_session") is True:
+            extra_write["manual_session"] = True
         self._write_execution_timetable_file(
             streams_copy,
             session_trading_date,
