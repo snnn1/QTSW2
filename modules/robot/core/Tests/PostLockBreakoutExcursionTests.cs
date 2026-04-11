@@ -134,7 +134,7 @@ public static class PostLockBreakoutExcursionTests
             var tradingDate = new DateOnly(2026, 6, 3);
             var sm = new StreamStateMachine(
                 time, spec, log, journals, tradingDate, "hash", directive,
-                ExecutionMode.DRYRUN, 1, 2, tempRoot,
+                ExecutionMode.DRYRUN, 1, 2, tempRoot, tempRoot,
                 executionAdapter: adapter,
                 riskGate: riskGate,
                 executionJournal: new ExecutionJournal(tempRoot, log));

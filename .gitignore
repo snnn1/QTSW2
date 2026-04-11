@@ -48,6 +48,9 @@ data/raw/**/*.dat
 data/processed/**/*.parquet
 data/processed/**/*.csv
 
+# Isolated SIM playback run state (QTSW2_ISOLATED_PLAYBACK=1)
+data/playback/
+
 # Also exclude data files at root level or other locations
 *.parquet
 *.csv

@@ -30,9 +30,15 @@ public enum ConnectionRecoveryState
 public sealed class RobotEngine : IExecutionRecoveryGuard
 {
     private readonly string _root;
+    /// <summary>
+    /// Root for persisted robot state (same tree as project root: logs/robot/journal, data/execution_journals, logs/robot/*.jsonl).
+    /// Under isolated SIM playback (env QTSW2_ISOLATED_PLAYBACK=1): <c>data/playback/{run_id}/</c>.
+    /// </summary>
+    private string _persistenceBase;
     private readonly RobotLogger _log; // Kept for backward compatibility during migration
     private readonly RobotLoggingService? _loggingService; // New async logging service (Fix B)
-    private readonly JournalStore _journals;
+    /// <summary>Stream + execution journal store. Rebound in <see cref="Start"/> when isolated playback is enabled.</summary>
+    private JournalStore _journals;
     private readonly TimetableFilePoller _timetablePoller;
     private readonly object _engineLock = new object(); // Serialize engine entrypoints (Tick/OnBar/etc.)
     
@@ -325,7 +331,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private readonly Dictionary<string, (string tradingDay, int index)> _currentSessionKeyByClass = new();
     private IExecutionAdapter? _executionAdapter;
     private RiskGate? _riskGate;
-    private readonly ExecutionJournal _executionJournal;
+    private ExecutionJournal _executionJournal;
     private InstrumentIntentCoordinator? _intentExposureCoordinator;
     private readonly ExecutionEventWriter _eventWriter;
     private ReconciliationRunner? _reconciliationRunner;
@@ -706,7 +712,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         // Create logger with service reference so ENGINE logs route through singleton
         _log = new RobotLogger(projectRoot, _resolvedLogDir, instrument, _loggingService);
         
-        _journals = new JournalStore(projectRoot);
+        _persistenceBase = projectRoot;
+        _journals = new JournalStore(_persistenceBase);
         _timetablePoller = new TimetableFilePoller(timetablePollInterval);
 
         _specPath = Path.Combine(_root, "configs", "analyzer_robot_parity.json");
@@ -721,15 +728,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         // NOTE: KillSwitch logs during construction. To ensure ALL logs include run_id,
         // we delay KillSwitch creation until Start() after _runId is set on the logger.
-        _executionJournal = new ExecutionJournal(projectRoot, _log);
+        _executionJournal = new ExecutionJournal(_persistenceBase, _log);
         JournalParityPendingLedger.Clear();
-        void NotifyReleaseSuppressionActivity()
-        {
-            _releaseReconRedundancy.NotifyExecutionActivity();
-            _mismatchCoordinator?.NotifyReconciliationAuditWake();
-        }
-        _executionJournal.SetReleaseSuppressionActivityNotify(NotifyReleaseSuppressionActivity);
-        InstrumentExecutionAuthority.SetReleaseSuppressionActivityNotify(NotifyReleaseSuppressionActivity);
+        WireExecutionJournalReleaseSuppressionCallbacks();
         _executionSummary = new ExecutionSummary();
         _eventWriter = new ExecutionEventWriter(projectRoot, () => TradingDateString, _log, () => _runId ?? "");
     }
@@ -797,11 +798,101 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         _healthMonitor.ReportCritical("EXECUTION_POLICY_VALIDATION_FAILED", payload);
     }
 
+    private static string SanitizeRunIdForPath(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return "";
+        var s = raw.Trim();
+        var filtered = new string(s.Where(c => char.IsLetterOrDigit(c) || c == '-' || c == '_').ToArray());
+        if (filtered.Length == 0) return "";
+        return filtered.Length > 128 ? filtered.Substring(0, 128) : filtered;
+    }
+
+    /// <summary>Optional env <c>QTSW2_RUN_ID</c> for stable playback folder names (alphanumeric, _, -).</summary>
+    private void ApplyOptionalRunIdFromEnvironment()
+    {
+        var s = SanitizeRunIdForPath(Environment.GetEnvironmentVariable("QTSW2_RUN_ID"));
+        if (s.Length > 0)
+            _runId = s;
+    }
+
+    private string ComputeNextPersistenceBase(out bool isolatedPlayback)
+    {
+        isolatedPlayback = _executionMode == ExecutionMode.SIM
+            && string.Equals(Environment.GetEnvironmentVariable("QTSW2_ISOLATED_PLAYBACK"), "1", StringComparison.OrdinalIgnoreCase);
+        if (!isolatedPlayback)
+            return _root;
+        return Path.Combine(_root, "data", "playback", _runId ?? "unknown");
+    }
+
+    private void WireExecutionJournalReleaseSuppressionCallbacks()
+    {
+        void NotifyReleaseSuppressionActivity()
+        {
+            _releaseReconRedundancy.NotifyExecutionActivity();
+            _mismatchCoordinator?.NotifyReconciliationAuditWake();
+        }
+        _executionJournal.SetReleaseSuppressionActivityNotify(NotifyReleaseSuppressionActivity);
+        InstrumentExecutionAuthority.SetReleaseSuppressionActivityNotify(NotifyReleaseSuppressionActivity);
+    }
+
+    /// <summary>
+    /// Rebind stream + execution journals to <see cref="_persistenceBase"/> when isolated SIM playback is enabled
+    /// (<c>QTSW2_ISOLATED_PLAYBACK=1</c>). Live and default SIM keep project root.
+    /// </summary>
+    private void RebindPersistenceIfNeeded(DateTimeOffset utcNow)
+    {
+        ApplyOptionalRunIdFromEnvironment();
+        var nextBase = ComputeNextPersistenceBase(out var isolated);
+        try
+        {
+            var cur = Path.GetFullPath(_persistenceBase);
+            var nxt = Path.GetFullPath(nextBase);
+            if (string.Equals(cur, nxt, StringComparison.OrdinalIgnoreCase))
+                return;
+        }
+        catch
+        {
+            if (string.Equals(_persistenceBase, nextBase, StringComparison.OrdinalIgnoreCase))
+                return;
+        }
+
+        _persistenceBase = nextBase;
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(_persistenceBase, "logs", "robot", "journal"));
+            Directory.CreateDirectory(Path.Combine(_persistenceBase, "data", "execution_journals"));
+            Directory.CreateDirectory(Path.Combine(_persistenceBase, "logs", "robot"));
+        }
+        catch (Exception ex)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "PERSISTENCE_REBIND_ERROR", state: "ENGINE",
+                new { error = ex.Message, target = _persistenceBase }));
+            throw;
+        }
+
+        _journals = new JournalStore(_persistenceBase);
+        JournalParityPendingLedger.Clear();
+        _executionJournal = new ExecutionJournal(_persistenceBase, _log);
+        WireExecutionJournalReleaseSuppressionCallbacks();
+
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "PERSISTENCE_BASE_ACTIVE", state: "ENGINE",
+            new
+            {
+                persistence_base = _persistenceBase,
+                isolated_playback = isolated,
+                run_id = _runId,
+                note = isolated
+                    ? "SIM + QTSW2_ISOLATED_PLAYBACK=1: stream and execution journals under data/playback/{run_id}."
+                    : "Global persistence at project root."
+            }));
+    }
+
     public void Start()
     {
         // CRITICAL: Set run_id before any Start-path logs
         _runId = Guid.NewGuid().ToString("N");
         _engineStartUtc = DateTimeOffset.UtcNow;
+        RebindPersistenceIfNeeded(_engineStartUtc);
         _log.SetRunId(_runId);
         _runtimeAudit = new RuntimeAuditHub(_log, () => _runId ?? "");
         RuntimeAuditHubRef.Active = _runtimeAudit;
@@ -4920,7 +5011,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     _executionMode, 
                     orderQuantity, // baseSize (existing parameter)
                     maxSize, // NEW: maxSize parameter
-                    _root, // Project root for range event persistence
+                    _root, // Repository root (market data)
+                    _persistenceBase, // Robot state root (journals + hydration JSONL; isolated when QTSW2_ISOLATED_PLAYBACK=1)
                     executionAdapter: _executionAdapter, 
                     riskGate: _riskGate, 
                     executionJournal: _executionJournal, 

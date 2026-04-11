@@ -195,7 +195,7 @@ public static class StartupExecutionContextRaceScenarioTests
 
         var sm = new StreamStateMachine(
             time, spec, log, journals, tradingDate, "hash", directive,
-            ExecutionMode.DRYRUN, 1, 2, tempRoot,
+            ExecutionMode.DRYRUN, 1, 2, tempRoot, tempRoot,
             executionAdapter: gated,
             riskGate: riskGate,
             executionJournal: new ExecutionJournal(tempRoot, log));

@@ -351,7 +351,7 @@ public static class BreakoutValidityGateTests
 
         var sm = new StreamStateMachine(
             time, spec, log, journals, tradingDate, "hash", directive,
-            ExecutionMode.DRYRUN, 1, 2, tempRoot,
+            ExecutionMode.DRYRUN, 1, 2, tempRoot, tempRoot,
             executionAdapter: adapter,
             executionJournal: new ExecutionJournal(tempRoot, log));
 

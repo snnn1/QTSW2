@@ -174,7 +174,7 @@ public static class OrderReconciliationRecoveryTests
 
         var sm = new StreamStateMachine(
             time, spec, log, journals, tradingDate, "hash", directive,
-            ExecutionMode.DRYRUN, 1, 2, tempRoot,
+            ExecutionMode.DRYRUN, 1, 2, tempRoot, tempRoot,
             executionAdapter: new NullExecutionAdapter(log),
             executionJournal: new ExecutionJournal(tempRoot, log));
 
@@ -217,7 +217,7 @@ public static class OrderReconciliationRecoveryTests
 
         var sm = new StreamStateMachine(
             time, spec, log, journals, tradingDate, "hash", directive,
-            ExecutionMode.DRYRUN, 1, 2, tempRoot,
+            ExecutionMode.DRYRUN, 1, 2, tempRoot, tempRoot,
             executionAdapter: new NullExecutionAdapter(log),
             executionJournal: new ExecutionJournal(tempRoot, log));
 

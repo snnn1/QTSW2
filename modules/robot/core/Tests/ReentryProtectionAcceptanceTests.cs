@@ -99,6 +99,7 @@ public static class ReentryProtectionAcceptanceTests
                 1,
                 2,
                 tempRoot,
+                tempRoot,
                 executionAdapter: new NullExecutionAdapter(log),
                 executionJournal: new ExecutionJournal(tempRoot, log));
 
@@ -159,6 +160,7 @@ public static class ReentryProtectionAcceptanceTests
                 ExecutionMode.DRYRUN,
                 1,
                 2,
+                tempRoot,
                 tempRoot,
                 executionAdapter: new NullExecutionAdapter(log),
                 executionJournal: new ExecutionJournal(tempRoot, log));
@@ -222,6 +224,7 @@ public static class ReentryProtectionAcceptanceTests
                 ExecutionMode.DRYRUN,
                 1,
                 2,
+                tempRoot,
                 tempRoot,
                 executionAdapter: new NullExecutionAdapter(log),
                 executionJournal: new ExecutionJournal(tempRoot, log));

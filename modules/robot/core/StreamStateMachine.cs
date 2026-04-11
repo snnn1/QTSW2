@@ -129,7 +129,10 @@ public sealed class StreamStateMachine
     private readonly ParitySpec _spec;
     private readonly RobotLogger _log;
     private readonly JournalStore _journals;
+    /// <summary>Repository root for market data (e.g. data/raw).</summary>
     private readonly string _projectRoot;
+    /// <summary>Root for robot state: journals, hydration/range JSONL, execution journal scans (may equal <see cref="_projectRoot"/> or an isolated playback tree).</summary>
+    private readonly string _robotStateRoot;
     private readonly RangeLockedEventPersister? _rangePersister;
     private readonly HydrationEventPersister? _hydrationPersister;
     private readonly RangeBuildingSnapshotPersister? _rangeBuildingSnapshotPersister;
@@ -302,7 +305,8 @@ public sealed class StreamStateMachine
         ExecutionMode executionMode,
         int orderQuantity, // baseSize (PHASE 3.2: Fixed order quantity, mandatory, code-controlled)
         int maxQuantity, // NEW: maxSize (policy max_size)
-        string projectRoot, // Project root directory for range event persistence
+        string projectRoot, // Repository root (market data paths)
+        string robotStateRoot, // Root for journals + hydration/range persistence (same layout as project root)
         IExecutionAdapter? executionAdapter = null,
         RiskGate? riskGate = null,
         ExecutionJournal? executionJournal = null,
@@ -319,6 +323,7 @@ public sealed class StreamStateMachine
         _log = log;
         _journals = journals;
         _projectRoot = projectRoot;
+        _robotStateRoot = robotStateRoot;
         _timetableHash = timetableHash;
         _executionMode = executionMode;
         _executionAdapter = executionAdapter;
@@ -331,13 +336,13 @@ public sealed class StreamStateMachine
         _eventWriter = eventWriter;
 
         // Initialize range event persister (singleton)
-        _rangePersister = RangeLockedEventPersister.GetInstance(_projectRoot);
+        _rangePersister = RangeLockedEventPersister.GetInstance(_robotStateRoot);
         
         // Initialize hydration event persister (singleton)
-        _hydrationPersister = HydrationEventPersister.GetInstance(_projectRoot);
+        _hydrationPersister = HydrationEventPersister.GetInstance(_robotStateRoot);
         
         // Initialize RANGE_BUILDING snapshot persister (singleton)
-        _rangeBuildingSnapshotPersister = RangeBuildingSnapshotPersister.GetInstance(_projectRoot);
+        _rangeBuildingSnapshotPersister = RangeBuildingSnapshotPersister.GetInstance(_robotStateRoot);
         
         // PHASE 3.2: Store and validate order quantity
         _orderQuantity = orderQuantity;
@@ -5784,12 +5789,12 @@ public sealed class StreamStateMachine
         try
         {
             // Try hydration log first
-            var hydrationFile = Path.Combine(_projectRoot, "logs", "robot", $"hydration_{tradingDay}.jsonl");
+            var hydrationFile = Path.Combine(_robotStateRoot, "logs", "robot", $"hydration_{tradingDay}.jsonl");
             var usingRangesFile = false;
             if (!File.Exists(hydrationFile))
             {
                 // Fallback to ranges file
-                hydrationFile = Path.Combine(_projectRoot, "logs", "robot", $"ranges_{tradingDay}.jsonl");
+                hydrationFile = Path.Combine(_robotStateRoot, "logs", "robot", $"ranges_{tradingDay}.jsonl");
                 usingRangesFile = true;
                 if (!File.Exists(hydrationFile))
                 {
@@ -5799,8 +5804,8 @@ public sealed class StreamStateMachine
                         {
                             trading_day = tradingDay,
                             stream_id = streamId,
-                            hydration_file = Path.Combine(_projectRoot, "logs", "robot", $"hydration_{tradingDay}.jsonl"),
-                            ranges_file = Path.Combine(_projectRoot, "logs", "robot", $"ranges_{tradingDay}.jsonl"),
+                            hydration_file = Path.Combine(_robotStateRoot, "logs", "robot", $"hydration_{tradingDay}.jsonl"),
+                            ranges_file = Path.Combine(_robotStateRoot, "logs", "robot", $"ranges_{tradingDay}.jsonl"),
                             note = "Will proceed without restoration - range will be recomputed"
                         });
                     return;
@@ -7078,7 +7083,7 @@ public sealed class StreamStateMachine
         var pattern = tradingDate != null
             ? $"{tradingDate}_*_{intentId}.json"
             : $"*_*_{intentId}.json";
-        var journalDir = Path.Combine(_projectRoot, "data", "execution_journals");
+        var journalDir = Path.Combine(_robotStateRoot, "data", "execution_journals");
         
         try
         {
@@ -7283,7 +7288,7 @@ public sealed class StreamStateMachine
         if (string.IsNullOrWhiteSpace(_journal.OriginalIntentId) && _executionJournal != null)
         {
             var pattern = $"{TradingDate}_{Stream}_*.json";
-            var journalDir = Path.Combine(_projectRoot, "data", "execution_journals");
+            var journalDir = Path.Combine(_robotStateRoot, "data", "execution_journals");
             try
             {
                 if (Directory.Exists(journalDir))
@@ -7670,7 +7675,7 @@ public sealed class StreamStateMachine
         var pattern = originalTradingDate != null
             ? $"{originalTradingDate}_*_{_journal.OriginalIntentId}.json"
             : $"*_*_{_journal.OriginalIntentId}.json"; // Search all dates if PriorJournalKey not available
-        var journalDir = Path.Combine(_projectRoot, "data", "execution_journals");
+        var journalDir = Path.Combine(_robotStateRoot, "data", "execution_journals");
         ExecutionJournalEntry? originalEntry = null;
         
         try
