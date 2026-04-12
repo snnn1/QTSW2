@@ -22,14 +22,19 @@ public static class RunRootArtifacts
         Environment.NewLine +
         "- " + Environment.NewLine;
 
-    public static void EnsureBootstrapFiles(string persistenceBase)
+    /// <param name="projectRootForPlaybackPointer">When set (isolated playback runs), updates <c>runs/LATEST_RUN.txt</c>.</param>
+    public static void EnsureBootstrapFiles(string persistenceBase, string? projectRootForPlaybackPointer = null)
     {
         try
         {
             var notes = Path.Combine(persistenceBase, NotesFileName);
             if (!File.Exists(notes))
                 File.WriteAllText(notes, NotesTemplate);
-            // KEY_EVENTS.jsonl is owned by KeyEventWriter (append-only signal timeline).
+            var keyEvents = Path.Combine(persistenceBase, KeyEventsFileName);
+            if (!File.Exists(keyEvents))
+                File.WriteAllText(keyEvents, "");
+            if (!string.IsNullOrEmpty(projectRootForPlaybackPointer))
+                WriteLatestRunPointer(projectRootForPlaybackPointer, persistenceBase);
         }
         catch
         {

@@ -36,7 +36,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private readonly string _root;
     /// <summary>
     /// Run artifact root: <c>state/</c>, <c>events/</c>, <c>logs/</c>, <c>decisions/</c>, <c>derived/</c> under <see cref="RobotRunArtifactPaths"/>.
-    /// Under SIM + journal bypass (e.g. NinjaTrader Playback account): <c>runs/YYYY-MM-DD__SESSION__RUNID_SHORT/</c> (human-readable; see <see cref="RunDirectoryNaming"/>).
+    /// Under SIM + journal bypass (e.g. NinjaTrader Playback account): <c>runs/&lt;run_id&gt;/</c> (engine <see cref="_runId"/>).
     /// </summary>
     private string _persistenceBase;
     /// <summary>True when this process uses an isolated run tree under <c>runs/</c> (SIM + ignore existing stream journals).</summary>
@@ -849,10 +849,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         isolatedPlayback = _executionMode == ExecutionMode.SIM && _ignoreExistingStreamJournals;
         if (!isolatedPlayback)
             return _root;
-        var ymd = RunDirectoryNaming.ChicagoCalendarDateYyyyMmDd(_engineStartUtc);
-        var modeLabel = RunDirectoryNaming.ModeLabel(_executionMode);
-        var shortId = RunDirectoryNaming.ShortRunId(_runId);
-        var folder = RunDirectoryNaming.BuildFolderName(ymd, modeLabel, shortId);
+        var folder = string.IsNullOrWhiteSpace(_runId) ? "unknown_run" : _runId.Trim();
         return RunDirectoryNaming.AllocateUniquePath(Path.Combine(_root, "runs"), folder);
     }
 
@@ -921,7 +918,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             {
                 RebindRobotLogDirectoryIfNeeded();
                 if (isolated)
-                    RunRootArtifacts.EnsureBootstrapFiles(_persistenceBase);
+                    RunRootArtifacts.EnsureBootstrapFiles(_persistenceBase, _root);
                 return;
             }
         }
@@ -931,7 +928,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             {
                 RebindRobotLogDirectoryIfNeeded();
                 if (isolated)
-                    RunRootArtifacts.EnsureBootstrapFiles(_persistenceBase);
+                    RunRootArtifacts.EnsureBootstrapFiles(_persistenceBase, _root);
                 return;
             }
         }
@@ -960,7 +957,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
 
         if (isolated)
-            RunRootArtifacts.EnsureBootstrapFiles(_persistenceBase);
+            RunRootArtifacts.EnsureBootstrapFiles(_persistenceBase, _root);
 
         RebindRobotLogDirectoryIfNeeded();
 
@@ -976,7 +973,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 isolated_playback = isolated,
                 run_id = _runId,
                 note = isolated
-                    ? "SIM + journal bypass (e.g. Playback account): stream and execution journals under runs/YYYY-MM-DD__SESSION__RUNID_SHORT/ (see summary.json at run root)."
+                    ? "SIM + journal bypass (e.g. Playback account): stream and execution journals under runs/<run_id>/ (KEY_EVENTS.jsonl, summary.json on stop; see runs/LATEST_RUN.txt)."
                     : "Global persistence at project root."
             }));
     }

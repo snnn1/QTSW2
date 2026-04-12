@@ -15,7 +15,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyDescriptionAttribute("Shared DTOs and interfaces for IEA replay. Referenced by net48 IEA and net8 Repla" +
     "y.")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+39053eea3afe81034217ca979a3592dc30daad8f")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+924e1f63d1ed814deefe5db1711c5d30fedfdd09")]
 [assembly: System.Reflection.AssemblyProductAttribute("Robot.Contracts")]
 [assembly: System.Reflection.AssemblyTitleAttribute("Robot.Contracts")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

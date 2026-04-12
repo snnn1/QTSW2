@@ -16,7 +16,7 @@ namespace QTSW2.Robot.Core.Execution;
 /// </summary>
 public sealed class ExecutionEventWriter
 {
-    /// <summary>Persistence root for canonical JSONL (repo root or run-scoped <c>runs/YYYY-MM-DD__SESSION__RUNID_SHORT/</c> when isolated playback).</summary>
+    /// <summary>Persistence root for canonical JSONL (repo root or run-scoped <c>runs/&lt;run_id&gt;/</c> when isolated playback).</summary>
     private readonly string _projectRoot;
     private readonly Func<string> _getTradingDate;
     private readonly Func<string>? _getRunId;
