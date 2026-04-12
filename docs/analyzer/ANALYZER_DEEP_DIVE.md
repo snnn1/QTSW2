@@ -674,7 +674,7 @@ ES_2025-01-02_to_2025-11-27_1633trades_45winrate_-9profit_20251128_163300.parque
 
 **Script Integration**:
 - `tools/run_analyzer_parallel.py`: Parallel processing script
-- `modules/analyzer/scripts/run_data_processed.py`: CLI runner
+- `system/modules/analyzer/scripts/run_data_processed.py`: CLI runner (legacy: `modules/analyzer/scripts/run_data_processed.py`)
 
 ### Data Merger Integration
 

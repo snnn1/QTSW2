@@ -11,6 +11,23 @@ from dataclasses import dataclass
 from typing import Optional
 
 
+def _resolve_merger_script(root: Path) -> Path:
+    """
+    Post-refactor: system/modules/merger/merger.py.
+    Legacy: modules/merger/merger.py at repo root.
+    """
+    system_p = root / "system" / "modules" / "merger" / "merger.py"
+    legacy_p = root / "modules" / "merger" / "merger.py"
+    if system_p.is_file():
+        return system_p
+    if legacy_p.is_file():
+        return legacy_p
+    raise ValueError(
+        "Merger script not found. Checked: "
+        f"{system_p} and {legacy_p}."
+    )
+
+
 @dataclass
 class PipelineConfig:
     """
@@ -66,9 +83,15 @@ class PipelineConfig:
         data_translated = qtsw2_root / "data" / "translated"
         analyzer_runs = qtsw2_root / "data" / "analyzed"
         
-        # Script paths
-        merger_script = qtsw2_root / "modules" / "merger" / "merger.py"
-        parallel_analyzer_script = qtsw2_root / "ops" / "maintenance" / "run_analyzer_parallel.py"
+        # Script paths (post-refactor: merger under system/modules/; parallel runner under tools/)
+        merger_script = _resolve_merger_script(qtsw2_root)
+        parallel_analyzer_script = qtsw2_root / "tools" / "run_analyzer_parallel.py"
+        if not parallel_analyzer_script.is_file():
+            raise ValueError(
+                "Parallel analyzer script not found: "
+                f"{parallel_analyzer_script}. "
+                "Expected QTSW2_ROOT/tools/run_analyzer_parallel.py."
+            )
         
         # Logging directories
         logs_dir = qtsw2_root / "automation" / "logs"
@@ -112,8 +135,8 @@ LOGS_DIR = QTSW2_ROOT / "automation" / "logs"
 EVENT_LOGS_DIR = LOGS_DIR / "events"
 
 TRANSLATOR_SCRIPT = QTSW2_ROOT / "tools" / "translate_raw.py"  # Deprecated
-PARALLEL_ANALYZER_SCRIPT = QTSW2_ROOT / "ops" / "maintenance" / "run_analyzer_parallel.py"
-DATA_MERGER_SCRIPT = QTSW2_ROOT / "modules" / "merger" / "merger.py"
+PARALLEL_ANALYZER_SCRIPT = QTSW2_ROOT / "tools" / "run_analyzer_parallel.py"
+DATA_MERGER_SCRIPT = _resolve_merger_script(QTSW2_ROOT)
 
 TRANSLATOR_TIMEOUT = 3600
 ANALYZER_TIMEOUT = 21600

@@ -62,7 +62,17 @@ def emit_event(run_id: Optional[str], stage: str, event: str, msg: str = "", dat
 
 # Base paths
 QTSW2_ROOT = Path(__file__).parent.parent
-ANALYZER_SCRIPT = QTSW2_ROOT / "modules" / "analyzer" / "scripts" / "run_data_processed.py"
+# Post-refactor default: analyzer lives under system/modules/; legacy repo-root modules/ optional
+_DEFAULT_ANALYZER_SYSTEM = (
+    QTSW2_ROOT / "system" / "modules" / "analyzer" / "scripts" / "run_data_processed.py"
+)
+_DEFAULT_ANALYZER_LEGACY = QTSW2_ROOT / "modules" / "analyzer" / "scripts" / "run_data_processed.py"
+if _DEFAULT_ANALYZER_SYSTEM.is_file():
+    ANALYZER_SCRIPT = _DEFAULT_ANALYZER_SYSTEM
+elif _DEFAULT_ANALYZER_LEGACY.is_file():
+    ANALYZER_SCRIPT = _DEFAULT_ANALYZER_LEGACY
+else:
+    ANALYZER_SCRIPT = _DEFAULT_ANALYZER_SYSTEM
 DATA_PROCESSED = QTSW2_ROOT / "data" / "data_processed"
 EVENT_LOGS_DIR = QTSW2_ROOT / "automation" / "logs" / "events"
 
@@ -235,7 +245,13 @@ def run_parallel(instruments: List[str], max_workers: int = None, data_folder: P
         analyzer_script = ANALYZER_SCRIPT
     
     if not analyzer_script.exists():
-        logger.error(f"Analyzer script not found: {analyzer_script}")
+        logger.error("Analyzer script not found: %s", analyzer_script)
+        if analyzer_script == ANALYZER_SCRIPT:
+            logger.error(
+                "Expected default at %s or (legacy) %s",
+                _DEFAULT_ANALYZER_SYSTEM,
+                _DEFAULT_ANALYZER_LEGACY,
+            )
         return False
     
     if not data_folder.exists():

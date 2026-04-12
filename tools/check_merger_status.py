@@ -1,9 +1,13 @@
 """Check merger status and recent activity"""
 import json
+import sys
 from pathlib import Path
 from datetime import datetime
 
 qtsw2_root = Path(__file__).parent.parent
+_tools = qtsw2_root / "tools"
+if str(_tools) not in sys.path:
+    sys.path.insert(0, str(_tools))
 
 print("="*80)
 print("MERGER STATUS CHECK")
@@ -62,8 +66,12 @@ if pipeline_files:
     else:
         print(f"  [WARNING] No merger events found in latest run")
 
-# Check merger script
-merger_script = qtsw2_root / "modules" / "merger" / "merger.py"
+# Check merger script (same resolution as pipeline config)
 print(f"\n[MERGER SCRIPT]")
-print(f"  Path: {merger_script}")
-print(f"  Exists: {merger_script.exists()}")
+try:
+    from automation.config import PipelineConfig
+    merger_script = PipelineConfig.from_environment(qtsw2_root).merger_script
+    print(f"  Path: {merger_script}")
+    print(f"  Exists: {merger_script.exists()}")
+except ValueError as e:
+    print(f"  Error: {e}")

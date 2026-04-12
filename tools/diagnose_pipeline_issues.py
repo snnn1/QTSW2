@@ -10,10 +10,13 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Any
 
-# Add project root to path
+# Add project root and tools/ so `automation.*` resolves (package lives under tools/automation)
 qtsw2_root = Path(__file__).parent.parent
+_tools = qtsw2_root / "tools"
 if str(qtsw2_root) not in sys.path:
     sys.path.insert(0, str(qtsw2_root))
+if str(_tools) not in sys.path:
+    sys.path.insert(0, str(_tools))
 
 def print_section(title: str):
     print("\n" + "="*80)
@@ -100,7 +103,8 @@ def test_analyzer():
     """Test analyzer script"""
     print_section("ANALYZER TEST")
     
-    analyzer_script = qtsw2_root / "ops" / "maintenance" / "run_analyzer_parallel.py"
+    from automation.config import PipelineConfig
+    analyzer_script = PipelineConfig.from_environment(qtsw2_root).parallel_analyzer_script
     
     # Test script exists
     if not analyzer_script.exists():
@@ -130,7 +134,12 @@ def test_merger():
     """Test merger script"""
     print_section("MERGER TEST")
     
-    merger_script = qtsw2_root / "modules" / "merger" / "merger.py"
+    try:
+        from automation.config import PipelineConfig
+        merger_script = PipelineConfig.from_environment(qtsw2_root).merger_script
+    except ValueError as e:
+        print_result("Merger script resolve", False, str(e))
+        return False
     
     # Test script exists
     if not merger_script.exists():

@@ -3,8 +3,13 @@ import sys
 import subprocess
 from pathlib import Path
 
-qtsw2_root = Path(__file__).parent.parent
-analyzer_script = qtsw2_root / "ops" / "maintenance" / "run_analyzer_parallel.py"
+_tools = Path(__file__).parent
+qtsw2_root = _tools.parent
+if str(_tools) not in sys.path:
+    sys.path.insert(0, str(_tools))
+from automation.config import PipelineConfig
+
+analyzer_script = PipelineConfig.from_environment(qtsw2_root).parallel_analyzer_script
 
 print("="*80)
 print("MANUAL ANALYZER TEST")
