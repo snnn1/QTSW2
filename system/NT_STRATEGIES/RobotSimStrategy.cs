@@ -243,6 +243,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (!string.IsNullOrEmpty(state)) parts.Add($"state={state}");
                 if (!string.IsNullOrEmpty(instanceId)) parts.Add($"instance={instanceId}");
                 if (!string.IsNullOrEmpty(extra)) parts.Add(extra);
+                var persistRoot = Path.GetFullPath(runRoot);
+                if (RobotRunArtifactPaths.IsRunScopedPersistence(persistRoot))
+                {
+                    parts.Add($"run_id={RobotRunArtifactPaths.AuditRunIdLabel(persistRoot, Environment.GetEnvironmentVariable("QTSW2_RUN_ID"))}");
+                    parts.Add("scope=RUN");
+                }
+                else
+                {
+                    parts.Add("run_id=NONE");
+                    parts.Add("scope=GLOBAL");
+                }
                 var line = string.Join(" | ", parts) + Environment.NewLine;
                 File.AppendAllText(path, line);
             }
@@ -290,13 +301,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Configure)
             {
-                TraceLifecycle("Configure_ENTER", Instrument?.MasterInstrument?.Name, "Configure", _instanceId);
                 AddDataSeries(BarsPeriodType.Second, 1);
-                TraceLifecycle("Configure_EXIT", Instrument?.MasterInstrument?.Name, "Configure", _instanceId);
             }
             else if (State == State.DataLoaded)
             {
-                TraceLifecycle("DataLoaded_ENTER", Instrument?.MasterInstrument?.Name, "DataLoaded");
                 try
                 {
                     // Verify non-live (Simulation / Playback) account — same rules as NinjaTraderSimAdapter

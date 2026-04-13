@@ -33,6 +33,8 @@
     <Compile Remove="SiblingProtectiveCancelQueue.Test\**\*" />
     <!-- Modules harness stubs — NT + OrderRegistryPhase2 supply real implementations -->
     <Compile Remove="Execution\InstrumentExecutionAuthority.HarnessPartial.cs" />
+    <!-- Single source: modules copy (avoid drift vs RobotCore duplicate) -->
+    <Compile Remove="Execution\MismatchEscalationCoordinator.cs" />
   </ItemGroup>
   <ItemGroup>
     <!-- Shared types from modules/robot/core (NT project targets net48, core targets net8) -->
@@ -40,6 +42,9 @@
     <Compile Include="..\modules\robot\core\RunDirectoryNaming.cs" Link="RunDirectoryNaming.cs" />
     <Compile Include="..\modules\robot\core\RunRootArtifacts.cs" Link="RunRootArtifacts.cs" />
     <Compile Include="..\modules\robot\core\RunSummaryBuilder.cs" Link="RunSummaryBuilder.cs" />
+    <Compile Include="..\modules\robot\core\KeyEventsContractCatalog.cs" Link="KeyEventsContractCatalog.cs" />
+    <Compile Include="..\modules\robot\core\KeyEventsContractValidation.cs" Link="KeyEventsContractValidation.cs" />
+    <Compile Include="..\modules\robot\core\KeyEventsNarrativeReader.cs" Link="KeyEventsNarrativeReader.cs" />
     <Compile Include="..\modules\robot\core\Execution\KeyEventWriter.cs" Link="Execution\KeyEventWriter.cs" />
     <Compile Include="..\modules\robot\core\EntryOrderRecoveryTypes.cs" Link="EntryOrderRecoveryTypes.cs" />
     <Compile Include="..\modules\robot\core\Execution\AdoptionDeferralDecision.cs" Link="Execution\AdoptionDeferralDecision.cs" />
@@ -51,6 +56,7 @@
     <Compile Include="..\modules\robot\core\Execution\ReleaseAdoptionContractModels.cs" Link="Execution\ReleaseAdoptionContractModels.cs" />
     <Compile Include="..\modules\robot\core\Execution\ReconciliationBlockerModels.cs" Link="Execution\ReconciliationBlockerModels.cs" />
     <Compile Include="..\modules\robot\core\Execution\StateConsistencyGateModels.cs" Link="Execution\StateConsistencyGateModels.cs" />
+    <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.cs" Link="Execution\MismatchEscalationCoordinator.cs" />
     <Compile Include="..\modules\robot\core\Execution\JournalIntegrityGuarantee.cs" Link="Execution\JournalIntegrityGuarantee.cs" />
     <Compile Include="..\modules\robot\core\Execution\JournalParityPendingLedger.cs" Link="Execution\JournalParityPendingLedger.cs" />
     <Compile Include="..\modules\robot\core\Execution\ExecutionSafetyGate.cs" Link="Execution\ExecutionSafetyGate.cs" />

@@ -300,7 +300,7 @@ public sealed class RobotLoggingService : IDisposable
     /// <param name="robotLogDirectory">Absolute run-authoritative <c>logs/robot</c> directory (typically <see cref="RobotRunArtifactPaths.LogsRobot"/>).</param>
     public static RobotLoggingService GetOrCreate(string configRoot, string? robotLogDirectory = null)
     {
-        var effective = robotLogDirectory ?? Path.Combine(configRoot, "logs", "robot");
+        var effective = robotLogDirectory ?? RobotRunArtifactPaths.LogsRobot(configRoot);
         var key = effective;
 
         lock (_instancesLock)
@@ -356,7 +356,7 @@ public sealed class RobotLoggingService : IDisposable
         _instanceCounter++;
         
         // Load logging configuration
-        _config = LoggingConfig.LoadFromFile(configRoot, _logDirectory);
+        _config = LoggingConfig.LoadFromFile(configRoot, _logDirectory, suppressEmergencyWrite: true);
         _maxLogFileSizeBytes = _config.max_file_size_mb * 1024 * 1024;
         _minLogLevel = _config.min_log_level ?? "INFO";
         
@@ -851,6 +851,21 @@ public sealed class RobotLoggingService : IDisposable
         
         return false;
     }
+
+    /// <summary>Persistence base from <c>.../logs/robot</c> → parent of <c>logs</c> (engine <c>_persistenceBase</c>).</summary>
+    private string GetPersistenceBaseFromLogsRobotDir()
+    {
+        try
+        {
+            var robotLogs = Path.GetFullPath(_logDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            var logsDir = Path.GetDirectoryName(robotLogs);
+            return Path.GetDirectoryName(logsDir ?? "") ?? "";
+        }
+        catch
+        {
+            return "";
+        }
+    }
     
     /// <summary>
     /// Write event to health sink with slot_instance_key granularity.
@@ -862,6 +877,12 @@ public sealed class RobotLoggingService : IDisposable
         StreamWriter? writer = null;
         try
         {
+            var persist = GetPersistenceBaseFromLogsRobotDir();
+            evt.scope = RobotRunArtifactPaths.AuditScopeLabel(persist);
+            evt.run_id = RobotRunArtifactPaths.IsRunScopedPersistence(persist)
+                ? RobotRunArtifactPaths.AuditRunIdLabel(persist, evt.run_id)
+                : "NONE";
+
             // Extract fields for health sink path
             var tradingDate = evt.trading_date ?? "";
             var instrument = string.IsNullOrWhiteSpace(evt.instrument) ? "ENGINE" : evt.instrument;
@@ -1394,7 +1415,7 @@ public sealed class RobotLoggingService : IDisposable
     /// </summary>
     public static RobotLoggingService? GetInstance(string configRoot, string? robotLogDirectory = null)
     {
-        var key = robotLogDirectory ?? Path.Combine(configRoot, "logs", "robot");
+        var key = robotLogDirectory ?? RobotRunArtifactPaths.LogsRobot(configRoot);
         lock (_instancesLock)
         {
             _instances.TryGetValue(key, out var instance);

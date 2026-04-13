@@ -274,6 +274,48 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
     }
 
+    /// <summary>
+    /// IEA workload for a broker snapshot instrument: while &gt;0, mismatch/reconciliation must not treat journal as authoritative for that instrument.
+    /// </summary>
+    private int GetPendingIeAWorkloadForBrokerInstrument(string brokerInstrument)
+    {
+        if (_executionPolicy?.UseInstrumentExecutionAuthority != true) return 0;
+        if (string.IsNullOrWhiteSpace(_accountName)) return 0;
+        var trim = brokerInstrument?.Trim() ?? "";
+        if (string.IsNullOrEmpty(trim)) return 0;
+        if (!ReconciliationIeaLookup.TryResolve(_accountName, trim, 0, GetExecutionInstrument, out var iea) || iea == null)
+            return 0;
+        return iea.PendingExecutionWorkloadCount;
+    }
+
+    private void LogAndDrainCallbackIngressBeforeReconciliation(DateTimeOffset utcNow, DateTimeOffset nowWall)
+    {
+        if (_executionAdapter is not NinjaTraderSimAdapter adapter) return;
+        adapter.GetTotalCallbackIngressQueueLengths(out var execBefore, out var ordBefore);
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "EXECUTION_QUEUE_DRAIN_START", state: "ENGINE",
+            new
+            {
+                instrument = "*",
+                pending_execution_count = execBefore,
+                run_id = _runId ?? "",
+                ts_utc = nowWall.ToString("o"),
+                order_ingress_queued = ordBefore,
+                note = "Strategy-thread drain of non-IEA callback ingress (bounded); IEA mode uses per-instrument IEA queue gating"
+            }));
+        adapter.DrainCallbackIngress(nowWall);
+        adapter.GetTotalCallbackIngressQueueLengths(out var execAfter, out var ordAfter);
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "EXECUTION_QUEUE_DRAIN_END", state: "ENGINE",
+            new
+            {
+                instrument = "*",
+                pending_execution_count = execAfter,
+                run_id = _runId ?? "",
+                ts_utc = DateTimeOffset.UtcNow.ToString("o"),
+                order_ingress_queued = ordAfter,
+                note = "After bounded drain; remaining items may be processed on a later tick"
+            }));
+    }
+
     private const string PENDING_FORCE_RECONCILE_FILE = "pending_force_reconcile.json";
 
     /// <summary>
@@ -345,6 +387,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private IExecutionAdapter? _executionAdapter;
     private RiskGate? _riskGate;
     private ExecutionJournal _executionJournal;
+    /// <summary>Transient fill observations so mismatch assembly does not classify <see cref="MismatchType.BROKER_AHEAD"/> while journal disk read lags <see cref="ExecutionJournal.RecordEntryFill"/>.</summary>
+    private readonly PendingFillBridge _pendingFillBridge;
     private InstrumentIntentCoordinator? _intentExposureCoordinator;
     private ExecutionEventWriter _eventWriter = null!;
     private ReconciliationRunner? _reconciliationRunner;
@@ -359,10 +403,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     // Logging configuration
     private readonly LoggingConfig _loggingConfig;
-    private readonly string _resolvedLogDir;
-    private readonly string _resolvedLogDirSource;
+    private string _resolvedLogDir;
+    private string _resolvedLogDirSource;
     private readonly string _loggingConfigPath;
-    private readonly string? _resolvedLogDirWarning;
+    private string? _resolvedLogDirWarning;
     /// <summary>Absolute <c>logs/robot</c> directory in use (may match isolated <see cref="_persistenceBase"/>).</summary>
     private string _activeRobotLogDir;
     private readonly bool _useAsyncLogging;
@@ -679,33 +723,44 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
         
         // Load logging configuration (filters, queues, rotation limits; physical paths are run-scoped under _persistenceBase).
-        _loggingConfig = LoggingConfig.LoadFromFile(projectRoot);
+        _loggingConfig = LoggingConfig.LoadFromFile(projectRoot, emergencyRobotLogDir: null, suppressEmergencyWrite: true);
         _loggingConfigPath = Path.Combine(projectRoot, "configs", "robot", "logging.json");
 
-        // Run-authoritative robot JSONL + daily markdown + archive tree: always _persistenceBase/logs/robot.
+        // Run-authoritative robot JSONL: isolated playback defers physical init until Start() → runs/<run_id>/logs/robot (never projectRoot/logs/robot).
         var effectiveLogDir = RobotRunArtifactPaths.LogsRobot(_persistenceBase);
-        var logDirSource = "persistence_base:logs/robot";
+        var deferPlaybackRobotLogs = executionMode == ExecutionMode.SIM && ignoreExistingStreamJournals;
         string? warning = null;
-        try
+        if (!deferPlaybackRobotLogs)
         {
-            Directory.CreateDirectory(effectiveLogDir);
-        }
-        catch (Exception ex)
-        {
-            warning = $"Failed to create log dir '{effectiveLogDir}'. Error: {ex.Message}";
-            try { Directory.CreateDirectory(effectiveLogDir); } catch { /* ignore */ }
+            try
+            {
+                Directory.CreateDirectory(effectiveLogDir);
+            }
+            catch (Exception ex)
+            {
+                warning = $"Failed to create log dir '{effectiveLogDir}'. Error: {ex.Message}";
+                try { Directory.CreateDirectory(effectiveLogDir); } catch { /* ignore */ }
+            }
         }
 
         _resolvedLogDir = effectiveLogDir;
-        _resolvedLogDirSource = logDirSource;
+        _resolvedLogDirSource = deferPlaybackRobotLogs ? "deferred_until_start:isolated_playback" : "persistence_base:logs/robot";
         _resolvedLogDirWarning = warning;
         _activeRobotLogDir = _resolvedLogDir;
         _useAsyncLogging = useAsyncLogging;
 
-        if (useAsyncLogging)
-            _loggingService = RobotLoggingService.GetOrCreate(projectRoot, _resolvedLogDir);
+        if (deferPlaybackRobotLogs)
+        {
+            _loggingService = null;
+            _log = new RobotLogger(projectRoot, null, instrument, null, deferPhysicalInitUntilRebind: true);
+        }
+        else
+        {
+            if (useAsyncLogging)
+                _loggingService = RobotLoggingService.GetOrCreate(projectRoot, _resolvedLogDir);
 
-        _log = new RobotLogger(projectRoot, _resolvedLogDir, instrument, _loggingService);
+            _log = new RobotLogger(projectRoot, _resolvedLogDir, instrument, _loggingService);
+        }
 
         _journals = new JournalStore(_persistenceBase);
         _timetablePoller = new TimetableFilePoller(timetablePollInterval);
@@ -722,7 +777,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         // NOTE: KillSwitch logs during construction. To ensure ALL logs include run_id,
         // we delay KillSwitch creation until Start() after _runId is set on the logger.
+        // RULE: ExecutionJournal ctor must not log — RobotLogger may block writes until Start() RebindLogging (isolated playback).
         _executionJournal = new ExecutionJournal(_persistenceBase, _log);
+        _pendingFillBridge = new PendingFillBridge(_log);
         JournalParityPendingLedger.Clear();
         WireExecutionJournalReleaseSuppressionCallbacks();
         _executionSummary = new ExecutionSummary();
@@ -809,21 +866,208 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             _runId = s;
     }
 
+    /// <summary>
+    /// Isolated SIM (Playback): reuse <c>QTSW2_RUN_ID</c> across all <see cref="RobotEngine"/> instances in the process so
+    /// <c>runs/&lt;run_id&gt;/</c> is shared. First engine generates and sets the env var (only when unset); live/other modes keep a unique Guid per engine.
+    /// </summary>
+    /// <param name="assignmentSource">Diagnostic: GENERATED_NEW, ENV_SHARED, ENV_INVALID_REGENERATED, or LIVE_UNIQUE.</param>
+    private void AssignRunIdAtSessionStart(out string assignmentSource)
+    {
+        var isolatedPlayback = _executionMode == ExecutionMode.SIM && _ignoreExistingStreamJournals;
+        if (!isolatedPlayback)
+        {
+            _runId = Guid.NewGuid().ToString("N");
+            assignmentSource = "LIVE_UNIQUE";
+            return;
+        }
+
+        var existingRunId = Environment.GetEnvironmentVariable("QTSW2_RUN_ID");
+        if (!string.IsNullOrWhiteSpace(existingRunId))
+        {
+            var s = SanitizeRunIdForPath(existingRunId);
+            if (s.Length > 0)
+            {
+                _runId = s;
+                assignmentSource = "ENV_SHARED";
+            }
+            else
+            {
+                _runId = Guid.NewGuid().ToString("N");
+                try
+                {
+                    Environment.SetEnvironmentVariable("QTSW2_RUN_ID", _runId);
+                }
+                catch
+                {
+                    /* best-effort */
+                }
+
+                assignmentSource = "ENV_INVALID_REGENERATED";
+            }
+        }
+        else
+        {
+            _runId = Guid.NewGuid().ToString("N");
+            try
+            {
+                Environment.SetEnvironmentVariable("QTSW2_RUN_ID", _runId);
+            }
+            catch
+            {
+                /* best-effort */
+            }
+
+            assignmentSource = "GENERATED_NEW";
+        }
+    }
+
     private string ComputeNextPersistenceBase(out bool isolatedPlayback)
     {
         isolatedPlayback = _executionMode == ExecutionMode.SIM && _ignoreExistingStreamJournals;
         if (!isolatedPlayback)
             return _root;
         var folder = string.IsNullOrWhiteSpace(_runId) ? "unknown_run" : _runId.Trim();
-        return RunDirectoryNaming.AllocateUniquePath(Path.Combine(_root, "runs"), folder);
+        var path = Path.Combine(_root, "runs", folder);
+        Directory.CreateDirectory(path);
+        return path;
     }
 
     /// <summary>
-    /// Effective <c>logs/robot</c> directory: under <see cref="_persistenceBase"/> when SIM + journal bypass; otherwise ctor-resolved log dir (live / default SIM).
+    /// Coordinator scope only: execution instruments for active (non-committed) streams, union instruments with open journal exposure on this engine (includes committed streams still carrying open entries).
+    /// Open journal rows are included only when (trading_date + stream/session + run persistence context) align with this engine.
+    /// Does not alter IEA, registry, or broker mutation ownership.
     /// </summary>
-    private string ComputeEffectiveRobotLogDirectory()
+    private IReadOnlyList<string> GetEngineScopedExecutionInstrumentKeys()
     {
-        return RobotRunArtifactPaths.LogsRobot(_persistenceBase);
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        lock (_engineLock)
+        {
+            foreach (var s in _streams.Values)
+            {
+                if (s.Committed) continue;
+                var ex = s.ExecutionInstrument?.Trim();
+                if (!string.IsNullOrEmpty(ex))
+                    set.Add(ex);
+            }
+        }
+
+        foreach (var kvp in _executionJournal.GetOpenJournalEntriesByInstrument())
+        {
+            if (kvp.Value == null || kvp.Value.Count == 0) continue;
+            foreach (var (td, stream, _, entry) in kvp.Value)
+            {
+                if (!IsOpenJournalRowInEngineCoordinatorScope(td, stream, entry))
+                    continue;
+                var jk = kvp.Key?.Trim();
+                if (!string.IsNullOrEmpty(jk))
+                {
+                    set.Add(jk);
+                    break;
+                }
+            }
+        }
+
+        return set.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    private bool IsExecutionInstrumentInThisEngineScope(string instrument)
+    {
+        if (string.IsNullOrWhiteSpace(instrument)) return false;
+        var key = instrument.Trim();
+        lock (_engineLock)
+        {
+            foreach (var s in _streams.Values)
+            {
+                if (s.Committed) continue;
+                if (string.Equals(s.ExecutionInstrument?.Trim(), key, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+        }
+
+        var canon = GetCanonicalInstrument(key);
+        foreach (var kvp in _executionJournal.GetOpenJournalEntriesByInstrument())
+        {
+            if (kvp.Value == null || kvp.Value.Count == 0) continue;
+            if (!ExecutionJournal.OpenJournalMapBucketMatches(kvp.Key, key, canon))
+                continue;
+            foreach (var (td, stream, _, entry) in kvp.Value)
+            {
+                if (IsOpenJournalRowInEngineCoordinatorScope(td, stream, entry))
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// When isolated playback uses <c>runs/&lt;run_id&gt;/</c>, require journal reads to stay tied to that folder (tail segment matches <see cref="_runId"/>).
+    /// </summary>
+    private bool IsPersistenceAlignedWithRunContext()
+    {
+        if (!_isolatedPlaybackPersistence)
+            return true;
+        if (string.IsNullOrWhiteSpace(_runId))
+            return true;
+        try
+        {
+            var full = Path.GetFullPath(_persistenceBase).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var tail = Path.GetFileName(full);
+            return string.Equals(tail, _runId.Trim(), StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Open journal rows count for coordinator scope when trading day, stream/session (via live <see cref="StreamStateMachine"/> when present), and run persistence context align.
+    /// </summary>
+    private bool IsOpenJournalRowInEngineCoordinatorScope(string tradingDateFromFile, string streamId, ExecutionJournalEntry entry)
+    {
+        if (string.IsNullOrWhiteSpace(streamId))
+            return false;
+        if (!_activeTradingDate.HasValue)
+            return false;
+        if (!IsPersistenceAlignedWithRunContext())
+            return false;
+
+        var sid = streamId.Trim();
+        var tdFile = tradingDateFromFile?.Trim() ?? "";
+
+        // Durable untracked-fill bucket: filename uses RECOVERY, not a calendar yyyy-MM-dd; scope to active engine + run folder only.
+        if (string.Equals(sid, ExecutionJournal.UntrackedFillRecoveryStream, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(tdFile, ExecutionJournal.UntrackedFillRecoveryTradingDateBucket, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (!string.Equals(tdFile, TradingDateString, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (!string.IsNullOrWhiteSpace(entry.TradingDate) &&
+            !string.Equals(entry.TradingDate.Trim(), tdFile, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (!string.IsNullOrWhiteSpace(entry.Stream) &&
+            !string.Equals(entry.Stream.Trim(), sid, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        lock (_engineLock)
+        {
+            if (_streams.TryGetValue(sid, out var sm))
+            {
+                if (!string.Equals(sm.TradingDate, TradingDateString, StringComparison.OrdinalIgnoreCase))
+                    return false;
+                // Session is implicit: sm.Session is this engine's session class for this stream id.
+                return true;
+            }
+        }
+
+        // Integrity-recovered synthetic stream (strategy stream id not in _streams); calendar day already matched.
+        if (string.Equals(sid, ExecutionJournal.RecoveredIntentStream, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return false;
     }
 
     private static bool RobotLogDirectoriesEqual(string a, string b)
@@ -840,11 +1084,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     }
 
     /// <summary>
-    /// Align async <see cref="RobotLoggingService"/> + <see cref="RobotLogger"/> with <see cref="ComputeEffectiveRobotLogDirectory"/> after <see cref="_persistenceBase"/> changes.
+    /// Align async <see cref="RobotLoggingService"/> + <see cref="RobotLogger"/> with <see cref="RobotRunArtifactPaths.LogsRobot"/> after <see cref="_persistenceBase"/> changes.
     /// </summary>
     private void RebindRobotLogDirectoryIfNeeded()
     {
-        var target = ComputeEffectiveRobotLogDirectory();
+        var target = RobotRunArtifactPaths.LogsRobot(_persistenceBase);
         if (RobotLogDirectoriesEqual(target, _activeRobotLogDir))
             return;
 
@@ -858,7 +1102,39 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             _loggingService = RobotLoggingService.GetOrCreate(_root, target);
 
         _log.RebindLogging(_loggingService, target);
-        _activeRobotLogDir = target;
+        _activeRobotLogDir = RobotRunArtifactPaths.LogsRobot(_persistenceBase);
+        _resolvedLogDir = _activeRobotLogDir;
+        _resolvedLogDirSource = _isolatedPlaybackPersistence ? "run_scoped:logs/robot" : "persistence_base:logs/robot";
+
+        if (_isolatedPlaybackPersistence && !string.IsNullOrWhiteSpace(_runId))
+        {
+            try
+            {
+                var full = Path.GetFullPath(target);
+                var rid = _runId.Trim();
+                if (full.IndexOf(rid, StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    var utcNow = _playbackStartTimeUtc ?? DateTimeOffset.UtcNow;
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "LOG_DIR_INVALID", state: "ENGINE",
+                        new
+                        {
+                            active_robot_log_dir = target,
+                            run_id = rid,
+                            note = "Isolated playback requires robot logs under runs/<run_id>/logs/robot"
+                        }));
+                    throw new InvalidOperationException(
+                        $"Robot logs directory is not run-scoped (missing run_id '{rid}' in path): '{full}'");
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                throw;
+            }
+            catch
+            {
+                /* best-effort validation only */
+            }
+        }
     }
 
     private void WireExecutionJournalReleaseSuppressionCallbacks()
@@ -950,10 +1226,17 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     public void Start()
     {
-        // CRITICAL: Set run_id before any Start-path logs
-        _runId = Guid.NewGuid().ToString("N");
+        // CRITICAL: Set run_id before any Start-path logs (RebindPersistenceIfNeeded → ApplyOptionalRunIdFromEnvironment refines from env after this)
+        AssignRunIdAtSessionStart(out var runIdAssignmentSource);
         _engineStartUtc = _playbackStartTimeUtc ?? DateTimeOffset.UtcNow;
         RebindPersistenceIfNeeded(_engineStartUtc);
+        LogEvent(RobotEvents.EngineBase(_engineStartUtc, tradingDate: "", eventType: "RUN_ID_ASSIGNED", state: "ENGINE",
+            new
+            {
+                run_id = _runId,
+                source = runIdAssignmentSource,
+                note = "Isolated playback: first engine sets QTSW2_RUN_ID when empty; subsequent engines reuse. Live: unique Guid per engine."
+            }));
         try
         {
             Environment.SetEnvironmentVariable("QTSW2_ROBOT_PERSISTENCE_BASE", _persistenceBase);
@@ -984,10 +1267,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         // Phase: initialize core under engine lock (serialize against timer/bar threads)
         lock (_engineLock)
         {
-            // Initialize KillSwitch after run_id is set so its constructor logs include run_id.
+            // KillSwitch construction is logging-free; startup audit is emitted from LogInitialized() after run_id / logger rebind.
             if (_killSwitch == null)
             {
                 _killSwitch = new KillSwitch(_root, _log);
+                _killSwitch.LogInitialized();
             }
 
             // Start async logging service if enabled (Fix B)
@@ -1009,10 +1293,21 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     spec_exists = File.Exists(_specPath)
                 }));
 
+            var resolvedRobotLogDir = _activeRobotLogDir ?? "";
+            string fpResolved;
+            try { fpResolved = string.IsNullOrWhiteSpace(resolvedRobotLogDir) ? "" : Path.GetFullPath(resolvedRobotLogDir); }
+            catch { fpResolved = resolvedRobotLogDir; }
+            var ridScope = _runId?.Trim() ?? "";
+            var isRunScoped = !string.IsNullOrEmpty(ridScope) && !string.IsNullOrEmpty(fpResolved) && fpResolved.IndexOf(ridScope, StringComparison.OrdinalIgnoreCase) >= 0;
+            if (_isolatedPlaybackPersistence && !isRunScoped)
+                throw new InvalidOperationException("LOG_DIR_RESOLVED: robot log directory must be run-scoped for isolated playback.");
+
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "LOG_DIR_RESOLVED", state: "ENGINE",
                 new
                 {
-                    log_dir = _resolvedLogDir,
+                    run_id = _runId,
+                    is_run_scoped = isRunScoped,
+                    log_dir = _activeRobotLogDir,
                     active_robot_log_dir = _activeRobotLogDir,
                     source = _resolvedLogDirSource,
                     env_QTSW2_LOG_DIR = envLogDir,
@@ -1423,12 +1718,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 runtimeAudit: _runtimeAudit,
                 convergenceTracker: _reconciliationConvergence,
                 redundancySuppression: _releaseReconRedundancy,
-                getCanonicalInstrumentForJournalAggregation: s => GetCanonicalInstrument(s));
+                getCanonicalInstrumentForJournalAggregation: s => GetCanonicalInstrument(s),
+                getPendingExecutionWorkloadForInstrument: GetPendingIeAWorkloadForBrokerInstrument,
+                getRunIdForReconciliationDiagnostics: () => _runId);
 
             // Gap 3 Phase 3–5: Protective coverage coordinator (blocks, corrective, emergency flatten escalation)
             _protectiveCoordinator = new ProtectiveCoverageCoordinator(
                 getSnapshot: () => _executionAdapter.GetAccountSnapshot(DateTimeOffset.UtcNow),
-                getActiveInstruments: () => Array.Empty<string>(),
+                getActiveInstruments: () => GetEngineScopedExecutionInstrumentKeys(),
                 isFlattenInProgress: _ => false,
                 isRecoveryInProgress: _ => false,
                 isInstrumentBlocked: inst => _frozenInstruments.Contains(inst),
@@ -1441,8 +1738,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     return FlattenResult.FailureResult("Emergency flatten enqueue not supported for this adapter", utcNow);
                 },
                 eventWriter: _eventWriter,
-                getActiveIntentIdsForInstrument: inst => _executionAdapter.GetActiveIntentIdsForProtectiveAudit(inst),
-                runtimeAudit: _runtimeAudit);
+                runtimeAudit: _runtimeAudit,
+                isInstrumentInEngineScope: IsExecutionInstrumentInThisEngineScope,
+                getPendingExecutionWorkloadForInstrument: GetPendingIeAWorkloadForBrokerInstrument,
+                getRunIdForMismatchDiagnostics: () => _runId);
 
             // Gap 4 + P1.5: Mismatch escalation + closed-loop state-consistency gate
             var stableWindowMs = _executionMode == ExecutionMode.SIM
@@ -1450,7 +1749,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 : MismatchEscalationPolicy.STATE_CONSISTENCY_STABLE_WINDOW_MS_LIVE;
             _mismatchCoordinator = new MismatchEscalationCoordinator(
                 getSnapshot: () => _executionAdapter.GetAccountSnapshot(DateTimeOffset.UtcNow),
-                getActiveInstruments: () => Array.Empty<string>(),
+                getActiveInstruments: () => GetEngineScopedExecutionInstrumentKeys(),
                 getMismatchObservations: (snap, utcNow) => AssembleMismatchObservations(snap, utcNow),
                 isInstrumentBlocked: inst => _frozenInstruments.Contains(inst) || (_protectiveCoordinator?.IsInstrumentBlockedByProtective(inst) ?? false),
                 isFlattenInProgress: _ => false,
@@ -1474,11 +1773,15 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                             instrument = inst,
                             note = "Persistent hedged net-flat gross-open — gate recovery scheduled (broker truth; journal model)"
                         }));
-                });
+                },
+                isInstrumentInEngineScope: IsExecutionInstrumentInThisEngineScope,
+                getPendingExecutionWorkloadForInstrument: GetPendingIeAWorkloadForBrokerInstrument,
+                getRunIdForMismatchDiagnostics: () => _runId);
 
             // P2 Phase 1: gate probe for aggregation guard + stream containment after blocked instrument flatten
             if (_executionAdapter is NinjaTraderSimAdapter simP2)
             {
+                simP2.SetPendingFillBridge(_pendingFillBridge);
                 simP2.SetMismatchExecutionTriggerCallback((inst, utc, d) =>
                 {
                     _releaseReconRedundancy.NotifyExecutionActivity();
@@ -2057,8 +2360,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             Stopwatch? wRecon = cpuProf ? Stopwatch.StartNew() : null;
 
             // Reconciliation: periodic orphaned journal cleanup (throttled). Skip during Historical - no live account.
+            // Drain non-IEA callback ingress first so journal updates from executions are applied before reconciliation.
             if (!isHistorical)
+            {
+                LogAndDrainCallbackIngressBeforeReconciliation(utcNow, nowWall);
                 RunReconciliationPeriodicThrottle(utcNow);
+            }
 
             reconciliationRunnerMs = wRecon?.ElapsedMilliseconds ?? 0;
             Stopwatch? wTimetableStream = cpuProf ? Stopwatch.StartNew() : null;
@@ -6000,13 +6307,17 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             var canonicalForJournalAgg = GetCanonicalInstrument(inst) ?? inst;
             var journalQty = _executionJournal.GetOpenJournalQuantitySumForInstrumentFromMap(openByInst, inst, canonicalForJournalAgg);
             var netJournalQty = _executionJournal.GetOpenJournalSignedNetForInstrumentFromMap(openByInst, inst, canonicalForJournalAgg);
+            var (pendingGrossOv, pendingNetOv) = _pendingFillBridge.GetEffectiveOverlays(inst, canonicalForJournalAgg, journalQty,
+                netJournalQty, brokerQty, netBrokerQty, utcNow);
+            var effectiveJournalQty = journalQty + pendingGrossOv;
+            var effectiveNetJournalQty = netJournalQty + pendingNetOv;
             var opposingMultiIntent = _executionJournal.HasOpposingDirectionOpenIntentsFromMap(openByInst, inst, canonicalForJournalAgg);
             var actGen = _releaseReconRedundancy.ExecutionActivityGeneration;
 
             var nonOwnerAssembleGate = useIea &&
-                brokerQty != journalQty &&
+                brokerQty != effectiveJournalQty &&
                 ReconciliationStateTracker.Shared.TryPeekNonOwnerWithStableQtyMismatchEpisode(
-                    account, inst, _reconciliationWriterInstanceId, brokerQty, journalQty, out _) &&
+                    account, inst, _reconciliationWriterInstanceId, brokerQty, effectiveJournalQty, out _) &&
                 (!ReconciliationIeaLookup.TryResolveForMismatchAssembly(account, inst, brokerWorking, GetExecutionInstrument,
                     out var ieaNonOwnerPregate, out _) || ieaNonOwnerPregate == null);
 
@@ -6015,7 +6326,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 var resurfaceNonOwnerAssemble = false;
                 if (_nonOwnerAssembleSuppressByInstrument.TryGetValue(inst, out var nos))
                 {
-                    var tupleMatch = nos.BrokerQty == brokerQty && nos.JournalQty == journalQty && nos.BrokerWorking == brokerWorking &&
+                    var tupleMatch = nos.BrokerQty == brokerQty && nos.JournalQty == effectiveJournalQty && nos.BrokerWorking == brokerWorking &&
                         nos.ActivityGeneration == actGen;
                     if (!tupleMatch)
                     {
@@ -6047,7 +6358,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         _nonOwnerAssembleSuppressByInstrument[inst] = new NonOwnerAssembleSuppressState
                         {
                             BrokerQty = brokerQty,
-                            JournalQty = journalQty,
+                            JournalQty = effectiveJournalQty,
                             BrokerWorking = brokerWorking,
                             ActivityGeneration = actGen,
                             AnchorUtc = utcNow
@@ -6062,7 +6373,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             if (useIea &&
                 _ieaUnavailableDegradedSuppressByInstrument.TryGetValue(inst, out var ieaDegSup) &&
                 ieaDegSup.BrokerQty == brokerQty &&
-                ieaDegSup.JournalQty == journalQty &&
+                ieaDegSup.JournalQty == effectiveJournalQty &&
                 ieaDegSup.BrokerWorking == brokerWorking &&
                 ieaDegSup.ActivityGeneration == actGen &&
                 (utcNow - ieaDegSup.AnchorUtc).TotalSeconds < IeaDegradedSuppressResurfaceSeconds)
@@ -6141,7 +6452,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 _ieaUnavailableDegradedSuppressByInstrument[inst] = new IeaUnavailableDegradedSuppressState
                 {
                     BrokerQty = brokerQty,
-                    JournalQty = journalQty,
+                    JournalQty = effectiveJournalQty,
                     BrokerWorking = brokerWorking,
                     ActivityGeneration = actGen,
                     AnchorUtc = utcNow
@@ -6157,7 +6468,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
 
             // Abs sums are not canonical for safety — use signed nets for net truth. See MismatchObservation.BrokerQty / NetBrokerQty.
-            var aggregatesAligned = brokerQty == journalQty && netBrokerQty == netJournalQty && brokerWorking == localWorking;
+            var aggregatesAligned = brokerQty == effectiveJournalQty && netBrokerQty == effectiveNetJournalQty && brokerWorking == localWorking;
             if (aggregatesAligned)
             {
                 _ieaUnavailableDegradedSuppressByInstrument.Remove(inst);
@@ -6244,9 +6555,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 ? MismatchType.ORDER_REGISTRY_MISSING
                 : MismatchClassification.Classify(
                     brokerQty,
-                    journalQty,
+                    effectiveJournalQty,
                     netBrokerQty,
-                    netJournalQty,
+                    effectiveNetJournalQty,
                     opposingMultiIntent,
                     brokerWorking,
                     effectiveLocalWorking);
@@ -6267,7 +6578,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                             iea_ambiguous = ieaOwnershipAmbiguous,
                             note = "Defer ORDER_REGISTRY_MISSING_FAIL_CLOSED pending recovery / ownership resolution"
                         }));
-                    if (brokerQty == journalQty)
+                    if (brokerQty == effectiveJournalQty)
                         continue;
                 }
                 else
@@ -6290,11 +6601,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 MismatchType = mismatchType,
                 Present = true,
                 Summary =
-                    $"broker_qty_abs={brokerQty} gross_journal_qty={journalQty} net_broker={netBrokerQty} net_journal={netJournalQty} structural_multi_intent={opposingMultiIntent} broker_working={brokerWorking} local_working={effectiveLocalWorking}",
+                    $"broker_qty_abs={brokerQty} gross_journal_qty={effectiveJournalQty} (disk_gross={journalQty} pending_gross_ov={pendingGrossOv}) net_broker={netBrokerQty} net_journal={effectiveNetJournalQty} (disk_net={netJournalQty} pending_net_ov={pendingNetOv}) structural_multi_intent={opposingMultiIntent} broker_working={brokerWorking} local_working={effectiveLocalWorking}",
                 BrokerQty = brokerQty,
-                LocalQty = journalQty,
+                LocalQty = effectiveJournalQty,
                 NetBrokerQty = netBrokerQty,
-                NetJournalQty = netJournalQty,
+                NetJournalQty = effectiveNetJournalQty,
                 BrokerWorkingOrderCount = brokerWorking,
                 LocalWorkingOrderCount = effectiveLocalWorking,
                 JournalOpenEntryCount = journalWorking,
@@ -6550,6 +6861,13 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         RunEnsureJournalIntegrity(inst, snap, utcNow, markEnsuredForInvariant: true);
     }
 
+    /// <summary>
+    /// Hard fail-closed broker flatten only for material parity breaks (position divergence, non-robot-tagged working orders).
+    /// <see cref="JournalParityStatus.WORKING_ORDER_MISMATCH"/> is left to mismatch escalation / state-consistency gate.
+    /// </summary>
+    private static bool JournalParityStatusWarrantsHardFailClosedFlatten(JournalParityStatus status) =>
+        status is JournalParityStatus.POSITION_MISMATCH or JournalParityStatus.UNKNOWN_ORDER_PRESENT;
+
     /// <summary>Fast path: only runs full ensure when parity is already broken (avoids log noise on hot execution paths).</summary>
     private void TryEnsureJournalIntegrityAfterExecutionActivity(string inst, DateTimeOffset utcNow,
         MismatchExecutionTriggerDetails triggerDetails = default)
@@ -6584,7 +6902,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         if (pre.IsOkOrPendingAlignment) return;
         if (triggerDetails.SuppressHardJournalIntegrityActions)
             return;
-        if (FeatureFlags.EnableHardFailClosedBrokerFlatten)
+        if (FeatureFlags.EnableHardFailClosedBrokerFlatten &&
+            JournalParityStatusWarrantsHardFailClosedFlatten(pre.Status))
         {
             try
             {

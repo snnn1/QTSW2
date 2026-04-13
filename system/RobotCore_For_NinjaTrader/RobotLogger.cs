@@ -20,15 +20,20 @@ public sealed class RobotLogger
     private readonly string? _instrument;
     private RobotLoggingService? _loggingService; // Optional reference to singleton service for ENGINE logs
     private string? _runId; // Engine run identifier (GUID per engine start)
+    /// <summary>When true, <see cref="Write"/> throws until <see cref="RebindLogging"/> (isolated playback: avoid project-root logs/robot before run id exists).</summary>
+    private bool _logWritesBlockedUntilRebind;
 
-    public RobotLogger(string projectRoot, string? customLogDir = null, string? instrument = null, RobotLoggingService? loggingService = null)
+    public RobotLogger(string projectRoot, string? customLogDir = null, string? instrument = null, RobotLoggingService? loggingService = null,
+        bool deferPhysicalInitUntilRebind = false)
     {
         _projectRoot = projectRoot;
         _instrument = instrument;
         _loggingService = loggingService;
-        
-        _robotLogDir = customLogDir ?? Path.Combine(projectRoot, "logs", "robot");
-        Directory.CreateDirectory(_robotLogDir);
+        _logWritesBlockedUntilRebind = deferPhysicalInitUntilRebind;
+
+        _robotLogDir = customLogDir ?? RobotRunArtifactPaths.LogsRobot(projectRoot);
+        if (!deferPhysicalInitUntilRebind)
+            Directory.CreateDirectory(_robotLogDir);
 
         // Generate unique instance ID to prevent shared file writes in fallback mode
         // Note: Using Substring instead of range operator for .NET Framework compatibility
@@ -46,6 +51,7 @@ public sealed class RobotLogger
     {
         _loggingService = loggingService;
         _robotLogDir = absoluteRobotLogDir;
+        _logWritesBlockedUntilRebind = false;
         try
         {
             Directory.CreateDirectory(_robotLogDir);
@@ -90,8 +96,59 @@ public sealed class RobotLogger
         return sanitized.ToUpperInvariant();
     }
 
+    private static bool LooksLikeRunScopedRobotLogDir(string absoluteRobotLogDir)
+    {
+        try
+        {
+            var fp = Path.GetFullPath(absoluteRobotLogDir);
+            return fp.IndexOf($"{Path.DirectorySeparatorChar}runs{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase) >= 0
+                || fp.IndexOf($"{Path.AltDirectorySeparatorChar}runs{Path.DirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase) >= 0
+                || fp.IndexOf($"{Path.DirectorySeparatorChar}runs{Path.AltDirectorySeparatorChar}", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void ValidateResolvedWritePath(string fullPath)
+    {
+        if (string.IsNullOrWhiteSpace(_robotLogDir))
+            throw new InvalidOperationException("Logging before initialization: robot log directory is not set.");
+
+        string root;
+        string cand;
+        try
+        {
+            root = Path.GetFullPath(_robotLogDir);
+            cand = Path.GetFullPath(fullPath);
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException("Invalid log path resolution.", ex);
+        }
+
+        var rn = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var under = cand.StartsWith(rn + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+            || cand.StartsWith(rn + Path.AltDirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(cand, rn, StringComparison.OrdinalIgnoreCase);
+        if (!under)
+            throw new InvalidOperationException("Attempt to write outside run log directory");
+
+        if (!string.IsNullOrWhiteSpace(_runId) && LooksLikeRunScopedRobotLogDir(_robotLogDir))
+        {
+            var rid = _runId.Trim();
+            if (cand.IndexOf(rid, StringComparison.OrdinalIgnoreCase) < 0)
+                throw new InvalidOperationException("Log path does not match run_id");
+        }
+    }
+
     public void Write(object evt)
     {
+        // RULE: No logging allowed before RobotEngine.Start() completes (isolated playback: RebindLogging clears this).
+        if (_logWritesBlockedUntilRebind)
+            throw new InvalidOperationException("Logging before initialization: RobotLogger.RebindLogging has not been applied.");
+
         // CRITICAL RULE: ALL logs SHOULD go through RobotLoggingService singleton for proper routing.
         // - ENGINE events (stream == "__engine__") → robot_ENGINE.jsonl
         // - Execution events (has intent_id) → robot_<instrument>.jsonl (per-instrument)
@@ -218,6 +275,7 @@ public sealed class RobotLogger
             var line = JsonUtil.Serialize(evt);
             lock (_lock)
             {
+                ValidateResolvedWritePath(_jsonlPath);
                 File.AppendAllText(_jsonlPath, line + Environment.NewLine);
             }
         }
@@ -233,6 +291,7 @@ public sealed class RobotLogger
                 try
                 {
                     var errorLogPath = Path.Combine(Path.GetDirectoryName(_jsonlPath) ?? "", $"robot_logging_errors_{_instanceId}.txt");
+                    ValidateResolvedWritePath(errorLogPath);
                     var errorMsg = $"[{now:yyyy-MM-dd HH:mm:ss} UTC] [Instance {_instanceId}] Logging error: {ex.Message}\n";
                     File.AppendAllText(errorLogPath, errorMsg);
                 }

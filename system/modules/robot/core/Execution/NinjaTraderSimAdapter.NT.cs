@@ -2032,6 +2032,15 @@ public sealed partial class NinjaTraderSimAdapter
             JournalParityPendingLedger.TryRecordTrustedFill(context.ExecutionInstrument.Trim(), parityKey,
                 entrySign * fillQuantity, intentId, utcNow);
 
+            var isLongEntry = !string.Equals(context.Direction, "Short", StringComparison.OrdinalIgnoreCase);
+            _pendingFillBridge?.RecordEntryFillObserved(
+                orderInfo.Instrument.Trim(),
+                fillQuantity,
+                isLongEntry,
+                utcNow,
+                context.IntentId,
+                order.OrderId?.ToString() ?? "");
+
             _executionJournal.RecordEntryFill(
                 context.IntentId, 
                 context.TradingDate, 

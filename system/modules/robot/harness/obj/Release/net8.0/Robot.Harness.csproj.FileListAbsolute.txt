@@ -19,3 +19,6 @@ C:\Users\jakej\QTSW2\modules\robot\harness\obj\Release\net8.0\refint\Robot.Harne
 C:\Users\jakej\QTSW2\modules\robot\harness\obj\Release\net8.0\Robot.Harness.pdb
 C:\Users\jakej\QTSW2\modules\robot\harness\obj\Release\net8.0\Robot.Harness.genruntimeconfig.cache
 C:\Users\jakej\QTSW2\modules\robot\harness\obj\Release\net8.0\ref\Robot.Harness.dll
+c:\Users\jakej\QTSW2\system\modules\robot\harness\obj\Release\net8.0\Robot.Harness.dll
+c:\Users\jakej\QTSW2\system\modules\robot\harness\obj\Release\net8.0\refint\Robot.Harness.dll
+c:\Users\jakej\QTSW2\system\modules\robot\harness\obj\Release\net8.0\Robot.Harness.pdb

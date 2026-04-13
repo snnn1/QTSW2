@@ -230,6 +230,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     /// <summary>Run-scoped KEY_EVENTS.jsonl (decision signal). Set by engine with persistence base.</summary>
     private KeyEventWriter? _keyEventWriter;
 
+    /// <summary>Overrides <see cref="KeyEventWriter"/> ENTRY_TERMINATED reason when broker cancel follows programmatic cancel (flatten / slot cleanup).</summary>
+    private readonly ConcurrentDictionary<string, string> _pendingEntryTerminationReason = new(StringComparer.OrdinalIgnoreCase);
+
     /// <summary>Gap 5: Set canonical event writer for replay. Call before SetNTContext when using IEA.</summary>
     public void SetEventWriter(ExecutionEventWriter? writer) => _eventWriter = writer;
 

@@ -498,6 +498,17 @@ public sealed partial class InstrumentExecutionAuthority
     /// <summary>Queue depth for heartbeat/observability.</summary>
     internal int QueueDepth => _executionQueue.Count;
 
+    /// <summary>
+    /// True when the IEA queue has pending work or the worker is executing an in-flight item.
+    /// Mismatch / reconciliation must not compare broker vs journal for this instrument until this is false.
+    /// </summary>
+    public bool HasPendingExecutionWork =>
+        QueueDepth > 0 || _currentWorkStartedUtc != DateTimeOffset.MinValue;
+
+    /// <summary>Diagnostic workload: queued items plus one while the worker is inside a dequeued action.</summary>
+    public int PendingExecutionWorkloadCount =>
+        QueueDepth + (_currentWorkStartedUtc != DateTimeOffset.MinValue ? 1 : 0);
+
     /// <summary>Last mutation timestamp for heartbeat.</summary>
     internal DateTimeOffset LastMutationUtc => _lastMutationUtc;
 

@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>10.0</LangVersion>
+    <RootNamespace>QTSW2.Robot.Core.KeyEventsNarrativeTool</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.Text.Json" Version="8.0.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="..\KeyEventsContractCatalog.cs" Link="KeyEventsContractCatalog.cs" />
+    <Compile Include="..\KeyEventsContractValidation.cs" Link="KeyEventsContractValidation.cs" />
+    <Compile Include="..\KeyEventsNarrativeReader.cs" Link="KeyEventsNarrativeReader.cs" />
+    <Compile Include="..\Tests\KeyEventsNarrativeReconstructionTests.cs" Link="KeyEventsNarrativeReconstructionTests.cs" />
+  </ItemGroup>
+</Project>

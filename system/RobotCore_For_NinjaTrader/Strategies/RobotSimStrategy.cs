@@ -145,6 +145,14 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Nonce (0=not run, 1=executed) prevents accidental re-execution; Interlocked ensures single execution.
         private int _testInjectNonce = 0;
 
+#if NINJATRADER
+        /// <summary>Latched when NinjaTrader reports a Playback (Market Replay) connection — see <see cref="UpdateMarketReplayConnectionFromNinja"/>.</summary>
+        private bool _marketReplayConnectionDetected;
+        private bool _loggedMarketReplayClockDiagnostic;
+        /// <summary>Last bar open UTC used for Tick/OnBar event clock (Market Replay / Historical).</summary>
+        private DateTimeOffset? _lastValidBarEventUtcOpen;
+#endif
+
         /// <summary>
         /// Primary series bar time from NinjaTrader <see cref="Times"/> — <see cref="Times"/> is UTC (SIM/playback), not Chicago local.
         /// Do not apply America/Chicago→UTC conversion here (that double-shifts the clock).
@@ -180,6 +188,33 @@ namespace NinjaTrader.NinjaScript.Strategies
             catch { /* PLAYBACK_TIME_UNKNOWN */ }
             return false;
         }
+
+#if NINJATRADER
+        /// <summary>
+        /// Detect Market Replay (Playback Connection). Primary signal: <see cref="Connection.Options"/>.Name contains "Playback"
+        /// (NinjaTrader documents Playback Connection). Does not use account name alone — Simulation forward can be non-Playback.
+        /// </summary>
+        private void UpdateMarketReplayConnectionFromNinja(NinjaTrader.Cbi.Connection? connection)
+        {
+            var optName = connection?.Options?.Name;
+            if (!string.IsNullOrEmpty(optName) &&
+                optName.IndexOf("Playback", StringComparison.OrdinalIgnoreCase) >= 0)
+                _marketReplayConnectionDetected = true;
+        }
+
+        /// <summary>Re-read account connection after DataLoaded (OnConnectionStatusUpdate may have fired first).</summary>
+        private void TryRefreshMarketReplayFromAccount()
+        {
+            try
+            {
+                UpdateMarketReplayConnectionFromNinja(Account?.Connection);
+            }
+            catch
+            {
+                /* NT API variance */
+            }
+        }
+#endif
 
         /// <summary>Derive canonical instrument from execution instrument (e.g. MES->ES, MNQ->NQ).</summary>
         private static string DeriveCanonicalFromExecutionInstrument(string execInst)
@@ -243,6 +278,17 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (!string.IsNullOrEmpty(state)) parts.Add($"state={state}");
                 if (!string.IsNullOrEmpty(instanceId)) parts.Add($"instance={instanceId}");
                 if (!string.IsNullOrEmpty(extra)) parts.Add(extra);
+                var persistRoot = Path.GetFullPath(runRoot);
+                if (RobotRunArtifactPaths.IsRunScopedPersistence(persistRoot))
+                {
+                    parts.Add($"run_id={RobotRunArtifactPaths.AuditRunIdLabel(persistRoot, Environment.GetEnvironmentVariable("QTSW2_RUN_ID"))}");
+                    parts.Add("scope=RUN");
+                }
+                else
+                {
+                    parts.Add("run_id=NONE");
+                    parts.Add("scope=GLOBAL");
+                }
                 var line = string.Join(" | ", parts) + Environment.NewLine;
                 File.AppendAllText(path, line);
             }
@@ -290,13 +336,10 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Configure)
             {
-                TraceLifecycle("Configure_ENTER", Instrument?.MasterInstrument?.Name, "Configure", _instanceId);
                 AddDataSeries(BarsPeriodType.Second, 1);
-                TraceLifecycle("Configure_EXIT", Instrument?.MasterInstrument?.Name, "Configure", _instanceId);
             }
             else if (State == State.DataLoaded)
             {
-                TraceLifecycle("DataLoaded_ENTER", Instrument?.MasterInstrument?.Name, "DataLoaded");
                 try
                 {
                     // Verify non-live (Simulation / Playback) account — same rules as NinjaTraderSimAdapter
@@ -541,6 +584,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (_engine != null)
                     _engine.LogEngineEvent(DateTimeOffset.UtcNow, "DATALOADED_WIRE_DONE", new Dictionary<string, object> { { "instrument", Instrument?.MasterInstrument?.Name ?? "" }, { "note", "WireNTContextToAdapter completed" } });
                 TraceLifecycle("DataLoaded_WIRE_DONE", Instrument?.MasterInstrument?.Name, "DataLoaded");
+
+#if NINJATRADER
+                TryRefreshMarketReplayFromAccount();
+#endif
 
                 _engineReady = true;
                 TraceLifecycle("DataLoaded_ENGINE_READY_TRUE", Instrument?.MasterInstrument?.Name, "DataLoaded");
@@ -1820,32 +1867,67 @@ namespace NinjaTrader.NinjaScript.Strategies
             // INVARIANT: BarsPeriod == 1 minute (enforced above)
             var barUtcOpenTime = barUtc.AddMinutes(-1);
 
+            // Single event clock for OHLC, Tick(), and OnBar(..., utcNow): bar open UTC (matches first arg to OnBar).
+            // Historical: always bar time. Realtime on Market Replay connection: bar time (not wall clock).
+            // Live Realtime (non-Playback connection): wall clock.
+#if NINJATRADER
+            var useBarEventClock = State == State.Historical || _marketReplayConnectionDetected;
+            DateTimeOffset eventUtcForEngine;
+            if (useBarEventClock)
+            {
+                eventUtcForEngine = barUtcOpenTime;
+                _lastValidBarEventUtcOpen = barUtcOpenTime;
+            }
+            else
+            {
+                eventUtcForEngine = nowUtc;
+            }
+#else
+            var useBarEventClock = State == State.Historical;
+            var eventUtcForEngine = useBarEventClock ? barUtcOpenTime : nowUtc;
+#endif
+
             // Deliver bar data to engine (bars only provide market data, not time advancement)
             if (logTiming) TraceLifecycle("OnBarUpdate_BEFORE_ONBAR", Instrument?.MasterInstrument?.Name, "Historical", _instanceId, $"bar={CurrentBar}");
-            _engine.OnBar(barUtcOpenTime, Instrument.MasterInstrument.Name, open, high, low, close, nowUtc);
+            _engine.OnBar(barUtcOpenTime, Instrument.MasterInstrument.Name, open, high, low, close, eventUtcForEngine);
             if (logTiming) TraceLifecycle("OnBarUpdate_AFTER_ONBAR", Instrument?.MasterInstrument?.Name, "Historical", _instanceId, $"bar={CurrentBar}");
             LogBarProfileIfSlow("onbar", barProfileSw.ElapsedMilliseconds - barProfileLastMs);
             barProfileLastMs = barProfileSw.ElapsedMilliseconds;
+
+#if NINJATRADER
+            if (_marketReplayConnectionDetected && _engine != null && !_loggedMarketReplayClockDiagnostic)
+            {
+                _loggedMarketReplayClockDiagnostic = true;
+                _engine.LogEngineEvent(eventUtcForEngine, "MARKET_REPLAY_EVENT_CLOCK", new Dictionary<string, object>
+                {
+                    { "instrument", Instrument?.MasterInstrument?.Name ?? "" },
+                    { "state", State.ToString() },
+                    { "note", "Playback Connection detected — Tick and OnBar utcNow use bar open time (event clock), not wall clock." }
+                });
+            }
+#endif
             
             // PATTERN 1: Drive Tick() from bar flow (bar-driven liveness)
             // Tick() is now invoked only when bars arrive, not from a synthetic timer
             // CRITICAL: During State.Historical ("Calculating"), pass bar time so that time-based logic
             // (forced flatten, PRE_HYDRATION transition, range lock at slot time) runs in bar context.
-            // Using real time during Historical caused: wrong timeframe range lock, forced flatten
-            // firing on every bar (if enabled after 15:55 CT), and "stuck on Calculating". See
-            // PRE_HYDRATION_AND_FORCED_FLATTEN_DEEP_DIVE.md.
-            var tickTimeUtc = State == State.Historical ? barUtc : nowUtc;
-            // Diagnostic: log once per 2 min so we can confirm bar-time fix is deployed (bar_time_used only in Historical) — gated when diagnostic_logging_during_historical=false
+            // Market Replay (Playback Connection) in Realtime also uses bar open time — not DateTime.UtcNow — so
+            // StreamStateMachine slot/range logic matches the replay clock. See PRE_HYDRATION_AND_FORCED_FLATTEN_DEEP_DIVE.md.
+            var tickTimeUtc = eventUtcForEngine;
+            // Diagnostic: log once per 2 min — gated when diagnostic_logging_during_historical=false
             if (!skipHistoricalDiag && _engine != null && (!_lastTickTimeDiagnosticUtc.TryGetValue(Instrument?.MasterInstrument?.Name ?? "", out var lastDiag) || (nowUtc - lastDiag).TotalMinutes >= 2.0))
             {
                 _lastTickTimeDiagnosticUtc[Instrument?.MasterInstrument?.Name ?? ""] = nowUtc;
-                _engine.LogEngineEvent(nowUtc, "TICK_TIME_SOURCE", new Dictionary<string, object>
+                _engine.LogEngineEvent(eventUtcForEngine, "TICK_TIME_SOURCE", new Dictionary<string, object>
                 {
                     { "instrument", Instrument?.MasterInstrument?.Name ?? "" },
                     { "state", State.ToString() },
-                    { "bar_time_used", State == State.Historical },
+                    { "bar_event_clock", useBarEventClock },
+#if NINJATRADER
+                    { "market_replay_connection", _marketReplayConnectionDetected },
+#endif
                     { "tick_time_utc", tickTimeUtc.ToString("o") },
-                    { "note", "Historical=bar time, Realtime=wall clock. Confirms bar-time fix is active." }
+                    { "note", "bar_event_clock=true: bar open UTC for Historical or Market Replay. false: wall clock (live Realtime)." }
                 });
             }
             if (logTiming) TraceLifecycle("OnBarUpdate_BEFORE_TICK", Instrument?.MasterInstrument?.Name, "Historical", _instanceId, $"bar={CurrentBar}");
@@ -2426,10 +2508,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 IeExecutionLatencyTrace.Write("STRATEGY_ON_EXECUTION_UPDATE", e.Execution.Order, e.Execution, orderInstrumentKey,
                     ieaInstanceId: null, fillQtyStrategy);
 
-                // Update broker sync gate timestamp (before forwarding)
-                _engine.OnBrokerExecutionUpdateObserved(DateTimeOffset.UtcNow);
-
+                // Forward first so execution journal + pending-fill bridge update before broker-sync wake
+                // (avoids mismatch timer seeing broker ahead of journal during fill propagation).
                 endpoint(e.Execution, e.Execution.Order);
+
+                _engine.OnBrokerExecutionUpdateObserved(DateTimeOffset.UtcNow);
             }
             catch (Exception ex)
             {
@@ -2473,6 +2556,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // ConnectionStatusEventArgs - pass the Connection.Status directly (NinjaTrader API)
                 // The Connection property has a Status property of type NinjaTrader.Cbi.ConnectionStatus
                 var connection = connectionStatusUpdate.Connection;
+#if NINJATRADER
+                UpdateMarketReplayConnectionFromNinja(connection);
+#endif
                 var ntStatus = connection?.Status;
                 // Use strongly-typed extension method (no reflection needed in strategy project)
                 // Null status fallback to ConnectionError

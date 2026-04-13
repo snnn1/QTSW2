@@ -29,6 +29,10 @@ public sealed class ProtectiveCoverageCoordinator
     private readonly RobotLogger? _log;
     private readonly ExecutionEventWriter? _eventWriter;
     private readonly RuntimeAuditHub? _runtimeAudit;
+    /// <summary>When set, audits and canonical events apply only to instruments managed by this <see cref="RobotEngine"/> (non-committed streams).</summary>
+    private readonly Func<string, bool>? _isInstrumentInEngineScope;
+    private readonly Func<string, int>? _getPendingExecutionWorkloadForInstrument;
+    private readonly Func<string?>? _getRunIdForMismatchDiagnostics;
     private readonly Timer _auditTimer;
     private DateTimeOffset _lastAuditUtc = DateTimeOffset.MinValue;
 
@@ -51,7 +55,10 @@ public sealed class ProtectiveCoverageCoordinator
         Func<ProtectiveCorrectiveRequest, ProtectiveCorrectiveResult>? submitCorrective = null,
         Func<string, DateTimeOffset, FlattenResult>? emergencyFlatten = null,
         ExecutionEventWriter? eventWriter = null,
-        RuntimeAuditHub? runtimeAudit = null)
+        RuntimeAuditHub? runtimeAudit = null,
+        Func<string, bool>? isInstrumentInEngineScope = null,
+        Func<string, int>? getPendingExecutionWorkloadForInstrument = null,
+        Func<string?>? getRunIdForMismatchDiagnostics = null)
     {
         _getSnapshot = getSnapshot ?? throw new ArgumentNullException(nameof(getSnapshot));
         _getActiveInstruments = getActiveInstruments ?? (() => Array.Empty<string>());
@@ -63,6 +70,9 @@ public sealed class ProtectiveCoverageCoordinator
         _log = log;
         _eventWriter = eventWriter;
         _runtimeAudit = runtimeAudit;
+        _isInstrumentInEngineScope = isInstrumentInEngineScope;
+        _getPendingExecutionWorkloadForInstrument = getPendingExecutionWorkloadForInstrument;
+        _getRunIdForMismatchDiagnostics = getRunIdForMismatchDiagnostics;
 
         _auditTimer = new Timer(OnAuditTick, null, ProtectiveAuditPolicy.PROTECTIVE_AUDIT_INTERVAL_ACTIVE_MS, ProtectiveAuditPolicy.PROTECTIVE_AUDIT_INTERVAL_ACTIVE_MS);
     }
@@ -91,7 +101,9 @@ public sealed class ProtectiveCoverageCoordinator
             var snapshot = _getSnapshot();
             var instruments = _getActiveInstruments();
 
-            if (instruments.Count == 0 && snapshot.Positions != null)
+            // Without engine scope: legacy behavior — expand to all account positions when the active list is empty.
+            // With engine scope: never fall back to the whole account; empty list means this engine has nothing to audit.
+            if (instruments.Count == 0 && snapshot.Positions != null && _isInstrumentInEngineScope == null)
             {
                 var fromPositions = snapshot.Positions
                     .Where(p => p.Quantity != 0 && !string.IsNullOrWhiteSpace(p.Instrument))
@@ -101,11 +113,28 @@ public sealed class ProtectiveCoverageCoordinator
                 instruments = fromPositions;
             }
 
+            if (_isInstrumentInEngineScope != null)
+                instruments = instruments.Where(i => !string.IsNullOrWhiteSpace(i) && _isInstrumentInEngineScope(i.Trim())).ToList();
+
             foreach (var instrument in instruments)
             {
                 if (string.IsNullOrWhiteSpace(instrument)) continue;
 
                 var inst = instrument.Trim();
+                var pendingIeA = _getPendingExecutionWorkloadForInstrument?.Invoke(inst) ?? 0;
+                if (pendingIeA > 0)
+                {
+                    _log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "PROTECTIVE_AUDIT_SKIPPED_PENDING_EXECUTION", state: "ENGINE",
+                        new
+                        {
+                            instrument = inst,
+                            pending_execution_count = pendingIeA,
+                            run_id = _getRunIdForMismatchDiagnostics?.Invoke() ?? "",
+                            ts_utc = utcNow.ToString("o")
+                        }));
+                    continue;
+                }
+
                 var blockedForAudit = _isInstrumentBlockedExternal(inst) || IsInstrumentBlockedByProtective(inst);
 
                 var result = ProtectiveCoverageAudit.Audit(
@@ -141,6 +170,10 @@ public sealed class ProtectiveCoverageCoordinator
 
     private void EmitCanonical(string inst, string eventType, DateTimeOffset utc, object payload, string severity = "INFO")
     {
+        if (_isInstrumentInEngineScope != null &&
+            (string.IsNullOrWhiteSpace(inst) || !_isInstrumentInEngineScope(inst.Trim())))
+            return;
+
         _eventWriter?.Emit(new CanonicalExecutionEvent
         {
             TimestampUtc = utc.ToString("o"),

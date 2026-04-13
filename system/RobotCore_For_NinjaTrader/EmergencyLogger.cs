@@ -64,7 +64,7 @@ public static class EmergencyLogger
     /// <summary>Backward-compatible overload: resolves <c>logs/robot</c> from project root and optional override.</summary>
     public static void WriteEngineFallback(string projectRoot, string? customLogDir, object evt)
     {
-        var dir = customLogDir ?? Path.Combine(projectRoot, "logs", "robot");
+        var dir = customLogDir ?? RobotRunArtifactPaths.LogsRobot(projectRoot);
         WriteEngineFallback(dir, evt);
     }
 

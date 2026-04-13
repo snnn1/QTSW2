@@ -47,6 +47,9 @@ public sealed class RobotLogEvent
     /// <summary>Current run ID if available</summary>
     public string? run_id { get; set; }
 
+    /// <summary>Audit: <c>RUN</c> when persistence is under <c>runs/&lt;id&gt;/</c>; <c>GLOBAL</c> for project-root logs (health sink, etc.).</summary>
+    public string? scope { get; set; }
+
     /// <summary>Short event name/type</summary>
     public string @event { get; set; } = "";
 

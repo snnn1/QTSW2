@@ -48,6 +48,10 @@ public readonly struct RecoveredIntentUpsertResult
 /// Execution journal for idempotency and audit trail.
 /// Persists per (trading_date, stream, intent_id) to prevent double-submission.
 /// </summary>
+/// <remarks>
+/// RULE: No logging allowed before <see cref="RobotEngine.Start"/> completes (see <see cref="RobotLogger.RebindLogging"/>).
+/// Constructor and cold-index rebuild must not call <c>_log.Write</c> — isolated playback defers logger rebind until Start().
+/// </remarks>
 public sealed class ExecutionJournal
 {
     private readonly string _journalDir;
@@ -180,6 +184,7 @@ public sealed class ExecutionJournal
 
     public ExecutionJournal(string projectRoot, RobotLogger log)
     {
+        // RULE: No logging allowed before RobotEngine.Start() completes — do not call _log.Write here (RobotLogger may be blocked until RebindLogging).
         _journalDir = RobotRunArtifactPaths.StateExecutionJournals(projectRoot);
         Directory.CreateDirectory(_journalDir);
         ValidateJournalDirectory();  // Phase 3.2: fail closed if not writable
@@ -191,17 +196,10 @@ public sealed class ExecutionJournal
                 RebuildAdoptionCandidateIndexFromDiskLocked();
             }
         }
-        catch (Exception ex)
+        catch (Exception)
         {
             _adoptionCandidateIndexWarmed = false;
-            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "EXECUTION_JOURNAL_ADOPTION_INDEX_REBUILD_FAILED", "ENGINE",
-                new
-                {
-                    warmed = false,
-                    error = ex.Message,
-                    exception_type = ex.GetType().Name,
-                    note = "Cold rebuild failed — adoption candidate lookups will use full journal scan until next successful rebuild"
-                }));
+            // Intentionally no _log.Write — constructor runs before logger rebind; adoption lookups fall back to full scan until a later rebuild path succeeds.
         }
     }
     
@@ -1948,14 +1946,7 @@ public sealed class ExecutionJournal
         }
 
         _adoptionCandidateIndexWarmed = true;
-        _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "EXECUTION_JOURNAL_ADOPTION_INDEX_REBUILT", "ENGINE",
-            new
-            {
-                warmed = true,
-                journal_file_total = files.Length,
-                adoption_candidate_intents = _adoptionCandidateIntentToNormInst.Count,
-                note = "Cold rebuild complete — candidate lookups use in-memory index"
-            }));
+        // RULE: No logging here — RebuildAdoptionCandidateIndexFromDiskLocked runs from ctor before RobotEngine.Start() / RebindLogging.
     }
 
     /// <summary>Full disk scan — same semantics as pre-index implementation. Caller must NOT hold <see cref="_lock"/> (method acquires per-file lock).</summary>

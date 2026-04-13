@@ -179,6 +179,12 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     /// <summary>Optional: notify mismatch gate coordinator of structured execution activity.</summary>
     private Action<string, DateTimeOffset, MismatchExecutionTriggerDetails>? _onMismatchExecutionTrigger;
 
+    /// <summary>Transient bridge so mismatch assembly does not see broker-ahead while journal disk read lags fills.</summary>
+    private PendingFillBridge? _pendingFillBridge;
+
+    /// <summary>In-memory pending fill observations for reconciliation only (not a position ledger).</summary>
+    public void SetPendingFillBridge(PendingFillBridge? bridge) => _pendingFillBridge = bridge;
+
     /// <summary>Wires execution/fill activity to <see cref="MismatchEscalationCoordinator.NotifyExecutionTrigger"/> (optional).</summary>
     public void SetMismatchExecutionTriggerCallback(Action<string, DateTimeOffset, MismatchExecutionTriggerDetails>? callback) =>
         _onMismatchExecutionTrigger = callback;

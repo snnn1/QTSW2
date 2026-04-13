@@ -22,8 +22,11 @@ public sealed class KillSwitch
     {
         _killSwitchPath = Path.Combine(projectRoot, "configs", "robot", "kill_switch.json");
         _log = log;
-        
-        // Log kill switch initialization at startup
+    }
+
+    /// <summary>Emit kill-switch startup audit after engine <c>Start()</c> / logger rebind (not from the constructor).</summary>
+    public void LogInitialized()
+    {
         var now = DateTimeOffset.UtcNow;
         if (File.Exists(_killSwitchPath))
         {
@@ -40,8 +43,8 @@ public sealed class KillSwitch
                             message = state.Message ?? "No message",
                             kill_switch_path = _killSwitchPath,
                             file_found = true,
-                            note = state.Enabled 
-                                ? "Kill switch is ENABLED - all execution is blocked" 
+                            note = state.Enabled
+                                ? "Kill switch is ENABLED - all execution is blocked"
                                 : "Kill switch is DISABLED - execution allowed"
                         }));
                 }

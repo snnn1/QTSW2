@@ -725,7 +725,7 @@ if (validateForcedFlatten)
 
     engine.Stop();
 
-    var logDir = Path.Combine(root, "logs", "robot");
+    var logDir = RobotRunArtifactPaths.LogsRobot(root);
     var journalDir = Path.Combine(logDir, "journal");
     var markersPath = Path.Combine(journalDir, "_forced_flatten_markers.json");
     var hasTriggered = File.Exists(markersPath);
@@ -832,7 +832,7 @@ if (validateSlotExpiry)
 
     engine.Stop();
 
-    var logDir = Path.Combine(root, "logs", "robot");
+    var logDir = RobotRunArtifactPaths.LogsRobot(root);
     var journalDir = Path.Combine(logDir, "journal");
 
     var logFiles = Directory.Exists(logDir) ? Directory.GetFiles(logDir, "*.jsonl") : Array.Empty<string>();

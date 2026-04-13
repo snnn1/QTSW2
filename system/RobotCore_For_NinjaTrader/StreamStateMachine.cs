@@ -5800,9 +5800,9 @@ public sealed class StreamStateMachine
         {
             // Try hydration log first (new layout), then legacy logs/robot, then ranges (new + legacy).
             var hydrationPreferred = Path.Combine(RobotRunArtifactPaths.LogsHydration(_robotStateRoot), $"hydration_{tradingDay}.jsonl");
-            var hydrationLegacy = Path.Combine(_robotStateRoot, "logs", "robot", $"hydration_{tradingDay}.jsonl");
+            var hydrationLegacy = Path.Combine(RobotRunArtifactPaths.LogsRobot(_robotStateRoot), $"hydration_{tradingDay}.jsonl");
             var rangesPreferred = Path.Combine(RobotRunArtifactPaths.LogsRanges(_robotStateRoot), $"ranges_{tradingDay}.jsonl");
-            var rangesLegacy = Path.Combine(_robotStateRoot, "logs", "robot", $"ranges_{tradingDay}.jsonl");
+            var rangesLegacy = Path.Combine(RobotRunArtifactPaths.LogsRobot(_robotStateRoot), $"ranges_{tradingDay}.jsonl");
 
             var hydrationFile = File.Exists(hydrationPreferred) ? hydrationPreferred
                 : (File.Exists(hydrationLegacy) ? hydrationLegacy : hydrationPreferred);

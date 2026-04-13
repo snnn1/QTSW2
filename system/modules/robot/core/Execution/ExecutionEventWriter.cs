@@ -56,6 +56,19 @@ public sealed class ExecutionEventWriter
         evt.EventFamily = string.IsNullOrEmpty(evt.EventFamily) ? ExecutionEventFamilies.GetFamily(evt.EventType).ToString() : evt.EventFamily;
 
         var path = GetStreamPath(tradingDate, instrument);
+        if (!IsStreamPathUnderPersistenceRoot(path))
+        {
+            _writeFailures++;
+            _log?.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate, "EXECUTION_EVENT_PATH_INVALID", "CRITICAL",
+                new
+                {
+                    path,
+                    persistence_base = _projectRoot,
+                    note = "Refusing write: stream path must be under engine _persistenceBase (events/execution_events/...)"
+                }));
+            return;
+        }
+
         var line = SerializeEvent(evt);
 
         lock (_writeLock)
@@ -102,6 +115,21 @@ public sealed class ExecutionEventWriter
         return Path.Combine(baseDir, inst + ".jsonl");
     }
 
+    private bool IsStreamPathUnderPersistenceRoot(string absoluteFilePath)
+    {
+        try
+        {
+            var root = Path.GetFullPath(_projectRoot.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            var file = Path.GetFullPath(absoluteFilePath);
+            return file.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                || file.StartsWith(root + Path.AltDirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private static string SanitizeFileName(string name)
     {
         var invalid = Path.GetInvalidFileNameChars();
@@ -111,7 +139,7 @@ public sealed class ExecutionEventWriter
         return result.Trim().ToUpperInvariant();
     }
 
-    private static string SerializeEvent(CanonicalExecutionEvent evt)
+    private string SerializeEvent(CanonicalExecutionEvent evt)
     {
         var dict = new Dictionary<string, object?>
         {
@@ -132,7 +160,9 @@ public sealed class ExecutionEventWriter
             ["lifecycle_state_after"] = evt.LifecycleStateAfter,
             ["severity"] = evt.Severity,
             ["source"] = evt.Source,
-            ["payload"] = evt.Payload
+            ["payload"] = evt.Payload,
+            ["scope"] = RobotRunArtifactPaths.AuditScopeLabel(_projectRoot),
+            ["run_id"] = RobotRunArtifactPaths.AuditRunIdLabel(_projectRoot, _getRunId?.Invoke())
         };
         return JsonUtil.Serialize(dict);
     }

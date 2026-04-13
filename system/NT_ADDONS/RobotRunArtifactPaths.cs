@@ -44,4 +44,66 @@ public static class RobotRunArtifactPaths
 
     public static string DecisionsDir(string persistenceBase)
         => Path.Combine(persistenceBase ?? "", "decisions");
+
+    /// <summary>True when <paramref name="persistenceBase"/> is under a <c>runs/&lt;id&gt;/</c> tree (isolated run artifacts).</summary>
+    public static bool IsRunScopedPersistence(string? persistenceBase)
+    {
+        if (string.IsNullOrWhiteSpace(persistenceBase)) return false;
+        try
+        {
+            var fp = Path.GetFullPath(persistenceBase.Trim());
+            var parts = fp.Split(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar }, StringSplitOptions.RemoveEmptyEntries);
+            for (var i = 0; i < parts.Length - 1; i++)
+            {
+                if (string.Equals(parts[i], "runs", StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+        }
+        catch
+        {
+            /* ignore */
+        }
+
+        return false;
+    }
+
+    /// <summary>Audit label: <c>RUN</c> under <c>runs/</c>, else <c>GLOBAL</c> (project-root persistence).</summary>
+    public static string AuditScopeLabel(string? persistenceBase)
+        => IsRunScopedPersistence(persistenceBase) ? "RUN" : "GLOBAL";
+
+    /// <summary>
+    /// Audit <c>run_id</c> string: prefer <paramref name="engineRunId"/> when set; else first path segment after <c>runs\</c>;
+    /// else <c>NONE</c> for global (non–run-folder) persistence.
+    /// </summary>
+    public static string AuditRunIdLabel(string? persistenceBase, string? engineRunId = null)
+    {
+        if (!string.IsNullOrWhiteSpace(engineRunId)) return engineRunId.Trim();
+        if (TryGetRunIdSegmentAfterRuns(persistenceBase, out var rid)) return rid;
+        return "NONE";
+    }
+
+    private static bool TryGetRunIdSegmentAfterRuns(string? persistenceBase, out string runId)
+    {
+        runId = "";
+        if (string.IsNullOrWhiteSpace(persistenceBase)) return false;
+        try
+        {
+            var fp = Path.GetFullPath(persistenceBase.Trim());
+            var parts = fp.Split(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar }, StringSplitOptions.RemoveEmptyEntries);
+            for (var i = 0; i < parts.Length - 1; i++)
+            {
+                if (string.Equals(parts[i], "runs", StringComparison.OrdinalIgnoreCase))
+                {
+                    runId = parts[i + 1];
+                    return !string.IsNullOrEmpty(runId);
+                }
+            }
+        }
+        catch
+        {
+            /* ignore */
+        }
+
+        return false;
+    }
 }

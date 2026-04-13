@@ -5800,9 +5800,9 @@ public sealed class StreamStateMachine
         {
             // Try hydration log first (new layout), then legacy logs/robot, then ranges (new + legacy).
             var hydrationPreferred = Path.Combine(RobotRunArtifactPaths.LogsHydration(_robotStateRoot), $"hydration_{tradingDay}.jsonl");
-            var hydrationLegacy = Path.Combine(_robotStateRoot, "logs", "robot", $"hydration_{tradingDay}.jsonl");
+            var hydrationLegacy = Path.Combine(RobotRunArtifactPaths.LogsRobot(_robotStateRoot), $"hydration_{tradingDay}.jsonl");
             var rangesPreferred = Path.Combine(RobotRunArtifactPaths.LogsRanges(_robotStateRoot), $"ranges_{tradingDay}.jsonl");
-            var rangesLegacy = Path.Combine(_robotStateRoot, "logs", "robot", $"ranges_{tradingDay}.jsonl");
+            var rangesLegacy = Path.Combine(RobotRunArtifactPaths.LogsRobot(_robotStateRoot), $"ranges_{tradingDay}.jsonl");
 
             var hydrationFile = File.Exists(hydrationPreferred) ? hydrationPreferred
                 : (File.Exists(hydrationLegacy) ? hydrationLegacy : hydrationPreferred);
@@ -7196,7 +7196,6 @@ public sealed class StreamStateMachine
                || string.Equals(msg, "SESSION_CLOSE_FLATTEN_ENQUEUED", StringComparison.OrdinalIgnoreCase);
     }
 
-    /// <summary>G4: Session-close wait uses <see cref="FlattenCompletionAuthority"/> when <see cref="IIEAOrderExecutor"/> is available; else legacy snapshot sum.</summary>
     private bool TryWaitBrokerFlatForExecutionInstrument(
         string executionInstrument,
         DateTimeOffset wallPollDeadlineUtc,
@@ -7207,37 +7206,22 @@ public sealed class StreamStateMachine
         // PLAYBACK_TIME_UNKNOWN: Physical broker polling must elapse in wall-clock time; snapshot uses Tick/event time for consistency with engine.
         while (DateTimeOffset.UtcNow <= wallPollDeadlineUtc)
         {
-            if (FlattenCompletionAuthority.TryGetCanonicalExposure(_executionAdapter, executionInstrument, out var canonEx))
+            try
             {
-                remainingSignedQty = FlattenCompletionAuthority.OfficialRemainingAbsQuantity(canonEx);
-                if (FlattenCompletionAuthority.IsOfficialFlattenComplete(canonEx))
+                var snap = _executionAdapter?.GetAccountSnapshot(accountSnapshotEventUtc);
+                remainingSignedQty = snap?.Positions?
+                                         .Where(p => string.Equals(p.Instrument, executionInstrument, StringComparison.OrdinalIgnoreCase))
+                                         .Sum(p => p.Quantity)
+                                     ?? 0;
+                if (remainingSignedQty == 0)
                     return true;
             }
-            else
+            catch
             {
-                try
-                {
-                    var snap = _executionAdapter?.GetAccountSnapshot(accountSnapshotEventUtc);
-                    remainingSignedQty = snap?.Positions?
-                                             .Where(p => string.Equals(p.Instrument, executionInstrument, StringComparison.OrdinalIgnoreCase))
-                                             .Sum(p => p.Quantity)
-                                         ?? 0;
-                    if (remainingSignedQty == 0)
-                        return true;
-                }
-                catch
-                {
-                    /* poll until deadline */
-                }
+                /* poll until deadline */
             }
 
             Thread.Sleep(100);
-        }
-
-        if (FlattenCompletionAuthority.TryGetCanonicalExposure(_executionAdapter, executionInstrument, out var canonFinal))
-        {
-            remainingSignedQty = FlattenCompletionAuthority.OfficialRemainingAbsQuantity(canonFinal);
-            return FlattenCompletionAuthority.IsOfficialFlattenComplete(canonFinal);
         }
 
         try

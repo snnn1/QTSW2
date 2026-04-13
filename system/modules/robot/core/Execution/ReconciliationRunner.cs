@@ -25,6 +25,8 @@ public sealed class ReconciliationRunner
     private readonly ReleaseReconciliationRedundancySuppression? _redundancySuppression;
     /// <summary>Maps execution root (e.g. MES) to canonical (e.g. ES) for journal open-qty aggregation; when null, only literal execution key matches.</summary>
     private readonly Func<string, string?>? _getCanonicalInstrumentForJournalAggregation;
+    private readonly Func<string, int>? _getPendingExecutionWorkloadForInstrument;
+    private readonly Func<string?>? _getRunIdForReconciliationDiagnostics;
 
     private DateTimeOffset _lastRunUtc = DateTimeOffset.MinValue;
     private const double ThrottleIntervalSeconds = 60.0;
@@ -56,7 +58,9 @@ public sealed class ReconciliationRunner
         RuntimeAuditHub? runtimeAudit = null,
         ReconciliationConvergenceTracker? convergenceTracker = null,
         ReleaseReconciliationRedundancySuppression? redundancySuppression = null,
-        Func<string, string?>? getCanonicalInstrumentForJournalAggregation = null)
+        Func<string, string?>? getCanonicalInstrumentForJournalAggregation = null,
+        Func<string, int>? getPendingExecutionWorkloadForInstrument = null,
+        Func<string?>? getRunIdForReconciliationDiagnostics = null)
     {
         _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         _journal = journal ?? throw new ArgumentNullException(nameof(journal));
@@ -71,6 +75,8 @@ public sealed class ReconciliationRunner
         _ = convergenceTracker;
         _redundancySuppression = redundancySuppression;
         _getCanonicalInstrumentForJournalAggregation = getCanonicalInstrumentForJournalAggregation;
+        _getPendingExecutionWorkloadForInstrument = getPendingExecutionWorkloadForInstrument;
+        _getRunIdForReconciliationDiagnostics = getRunIdForReconciliationDiagnostics;
     }
 
     private string? CanonicalInstrumentForJournal(string instTrim) =>
@@ -217,6 +223,21 @@ public sealed class ReconciliationRunner
             var instRoot = BrokerPositionResolver.NormalizeCanonicalKey(inst);
             if (string.IsNullOrEmpty(instRoot)) continue;
             var canonicalForJournal = CanonicalInstrumentForJournal(instRoot) ?? instRoot;
+
+            var pendingIeA = _getPendingExecutionWorkloadForInstrument?.Invoke(inst) ?? 0;
+            if (pendingIeA > 0)
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_DEFERRED_PENDING_IEA_EXECUTION", "ENGINE",
+                    new
+                    {
+                        instrument = inst,
+                        pending_execution_count = pendingIeA,
+                        run_id = _getRunIdForReconciliationDiagnostics?.Invoke() ?? "",
+                        ts_utc = utcNow.ToString("o"),
+                        note = "Skipping periodic qty reconciliation until IEA execution queue drains for instrument"
+                    }));
+                continue;
+            }
 
             var acct = _reconciliationAccountName?.Invoke();
             var instanceId = _reconciliationInstanceId?.Invoke() ?? "";
@@ -459,6 +480,10 @@ public sealed class ReconciliationRunner
             var entries = kvp.Value;
 
             if (entries.Count == 0) continue;
+
+            var pendingClosure = _getPendingExecutionWorkloadForInstrument?.Invoke(instrument) ?? 0;
+            if (pendingClosure > 0)
+                continue;
 
             var familyKey = BrokerFlatFamilyKey(instrument);
             if (!familyClosureReadiness.TryGetValue(familyKey, out var fr)) continue;

@@ -5,7 +5,8 @@ REM 1. Build Robot.Core.dll
 REM 2. Copy DLL to NinjaTrader Custom
 REM 3. Copy RobotSimStrategy.cs to Strategies (no AddOns source - avoids type duplicates)
 
-cd /d "%~dp0\.."
+REM Repo root = tools\batch\..\.. (QTSW2)
+cd /d "%~dp0\..\.."
 
 echo ============================================================
 echo   Building and Deploying Robot to NinjaTrader (DLL-only)
@@ -15,7 +16,7 @@ echo.
 
 REM Step 1: Build
 echo [1/3] Building Robot.Core.dll...
-dotnet build RobotCore_For_NinjaTrader\Robot.Core.csproj -c Release
+dotnet build system\RobotCore_For_NinjaTrader\Robot.Core.csproj -c Release
 if errorlevel 1 (
     echo [ERROR] Build failed.
     pause
@@ -26,7 +27,7 @@ echo.
 
 REM Step 2: Copy DLLs and dependencies (OneDrive only - close NinjaTrader first if locked)
 echo [2/3] Copying DLLs to NinjaTrader Custom (OneDrive)...
-set "BIN=RobotCore_For_NinjaTrader\bin\Release\net48"
+set "BIN=system\RobotCore_For_NinjaTrader\bin\Release\net48"
 set "NT_CUSTOM=%USERPROFILE%\OneDrive\Documents\NinjaTrader 8\bin\Custom"
 if exist "%NT_CUSTOM%" (
     copy /Y "%BIN%\Robot.Core.dll" "%NT_CUSTOM%\Robot.Core.dll" >nul
@@ -52,7 +53,7 @@ REM Step 3: Copy strategy (OneDrive only)
 echo [3/3] Copying RobotSimStrategy.cs to Strategies (OneDrive)...
 set "NT_STRATEGIES=%USERPROFILE%\OneDrive\Documents\NinjaTrader 8\bin\Custom\Strategies"
 if exist "%NT_STRATEGIES%" (
-    xcopy /Y /Q "RobotCore_For_NinjaTrader\Strategies\RobotSimStrategy.cs" "%NT_STRATEGIES%\"
+    xcopy /Y /Q "system\RobotCore_For_NinjaTrader\Strategies\RobotSimStrategy.cs" "%NT_STRATEGIES%\"
     echo [OK] Strategy synced to OneDrive.
 ) else (
     echo [ERROR] OneDrive Strategies folder not found: %NT_STRATEGIES%

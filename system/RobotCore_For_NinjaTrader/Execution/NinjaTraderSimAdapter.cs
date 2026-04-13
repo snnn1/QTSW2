@@ -184,6 +184,12 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     /// <summary>Optional: notify mismatch gate coordinator of structured execution activity.</summary>
     private Action<string, DateTimeOffset, MismatchExecutionTriggerDetails>? _onMismatchExecutionTrigger;
 
+    /// <summary>Transient bridge so mismatch assembly does not see broker-ahead while journal disk read lags fills.</summary>
+    private PendingFillBridge? _pendingFillBridge;
+
+    /// <summary>In-memory pending fill observations for reconciliation only (not a position ledger).</summary>
+    public void SetPendingFillBridge(PendingFillBridge? bridge) => _pendingFillBridge = bridge;
+
     /// <summary>Wires execution/fill activity to <see cref="MismatchEscalationCoordinator.NotifyExecutionTrigger"/> (optional).</summary>
     public void SetMismatchExecutionTriggerCallback(Action<string, DateTimeOffset, MismatchExecutionTriggerDetails>? callback) =>
         _onMismatchExecutionTrigger = callback;
@@ -229,6 +235,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
 
     /// <summary>Run-scoped KEY_EVENTS.jsonl (decision signal). Set by engine with persistence base.</summary>
     private KeyEventWriter? _keyEventWriter;
+
+    /// <summary>Prefer KEY_EVENTS ENTRY_TERMINATED reason when entry order ends without fill (no_fill / cancelled / flattened).</summary>
+    private readonly ConcurrentDictionary<string, string> _pendingEntryTerminationReason = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Gap 5: Set canonical event writer for replay. Call before SetNTContext when using IEA.</summary>
     public void SetEventWriter(ExecutionEventWriter? writer) => _eventWriter = writer;

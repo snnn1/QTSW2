@@ -97,6 +97,66 @@ public sealed partial class NinjaTraderSimAdapter
         }
     }
 
+    private void SetPendingEntryTerminationReason(string intentId, string reason)
+    {
+        if (string.IsNullOrWhiteSpace(intentId) || string.IsNullOrWhiteSpace(reason)) return;
+        var r = reason.Trim();
+        if (!string.Equals(r, "no_fill", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(r, "cancelled", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(r, "flattened", StringComparison.OrdinalIgnoreCase))
+            return;
+        _pendingEntryTerminationReason[intentId.Trim()] = r.ToLowerInvariant();
+    }
+
+    private void TryAppendKeyEventEntryFilled(
+        DateTimeOffset utcNow,
+        string instrument,
+        string? stream,
+        string intentId,
+        string tradingDate,
+        int fillQty,
+        decimal fillPrice,
+        string? brokerOrderId,
+        bool isPartial)
+    {
+        if (_keyEventWriter == null || string.IsNullOrEmpty(intentId)) return;
+        _keyEventWriter.AppendKeyEvent(utcNow, "ENTRY_FILLED", instrument?.Trim(),
+            string.IsNullOrEmpty(stream) ? null : stream, null,
+            new Dictionary<string, object?>
+            {
+                ["intent_id"] = intentId,
+                ["trading_date"] = string.IsNullOrEmpty(tradingDate) ? null : tradingDate,
+                ["fill_quantity"] = fillQty,
+                ["fill_price"] = fillPrice,
+                ["broker_order_id"] = brokerOrderId,
+                ["partial"] = isPartial
+            });
+    }
+
+    private void TryAppendKeyEventEntryTerminated(
+        DateTimeOffset utcNow,
+        string instrument,
+        string? stream,
+        string intentId,
+        string tradingDate,
+        string defaultReason)
+    {
+        if (_keyEventWriter == null || string.IsNullOrEmpty(intentId)) return;
+        if (!_keyEventWriter.TryShouldEmitEntryTerminated(intentId)) return;
+        var reason = defaultReason;
+        if (_pendingEntryTerminationReason.TryRemove(intentId, out var pending) &&
+            (pending == "no_fill" || pending == "cancelled" || pending == "flattened"))
+            reason = pending;
+        _keyEventWriter.AppendKeyEvent(utcNow, "ENTRY_TERMINATED", instrument?.Trim(),
+            string.IsNullOrEmpty(stream) ? null : stream, null,
+            new Dictionary<string, object?>
+            {
+                ["reason"] = reason,
+                ["intent_id"] = intentId,
+                ["trading_date"] = string.IsNullOrEmpty(tradingDate) ? null : tradingDate
+            });
+    }
+
     // IIEAOrderExecutor implementation (Phase 2: IEA delegates order ops to adapter)
     object IIEAOrderExecutor.CreateStopMarketOrder(string instrument, string direction, int quantity, decimal stopPrice, string tag, string? ocoGroup)
     {
@@ -2556,7 +2616,13 @@ public sealed partial class NinjaTraderSimAdapter
 
             _keyEventWriter?.AppendKeyEvent(acknowledgedAt, "ENTRY_SUBMITTED", instrument?.Trim(),
                 string.IsNullOrEmpty(stream) ? null : stream, null,
-                new Dictionary<string, object?> { ["broker_order_id"] = order.OrderId });
+                new Dictionary<string, object?>
+                {
+                    ["broker_order_id"] = order.OrderId,
+                    ["intent_id"] = intentId,
+                    ["trading_date"] = string.IsNullOrEmpty(tradingDate) ? null : tradingDate,
+                    ["direction"] = finalDirection
+                });
 
             return OrderSubmissionResult.SuccessResult(order.OrderId, utcNow, acknowledgedAt);
         }
@@ -3246,6 +3312,12 @@ public sealed partial class NinjaTraderSimAdapter
                         order_type = orderInfo.OrderType,
                         note = "OCO sibling cancelled (other leg filled) - expected behavior, not a rejection"
                     }));
+                if (orderInfo.IsEntryOrder && orderInfo.FilledQuantity == 0)
+                {
+                    var (tdOco, streamOco, _, _, _, _, _) = GetIntentInfo(intentId);
+                    TryAppendKeyEventEntryTerminated(utcNow, orderInfo.Instrument ?? "", string.IsNullOrEmpty(streamOco) ? null : streamOco,
+                        intentId, tdOco ?? "", "cancelled");
+                }
                 return; // Skip rejection handling
             }
             
@@ -3368,6 +3440,12 @@ public sealed partial class NinjaTraderSimAdapter
             orderInfo.State = "CANCELLED";
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "ORDER_CANCELLED",
                 new { broker_order_id = order.OrderId }));
+            if (orderInfo.IsEntryOrder && orderInfo.FilledQuantity == 0)
+            {
+                var (tdCx, streamCx, _, _, _, _, _) = GetIntentInfo(intentId);
+                TryAppendKeyEventEntryTerminated(utcNow, orderInfo.Instrument ?? "", string.IsNullOrEmpty(streamCx) ? null : streamCx,
+                    intentId, tdCx ?? "", "cancelled");
+            }
         }
     }
 
@@ -4173,6 +4251,10 @@ public sealed partial class NinjaTraderSimAdapter
                             trading_date = tradingDate,
                             stream = stream
                         }));
+                        var adoptQtyInt = (int)fillQuantity;
+                        var adoptPartial = order != null && adoptQtyInt < order.Quantity;
+                        TryAppendKeyEventEntryFilled(utcNow, instrumentForResolve, stream, adoptedRecord.IntentId, tradingDate,
+                            adoptQtyInt, fillPrice, brokerOrderIdStr, adoptPartial);
                         _coordinator?.OnEntryFill(adoptedRecord.IntentId, fillQuantity, stream, context.CanonicalInstrument ?? context.ExecutionInstrument, context.Direction ?? "", utcNow);
                         _iea?.HandleEntryFill(adoptedRecord.IntentId, intent, fillPrice, fillQuantity, fillQuantity, utcNow);
                         return;
@@ -4561,6 +4643,9 @@ public sealed partial class NinjaTraderSimAdapter
                         source = "robot",
                         mapped = true
                     }));
+                TryAppendKeyEventEntryFilled(utcNow, orderInfo.Instrument ?? "",
+                    string.IsNullOrEmpty(allocStream) ? null : allocStream,
+                    allocIntentId, allocTradingDate, allocFillQty, fillPrice, brokerOrderId, isPartial);
             }
 
             if (isAggregated && allocations.Count > 0)
@@ -5602,7 +5687,7 @@ public sealed partial class NinjaTraderSimAdapter
 
             _keyEventWriter?.AppendKeyEvent(utcNow, "PROTECTIVE_SUBMITTED", instrument?.Trim(),
                 string.IsNullOrEmpty(stream3) ? null : stream3, "STOP",
-                new Dictionary<string, object?> { ["broker_order_id"] = order.OrderId });
+                new Dictionary<string, object?> { ["broker_order_id"] = order.OrderId, ["order_role"] = "STOP" });
 
             return OrderSubmissionResult.SuccessResult(order.OrderId, utcNow, utcNow);
         }
@@ -6013,6 +6098,11 @@ public sealed partial class NinjaTraderSimAdapter
                 account = "SIM",
                 note = "Protective target order added to OrderMap for tracking"
             }));
+
+            var (tradingDateTgt, streamTgt, _, _, _, _, _) = GetIntentInfo(intentId);
+            _keyEventWriter?.AppendKeyEvent(utcNow, "PROTECTIVE_SUBMITTED", instrument?.Trim(),
+                string.IsNullOrEmpty(streamTgt) ? null : streamTgt, "TARGET",
+                new Dictionary<string, object?> { ["broker_order_id"] = order.OrderId, ["order_role"] = "TARGET" });
 
             return OrderSubmissionResult.SuccessResult(order.OrderId, utcNow, utcNow);
         }
@@ -7249,6 +7339,7 @@ public sealed partial class NinjaTraderSimAdapter
                     {
                         try
                         {
+                            SetPendingEntryTerminationReason(entryIntentId, "flattened");
                             var cancelled = CancelIntentOrders(entryIntentId, utcNow);
                             if (cancelled)
                             {
@@ -7467,6 +7558,8 @@ public sealed partial class NinjaTraderSimAdapter
                     foreach (var entryIntentId in entryIntentIdsToCancel)
                     {
                         var isInvalidState = invalidStateReasons.TryGetValue(entryIntentId, out var inv);
+                        if (isInvalidState)
+                            SetPendingEntryTerminationReason(entryIntentId, "no_fill");
                         var cid = isInvalidState ? $"CANCEL:{entryIntentId}:INVALID_STATE" : $"CANCEL:{entryIntentId}:POSITION_FLAT_CLEANUP";
                         _ntActionQueue.EnqueueNtAction(new NtCancelOrdersCommand(cid, entryIntentId, instrument, false, isInvalidState ? "INVALID_STATE" : "POSITION_FLAT_CLEANUP", utcNow), out _);
                         if (isInvalidState)
@@ -7483,6 +7576,8 @@ public sealed partial class NinjaTraderSimAdapter
                     {
                         try
                         {
+                            if (invalidStateReasons.TryGetValue(entryIntentId, out _))
+                                SetPendingEntryTerminationReason(entryIntentId, "no_fill");
                             var cancelled = CancelIntentOrders(entryIntentId, utcNow);
                             if (cancelled)
                             {

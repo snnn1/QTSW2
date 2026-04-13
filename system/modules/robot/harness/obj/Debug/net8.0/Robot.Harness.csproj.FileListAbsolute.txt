@@ -19,3 +19,6 @@ C:\Users\jakej\QTSW2\modules\robot\harness\obj\Debug\net8.0\Robot.Harness.genrun
 C:\Users\jakej\QTSW2\modules\robot\harness\obj\Debug\net8.0\ref\Robot.Harness.dll
 C:\Users\jakej\QTSW2\modules\robot\harness\bin\Debug\net8.0\Robot.Contracts.dll
 C:\Users\jakej\QTSW2\modules\robot\harness\bin\Debug\net8.0\Robot.Contracts.pdb
+c:\Users\jakej\QTSW2\system\modules\robot\harness\obj\Debug\net8.0\Robot.Harness.dll
+c:\Users\jakej\QTSW2\system\modules\robot\harness\obj\Debug\net8.0\refint\Robot.Harness.dll
+c:\Users\jakej\QTSW2\system\modules\robot\harness\obj\Debug\net8.0\Robot.Harness.pdb

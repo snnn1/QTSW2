@@ -107,7 +107,8 @@ public sealed class LoggingConfig
 
     /// <param name="configRoot">Repo root (configs live under <c>configs/</c>).</param>
     /// <param name="emergencyRobotLogDir">Run-authoritative <c>logs/robot</c> for emergency writes when load fails.</param>
-    public static LoggingConfig LoadFromFile(string configRoot, string? emergencyRobotLogDir = null)
+    /// <param name="suppressEmergencyWrite">When true, skip <see cref="EmergencyLogger"/> on parse failure (e.g. before engine <c>Start()</c>).</param>
+    public static LoggingConfig LoadFromFile(string configRoot, string? emergencyRobotLogDir = null, bool suppressEmergencyWrite = false)
     {
         var configPath = Path.Combine(configRoot, "configs", "robot", "logging.json");
         if (!File.Exists(configPath))
@@ -123,8 +124,11 @@ public sealed class LoggingConfig
         }
         catch (Exception ex)
         {
-            var dir = emergencyRobotLogDir ?? Path.Combine(configRoot, "logs", "robot");
-            EmergencyLogger.WriteConfigFailure(dir, "LOGGING_CONFIG_LOAD_FAILED", configPath, $"{ex.GetType().Name}: {ex.Message}");
+            if (!suppressEmergencyWrite)
+            {
+                var dir = emergencyRobotLogDir ?? RobotRunArtifactPaths.LogsRobot(configRoot);
+                EmergencyLogger.WriteConfigFailure(dir, "LOGGING_CONFIG_LOAD_FAILED", configPath, $"{ex.GetType().Name}: {ex.Message}");
+            }
             return new LoggingConfig();
         }
     }

@@ -133,6 +133,9 @@ public sealed class MismatchInstrumentState
     /// <summary>Start of continuous release-ready window (UTC).</summary>
     public DateTimeOffset FirstConsistentUtc { get; set; }
 
+    /// <summary>Compact key: when unchanged for <see cref="MismatchEscalationPolicy.GATE_RELEASE_QUIET_WINDOW_MS"/>, gate may release.</summary>
+    public string ReleaseQuietFingerprintKey { get; set; } = "";
+
     public DateTimeOffset LastConsistentUtc { get; set; }
     public DateTimeOffset LastReleaseUtc { get; set; }
     public DateTimeOffset LastGateEngagedUtc { get; set; }
@@ -256,6 +259,12 @@ public static class MismatchEscalationPolicy
 
     /// <summary>P1.5-C: Slightly longer window when snapshots/noise warrant (sim / harness).</summary>
     public const int STATE_CONSISTENCY_STABLE_WINDOW_MS_SIM = 12_000;
+
+    /// <summary>Release requires this many milliseconds with an unchanged <see cref="MismatchInstrumentState.ReleaseQuietFingerprintKey"/> while release invariants hold.</summary>
+    public const int GATE_RELEASE_QUIET_WINDOW_MS = 1_000;
+
+    /// <summary>Fail-safe: log if gate has been engaged this long without release; does not auto-release.</summary>
+    public const int GATE_MAX_DWELL_ALERT_MS = 30_000;
 
     // --- Progress-aware gate reconciliation throttle (no zero-progress CPU loops) ---
 

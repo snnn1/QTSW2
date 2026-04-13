@@ -34,6 +34,13 @@ public sealed class MismatchEscalationCoordinator
         _onForcedConvergenceFailure;
     private readonly Func<long>? _getExecutionActivityGeneration;
     private readonly Action<string, DateTimeOffset>? _onHedgedNetFlatPersistentEscalation;
+    /// <summary>G1: When mismatch <see cref="MismatchInstrumentState.Blocked"/> transitions, notifies engine/EPA to own durable authority (not parallel enforcement).</summary>
+    private readonly Action<string, bool, string?, DateTimeOffset>? _onMismatchExecutionBlockAuthorityChanged;
+    /// <summary>When set, mismatch audits and canonical events apply only to instruments managed by this <see cref="RobotEngine"/> (non-committed streams).</summary>
+    private readonly Func<string, bool>? _isInstrumentInEngineScope;
+    /// <summary>When non-null and returns &gt;0 for an instrument, mismatch gate work is deferred until IEA execution queue drains for that instrument.</summary>
+    private readonly Func<string, int>? _getPendingExecutionWorkloadForInstrument;
+    private readonly Func<string?>? _getRunIdForMismatchDiagnostics;
     /// <summary>One-shot hedged convergence escalation per instrument per gate episode.</summary>
     private readonly ConcurrentDictionary<string, byte> _hedgedNetFlatEscalationInvoked = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _auditRunLock = new();
@@ -61,6 +68,19 @@ public sealed class MismatchEscalationCoordinator
         new(StringComparer.OrdinalIgnoreCase);
 
     private const int ReleaseBlockedAfterFlatQuietSeconds = 30;
+
+    /// <summary>Throttle <see cref="MaybeEmitGateScopeRetainedActivePhase"/> while gate is active but engine scope is false.</summary>
+    private const int GateScopeRetainedLogQuietSeconds = 30;
+
+    private readonly Dictionary<string, DateTimeOffset> _gateScopeRetainedLogThrottle = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Throttle <see cref="MaybeEmitGateReleaseProgress"/> — prove stable clock without flooding per tick.</summary>
+    private const int GateReleaseProgressMinIntervalMs = 1000;
+
+    private readonly Dictionary<string, DateTimeOffset> _gateReleaseProgressLastEmit = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Throttle <see cref="MaybeEmitGateMaxDwellExceeded"/> (critical dwell alert).</summary>
+    private readonly Dictionary<string, DateTimeOffset> _gateMaxDwellLastEmit = new(StringComparer.OrdinalIgnoreCase);
 
     private int _mismatchDetectedCount;
     private int _mismatchPersistentCount;
@@ -106,7 +126,11 @@ public sealed class MismatchEscalationCoordinator
         Action<string, ReconciliationForcedConvergenceContext, ReconciliationForcedConvergenceResult>? onForcedConvergenceFailure =
             null,
         Func<long>? getExecutionActivityGeneration = null,
-        Action<string, DateTimeOffset>? onHedgedNetFlatPersistentEscalation = null)
+        Action<string, DateTimeOffset>? onHedgedNetFlatPersistentEscalation = null,
+        Action<string, bool, string?, DateTimeOffset>? onMismatchExecutionBlockAuthorityChanged = null,
+        Func<string, bool>? isInstrumentInEngineScope = null,
+        Func<string, int>? getPendingExecutionWorkloadForInstrument = null,
+        Func<string?>? getRunIdForMismatchDiagnostics = null)
     {
         _getSnapshot = getSnapshot ?? throw new ArgumentNullException(nameof(getSnapshot));
         _getActiveInstruments = getActiveInstruments ?? (() => Array.Empty<string>());
@@ -123,9 +147,13 @@ public sealed class MismatchEscalationCoordinator
         _onForcedConvergenceFailure = onForcedConvergenceFailure;
         _getExecutionActivityGeneration = getExecutionActivityGeneration;
         _onHedgedNetFlatPersistentEscalation = onHedgedNetFlatPersistentEscalation;
+        _onMismatchExecutionBlockAuthorityChanged = onMismatchExecutionBlockAuthorityChanged;
+        _isInstrumentInEngineScope = isInstrumentInEngineScope;
+        _getPendingExecutionWorkloadForInstrument = getPendingExecutionWorkloadForInstrument;
+        _getRunIdForMismatchDiagnostics = getRunIdForMismatchDiagnostics;
         _stableWindowMs = stateConsistencyStableWindowMs > 0
             ? stateConsistencyStableWindowMs
-            : MismatchEscalationPolicy.STATE_CONSISTENCY_STABLE_WINDOW_MS_LIVE;
+            : MismatchEscalationPolicy.GATE_RELEASE_QUIET_WINDOW_MS;
 
         var initialDue = getExecutionActivityGeneration != null
             ? MismatchEscalationPolicy.MISMATCH_AUDIT_INTERVAL_ACTIVE_MS
@@ -152,6 +180,17 @@ public sealed class MismatchEscalationCoordinator
         return _stateByInstrument.TryGetValue(instrument.Trim(), out var s) && s.Blocked;
     }
 
+    private void PublishMismatchExecutionBlockAuthorityIfChanged(string inst, MismatchInstrumentState state, bool wasBlocked,
+        DateTimeOffset utcNow)
+    {
+        if (wasBlocked == state.Blocked) return;
+        _onMismatchExecutionBlockAuthorityChanged?.Invoke(
+            inst,
+            state.Blocked,
+            string.IsNullOrEmpty(state.BlockReason) ? null : state.BlockReason,
+            utcNow);
+    }
+
     public string? GetBlockReason(string instrument)
     {
         if (string.IsNullOrWhiteSpace(instrument)) return null;
@@ -176,6 +215,9 @@ public sealed class MismatchEscalationCoordinator
         if (string.IsNullOrWhiteSpace(instrument)) return;
         var inst = instrument.Trim();
         if (!_stateByInstrument.TryGetValue(inst, out var state)) return;
+        if (_isInstrumentInEngineScope != null && !_isInstrumentInEngineScope(inst) &&
+            state.GateLifecyclePhase == GateLifecyclePhase.None)
+            return;
         if (state.GateLifecyclePhase == GateLifecyclePhase.None) return;
         var gp = state.GateProgress;
 
@@ -226,7 +268,7 @@ public sealed class MismatchEscalationCoordinator
                 snapshot = _getSnapshot();
                 var instruments = _getActiveInstruments();
 
-                if (instruments.Count == 0 && snapshot.Positions != null)
+                if (instruments.Count == 0 && snapshot.Positions != null && _isInstrumentInEngineScope == null)
                 {
                     var fromPositions = snapshot.Positions
                         .Where(p => (p.Quantity != 0 || !string.IsNullOrWhiteSpace(p.Instrument)) && !string.IsNullOrWhiteSpace(p.Instrument))
@@ -251,14 +293,61 @@ public sealed class MismatchEscalationCoordinator
                         instrumentsSet.Add(kv.Key);
                 }
 
+                // Retain instruments with active gate phase even when IsExecutionInstrumentInThisEngineScope is false
+                // (e.g. streams committed and journals closed while StablePendingRelease still needs ticks to release).
+                if (_isInstrumentInEngineScope != null)
+                {
+                    instrumentsSet.RemoveWhere(i =>
+                    {
+                        if (string.IsNullOrWhiteSpace(i)) return true;
+                        var trimmed = i.Trim();
+                        if (_isInstrumentInEngineScope(trimmed)) return false;
+                        if (_stateByInstrument.TryGetValue(trimmed, out var gateSt) &&
+                            gateSt.GateLifecyclePhase != GateLifecyclePhase.None)
+                        {
+                            MaybeEmitGateScopeRetainedActivePhase(utcNow, trimmed, gateSt.GateLifecyclePhase);
+                            return false;
+                        }
+
+                        return true;
+                    });
+                }
+
+                var deferredMismatchPendingIeA = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var inst in instrumentsSet)
                 {
+                    var pendingIeA = _getPendingExecutionWorkloadForInstrument?.Invoke(inst) ?? 0;
+                    if (pendingIeA > 0)
+                    {
+                        deferredMismatchPendingIeA.Add(inst);
+                        _log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "MISMATCH_EVAL_SKIPPED_PENDING_EXECUTION", state: "ENGINE",
+                            new
+                            {
+                                instrument = inst,
+                                pending_execution_count = pendingIeA,
+                                run_id = _getRunIdForMismatchDiagnostics?.Invoke() ?? "",
+                                ts_utc = utcNow.ToString("o")
+                            }));
+                        continue;
+                    }
+
+                    _log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "MISMATCH_EVAL_START", state: "ENGINE",
+                        new
+                        {
+                            instrument = inst,
+                            pending_execution_count = 0,
+                            run_id = _getRunIdForMismatchDiagnostics?.Invoke() ?? "",
+                            ts_utc = utcNow.ToString("o")
+                        }));
+
                     if (obsByInstrument.TryGetValue(inst, out var obs))
                         ProcessMismatchPresent(obs);
                     else
                         ProcessMismatchSignalAbsent(inst, utcNow);
                 }
 
+                // Gate advancement (stable window → release, restabilization) must run even when mismatch eval is
+                // deferred for pending IEA work — otherwise StablePendingRelease can stall forever with queued executions.
                 foreach (var inst in instrumentsSet.Where(IsGateActiveForInstrument))
                 {
                     obsByInstrument.TryGetValue(inst, out var gateObs);
@@ -389,8 +478,333 @@ public sealed class MismatchEscalationCoordinator
         return s.GateLifecyclePhase != GateLifecyclePhase.None;
     }
 
+    /// <summary>
+    /// Emits when an instrument stays in the mismatch audit set only because <see cref="GateLifecyclePhase"/> is non-None
+    /// while <c>IsExecutionInstrumentInThisEngineScope</c> is false — rate-limited to avoid log floods during long dwells.
+    /// </summary>
+    private void MaybeEmitGateScopeRetainedActivePhase(DateTimeOffset utcNow, string instrument, GateLifecyclePhase gatePhase)
+    {
+        if (_log == null) return;
+        if (_gateScopeRetainedLogThrottle.TryGetValue(instrument, out var last) &&
+            (utcNow - last).TotalSeconds < GateScopeRetainedLogQuietSeconds)
+            return;
+        _gateScopeRetainedLogThrottle[instrument] = utcNow;
+
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "GATE_SCOPE_RETAINED_ACTIVE_PHASE", state: "ENGINE",
+            new
+            {
+                instrument,
+                gate_phase = gatePhase.ToString(),
+                run_id = _getRunIdForMismatchDiagnostics?.Invoke() ?? "",
+                trading_date = "",
+                in_engine_scope = false,
+                reason = "active_gate_phase"
+            }));
+    }
+
+    private bool IsInstrumentInEngineScopeForDiagnostics(string instrument)
+    {
+        if (_isInstrumentInEngineScope == null) return true;
+        if (string.IsNullOrWhiteSpace(instrument)) return false;
+        return _isInstrumentInEngineScope(instrument.Trim());
+    }
+
+    private int EffectiveQuietWindowMs(MismatchInstrumentState state) =>
+        state.StableWindowMsApplied > 0 ? state.StableWindowMsApplied : _stableWindowMs;
+
+    /// <summary>Single-line key: unchanged across ticks while release invariants hold → quiet window can complete.</summary>
+    private static string BuildReleaseQuietFingerprint(
+        MismatchObservation obs,
+        StateConsistencyReleaseReadinessResult r,
+        int pendingIeA,
+        int preSigHash,
+        int postSigHash,
+        ulong externalFp,
+        ulong materialReadinessFp)
+    {
+        var summaryH = r.Summary != null ? StringComparer.Ordinal.GetHashCode(r.Summary) : 0;
+        return string.Format(CultureInfo.InvariantCulture,
+            "{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|{8}|{9}",
+            pendingIeA,
+            obs.BrokerWorkingOrderCount,
+            obs.LocalWorkingOrderCount,
+            r.DiagnosticBrokerPositionQty,
+            r.DiagnosticJournalOpenQty,
+            preSigHash,
+            postSigHash,
+            externalFp,
+            materialReadinessFp,
+            summaryH);
+    }
+
+    /// <summary>
+    /// After <see cref="MismatchEscalationPolicy.GATE_MAX_DWELL_ALERT_MS"/>, allow forced release when readiness is true,
+    /// execution queue is drained, nets agree, and we are only blocked by working-count noise, fingerprint jitter, or the quiet timer.
+    /// </summary>
+    private static bool ShouldForceMaxDwellSoftDegradeRelease(
+        long gateDwellMs,
+        StateConsistencyReleaseReadinessResult r,
+        int pendingIeA,
+        MismatchObservation obs,
+        bool fpChanged,
+        bool releaseConditionsMet,
+        long stableMs,
+        int quietWindowMs)
+    {
+        if (gateDwellMs < MismatchEscalationPolicy.GATE_MAX_DWELL_ALERT_MS) return false;
+        if (!r.ReleaseReady || pendingIeA != 0) return false;
+        if (r.UnexplainedBrokerPositionQty != 0 || r.UnexplainedBrokerWorkingCount != 0) return false;
+        if (obs.NetBrokerQty != obs.NetJournalQty) return false;
+
+        var stuckOnSoftBlockerOnly = fpChanged || !releaseConditionsMet ||
+                                     (releaseConditionsMet && !fpChanged && stableMs < quietWindowMs);
+        return stuckOnSoftBlockerOnly;
+    }
+
+    private void MaybeEmitGateMaxDwellExceeded(string inst, DateTimeOffset utcNow, MismatchInstrumentState state)
+    {
+        if (_log == null) return;
+        if (state.GateLifecyclePhase == GateLifecyclePhase.None) return;
+        if (state.LastGateEngagedUtc == default) return;
+        var dwellMs = (utcNow - state.LastGateEngagedUtc).TotalMilliseconds;
+        if (dwellMs < MismatchEscalationPolicy.GATE_MAX_DWELL_ALERT_MS) return;
+        if (_gateMaxDwellLastEmit.TryGetValue(inst, out var last) &&
+            (utcNow - last).TotalSeconds < 30)
+            return;
+        _gateMaxDwellLastEmit[inst] = utcNow;
+
+        var payload = new
+        {
+            instrument = inst,
+            gate_phase = state.GateLifecyclePhase.ToString(),
+            gate_dwell_ms = (long)dwellMs,
+            max_gate_dwell_ms = MismatchEscalationPolicy.GATE_MAX_DWELL_ALERT_MS,
+            note =
+                "Fail-safe: gate engaged longer than max_gate_dwell_ms — review; eligible ticks may apply GATE_SOFT_DEGRADE_FORCE_RELEASE when release_ready and only soft blockers remain",
+            run_id = _getRunIdForMismatchDiagnostics?.Invoke() ?? ""
+        };
+        _log.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "GATE_MAX_DWELL_EXCEEDED", payload));
+        if (IsInstrumentInEngineScopeForDiagnostics(inst))
+            EmitCanonical(inst, "GATE_MAX_DWELL_EXCEEDED", utcNow, payload, "CRITICAL");
+    }
+
+    /// <summary>Quiet-window / fingerprint progression while <see cref="GateLifecyclePhase.StablePendingRelease"/>.</summary>
+    private void MaybeEmitGateReleaseProgress(
+        string inst,
+        DateTimeOffset utcNow,
+        MismatchInstrumentState state,
+        StateConsistencyReleaseReadinessResult readiness,
+        long stableMs,
+        int quietWindowMs,
+        MismatchObservation obs,
+        int pendingIeA,
+        int preSigHash,
+        int postSigHash,
+        ulong externalFp,
+        bool fingerprintChanged,
+        string? resetReason)
+    {
+        if (_log == null) return;
+        if (state.GateLifecyclePhase != GateLifecyclePhase.StablePendingRelease) return;
+        if (_gateReleaseProgressLastEmit.TryGetValue(inst, out var last) &&
+            (utcNow - last).TotalMilliseconds < GateReleaseProgressMinIntervalMs)
+            return;
+        _gateReleaseProgressLastEmit[inst] = utcNow;
+
+        var inScope = IsInstrumentInEngineScopeForDiagnostics(inst);
+        var payload = new
+        {
+            instrument = inst,
+            gate_phase = state.GateLifecyclePhase.ToString(),
+            release_ready = readiness.ReleaseReady,
+            readiness_summary = readiness.Summary,
+            quiet_window_ms = quietWindowMs,
+            stable_for_ms = stableMs,
+            journal_open_qty = readiness.DiagnosticJournalOpenQty,
+            broker_qty = obs.BrokerQty,
+            pending_execution_workload = pendingIeA,
+            broker_working_count = obs.BrokerWorkingOrderCount,
+            local_working_count = obs.LocalWorkingOrderCount,
+            fingerprint_changed = fingerprintChanged,
+            reset_reason = resetReason,
+            progress_pre_hash = preSigHash,
+            progress_post_hash = postSigHash,
+            external_fingerprint = externalFp,
+            in_engine_scope = inScope,
+            run_id = _getRunIdForMismatchDiagnostics?.Invoke() ?? ""
+        };
+        _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "GATE_RELEASE_PROGRESS", payload));
+        if (inScope)
+            EmitCanonical(inst, "GATE_RELEASE_PROGRESS", utcNow, payload, "INFO");
+    }
+
+    private void EmitGateReleaseReset(
+        string inst,
+        DateTimeOffset utcNow,
+        MismatchInstrumentState state,
+        StateConsistencyReleaseReadinessResult readiness,
+        MismatchObservation obs,
+        int pendingIeA,
+        int preSigHash,
+        int postSigHash,
+        ulong externalFp,
+        string resetReason,
+        string? priorFingerprint,
+        string newFingerprint)
+    {
+        if (_log == null) return;
+        var stableMs = state.FirstConsistentUtc != default
+            ? (long)(utcNow - state.FirstConsistentUtc).TotalMilliseconds
+            : 0L;
+        var quietMs = EffectiveQuietWindowMs(state);
+        var inScope = IsInstrumentInEngineScopeForDiagnostics(inst);
+        var payload = new
+        {
+            instrument = inst,
+            gate_phase = state.GateLifecyclePhase.ToString(),
+            release_ready = readiness.ReleaseReady,
+            readiness_summary = readiness.Summary,
+            quiet_window_ms = quietMs,
+            stable_for_ms = stableMs,
+            journal_open_qty = readiness.DiagnosticJournalOpenQty,
+            broker_qty = obs.BrokerQty,
+            pending_execution_workload = pendingIeA,
+            broker_working_count = obs.BrokerWorkingOrderCount,
+            local_working_count = obs.LocalWorkingOrderCount,
+            fingerprint_changed = true,
+            reset_reason = resetReason,
+            prior_fingerprint = priorFingerprint,
+            new_fingerprint = newFingerprint,
+            progress_pre_hash = preSigHash,
+            progress_post_hash = postSigHash,
+            external_fingerprint = externalFp,
+            in_engine_scope = inScope,
+            run_id = _getRunIdForMismatchDiagnostics?.Invoke() ?? ""
+        };
+        _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "GATE_RELEASE_RESET", payload));
+        if (inScope)
+            EmitCanonical(inst, "GATE_RELEASE_RESET", utcNow, payload, "INFO");
+    }
+
+    private void EmitGateSoftDegradeForceRelease(
+        string inst,
+        DateTimeOffset utcNow,
+        MismatchInstrumentState state,
+        StateConsistencyReleaseReadinessResult readiness,
+        MismatchObservation obs,
+        int pendingIeA,
+        long gateDwellMs,
+        bool fingerprintChanged,
+        bool releaseConditionsMet,
+        long stableMs,
+        int quietWindowMs)
+    {
+        if (_log == null) return;
+        var inScope = IsInstrumentInEngineScopeForDiagnostics(inst);
+        var payload = new
+        {
+            instrument = inst,
+            gate_phase = state.GateLifecyclePhase.ToString(),
+            release_ready = readiness.ReleaseReady,
+            readiness_summary = readiness.Summary,
+            max_gate_dwell_ms = MismatchEscalationPolicy.GATE_MAX_DWELL_ALERT_MS,
+            gate_dwell_ms = gateDwellMs,
+            quiet_window_ms = quietWindowMs,
+            stable_for_ms = stableMs,
+            journal_open_qty = readiness.DiagnosticJournalOpenQty,
+            net_broker_qty = obs.NetBrokerQty,
+            net_journal_qty = obs.NetJournalQty,
+            pending_execution_workload = pendingIeA,
+            broker_working_count = obs.BrokerWorkingOrderCount,
+            local_working_count = obs.LocalWorkingOrderCount,
+            unexplained_broker_position_qty = readiness.UnexplainedBrokerPositionQty,
+            unexplained_broker_working_count = readiness.UnexplainedBrokerWorkingCount,
+            fingerprint_changed = fingerprintChanged,
+            release_conditions_met = releaseConditionsMet,
+            note =
+                "Max dwell exceeded: nets aligned, no unexplained risk, no IEA workload — forcing release despite working-order noise and/or fingerprint jitter",
+            run_id = _getRunIdForMismatchDiagnostics?.Invoke() ?? ""
+        };
+        _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "GATE_SOFT_DEGRADE_FORCE_RELEASE", payload));
+        if (inScope)
+            EmitCanonical(inst, "GATE_SOFT_DEGRADE_FORCE_RELEASE", utcNow, payload, "WARN");
+    }
+
+    private void EmitGateReleasedDiagnostic(
+        string inst,
+        DateTimeOffset utcNow,
+        StateConsistencyReleaseReadinessResult readiness,
+        MismatchObservation obs,
+        int pendingIeA,
+        int preSigHash,
+        int postSigHash,
+        ulong externalFp,
+        long stableMs,
+        int quietWindowMs,
+        string priorFingerprint,
+        bool maxDwellSoftDegrade,
+        long gateDwellMs)
+    {
+        if (_log == null) return;
+        var inScope = IsInstrumentInEngineScopeForDiagnostics(inst);
+        var payload = new
+        {
+            instrument = inst,
+            gate_phase = GateLifecyclePhase.None.ToString(),
+            release_ready = readiness.ReleaseReady,
+            readiness_summary = readiness.Summary,
+            quiet_window_ms = quietWindowMs,
+            stable_for_ms = stableMs,
+            max_dwell_soft_degrade = maxDwellSoftDegrade,
+            gate_dwell_ms = gateDwellMs,
+            journal_open_qty = readiness.DiagnosticJournalOpenQty,
+            broker_qty = obs.BrokerQty,
+            pending_execution_workload = pendingIeA,
+            broker_working_count = obs.BrokerWorkingOrderCount,
+            local_working_count = obs.LocalWorkingOrderCount,
+            fingerprint_changed = false,
+            reset_reason = (string?)null,
+            prior_quiet_fingerprint = priorFingerprint,
+            progress_pre_hash = preSigHash,
+            progress_post_hash = postSigHash,
+            external_fingerprint = externalFp,
+            in_engine_scope = inScope,
+            run_id = _getRunIdForMismatchDiagnostics?.Invoke() ?? ""
+        };
+        _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "GATE_RELEASED", payload));
+        if (inScope)
+            EmitCanonical(inst, "GATE_RELEASED", utcNow, payload, "INFO");
+    }
+
+    private void EmitGateReleaseBlocked(
+        string inst,
+        DateTimeOffset utcNow,
+        MismatchInstrumentState state,
+        string reason,
+        StateConsistencyReleaseReadinessResult readiness)
+    {
+        if (_log == null) return;
+        var inScope = IsInstrumentInEngineScopeForDiagnostics(inst);
+        var payload = new
+        {
+            instrument = inst,
+            gate_phase = state.GateLifecyclePhase.ToString(),
+            reason,
+            release_ready = readiness.ReleaseReady,
+            in_engine_scope = inScope,
+            run_id = _getRunIdForMismatchDiagnostics?.Invoke() ?? ""
+        };
+        _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "GATE_RELEASE_BLOCKED", payload));
+        if (inScope)
+            EmitCanonical(inst, "GATE_RELEASE_BLOCKED", utcNow, payload, "WARN");
+    }
+
     private void EmitCanonical(string inst, string eventType, DateTimeOffset utc, object payload, string severity = "INFO")
     {
+        if (_isInstrumentInEngineScope != null &&
+            (string.IsNullOrWhiteSpace(inst) || !_isInstrumentInEngineScope(inst.Trim())))
+            return;
+
         _eventWriter?.Emit(new CanonicalExecutionEvent
         {
             TimestampUtc = utc.ToString("o"),
@@ -428,6 +842,8 @@ public sealed class MismatchEscalationCoordinator
             (utcNow - prev.Utc).TotalSeconds < ReleaseBlockedAfterFlatQuietSeconds)
             return;
         _releaseBlockedAfterFlatTelemetry[inst] = (quietHash, utcNow);
+
+        EmitGateReleaseBlocked(inst, utcNow, state, "release_not_ready_while_broker_flat", readiness);
 
         var payload = new
         {
@@ -492,6 +908,7 @@ public sealed class MismatchEscalationCoordinator
 
         if (state.EscalationState == MismatchEscalationState.NONE)
         {
+            var wasBlocked = state.Blocked;
             state.EscalationState = MismatchEscalationState.DETECTED;
             state.MismatchType = obs.MismatchType;
             state.FirstDetectedUtc = utcNow;
@@ -521,6 +938,7 @@ public sealed class MismatchEscalationCoordinator
             _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_FOUR_STATE_TSV",
                 new { four_state_tsv = tsv, note = "Tab-separated; columns match STATE_CONSISTENCY_GATE audit spec" }));
             EmitCanonical(inst, "STATE_CONSISTENCY_GATE_FOUR_STATE_TSV", utcNow, new { four_state_tsv = tsv }, "INFO");
+            PublishMismatchExecutionBlockAuthorityIfChanged(inst, state, wasBlocked, utcNow);
             return;
         }
 
@@ -533,6 +951,7 @@ public sealed class MismatchEscalationCoordinator
         {
             if (state.PersistenceMs >= MismatchEscalationPolicy.MISMATCH_PERSISTENT_THRESHOLD_MS)
             {
+                var wasBlocked = state.Blocked;
                 state.EscalationState = MismatchEscalationState.PERSISTENT_MISMATCH;
                 state.Blocked = true;
                 state.BlockReason = MismatchEscalationPolicy.BLOCK_REASON_PERSISTENT_MISMATCH;
@@ -544,6 +963,7 @@ public sealed class MismatchEscalationCoordinator
                 _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "RECONCILIATION_MISMATCH_BLOCKED", p));
                 _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH", p));
                 EmitCanonical(inst, "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH", utcNow, p, "ERROR");
+                PublishMismatchExecutionBlockAuthorityIfChanged(inst, state, wasBlocked, utcNow);
             }
             return;
         }
@@ -669,6 +1089,7 @@ public sealed class MismatchEscalationCoordinator
         if (state.EscalationState == MismatchEscalationState.DETECTED &&
             state.PersistenceMs >= MismatchEscalationPolicy.MISMATCH_PERSISTENT_THRESHOLD_MS)
         {
+            var wasBlockedA = state.Blocked;
             state.EscalationState = MismatchEscalationState.PERSISTENT_MISMATCH;
             state.Blocked = true;
             state.BlockReason = MismatchEscalationPolicy.BLOCK_REASON_PERSISTENT_MISMATCH;
@@ -678,6 +1099,7 @@ public sealed class MismatchEscalationCoordinator
             var p = ToGatePayload(state, inst, utcNow, obsForSig, null, null);
             _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH", p));
             EmitCanonical(inst, "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH", utcNow, p, "ERROR");
+            PublishMismatchExecutionBlockAuthorityIfChanged(inst, state, wasBlockedA, utcNow);
         }
 
         if (state.GateLifecyclePhase == GateLifecyclePhase.DetectedBlocked)
@@ -912,6 +1334,9 @@ public sealed class MismatchEscalationCoordinator
             : StateConsistencyAuditFormat.DescribeProgressChange(sigProbe, postSig);
 
         var materialReadinessFp = BuildMaterialReadinessFingerprint(readiness, state.MismatchType);
+        var pendingIeA = _getPendingExecutionWorkloadForInstrument?.Invoke(inst) ?? 0;
+        var releaseQuietFingerprint = BuildReleaseQuietFingerprint(obsForSig, readiness, pendingIeA, preSigHash, postSigHash,
+            fpNow, materialReadinessFp);
         var identicalStallCycle = skipExpensive && !externalFingerprintChanged && !progressChanged &&
                                   IsStallLikeSkipReason(skipReason);
         if (identicalStallCycle)
@@ -1049,23 +1474,28 @@ public sealed class MismatchEscalationCoordinator
         else
             TestGateResultSuppressCount++;
 
+        MaybeEmitGateMaxDwellExceeded(inst, utcNow, state);
+
         if (state.EscalationState == MismatchEscalationState.FAIL_CLOSED ||
             state.GateLifecyclePhase == GateLifecyclePhase.FailClosed)
             return;
 
-        // Fail-closed unchanged. Persistent mismatch blocks only while not release-ready; when ready, stability window + release still apply (no stuck-forever).
+        // Fail-closed unchanged. Persistent mismatch blocks only while not release-ready; when ready, quiet window + release still apply (no stuck-forever).
         if ((state.EscalationState == MismatchEscalationState.PERSISTENT_MISMATCH ||
              state.GateLifecyclePhase == GateLifecyclePhase.PersistentMismatch) &&
             !readiness.ReleaseReady)
             return;
 
-        var windowMs = state.StableWindowMsApplied > 0 ? state.StableWindowMsApplied : _stableWindowMs;
+        var quietWindowMs = EffectiveQuietWindowMs(state);
+        var releaseConditionsMet = readiness.ReleaseReady && pendingIeA == 0 &&
+                                     obsForSig.BrokerWorkingOrderCount == 0 && obsForSig.LocalWorkingOrderCount == 0;
 
         if (!readiness.ReleaseReady)
         {
             TryEmitReleaseBlockedAfterFlat(inst, utcNow, state, readiness, recon, skipExpensive);
             if (state.GateLifecyclePhase == GateLifecyclePhase.StablePendingRelease)
             {
+                EmitGateReleaseBlocked(inst, utcNow, state, "readiness_lost_restabilization", readiness);
                 var resetPayload = new
                 {
                     gate = ToGatePayload(state, inst, utcNow, obsForSig, recon, readiness),
@@ -1075,6 +1505,7 @@ public sealed class MismatchEscalationCoordinator
                 EmitCanonical(inst, "STATE_CONSISTENCY_GATE_RESTABILIZATION_RESET", utcNow, resetPayload, "WARN");
                 state.GateLifecyclePhase = GateLifecyclePhase.Reconciling;
                 state.FirstConsistentUtc = default;
+                state.ReleaseQuietFingerprintKey = "";
             }
             return;
         }
@@ -1085,37 +1516,84 @@ public sealed class MismatchEscalationCoordinator
         {
             state.GateLifecyclePhase = GateLifecyclePhase.StablePendingRelease;
             var preserveStableClock = readiness.ReleaseReady && skipExpensive && !externalFingerprintChanged &&
-                                      IsStallLikeSkipReason(skipReason) && state.FirstConsistentUtc != default;
-            if (!preserveStableClock)
-                state.FirstConsistentUtc = utcNow;
+                                      IsStallLikeSkipReason(skipReason) && state.FirstConsistentUtc != default &&
+                                      releaseQuietFingerprint == state.ReleaseQuietFingerprintKey &&
+                                      !string.IsNullOrEmpty(state.ReleaseQuietFingerprintKey);
             if (!preserveStableClock)
             {
+                state.FirstConsistentUtc = utcNow;
+                state.ReleaseQuietFingerprintKey = releaseQuietFingerprint;
                 var spPayload = ToGatePayload(state, inst, utcNow, obsForSig, recon, readiness);
                 _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_STABLE_PENDING_RELEASE", spPayload));
                 EmitCanonical(inst, "STATE_CONSISTENCY_GATE_STABLE_PENDING_RELEASE", utcNow, spPayload, "INFO");
             }
+            else
+                state.ReleaseQuietFingerprintKey = releaseQuietFingerprint;
             return;
         }
 
         var stableMs = state.FirstConsistentUtc != default
             ? (long)(utcNow - state.FirstConsistentUtc).TotalMilliseconds
             : 0;
+        var gateDwellMs = state.LastGateEngagedUtc != default
+            ? (long)(utcNow - state.LastGateEngagedUtc).TotalMilliseconds
+            : 0L;
 
-        if (stableMs < windowMs)
+        var fpChanged = !string.IsNullOrEmpty(state.ReleaseQuietFingerprintKey) &&
+                        releaseQuietFingerprint != state.ReleaseQuietFingerprintKey;
+        var softDegradeForce = ShouldForceMaxDwellSoftDegradeRelease(
+            gateDwellMs, readiness, pendingIeA, obsForSig, fpChanged, releaseConditionsMet, stableMs, quietWindowMs);
+
+        if (fpChanged && !softDegradeForce)
+        {
+            EmitGateReleaseReset(inst, utcNow, state, readiness, obsForSig, pendingIeA, preSigHash, postSigHash, fpNow,
+                "quiet_fingerprint_changed", state.ReleaseQuietFingerprintKey, releaseQuietFingerprint);
+            state.FirstConsistentUtc = utcNow;
+            state.ReleaseQuietFingerprintKey = releaseQuietFingerprint;
+            MaybeEmitGateReleaseProgress(inst, utcNow, state, readiness, 0, quietWindowMs, obsForSig, pendingIeA,
+                preSigHash, postSigHash, fpNow, true, "quiet_fingerprint_changed");
             return;
+        }
+
+        if (!releaseConditionsMet && !softDegradeForce)
+        {
+            state.FirstConsistentUtc = utcNow;
+            MaybeEmitGateReleaseProgress(inst, utcNow, state, readiness, 0, quietWindowMs, obsForSig, pendingIeA,
+                preSigHash, postSigHash, fpNow, false, "release_conditions_not_met");
+            return;
+        }
+
+        if (stableMs < quietWindowMs && !softDegradeForce)
+        {
+            MaybeEmitGateReleaseProgress(inst, utcNow, state, readiness, stableMs, quietWindowMs, obsForSig, pendingIeA,
+                preSigHash, postSigHash, fpNow, false, null);
+            return;
+        }
+
+        if (softDegradeForce)
+            EmitGateSoftDegradeForceRelease(inst, utcNow, state, readiness, obsForSig, pendingIeA, gateDwellMs, fpChanged,
+                releaseConditionsMet, stableMs, quietWindowMs);
 
         var releaseCompletedUnderStall = skipExpensive && IsStallLikeSkipReason(skipReason);
 
-        var releaseSource = state.EscalationState == MismatchEscalationState.PERSISTENT_MISMATCH
-            ? "persistent_recovery"
-            : "standard";
+        var releaseSource = softDegradeForce
+            ? "max_dwell_soft_degrade"
+            : state.EscalationState == MismatchEscalationState.PERSISTENT_MISMATCH
+                ? "persistent_recovery"
+                : "standard";
 
+        var priorQuietFp = state.ReleaseQuietFingerprintKey;
+        EmitGateReleasedDiagnostic(inst, utcNow, readiness, obsForSig, pendingIeA, preSigHash, postSigHash,
+            fpNow, stableMs, quietWindowMs, priorQuietFp, softDegradeForce, gateDwellMs);
+
+        var wasBlockedRelease = state.Blocked;
         state.Blocked = false;
         state.BlockReason = "";
         state.EscalationState = MismatchEscalationState.NONE;
         state.GateLifecyclePhase = GateLifecyclePhase.None;
         state.LastReleaseUtc = utcNow;
         state.FirstConsistentUtc = default;
+        state.ReleaseQuietFingerprintKey = "";
         state.ConsecutiveCleanPassCount = 0;
         state.MismatchStillPresent = false;
         state.GateProgress.Reset();
@@ -1126,13 +1604,17 @@ public sealed class MismatchEscalationCoordinator
         state.ForcedConvergenceSucceeded = false;
         _mismatchClearedCount++;
         _hedgedNetFlatEscalationInvoked.TryRemove(inst, out _);
+        _gateReleaseProgressLastEmit.Remove(inst);
+        _gateMaxDwellLastEmit.Remove(inst);
 
         var releasedPayload = new
         {
             gate = ToGatePayload(state, inst, utcNow, obsForSig, recon, readiness),
             stable_for_ms = stableMs,
-            stable_window_ms = windowMs,
-            release_source = releaseSource
+            stable_window_ms = quietWindowMs,
+            release_source = releaseSource,
+            max_dwell_soft_degrade = softDegradeForce,
+            gate_dwell_ms = gateDwellMs
         };
         _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_RELEASED", releasedPayload));
         EmitCanonical(inst, "STATE_CONSISTENCY_GATE_RELEASED", utcNow, releasedPayload, "INFO");
@@ -1144,7 +1626,7 @@ public sealed class MismatchEscalationCoordinator
                 instrument = inst,
                 skip_reason = skipReason,
                 stable_for_ms = stableMs,
-                stable_window_ms = windowMs,
+                stable_window_ms = quietWindowMs,
                 release_source = releaseSource,
                 note = "TEMP_DEBUG: gate released while expensive recon skipped (stall); remove when stable"
             };
@@ -1152,6 +1634,7 @@ public sealed class MismatchEscalationCoordinator
             EmitCanonical(inst, "GATE_RELEASE_COMPLETED_UNDER_STALL", utcNow, underStallDbg, "INFO");
         }
         _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "RECONCILIATION_MISMATCH_CLEARED", ToGatePayload(state, inst, utcNow, obsForSig, null, null)));
+        PublishMismatchExecutionBlockAuthorityIfChanged(inst, state, wasBlockedRelease, utcNow);
     }
 
     private static MismatchObservation CoalesceGateObservation(string inst, MismatchInstrumentState state,
@@ -1412,6 +1895,8 @@ public sealed class MismatchEscalationCoordinator
             readiness_contradictions = readiness?.Contradictions,
             broker_qty = obs?.BrokerQty ?? 0,
             local_qty = obs?.LocalQty ?? 0,
+            payload_local_qty = obs?.LocalQty ?? 0,
+            diagnostic_journal_open_qty = readiness?.DiagnosticJournalOpenQty,
             mismatch_type = state.MismatchType.ToString(),
             persistence_ms = state.PersistenceMs,
             timestamp_utc = utcNow.ToString("o"),
@@ -1478,6 +1963,8 @@ public sealed class MismatchEscalationCoordinator
             readiness_contradictions = readiness?.Contradictions,
             broker_qty = obs?.BrokerQty ?? 0,
             local_qty = obs?.LocalQty ?? 0,
+            payload_local_qty = obs?.LocalQty ?? 0,
+            diagnostic_journal_open_qty = readiness?.DiagnosticJournalOpenQty,
             mismatch_type = state.MismatchType.ToString(),
             persistence_ms = state.PersistenceMs,
             timestamp_utc = utcNow.ToString("o"),
@@ -1623,6 +2110,7 @@ public sealed class MismatchEscalationCoordinator
             return;
         }
 
+        var wasBlockedFc = state.Blocked;
         state.EscalationState = MismatchEscalationState.FAIL_CLOSED;
         state.GateLifecyclePhase = GateLifecyclePhase.FailClosed;
         state.Blocked = true;
@@ -1635,6 +2123,7 @@ public sealed class MismatchEscalationCoordinator
         EmitCanonical(inst, ExecutionEventTypes.MISMATCH_FAIL_CLOSED, utcNow, failPayload, "CRITICAL");
         _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_RECOVERY_FAILED", failPayload));
         EmitCanonical(inst, "STATE_CONSISTENCY_GATE_RECOVERY_FAILED", utcNow, failPayload, "CRITICAL");
+        PublishMismatchExecutionBlockAuthorityIfChanged(inst, state, wasBlockedFc, utcNow);
         _onForcedConvergenceFailure?.Invoke(inst, ctx, result);
     }
 

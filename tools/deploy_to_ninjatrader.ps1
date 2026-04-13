@@ -18,7 +18,7 @@ Write-Host ""
 
 # Step 1: Build
 Write-Host "[1/4] Building Robot.Core (Release)..." -ForegroundColor Cyan
-dotnet build (Join-Path $projectRoot "RobotCore_For_NinjaTrader\Robot.Core.csproj") -c Release | Out-Null
+dotnet build (Join-Path $projectRoot "system\RobotCore_For_NinjaTrader\Robot.Core.csproj") -c Release | Out-Null
 if ($LASTEXITCODE -ne 0) {
     Write-Host "[ERROR] Build failed" -ForegroundColor Red
     exit 1
