@@ -53,7 +53,7 @@ public sealed class RiskGate
     {
         var failedGates = new List<string>();
 
-        // Gate -1: Instrument frozen (protective failure, reconciliation mismatch, etc.)
+        // Gate -1: Instrument execution lock (freeze latch / IEA supervisory — protective latch is EPA path-scoped)
         if (_isInstrumentFrozen != null && _isInstrumentFrozen(instrument))
         {
             failedGates.Add("INSTRUMENT_FROZEN");

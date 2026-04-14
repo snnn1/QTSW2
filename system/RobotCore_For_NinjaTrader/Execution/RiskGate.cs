@@ -76,7 +76,7 @@ public sealed class RiskGate
             return (false, "MISMATCH_EXECUTION_BLOCK", failedGates);
         }
 
-        // Gate -1b: Instrument frozen / protective / IEA supervisory (excludes mismatch authority — see gate -1a)
+        // Gate -1b: Instrument freeze latch / IEA supervisory (excludes mismatch authority — see gate -1a; protective latch is EPA path-scoped)
         if (_isInstrumentFrozen != null && _isInstrumentFrozen(instrument))
         {
             failedGates.Add("INSTRUMENT_FROZEN");

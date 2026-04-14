@@ -1,0 +1,726 @@
+{
+  "schema_version": "2",
+  "generated_at_utc": "2026-04-13T02:14:55.979574+00:00",
+  "run_root": "C:\\Users\\jakej\\QTSW2\\runs\\be741a288a9e42de8a2e8b508e0cbda5",
+  "verdict": {
+    "explainable": false,
+    "primary_issue": "INSTRUMENT_MISMATCH",
+    "confidence": "MEDIUM"
+  },
+  "broker_truth": {
+    "positions": {
+      "MNQ": 1
+    }
+  },
+  "system_truth": {
+    "positions": {
+      "M2K": {
+        "submitted": true,
+        "filled": false
+      },
+      "MCL": {
+        "submitted": true,
+        "filled": true
+      },
+      "MGC": {
+        "submitted": true,
+        "filled": true
+      },
+      "MNG": {
+        "submitted": true,
+        "filled": true
+      },
+      "MNQ": {
+        "submitted": true,
+        "filled": true
+      }
+    }
+  },
+  "unexplained_positions": [],
+  "section_a": {
+    "files_matched_json_jsonl": 63,
+    "files_scanned_relative": [
+      "KEY_EVENTS.jsonl",
+      "data\\risk_latches\\risk_latch_Playback101_MGC.json",
+      "data\\risk_latches\\risk_latch_Playback101_MNG.json",
+      "data\\risk_latches\\risk_latch_Playback101_MNQ.json",
+      "decisions\\mismatch_execution_block_decisions.jsonl",
+      "derived\\execution_summaries\\summary_20260413021230.json",
+      "derived\\execution_summaries\\summary_20260413021303.json",
+      "derived\\execution_summaries\\summary_20260413021355.json",
+      "derived\\execution_summaries\\summary_20260413021356.json",
+      "derived\\execution_summaries\\summary_20260413021357.json",
+      "derived\\execution_summaries\\summary_20260413021358.json",
+      "events\\execution_events\\2026-04-08\\MGC_BE741A28.jsonl",
+      "events\\execution_events\\2026-04-08\\MNG_BE741A28.jsonl",
+      "events\\execution_events\\2026-04-08\\MNQ_BE741A28.jsonl",
+      "logs\\health\\2026-04-08_ENGINE___ENGINE__.jsonl",
+      "logs\\health\\2026-04-08_GC_GC2.jsonl",
+      "logs\\health\\2026-04-08_MCL_CL2.jsonl",
+      "logs\\health\\2026-04-08_MNQ_NQ1.jsonl",
+      "logs\\health\\2026-04-08_NG_NG1.jsonl",
+      "logs\\health\\2026-04-08_NG_NG1_NG1_07_30_2026-04-08.jsonl",
+      "logs\\health\\2026-04-08_NQ_NQ1.jsonl",
+      "logs\\health\\_ENGINE_.jsonl",
+      "logs\\health\\_ENGINE___ENGINE__.jsonl",
+      "logs\\health\\_M2K_.jsonl",
+      "logs\\health\\_MCL_.jsonl",
+      "logs\\health\\_MGC_.jsonl",
+      "logs\\health\\_MNG_.jsonl",
+      "logs\\health\\_MNQ_.jsonl",
+      "logs\\hydration\\hydration_2026-04-08.jsonl",
+      "logs\\range_building\\range_building_2026-04-08.jsonl",
+      "logs\\ranges\\ranges_2026-04-08.jsonl",
+      "logs\\robot\\iea_execution_latency.jsonl",
+      "logs\\robot\\order_update_integrity_forensic.jsonl",
+      "logs\\robot\\robot_CL.jsonl",
+      "logs\\robot\\robot_ENGINE.jsonl",
+      "logs\\robot\\robot_ENGINE_20260413_021110.jsonl",
+      "logs\\robot\\robot_GC.jsonl",
+      "logs\\robot\\robot_M2K.jsonl",
+      "logs\\robot\\robot_MCL.jsonl",
+      "logs\\robot\\robot_MGC.jsonl",
+      "logs\\robot\\robot_MNG.jsonl",
+      "logs\\robot\\robot_MNQ.jsonl",
+      "logs\\robot\\robot_NG.jsonl",
+      "logs\\robot\\robot_NQ.jsonl",
+      "logs\\robot\\robot_RTY.jsonl",
+      "state\\execution_journals\\2026-04-08_CL2_1dce7c56d37da6a6.json",
+      "state\\execution_journals\\2026-04-08_CL2_8b36fc2f2d13f2e9.json",
+      "state\\execution_journals\\2026-04-08_GC2_d9aa5fb32f831b22.json",
+      "state\\execution_journals\\2026-04-08_GC2_fa1a13385d4703fb.json",
+      "state\\execution_journals\\2026-04-08_NG1_042aea2d918cb865.json",
+      "state\\execution_journals\\2026-04-08_NG1_bf0372011dfa1e68.json",
+      "state\\execution_journals\\2026-04-08_NQ1_0a59cf5056442a68.json",
+      "state\\execution_journals\\2026-04-08_NQ1_e76a758813c13e7b.json",
+      "state\\execution_journals\\2026-04-08_RTY2_330657abe6175bc4.json",
+      "state\\execution_journals\\2026-04-08_RTY2_6e1b04adf77c8746.json",
+      "state\\execution_journals\\RECOVERY_UNTRACKED_RECOVERY_UNTR428d30eaf0673ce0.json",
+      "state\\execution_journals\\RECOVERY_UNTRACKED_RECOVERY_UNTRb9fda0adfdb46b18.json",
+      "state\\stream_journals\\2026-04-08_CL2.json",
+      "state\\stream_journals\\2026-04-08_GC2.json",
+      "state\\stream_journals\\2026-04-08_NG1.json",
+      "state\\stream_journals\\2026-04-08_NQ1.json",
+      "state\\stream_journals\\2026-04-08_RTY2.json",
+      "summary.json"
+    ]
+  },
+  "section_b": {
+    "broker_positions_from_execution_events": [
+      {
+        "instrument": "MNQ",
+        "broker_position_qty": 1.0,
+        "broker_direction": null,
+        "source_file": "events\\execution_events\\2026-04-08\\MNQ_BE741A28.jsonl:26",
+        "line_hint": "NET_POSITION_MISMATCH"
+      }
+    ]
+  },
+  "section_c": {
+    "execution_journal_rows": [
+      {
+        "instrument": "MCL",
+        "stream": "CL2",
+        "intent_id": "1dce7c56d37da6a6",
+        "broker_order_id": "640f985f77aa4f618320b57b5190b33b",
+        "entry_submitted": true,
+        "entry_filled": false,
+        "source_file": "state\\execution_journals\\2026-04-08_CL2_1dce7c56d37da6a6.json"
+      },
+      {
+        "instrument": "MCL",
+        "stream": "CL2",
+        "intent_id": "8b36fc2f2d13f2e9",
+        "broker_order_id": "e6214b7556d244a184fec21ec1defd3d",
+        "entry_submitted": true,
+        "entry_filled": true,
+        "source_file": "state\\execution_journals\\2026-04-08_CL2_8b36fc2f2d13f2e9.json"
+      },
+      {
+        "instrument": "MGC",
+        "stream": "GC2",
+        "intent_id": "d9aa5fb32f831b22",
+        "broker_order_id": "4f4128163dc546d799f89432c1c52854",
+        "entry_submitted": true,
+        "entry_filled": false,
+        "source_file": "state\\execution_journals\\2026-04-08_GC2_d9aa5fb32f831b22.json"
+      },
+      {
+        "instrument": "MGC",
+        "stream": "GC2",
+        "intent_id": "fa1a13385d4703fb",
+        "broker_order_id": "576a966c7bac47259cb366cf766ac7b8",
+        "entry_submitted": true,
+        "entry_filled": true,
+        "source_file": "state\\execution_journals\\2026-04-08_GC2_fa1a13385d4703fb.json"
+      },
+      {
+        "instrument": "MNG",
+        "stream": "NG1",
+        "intent_id": "042aea2d918cb865",
+        "broker_order_id": "b3e61d3724fd4f87bc871b78081fc260",
+        "entry_submitted": true,
+        "entry_filled": true,
+        "source_file": "state\\execution_journals\\2026-04-08_NG1_042aea2d918cb865.json"
+      },
+      {
+        "instrument": "MNG",
+        "stream": "NG1",
+        "intent_id": "bf0372011dfa1e68",
+        "broker_order_id": "6d31b066eaf14032a4ac57d217f1b2a9",
+        "entry_submitted": true,
+        "entry_filled": false,
+        "source_file": "state\\execution_journals\\2026-04-08_NG1_bf0372011dfa1e68.json"
+      },
+      {
+        "instrument": "MNQ",
+        "stream": "NQ1",
+        "intent_id": "0a59cf5056442a68",
+        "broker_order_id": "77edf994c61d43948331d9b0ecf07d0f",
+        "entry_submitted": true,
+        "entry_filled": true,
+        "source_file": "state\\execution_journals\\2026-04-08_NQ1_0a59cf5056442a68.json"
+      },
+      {
+        "instrument": "MNQ",
+        "stream": "NQ1",
+        "intent_id": "e76a758813c13e7b",
+        "broker_order_id": "af6c13796d9240e8af8a2da3c791646b",
+        "entry_submitted": true,
+        "entry_filled": false,
+        "source_file": "state\\execution_journals\\2026-04-08_NQ1_e76a758813c13e7b.json"
+      },
+      {
+        "instrument": "M2K",
+        "stream": "RTY2",
+        "intent_id": "330657abe6175bc4",
+        "broker_order_id": "39a0faaa50cf44d9876bc766937181f4",
+        "entry_submitted": true,
+        "entry_filled": false,
+        "source_file": "state\\execution_journals\\2026-04-08_RTY2_330657abe6175bc4.json"
+      },
+      {
+        "instrument": "M2K",
+        "stream": "RTY2",
+        "intent_id": "6e1b04adf77c8746",
+        "broker_order_id": "aa541fc52b7e49329fe52d6fae011007",
+        "entry_submitted": true,
+        "entry_filled": false,
+        "source_file": "state\\execution_journals\\2026-04-08_RTY2_6e1b04adf77c8746.json"
+      },
+      {
+        "instrument": "MNG",
+        "stream": "UNTRACKED_RECOVERY",
+        "intent_id": "UNTR428d30eaf0673ce0",
+        "broker_order_id": "b76597ac318344eca148a9de8ceb9c4f",
+        "entry_submitted": true,
+        "entry_filled": true,
+        "source_file": "state\\execution_journals\\RECOVERY_UNTRACKED_RECOVERY_UNTR428d30eaf0673ce0.json"
+      },
+      {
+        "instrument": "MGC",
+        "stream": "UNTRACKED_RECOVERY",
+        "intent_id": "UNTRb9fda0adfdb46b18",
+        "broker_order_id": "1c938c98b42b425f9d9e07d10e978743",
+        "entry_submitted": true,
+        "entry_filled": true,
+        "source_file": "state\\execution_journals\\RECOVERY_UNTRACKED_RECOVERY_UNTRb9fda0adfdb46b18.json"
+      }
+    ]
+  },
+  "section_h": {
+    "instruments": [
+      {
+        "instrument": "M2K",
+        "execution_source": "SYSTEM",
+        "has_execution_journal": true,
+        "entry_evidence_count": 4,
+        "entry_evidence_sample": [
+          "logs\\robot\\robot_M2K.jsonl:8 event=INTENT_LIFECYCLE_TRANSITION newState=ENTRY_SUBMITTED",
+          "logs\\robot\\robot_M2K.jsonl:9 event=ORDER_SUBMIT_SUCCESS",
+          "logs\\robot\\robot_M2K.jsonl:16 event=INTENT_LIFECYCLE_TRANSITION newState=ENTRY_SUBMITTED",
+          "logs\\robot\\robot_M2K.jsonl:17 event=ORDER_SUBMIT_SUCCESS"
+        ]
+      },
+      {
+        "instrument": "MCL",
+        "execution_source": "SYSTEM",
+        "has_execution_journal": true,
+        "entry_evidence_count": 4,
+        "entry_evidence_sample": [
+          "logs\\robot\\robot_MCL.jsonl:8 event=INTENT_LIFECYCLE_TRANSITION newState=ENTRY_SUBMITTED",
+          "logs\\robot\\robot_MCL.jsonl:9 event=ORDER_SUBMIT_SUCCESS",
+          "logs\\robot\\robot_MCL.jsonl:14 event=INTENT_LIFECYCLE_TRANSITION newState=ENTRY_SUBMITTED",
+          "logs\\robot\\robot_MCL.jsonl:16 event=ORDER_SUBMIT_SUCCESS"
+        ]
+      },
+      {
+        "instrument": "MGC",
+        "execution_source": "SYSTEM",
+        "has_execution_journal": true,
+        "entry_evidence_count": 4,
+        "entry_evidence_sample": [
+          "logs\\robot\\robot_MGC.jsonl:8 event=INTENT_LIFECYCLE_TRANSITION newState=ENTRY_SUBMITTED",
+          "logs\\robot\\robot_MGC.jsonl:9 event=ORDER_SUBMIT_SUCCESS",
+          "logs\\robot\\robot_MGC.jsonl:14 event=INTENT_LIFECYCLE_TRANSITION newState=ENTRY_SUBMITTED",
+          "logs\\robot\\robot_MGC.jsonl:15 event=ORDER_SUBMIT_SUCCESS"
+        ]
+      },
+      {
+        "instrument": "MNG",
+        "execution_source": "SYSTEM",
+        "has_execution_journal": true,
+        "entry_evidence_count": 4,
+        "entry_evidence_sample": [
+          "logs\\robot\\robot_MNG.jsonl:6 event=INTENT_LIFECYCLE_TRANSITION newState=ENTRY_SUBMITTED",
+          "logs\\robot\\robot_MNG.jsonl:7 event=ORDER_SUBMIT_SUCCESS",
+          "logs\\robot\\robot_MNG.jsonl:10 event=INTENT_LIFECYCLE_TRANSITION newState=ENTRY_SUBMITTED",
+          "logs\\robot\\robot_MNG.jsonl:11 event=ORDER_SUBMIT_SUCCESS"
+        ]
+      },
+      {
+        "instrument": "MNQ",
+        "execution_source": "SYSTEM",
+        "has_execution_journal": true,
+        "entry_evidence_count": 4,
+        "entry_evidence_sample": [
+          "logs\\robot\\robot_MNQ.jsonl:6 event=INTENT_LIFECYCLE_TRANSITION newState=ENTRY_SUBMITTED",
+          "logs\\robot\\robot_MNQ.jsonl:7 event=ORDER_SUBMIT_SUCCESS",
+          "logs\\robot\\robot_MNQ.jsonl:12 event=INTENT_LIFECYCLE_TRANSITION newState=ENTRY_SUBMITTED",
+          "logs\\robot\\robot_MNQ.jsonl:13 event=ORDER_SUBMIT_SUCCESS"
+        ]
+      }
+    ]
+  },
+  "section_i": {
+    "broker_order_map": [
+      {
+        "broker_order_id": "19a9b44583304279a7962f59360da17d",
+        "intent_id": "0a59cf5056442a68",
+        "instrument": "NQ",
+        "stream": "NQ1"
+      },
+      {
+        "broker_order_id": "1c938c98b42b425f9d9e07d10e978743",
+        "intent_id": "UNTRb9fda0adfdb46b18",
+        "instrument": "MGC",
+        "stream": "UNTRACKED_RECOVERY"
+      },
+      {
+        "broker_order_id": "1fac15ab8b86454ab6278e9be034b82e",
+        "intent_id": "8b36fc2f2d13f2e9",
+        "instrument": "MCL",
+        "stream": "CL2"
+      },
+      {
+        "broker_order_id": "39a0faaa50cf44d9876bc766937181f4",
+        "intent_id": "330657abe6175bc4",
+        "instrument": "M2K",
+        "stream": "RTY2"
+      },
+      {
+        "broker_order_id": "48c40c58dd8d4ec4b7049d7a2751a6a0",
+        "intent_id": "0a59cf5056442a68",
+        "instrument": "NQ",
+        "stream": "NQ1"
+      },
+      {
+        "broker_order_id": "4f4128163dc546d799f89432c1c52854",
+        "intent_id": "d9aa5fb32f831b22",
+        "instrument": "MGC",
+        "stream": "GC2"
+      },
+      {
+        "broker_order_id": "5488f0e733964c28a5e736dc9b4ad7c0",
+        "intent_id": "8b36fc2f2d13f2e9",
+        "instrument": "MCL",
+        "stream": "CL2"
+      },
+      {
+        "broker_order_id": "576a966c7bac47259cb366cf766ac7b8",
+        "intent_id": "fa1a13385d4703fb",
+        "instrument": "MGC",
+        "stream": "GC2"
+      },
+      {
+        "broker_order_id": "640f985f77aa4f618320b57b5190b33b",
+        "intent_id": "1dce7c56d37da6a6",
+        "instrument": "MCL",
+        "stream": "CL2"
+      },
+      {
+        "broker_order_id": "6d31b066eaf14032a4ac57d217f1b2a9",
+        "intent_id": "bf0372011dfa1e68",
+        "instrument": "MNG",
+        "stream": "NG1"
+      },
+      {
+        "broker_order_id": "752b3e2c06b94a2f97584a13bc500c3b",
+        "intent_id": "0a59cf5056442a68",
+        "instrument": "MNQ",
+        "stream": "NQ1"
+      },
+      {
+        "broker_order_id": "77edf994c61d43948331d9b0ecf07d0f",
+        "intent_id": "0a59cf5056442a68",
+        "instrument": "NQ",
+        "stream": "NQ1"
+      },
+      {
+        "broker_order_id": "aa541fc52b7e49329fe52d6fae011007",
+        "intent_id": "6e1b04adf77c8746",
+        "instrument": "M2K",
+        "stream": "RTY2"
+      },
+      {
+        "broker_order_id": "af6c13796d9240e8af8a2da3c791646b",
+        "intent_id": "e76a758813c13e7b",
+        "instrument": "MNQ",
+        "stream": "NQ1"
+      },
+      {
+        "broker_order_id": "b3e61d3724fd4f87bc871b78081fc260",
+        "intent_id": "042aea2d918cb865",
+        "instrument": "MNG",
+        "stream": "NG1"
+      },
+      {
+        "broker_order_id": "b76597ac318344eca148a9de8ceb9c4f",
+        "intent_id": "UNTR428d30eaf0673ce0",
+        "instrument": "MNG",
+        "stream": "UNTRACKED_RECOVERY"
+      },
+      {
+        "broker_order_id": "d800b28d68514b38a7c7a171d1ec1ea8",
+        "intent_id": "0a59cf5056442a68",
+        "instrument": "NQ",
+        "stream": "NQ1"
+      },
+      {
+        "broker_order_id": "e6214b7556d244a184fec21ec1defd3d",
+        "intent_id": "8b36fc2f2d13f2e9",
+        "instrument": "CL",
+        "stream": "CL2"
+      }
+    ],
+    "execution_journal_links": [
+      {
+        "instrument": "MCL",
+        "stream": "CL2",
+        "intent_id": "1dce7c56d37da6a6",
+        "broker_order_id": "640f985f77aa4f618320b57b5190b33b",
+        "entry_submitted": true,
+        "entry_filled": false,
+        "source_file": "state\\execution_journals\\2026-04-08_CL2_1dce7c56d37da6a6.json",
+        "linkage_status": "LINKED"
+      },
+      {
+        "instrument": "MCL",
+        "stream": "CL2",
+        "intent_id": "8b36fc2f2d13f2e9",
+        "broker_order_id": "e6214b7556d244a184fec21ec1defd3d",
+        "entry_submitted": true,
+        "entry_filled": true,
+        "source_file": "state\\execution_journals\\2026-04-08_CL2_8b36fc2f2d13f2e9.json",
+        "linkage_status": "LINKED"
+      },
+      {
+        "instrument": "MGC",
+        "stream": "GC2",
+        "intent_id": "d9aa5fb32f831b22",
+        "broker_order_id": "4f4128163dc546d799f89432c1c52854",
+        "entry_submitted": true,
+        "entry_filled": false,
+        "source_file": "state\\execution_journals\\2026-04-08_GC2_d9aa5fb32f831b22.json",
+        "linkage_status": "LINKED"
+      },
+      {
+        "instrument": "MGC",
+        "stream": "GC2",
+        "intent_id": "fa1a13385d4703fb",
+        "broker_order_id": "576a966c7bac47259cb366cf766ac7b8",
+        "entry_submitted": true,
+        "entry_filled": true,
+        "source_file": "state\\execution_journals\\2026-04-08_GC2_fa1a13385d4703fb.json",
+        "linkage_status": "LINKED"
+      },
+      {
+        "instrument": "MNG",
+        "stream": "NG1",
+        "intent_id": "042aea2d918cb865",
+        "broker_order_id": "b3e61d3724fd4f87bc871b78081fc260",
+        "entry_submitted": true,
+        "entry_filled": true,
+        "source_file": "state\\execution_journals\\2026-04-08_NG1_042aea2d918cb865.json",
+        "linkage_status": "LINKED"
+      },
+      {
+        "instrument": "MNG",
+        "stream": "NG1",
+        "intent_id": "bf0372011dfa1e68",
+        "broker_order_id": "6d31b066eaf14032a4ac57d217f1b2a9",
+        "entry_submitted": true,
+        "entry_filled": false,
+        "source_file": "state\\execution_journals\\2026-04-08_NG1_bf0372011dfa1e68.json",
+        "linkage_status": "LINKED"
+      },
+      {
+        "instrument": "MNQ",
+        "stream": "NQ1",
+        "intent_id": "0a59cf5056442a68",
+        "broker_order_id": "77edf994c61d43948331d9b0ecf07d0f",
+        "entry_submitted": true,
+        "entry_filled": true,
+        "source_file": "state\\execution_journals\\2026-04-08_NQ1_0a59cf5056442a68.json",
+        "linkage_status": "LINKED"
+      },
+      {
+        "instrument": "MNQ",
+        "stream": "NQ1",
+        "intent_id": "e76a758813c13e7b",
+        "broker_order_id": "af6c13796d9240e8af8a2da3c791646b",
+        "entry_submitted": true,
+        "entry_filled": false,
+        "source_file": "state\\execution_journals\\2026-04-08_NQ1_e76a758813c13e7b.json",
+        "linkage_status": "LINKED"
+      },
+      {
+        "instrument": "M2K",
+        "stream": "RTY2",
+        "intent_id": "330657abe6175bc4",
+        "broker_order_id": "39a0faaa50cf44d9876bc766937181f4",
+        "entry_submitted": true,
+        "entry_filled": false,
+        "source_file": "state\\execution_journals\\2026-04-08_RTY2_330657abe6175bc4.json",
+        "linkage_status": "LINKED"
+      },
+      {
+        "instrument": "M2K",
+        "stream": "RTY2",
+        "intent_id": "6e1b04adf77c8746",
+        "broker_order_id": "aa541fc52b7e49329fe52d6fae011007",
+        "entry_submitted": true,
+        "entry_filled": false,
+        "source_file": "state\\execution_journals\\2026-04-08_RTY2_6e1b04adf77c8746.json",
+        "linkage_status": "LINKED"
+      },
+      {
+        "instrument": "MNG",
+        "stream": "UNTRACKED_RECOVERY",
+        "intent_id": "UNTR428d30eaf0673ce0",
+        "broker_order_id": "b76597ac318344eca148a9de8ceb9c4f",
+        "entry_submitted": true,
+        "entry_filled": true,
+        "source_file": "state\\execution_journals\\RECOVERY_UNTRACKED_RECOVERY_UNTR428d30eaf0673ce0.json",
+        "linkage_status": "LINKED"
+      },
+      {
+        "instrument": "MGC",
+        "stream": "UNTRACKED_RECOVERY",
+        "intent_id": "UNTRb9fda0adfdb46b18",
+        "broker_order_id": "1c938c98b42b425f9d9e07d10e978743",
+        "entry_submitted": true,
+        "entry_filled": true,
+        "source_file": "state\\execution_journals\\RECOVERY_UNTRACKED_RECOVERY_UNTRb9fda0adfdb46b18.json",
+        "linkage_status": "LINKED"
+      }
+    ],
+    "broker_position_linkage": [
+      {
+        "instrument": "MNQ",
+        "linkage_status": "LINKED",
+        "execution_journal_rows_with_broker_id": 2
+      }
+    ]
+  },
+  "section_j": {
+    "timeline_top_events": [
+      {
+        "rank": 1,
+        "ts_utc": "2026-04-08T12:30:00+00:00",
+        "event_type": "RANGE_LOCK_OUTCOME",
+        "instrument": "MNQ",
+        "source_file": "KEY_EVENTS.jsonl:1"
+      },
+      {
+        "rank": 2,
+        "ts_utc": "2026-04-08T12:30:00+00:00",
+        "event_type": "RANGE_LOCK_OUTCOME",
+        "instrument": "MNG",
+        "source_file": "KEY_EVENTS.jsonl:2"
+      },
+      {
+        "rank": 3,
+        "ts_utc": "2026-04-08T15:00:00+00:00",
+        "event_type": "RANGE_LOCK_OUTCOME",
+        "instrument": "MCL",
+        "source_file": "KEY_EVENTS.jsonl:11"
+      },
+      {
+        "rank": 4,
+        "ts_utc": "2026-04-08T16:00:00+00:00",
+        "event_type": "RANGE_LOCK_OUTCOME",
+        "instrument": "MGC",
+        "source_file": "KEY_EVENTS.jsonl:16"
+      },
+      {
+        "rank": 5,
+        "ts_utc": "2026-04-08T16:00:00+00:00",
+        "event_type": "RANGE_LOCK_OUTCOME",
+        "instrument": "M2K",
+        "source_file": "KEY_EVENTS.jsonl:17"
+      },
+      {
+        "rank": 6,
+        "ts_utc": "2026-04-13T02:09:13.249634+00:00",
+        "event_type": "INTENT_LIFECYCLE_TRANSITION",
+        "instrument": "MNQ",
+        "source_file": "logs\\robot\\robot_MNQ.jsonl:10"
+      },
+      {
+        "rank": 7,
+        "ts_utc": "2026-04-13T02:09:13.254639+00:00",
+        "event_type": "ORDER_SUBMIT_SUCCESS",
+        "instrument": "MNQ",
+        "source_file": "logs\\robot\\robot_MNQ.jsonl:7"
+      },
+      {
+        "rank": 8,
+        "ts_utc": "2026-04-13T02:09:13.254639+00:00",
+        "event_type": "INTENT_LIFECYCLE_TRANSITION",
+        "instrument": "MNQ",
+        "source_file": "logs\\robot\\robot_MNQ.jsonl:6"
+      },
+      {
+        "rank": 9,
+        "ts_utc": "2026-04-13T02:09:14.058419+00:00",
+        "event_type": "ORDER_SUBMIT_SUCCESS",
+        "instrument": "MNQ",
+        "source_file": "logs\\robot\\robot_MNQ.jsonl:13"
+      },
+      {
+        "rank": 10,
+        "ts_utc": "2026-04-13T02:09:14.058419+00:00",
+        "event_type": "INTENT_LIFECYCLE_TRANSITION",
+        "instrument": "MNQ",
+        "source_file": "logs\\robot\\robot_MNQ.jsonl:12"
+      },
+      {
+        "rank": 11,
+        "ts_utc": "2026-04-13T02:09:14.087630+00:00",
+        "event_type": "INTENT_LIFECYCLE_TRANSITION",
+        "instrument": "MNQ",
+        "source_file": "logs\\robot\\robot_MNQ.jsonl:16"
+      },
+      {
+        "rank": 12,
+        "ts_utc": "2026-04-13T02:09:14.135453+00:00",
+        "event_type": "ORDER_SUBMIT_SUCCESS",
+        "instrument": "MNG",
+        "source_file": "logs\\robot\\robot_MNG.jsonl:7"
+      },
+      {
+        "rank": 13,
+        "ts_utc": "2026-04-13T02:09:14.135453+00:00",
+        "event_type": "INTENT_LIFECYCLE_TRANSITION",
+        "instrument": "MNG",
+        "source_file": "logs\\robot\\robot_MNG.jsonl:6"
+      },
+      {
+        "rank": 14,
+        "ts_utc": "2026-04-13T02:09:14.179331+00:00",
+        "event_type": "ORDER_SUBMIT_SUCCESS",
+        "instrument": "MNG",
+        "source_file": "logs\\robot\\robot_MNG.jsonl:11"
+      },
+      {
+        "rank": 15,
+        "ts_utc": "2026-04-13T02:09:14.179331+00:00",
+        "event_type": "INTENT_LIFECYCLE_TRANSITION",
+        "instrument": "MNG",
+        "source_file": "logs\\robot\\robot_MNG.jsonl:10"
+      },
+      {
+        "rank": 16,
+        "ts_utc": "2026-04-13T02:09:14.180335+00:00",
+        "event_type": "INTENT_LIFECYCLE_TRANSITION",
+        "instrument": "MNG",
+        "source_file": "logs\\robot\\robot_MNG.jsonl:14"
+      },
+      {
+        "rank": 17,
+        "ts_utc": "2026-04-13T02:09:14.205267+00:00",
+        "event_type": "INTENT_LIFECYCLE_TRANSITION",
+        "instrument": "MNG",
+        "source_file": "logs\\robot\\robot_MNG.jsonl:17"
+      },
+      {
+        "rank": 18,
+        "ts_utc": "2026-04-13T02:09:54.146114+00:00",
+        "event_type": "ORDER_SUBMIT_SUCCESS",
+        "instrument": "NQ",
+        "source_file": "logs\\robot\\robot_NQ.jsonl:2527"
+      },
+      {
+        "rank": 19,
+        "ts_utc": "2026-04-13T02:09:54.146114+00:00",
+        "event_type": "ORDER_SUBMIT_SUCCESS",
+        "instrument": "NQ",
+        "source_file": "logs\\robot\\robot_NQ.jsonl:2535"
+      },
+      {
+        "rank": 20,
+        "ts_utc": "2026-04-13T02:09:54.146114+00:00",
+        "event_type": "ENTRY_FILLED",
+        "instrument": "MNQ",
+        "source_file": "KEY_EVENTS.jsonl:4"
+      }
+    ]
+  },
+  "section_k": {
+    "instruments_execution_journals": [
+      "M2K",
+      "MCL",
+      "MGC",
+      "MNG",
+      "MNQ"
+    ],
+    "instruments_execution_events": [
+      "MGC",
+      "MNG",
+      "MNQ"
+    ],
+    "instruments_key_events": [
+      "CL",
+      "GC",
+      "M2K",
+      "MCL",
+      "MGC",
+      "MNG",
+      "MNQ",
+      "NG",
+      "NQ"
+    ],
+    "flag": "INSTRUMENT_MISMATCH"
+  },
+  "section_l": {
+    "position_not_adopted_tags": [
+      "INSTRUMENT_MISMATCH",
+      "TIMING_MISMATCH"
+    ],
+    "timing_mismatch_details": [
+      "TIMING_MISMATCH intent=1dce7c56... submitted=2026-04-13 observed=2026-04-08 state\\execution_journals\\2026-04-08_CL2_1dce7c56d37da6a6.json:1",
+      "TIMING_MISMATCH intent=d9aa5fb3... submitted=2026-04-13 observed=2026-04-08 state\\execution_journals\\2026-04-08_GC2_d9aa5fb32f831b22.json:1",
+      "TIMING_MISMATCH intent=fa1a1338... submitted=2026-04-13 observed=2026-04-08 state\\execution_journals\\2026-04-08_GC2_fa1a13385d4703fb.json:1",
+      "TIMING_MISMATCH intent=042aea2d... submitted=2026-04-13 observed=2026-04-08 state\\execution_journals\\2026-04-08_NG1_042aea2d918cb865.json:1",
+      "TIMING_MISMATCH intent=bf037201... submitted=2026-04-13 observed=2026-04-08 state\\execution_journals\\2026-04-08_NG1_bf0372011dfa1e68.json:1",
+      "TIMING_MISMATCH intent=e76a7588... submitted=2026-04-13 observed=2026-04-08 state\\execution_journals\\2026-04-08_NQ1_e76a758813c13e7b.json:1",
+      "TIMING_MISMATCH intent=330657ab... submitted=2026-04-13 observed=2026-04-08 state\\execution_journals\\2026-04-08_RTY2_330657abe6175bc4.json:1",
+      "TIMING_MISMATCH intent=6e1b04ad... submitted=2026-04-13 observed=2026-04-08 state\\execution_journals\\2026-04-08_RTY2_6e1b04adf77c8746.json:1"
+    ]
+  },
+  "section_m": {
+    "preventable": "YES",
+    "preventable_note": "heuristic: YES if INSTRUMENT_MISMATCH or NO_EXECUTION_JOURNAL"
+  }
+}

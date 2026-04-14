@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 
 namespace QTSW2.Robot.Core.Execution;
@@ -6,6 +7,13 @@ namespace QTSW2.Robot.Core.Execution;
 /// Structural state only: measures broker/journal parity, authority inputs, repair latches, and exposure anomalies.
 /// Returns minimal blocker reasons; does not enqueue work, mutate execution policy, or perform overlays.
 /// </summary>
+/// <remarks>
+/// Phase 3 demotion (feature flags): parity-not-OK and journal-repair latch may be demoted from submit denies to diagnostics-only.
+/// Tier-1 <see cref="QuantExecutionInstrumentPhase.RecoveryRequired"/> blocks directional entries before parity/authority; non-directional
+/// submits (e.g. protective) still flow through parity/repair/authority — demoted parity/repair avoids double jeopardy with store recovery mode.
+/// Position-authority matrix (<see cref="TryAuthorizeOrderSubmitByAuthority"/>) remains; UNKNOWN still denies broadly; overlap with RecoveryRequired
+/// is mainly directional (handled at quant gate first).
+/// </remarks>
 public static class ExecutionStructuralLayer
 {
     /// <summary>Primary structural blocker vocabulary for order-submit path (Reason on <see cref="ExecutionSafetySnapshot"/>).</summary>
@@ -18,6 +26,9 @@ public static class ExecutionStructuralLayer
         public const string AuthorityRecovery = "authority_recovery";
         public const string AuthorityNotReal = "authority_not_real";
         public const string NoActiveExposuresWithBrokerPosition = "no_active_exposures_with_broker_position";
+        public const string QuantUnmappedExecution = "quant_unmapped_execution";
+        public const string QuantExecutionLocked = "quant_execution_locked";
+        public const string QuantRecoveryRequired = "quant_recovery_required";
     }
 
     private readonly struct ParityRegistryView : IJournalParityRegistryView
@@ -34,6 +45,11 @@ public static class ExecutionStructuralLayer
 
     private static string NormalizeInstrument(string? instrument) =>
         string.IsNullOrWhiteSpace(instrument) ? "" : instrument.Trim();
+
+    private static bool IsBookkeepingLagProtected(string inst, DateTimeOffset utc) =>
+        PendingAlignmentAuthority.IsPendingAlignment(inst, utc)
+        || (FeatureFlags.QuantExecutionControlStoreEnabled
+            && QuantExecutionControlStore.OffersBookkeepingLagProtection(inst, utc));
 
     private static void ApplyFacts(
         ExecutionSafetySnapshot snap,
@@ -53,6 +69,37 @@ public static class ExecutionStructuralLayer
         snap.StructuralRepairActive = repairActive;
         snap.NoActiveExposuresWithBrokerPosition = noExposureBrokerOpen;
         snap.AuthorityState = authorityState;
+    }
+
+    /// <summary>
+    /// Bookkeeping-lag tolerance: broker snapshot + pending-alignment window + explainable parity — not foreign/insufficient-data faults.
+    /// Does not apply to <see cref="ExecutionSafetyEvaluationRequest.RecoveryExecutionDisallowed"/> (handled separately).
+    /// </summary>
+    private static bool TryBookkeepingLagStructuralBypass(
+        ExecutionSafetyEvaluationRequest req,
+        JournalParityResult parity,
+        string inst,
+        out string detail)
+    {
+        detail = "";
+        if (!FeatureFlags.StructuralLayerAllowSubmitDuringPendingAlignmentLag)
+            return false;
+        if (string.IsNullOrEmpty(inst))
+            return false;
+        if (!IsBookkeepingLagProtected(inst, req.UtcNow))
+            return false;
+        if (parity.BrokerPositionQty == 0)
+            return false;
+        if (parity.Status == JournalParityStatus.INSUFFICIENT_DATA)
+            return false;
+        if (parity.IeaUnavailableWhenRequired)
+            return false;
+        // Untagged / foreign broker orders — structural risk, not journal lag.
+        if (parity.Status == JournalParityStatus.UNKNOWN_ORDER_PRESENT)
+            return false;
+
+        detail = "structural_bookkeeping_lag_bypass_pending_alignment:parity=" + parity.Status;
+        return true;
     }
 
     /// <summary>
@@ -79,6 +126,35 @@ public static class ExecutionStructuralLayer
             return false;
         }
 
+        if (FeatureFlags.QuantExecutionControlStoreEnabled && !flattenAuthorityBypass)
+        {
+            var qPhase = QuantExecutionControlStore.GetSnapshot(inst).Phase;
+            if (qPhase == QuantExecutionInstrumentPhase.UnmappedExecution)
+            {
+                snapshot.Reason = StructuralBlocker.QuantUnmappedExecution;
+                snapshot.Detail = "tier1_quant_phase_unmapped";
+                return false;
+            }
+
+            if (qPhase == QuantExecutionInstrumentPhase.ExecutionLocked)
+            {
+                snapshot.Reason = StructuralBlocker.QuantExecutionLocked;
+                snapshot.Detail = "tier1_quant_phase_locked";
+                return false;
+            }
+
+            if (qPhase == QuantExecutionInstrumentPhase.RecoveryRequired)
+            {
+                var blockDirectional = string.IsNullOrEmpty(orderSubmitBlockedWhat) || IsDirectionalOrderSubmit(orderSubmitBlockedWhat);
+                if (blockDirectional)
+                {
+                    snapshot.Reason = StructuralBlocker.QuantRecoveryRequired;
+                    snapshot.Detail = "tier1_quant_phase_recovery_required";
+                    return false;
+                }
+            }
+        }
+
         var canonical = string.IsNullOrWhiteSpace(req.CanonicalInstrument) ? inst : req.CanonicalInstrument.Trim();
         var registry = new ParityRegistryView(req.UseInstrumentExecutionAuthority, req.IeaOwnedPlusAdoptedWorking);
         var parity = JournalParityChecker.CheckJournalParity(
@@ -97,21 +173,63 @@ public static class ExecutionStructuralLayer
             recoveredOpen);
         var authorityState = derived.ToString();
 
-        var repairActive = req.RecoveryExecutionDisallowed || req.JournalIntegrityOrReconciliationRepairActive;
-        ApplyFacts(snapshot, parity, realOpen, recoveredOpen, authorityState, repairActive, noExposureBrokerOpen: false);
+        var recoveryExecutionBlocked = req.RecoveryExecutionDisallowed;
+        var journalRepairLatch = req.JournalIntegrityOrReconciliationRepairActive;
+        var repairActiveForSnapshot = recoveryExecutionBlocked || journalRepairLatch;
+        ApplyFacts(snapshot, parity, realOpen, recoveredOpen, authorityState, repairActiveForSnapshot, noExposureBrokerOpen: false);
 
-        if (repairActive)
+        // Recovery guard (disconnect / stand-down): never bypass — not bookkeeping lag.
+        if (recoveryExecutionBlocked)
         {
             snapshot.Reason = StructuralBlocker.RepairActive;
-            snapshot.Detail = req.RecoveryExecutionDisallowed ? "recovery_execution_disallowed" : "journal_repair_active";
+            snapshot.Detail = "recovery_execution_disallowed";
             return false;
+        }
+
+        if (journalRepairLatch)
+        {
+            if (TryBookkeepingLagStructuralBypass(req, parity, inst, out var repairLagDetail))
+            {
+                snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
+                    ? repairLagDetail
+                    : snapshot.Detail + ";" + repairLagDetail;
+            }
+            else if (FeatureFlags.StructuralLayerPhase3DemoteRepairActiveSubmitDeny)
+            {
+                const string tag = "phase3_repair_active_demoted_to_diagnostic";
+                snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
+                    ? tag
+                    : snapshot.Detail + ";" + tag;
+            }
+            else
+            {
+                snapshot.Reason = StructuralBlocker.RepairActive;
+                snapshot.Detail = "journal_repair_active";
+                return false;
+            }
         }
 
         if (!parity.IsOkOrPendingAlignment)
         {
-            snapshot.Reason = StructuralBlocker.ParityNotOk;
-            snapshot.Detail = parity.Status.ToString();
-            return false;
+            if (TryBookkeepingLagStructuralBypass(req, parity, inst, out var parityLagDetail))
+            {
+                snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
+                    ? parityLagDetail
+                    : snapshot.Detail + ";" + parityLagDetail;
+            }
+            else if (FeatureFlags.StructuralLayerPhase3DemoteParityNotOkSubmitDeny)
+            {
+                var tag = "phase3_parity_not_ok_demoted_to_diagnostic:parity=" + parity.Status;
+                snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
+                    ? tag
+                    : snapshot.Detail + ";" + tag;
+            }
+            else
+            {
+                snapshot.Reason = StructuralBlocker.ParityNotOk;
+                snapshot.Detail = parity.Status.ToString();
+                return false;
+            }
         }
 
         if (flattenAuthorityBypass)
@@ -147,6 +265,15 @@ public static class ExecutionStructuralLayer
         if (noActiveExposures && parity.BrokerPositionQty != 0)
         {
             snapshot.NoActiveExposuresWithBrokerPosition = true;
+            // First protective stop after a mapped fill may race exposure registration; do not hard-deny on this alone.
+            if (string.Equals(orderSubmitBlockedWhat, "SUBMIT_PROTECTIVE_STOP", StringComparison.Ordinal))
+            {
+                const string prot = "no_active_exposures_bypass_submittable_protective_with_broker_position";
+                snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail) ? prot : snapshot.Detail + ";" + prot;
+                snapshot.Reason = "";
+                return true;
+            }
+
             snapshot.Reason = StructuralBlocker.NoActiveExposuresWithBrokerPosition;
             snapshot.Detail = null;
             return false;

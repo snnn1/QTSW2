@@ -16,14 +16,24 @@ public static class ExecutionPermissionAuthority
     /// </summary>
     /// <param name="globalKillSwitchActive">When non-null and returns true, mirrors RiskGate kill-switch deny.</param>
     /// <param name="mismatchExecutionBlocked">G1: EPA-owned mismatch execution block only — when true, deny <c>MISMATCH_EXECUTION_BLOCK</c> (mirrors RiskGate gate −1a).</param>
-    /// <param name="instrumentFrozenOrEpaBlocked">Frozen / protective / IEA supervisory — excludes mismatch authority (gate −1b).</param>
+    /// <param name="instrumentFrozenOrEpaBlocked">
+    /// Gate −1b: engine execution lock + optional protective/coverage policy by <paramref name="submitPath"/> (e.g. exempt
+    /// <c>SUBMIT_PROTECTIVE_STOP</c> from protective-coordinator latch). Signature receives <c>(instrument, submit_path)</c>.
+    /// </param>
+    /// <param name="submitPath">Adapter submit bucket (<c>SUBMIT_ENTRY_STOP</c>, <c>SUBMIT_PROTECTIVE_STOP</c>, etc.).</param>
     /// <param name="denyReason">Stable machine-oriented code for logs and tests.</param>
+    /// <param name="skipMismatchExecutionBlock">
+    /// When true, mismatch execution block is not evaluated (used for <c>SUBMIT_PROTECTIVE_STOP</c> only after
+    /// <see cref="ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure"/> succeeds in the adapter).
+    /// </param>
     public static bool TryAdapterOrderSubmitPreflight(
         Func<bool>? globalKillSwitchActive,
         Func<string, bool>? mismatchExecutionBlocked,
-        Func<string, bool>? instrumentFrozenOrEpaBlocked,
+        Func<string, string?, bool>? instrumentFrozenOrEpaBlocked,
         string instrument,
-        out string denyReason)
+        string submitPath,
+        out string denyReason,
+        bool skipMismatchExecutionBlock = false)
     {
         denyReason = "";
         if (globalKillSwitchActive != null && globalKillSwitchActive())
@@ -33,13 +43,15 @@ public static class ExecutionPermissionAuthority
         }
 
         var inst = instrument?.Trim() ?? "";
-        if (!string.IsNullOrEmpty(inst) && mismatchExecutionBlocked != null && mismatchExecutionBlocked(inst))
+        if (!skipMismatchExecutionBlock &&
+            !string.IsNullOrEmpty(inst) && mismatchExecutionBlocked != null && mismatchExecutionBlocked(inst))
         {
             denyReason = "MISMATCH_EXECUTION_BLOCK";
             return false;
         }
 
-        if (!string.IsNullOrEmpty(inst) && instrumentFrozenOrEpaBlocked != null && instrumentFrozenOrEpaBlocked(inst))
+        if (!string.IsNullOrEmpty(inst) && instrumentFrozenOrEpaBlocked != null &&
+            instrumentFrozenOrEpaBlocked(inst, submitPath))
         {
             denyReason = "INSTRUMENT_FROZEN_OR_EPA_BLOCKED";
             return false;

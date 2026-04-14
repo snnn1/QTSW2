@@ -1,8 +1,8 @@
 {
   "version": 2,
-  "dgSpecHash": "z9C7SDZQScc=",
+  "dgSpecHash": "b1Svy6keaDg=",
   "success": true,
-  "projectFilePath": "c:\\Users\\jakej\\QTSW2\\system\\RobotCore_For_NinjaTrader\\SiblingProtectiveCancelQueue.Test\\SiblingProtectiveCancelQueue.Test.csproj",
+  "projectFilePath": "C:\\Users\\jakej\\QTSW2\\system\\RobotCore_For_NinjaTrader\\SiblingProtectiveCancelQueue.Test\\SiblingProtectiveCancelQueue.Test.csproj",
   "expectedPackageFiles": [
     "C:\\Users\\jakej\\.nuget\\packages\\microsoft.bcl.asyncinterfaces\\8.0.0\\microsoft.bcl.asyncinterfaces.8.0.0.nupkg.sha512",
     "C:\\Users\\jakej\\.nuget\\packages\\microsoft.netframework.referenceassemblies\\1.0.3\\microsoft.netframework.referenceassemblies.1.0.3.nupkg.sha512",

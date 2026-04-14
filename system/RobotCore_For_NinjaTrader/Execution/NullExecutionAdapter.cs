@@ -210,6 +210,9 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
         return false;
     }
 
+    /// <inheritdoc />
+    public bool TryRecognizeSelfInitiatedFlattenCloseFill(string instrument, DateTimeOffset utcNow) => false;
+
     public IReadOnlyCollection<string> GetActiveIntentIdsForProtectiveAudit(string instrument)
     {
         return Array.Empty<string>();

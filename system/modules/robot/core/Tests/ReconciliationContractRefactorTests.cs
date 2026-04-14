@@ -15,7 +15,7 @@ public static class ReconciliationContractRefactorTests
         if (!b) return (false, eb);
         var (c, ec) = Case3_MixedBlockers();
         if (!c) return (false, ec);
-        var (d, ed) = Case4_LegacyCountFailClosed();
+        var (d, ed) = Case4_LegacyClassifierGapInformational();
         if (!d) return (false, ed);
         var (e, ee) = Case5_ScheduleSignals();
         if (!e) return (false, ee);
@@ -115,7 +115,7 @@ public static class ReconciliationContractRefactorTests
         return (true, null);
     }
 
-    private static (bool, string?) Case4_LegacyCountFailClosed()
+    private static (bool, string?) Case4_LegacyClassifierGapInformational()
     {
         var inp = new StateConsistencyReleaseEvaluationInput
         {
@@ -131,10 +131,12 @@ public static class ReconciliationContractRefactorTests
             UseInstrumentExecutionAuthority = false
         };
         var r = StateConsistencyReleaseEvaluator.Evaluate(inp);
-        if (r.ReleaseReady)
-            return (false, "Case4: legacy count without classifier must block");
         if (!r.LegacyClassifierGap)
             return (false, "Case4: expected LegacyClassifierGap flag");
+        if (!r.ReleaseReady)
+            return (false, "Case4: legacy gap without classifier is informational — release when broker/journal/IEA explainable");
+        if (!r.Contradictions.Contains("info_legacy_classifier_gap_pending_adoption"))
+            return (false, "Case4: expected info_legacy_classifier_gap_pending_adoption contradiction");
         return (true, null);
     }
 

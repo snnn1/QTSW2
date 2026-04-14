@@ -331,5 +331,8 @@ public static class StartupExecutionContextRaceScenarioTests
 
         public bool TryTriggerHardFlatten(string instrument, string reason, DateTimeOffset utcNow) =>
             _inner.TryTriggerHardFlatten(instrument, reason, utcNow);
+
+        public bool TryRecognizeSelfInitiatedFlattenCloseFill(string instrument, DateTimeOffset utcNow) =>
+            _inner.TryRecognizeSelfInitiatedFlattenCloseFill(instrument, utcNow);
     }
 }

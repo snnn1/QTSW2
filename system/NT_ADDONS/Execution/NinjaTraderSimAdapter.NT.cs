@@ -595,6 +595,19 @@ public sealed partial class NinjaTraderSimAdapter
         }
     }
 
+    /// <inheritdoc cref="IExecutionAdapter.TryRecognizeSelfInitiatedFlattenCloseFill"/>
+    public bool TryRecognizeSelfInitiatedFlattenCloseFill(string instrument, DateTimeOffset utcNow)
+    {
+        var inst = instrument?.Trim() ?? "";
+        if (string.IsNullOrEmpty(inst)) return false;
+        lock (_flattenRecognitionLock)
+        {
+            if (string.IsNullOrEmpty(_lastFlattenInstrument)) return false;
+            if (!ExecutionInstrumentResolver.IsSameInstrument(_lastFlattenInstrument, inst)) return false;
+            return (utcNow - _lastFlattenUtc).TotalSeconds < FLATTEN_RECOGNITION_WINDOW_SECONDS;
+        }
+    }
+
     /// <summary>
     /// P2.6.7: Emergency flatten — still bypasses IEA queue but is constrained: strategy thread only + explicit policy classification before submit.
     /// </summary>
@@ -3978,21 +3991,14 @@ public sealed partial class NinjaTraderSimAdapter
         if (string.IsNullOrEmpty(intentId))
         {
             var instrument = order.Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
-            
-            // Broker flatten recognition: if we recently called Flatten for this instrument,
-            // this fill is our own flatten order - route through canonical exit path (P0)
-            lock (_flattenRecognitionLock)
+
+            if (TryRecognizeSelfInitiatedFlattenCloseFill(instrument, utcNow))
             {
-                if (!string.IsNullOrEmpty(_lastFlattenInstrument) &&
-                    ExecutionInstrumentResolver.IsSameInstrument(_lastFlattenInstrument, instrument) &&
-                    (utcNow - _lastFlattenUtc).TotalSeconds < FLATTEN_RECOGNITION_WINDOW_SECONDS)
-                {
-                    ProcessBrokerFlattenFill(execution, instrument, fillPrice, fillQuantity, utcNow, order.OrderId, order);
-                    CheckAllInstrumentsForFlatPositions(utcNow);
-                    return;
-                }
+                ProcessBrokerFlattenFill(execution, instrument, fillPrice, fillQuantity, utcNow, order.OrderId, order);
+                CheckAllInstrumentsForFlatPositions(utcNow);
+                return;
             }
-            
+
             EmitUnmappedFill(instrument, "UNTrackED_TAG", fillPrice, fillQuantity, utcNow, order.OrderId, order, tag: encodedTag);
             LogCriticalWithIeaContext(utcNow, "", instrument, "EXECUTION_UPDATE_UNTrackED_FILL_CRITICAL",
                 new 
@@ -5176,6 +5182,7 @@ public sealed partial class NinjaTraderSimAdapter
     {
         // Race mitigation: latch kill-switch before any logging / secondary work so no submit can slip past.
         ExecutionSafetyGate.ApplyUnmappedExecutionKillSwitch(instrument, unmappedReason, utcNow);
+        QuantExecutionControlStore.NotifyUnmappedExecution(instrument, utcNow, unmappedReason);
         var instKey = (instrument ?? "").Trim();
         if (!string.IsNullOrEmpty(instKey))
         {

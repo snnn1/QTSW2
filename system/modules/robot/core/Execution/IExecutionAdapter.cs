@@ -234,6 +234,12 @@ public interface IExecutionAdapter
     FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow);
 
     /// <summary>
+    /// True when an untagged execution fill is likely the close from a recent self-initiated <c>Account.Flatten</c> (full NT builds).
+    /// Default false for harness / stubs.
+    /// </summary>
+    bool TryRecognizeSelfInitiatedFlattenCloseFill(string instrument, DateTimeOffset utcNow) => false;
+
+    /// <summary>
     /// True when the adapter is safe to drive real or simulated submission paths (NT context wired; SIM verified when applicable).
     /// Used to gate pre-hydration and bracket submission during startup before DataLoaded wiring completes.
     /// </summary>

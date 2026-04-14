@@ -18,6 +18,12 @@ public sealed partial class NinjaTraderLiveAdapter : IExecutionAdapter
     private object? _ntAccount;   // NinjaTrader.Cbi.Account when SetNTContext called
     private object? _ntInstrument; // NinjaTrader.Cbi.Instrument when SetNTContext called
 
+    // Broker flatten recognition: Account.Flatten close orders have no QTSW2 tag; seed like Sim so fills route correctly when LIVE execution updates land.
+    private readonly object _flattenRecognitionLock = new();
+    private string? _lastFlattenInstrument;
+    private DateTimeOffset _lastFlattenUtc;
+    private const int FLATTEN_RECOGNITION_WINDOW_SECONDS = 10;
+
     /// <inheritdoc />
     public bool IsExecutionContextReady => _ntAccount != null && _ntInstrument != null;
 

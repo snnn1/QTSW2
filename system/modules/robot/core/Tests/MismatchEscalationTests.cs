@@ -12,6 +12,10 @@ public static class MismatchEscalationTests
 {
     public static (bool Pass, string? Error) RunMismatchEscalationTests()
     {
+        var prevMismatchBlock = FeatureFlags.ControlPlaneMismatchExecutionBlockAuthority;
+        FeatureFlags.ControlPlaneMismatchExecutionBlockAuthority = true;
+        try
+        {
         var utcNow = DateTimeOffset.UtcNow;
         var emptySnap = new AccountSnapshot { Positions = new List<PositionSnapshot>(), WorkingOrders = new List<WorkingOrderSnapshot>() };
 
@@ -198,6 +202,64 @@ public static class MismatchEscalationTests
         if (state?.EscalationState != MismatchEscalationState.PERSISTENT_MISMATCH)
             return (false, $"STRUCTURAL_MULTI_INTENT: expected PERSISTENT_MISMATCH after long persistence, got {state?.EscalationState}");
 
+        // 12. Pending alignment authority: broker/journal lag mismatch suppressed while trusted fill ledger is pending
+        JournalParityPendingLedger.Clear();
+        var coord7 = new MismatchEscalationCoordinator(
+            getSnapshot: () => emptySnap,
+            getActiveInstruments: () => Array.Empty<string>(),
+            getMismatchObservations: (_, _) => Array.Empty<MismatchObservation>(),
+            isInstrumentBlocked: _ => false,
+            isFlattenInProgress: _ => false,
+            isRecoveryInProgress: _ => false,
+            log: null);
+        JournalParityPendingLedger.TryRecordTrustedFill("PEND1", "dk", 1, "int", utcNow);
+        coord7.ProcessObservationForTest(new MismatchObservation
+        {
+            Instrument = "PEND1",
+            MismatchType = MismatchType.NET_POSITION_MISMATCH,
+            Present = true,
+            BrokerQty = 1,
+            LocalQty = 0,
+            NetBrokerQty = 1,
+            NetJournalQty = 0,
+            ObservedUtc = utcNow
+        });
+        state = coord7.GetStateForTest("PEND1");
+        if (state != null && state.EscalationState != MismatchEscalationState.NONE)
+            return (false, "pending_alignment: NET_POSITION first escalation should be suppressed with pending ledger");
+        JournalParityPendingLedger.Clear();
+
+        // 13. STRUCTURAL_MULTI_INTENT still engages when ledger pending (not a pure lag classification)
+        JournalParityPendingLedger.TryRecordTrustedFill("PEND2", "dk2", 1, "int", utcNow);
+        var coord8 = new MismatchEscalationCoordinator(
+            getSnapshot: () => emptySnap,
+            getActiveInstruments: () => Array.Empty<string>(),
+            getMismatchObservations: (_, _) => Array.Empty<MismatchObservation>(),
+            isInstrumentBlocked: _ => false,
+            isFlattenInProgress: _ => false,
+            isRecoveryInProgress: _ => false,
+            log: null);
+        coord8.ProcessObservationForTest(new MismatchObservation
+        {
+            Instrument = "PEND2",
+            MismatchType = MismatchType.STRUCTURAL_MULTI_INTENT,
+            Present = true,
+            BrokerQty = 2,
+            LocalQty = 4,
+            NetBrokerQty = 0,
+            NetJournalQty = 0,
+            ObservedUtc = utcNow
+        });
+        state = coord8.GetStateForTest("PEND2");
+        if (state?.EscalationState != MismatchEscalationState.DETECTED)
+            return (false, "STRUCTURAL_MULTI with pending ledger should still engage gate");
+        JournalParityPendingLedger.Clear();
+
         return (true, null);
+        }
+        finally
+        {
+            FeatureFlags.ControlPlaneMismatchExecutionBlockAuthority = prevMismatchBlock;
+        }
     }
 }

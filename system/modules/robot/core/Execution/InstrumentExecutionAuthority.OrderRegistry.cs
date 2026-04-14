@@ -351,5 +351,8 @@ public sealed partial class InstrumentExecutionAuthority
                 note = "Synchronous RegisterAdoptedOrder; broker_event_time from OrderInfo.BrokerLastEventUtc or EntryFillTime when set"
             }));
         NotifyReleaseSuppressionActivity();
+
+        // Tier 1 quant control: reconnect adoption — broker has live risk; journal/history may still be catching up.
+        QuantExecutionControlStore.NotifyRecoveredReconnect(instrument ?? "", utcNow);
     }
 }

@@ -203,14 +203,20 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     /// <summary>Optional: per-instrument journal integrity / reconciliation repair in progress (execution safety gate).</summary>
     private Func<string, bool>? _journalIntegrityRepairActiveForInstrumentCallback;
 
+    /// <summary>
+    /// Integration/harness tests only: when non-null, <see cref="BuildExecutionSafetyEvaluationRequest"/> uses this factory
+    /// instead of <see cref="GetAccountSnapshot"/> (avoids NT context). Set to null to restore production behavior.
+    /// </summary>
+    private Func<DateTimeOffset, AccountSnapshot?>? _executionSafetyTestGetAccountSnapshot;
+
     /// <summary>RiskGate gate 1: global kill switch — adapter order submits must mirror stream path.</summary>
     private Func<bool>? _isGlobalKillSwitchActive;
 
     /// <summary>G1: RiskGate gate −1a — EPA/engine mismatch execution block (mirrors <see cref="RiskGate"/> before frozen).</summary>
     private Func<string, bool>? _isMismatchExecutionBlocked;
 
-    /// <summary>RiskGate gate −1b: frozen / protective / IEA supervisory — excludes mismatch authority.</summary>
-    private Func<string, bool>? _isInstrumentFrozenOrEpaBlocked;
+    /// <summary>RiskGate gate −1b: execution lock + path-aware policy (instrument, submit_path) — excludes mismatch authority.</summary>
+    private Func<string, string?, bool>? _isInstrumentFrozenOrEpaBlocked;
 
     /// <summary>Authoritative engine session day (<see cref="RobotEngine.TradingDateString"/>). When null, session-identity gate is skipped (harness/tests).</summary>
     private Func<string?>? _getActiveTradingDateString;
@@ -942,7 +948,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         Func<string, bool>? journalIntegrityRepairActiveForInstrumentCallback = null,
         Func<bool>? isGlobalKillSwitchActive = null,
         Func<string, bool>? isMismatchExecutionBlocked = null,
-        Func<string, bool>? isInstrumentFrozenOrEpaBlocked = null)
+        Func<string, string?, bool>? isInstrumentFrozenOrEpaBlocked = null)
     {
         _standDownStreamCallback = standDownStreamCallback;
         _getNotificationServiceCallback = getNotificationServiceCallback;
@@ -959,6 +965,13 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         _isMismatchExecutionBlocked = isMismatchExecutionBlocked;
         _isInstrumentFrozenOrEpaBlocked = isInstrumentFrozenOrEpaBlocked;
     }
+
+    /// <summary>
+    /// Integration/harness tests: supply account snapshots for execution-safety evaluation without NT context.
+    /// Pair with <see cref="TryExecutionSafetyGateForOrderSubmitIntegration"/> / structural diagnostics. Clear when done.
+    /// </summary>
+    public void SetExecutionSafetyTestAccountSnapshotFactory(Func<DateTimeOffset, AccountSnapshot?>? factory) =>
+        _executionSafetyTestGetAccountSnapshot = factory;
 
     /// <summary>True after any session identity mismatch (until process restart). No automatic reset.</summary>
     public bool IsSessionIdentityLatched => Volatile.Read(ref _sessionMismatchBlocked) != 0;
@@ -1785,7 +1798,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         AccountSnapshot? snap = null;
         try
         {
-            snap = GetAccountSnapshot(utcNow);
+            snap = _executionSafetyTestGetAccountSnapshot != null
+                ? _executionSafetyTestGetAccountSnapshot(utcNow)
+                : GetAccountSnapshot(utcNow);
         }
         catch
         {
@@ -1965,12 +1980,15 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
 #if !NINJATRADER
         return true;
 #else
+        var protectiveStructuralFirst = string.Equals(blockedWhat, "SUBMIT_PROTECTIVE_STOP", StringComparison.Ordinal);
         if (!ExecutionPermissionAuthority.TryAdapterOrderSubmitPreflight(
                 _isGlobalKillSwitchActive,
                 _isMismatchExecutionBlocked,
                 _isInstrumentFrozenOrEpaBlocked,
                 instrument,
-                out var epaDeny))
+                blockedWhat,
+                out var epaDeny,
+                skipMismatchExecutionBlock: protectiveStructuralFirst))
         {
             var inst = instrument?.Trim() ?? "";
             EmitExecutionBlockedEpa(blockedWhat, intentId, inst, epaDeny, utcNow);
@@ -2023,6 +2041,45 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         }
 
         return true;
+#endif
+    }
+
+    /// <summary>
+    /// Integration tests: same implementation as the private order-submit safety gate (EPA preflight + structural + overlay).
+    /// Use <see cref="SetExecutionSafetyTestAccountSnapshotFactory"/> when NT context is not set.
+    /// </summary>
+    public bool TryExecutionSafetyGateForOrderSubmitIntegration(
+        string intentId,
+        string instrument,
+        string blockedWhat,
+        DateTimeOffset utcNow,
+        out OrderSubmissionResult? failure) =>
+        TryExecutionSafetyGateForOrderSubmit(intentId, instrument, blockedWhat, utcNow, out failure);
+
+    /// <summary>
+    /// Integration tests: structural layer only using the same <see cref="BuildExecutionSafetyEvaluationRequest"/> as the gate
+    /// (for asserting <see cref="ExecutionSafetySnapshot"/> fields without duplicating request wiring).
+    /// </summary>
+    public bool TryExecutionSafetyStructuralEvaluationFromAdapterRequest(
+        string intentId,
+        string instrument,
+        string blockedWhat,
+        DateTimeOffset utcNow,
+        out ExecutionSafetySnapshot snapshot)
+    {
+        snapshot = new ExecutionSafetySnapshot();
+#if !NINJATRADER
+        return true;
+#else
+        try
+        {
+            var req = BuildExecutionSafetyEvaluationRequest(instrument, intentId, utcNow);
+            return ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, blockedWhat, false, out snapshot);
+        }
+        catch
+        {
+            return false;
+        }
 #endif
     }
 

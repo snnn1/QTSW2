@@ -314,4 +314,7 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
             new { instrument, reason, note = "NT_ADDONS stub — use Robot.Core LIVE build for Account.Flatten" }));
         return false;
     }
+
+    /// <inheritdoc />
+    public bool TryRecognizeSelfInitiatedFlattenCloseFill(string instrument, DateTimeOffset utcNow) => false;
 }

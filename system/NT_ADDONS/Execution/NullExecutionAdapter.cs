@@ -189,4 +189,7 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
             new { instrument, reason, note = "DRYRUN — no broker flatten" }));
         return false;
     }
+
+    /// <inheritdoc />
+    public bool TryRecognizeSelfInitiatedFlattenCloseFill(string instrument, DateTimeOffset utcNow) => false;
 }

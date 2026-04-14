@@ -28,7 +28,7 @@ public static class AuthorityContradictionTests
     /// </summary>
     private static string? Case_MismatchBlockVsBrokerFlattenTruth()
     {
-        if (ExecutionPermissionAuthority.TryAdapterOrderSubmitPreflight(() => false, _ => true, _ => false, "MES", out var deny) ||
+        if (ExecutionPermissionAuthority.TryAdapterOrderSubmitPreflight(() => false, _ => true, (_, _) => false, "MES", "SUBMIT_ENTRY_STOP", out var deny) ||
             deny != "MISMATCH_EXECUTION_BLOCK")
             return "expected EPA deny MISMATCH_EXECUTION_BLOCK when mismatch callback true";
 

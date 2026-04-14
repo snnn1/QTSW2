@@ -37,6 +37,12 @@ public sealed class JournalParityResult
     public int OrphanOrdersDetected { get; init; }
     public long? SnapshotAgeMs { get; init; }
     public bool IeaUnavailableWhenRequired { get; init; }
+    /// <summary>Populated when <see cref="Status"/> is <see cref="JournalParityStatus.PARITY_PENDING_ALIGNMENT"/>.</summary>
+    public string? PendingAlignmentCause { get; init; }
+    /// <summary>Expected abs position delta budget for pending alignment (ledger sum or post-fill gate cumulative).</summary>
+    public int ExpectedFillDeltaAbs { get; init; }
+    /// <summary>True when hard fail-closed escalation is deferred because parity is classified as pending alignment.</summary>
+    public bool EscalationSuppressed { get; init; }
 
     public bool IsOk => Status == JournalParityStatus.PARITY_OK;
 
@@ -159,6 +165,26 @@ public static class JournalParityChecker
 
         if (orphans > 0)
         {
+            // During post-mapped-fill alignment, non–robot-tagged working orders are often transient (OCO sibling churn,
+            // ownership visibility lag). Do not classify as UNKNOWN_ORDER_PRESENT here — that status drives hard-flatten
+            // and integrity escalation without pending-alignment tolerance.
+            if (PendingAlignmentAuthority.IsPendingAlignment(inst, utcNow))
+            {
+                return new JournalParityResult
+                {
+                    Status = JournalParityStatus.PARITY_PENDING_ALIGNMENT,
+                    BrokerPositionQty = brokerPos,
+                    JournalOpenQty = journalOpen,
+                    UnexplainedPositionQty = posDiff,
+                    UnexplainedWorkingOrders = unexplainedW,
+                    OrphanOrdersDetected = orphans,
+                    SnapshotAgeMs = ageMs,
+                    PendingAlignmentCause = "orphan_working_orders_pending_alignment",
+                    ExpectedFillDeltaAbs = 0,
+                    EscalationSuppressed = true
+                };
+            }
+
             return new JournalParityResult
             {
                 Status = JournalParityStatus.UNKNOWN_ORDER_PRESENT,
@@ -190,6 +216,11 @@ public static class JournalParityChecker
                     unexplainedW, out var pendingResult))
                 return pendingResult;
 
+            if (!brokerHedgedSameInstrument && !journalOpposingIntents && structuralMatchesSignedMagnitude &&
+                PostFillAlignmentGate.TryClassifyPendingAlignment(inst, utcNow, posDiff, Math.Abs(signedDelta), brokerPos,
+                    journalOpen, unexplainedW, ageMs, out var gatePending))
+                return gatePending;
+
             return new JournalParityResult
             {
                 Status = JournalParityStatus.POSITION_MISMATCH,
@@ -216,6 +247,7 @@ public static class JournalParityChecker
             };
         }
 
+        PostFillAlignmentGate.ClearOnParityOk(inst);
         return new JournalParityResult
         {
             Status = JournalParityStatus.PARITY_OK,
@@ -260,7 +292,10 @@ public static class JournalParityChecker
                     UnexplainedPositionQty = 0,
                     UnexplainedWorkingOrders = unexplainedW,
                     OrphanOrdersDetected = 0,
-                    SnapshotAgeMs = ageMs
+                    SnapshotAgeMs = ageMs,
+                    PendingAlignmentCause = "parity_pending_ledger",
+                    ExpectedFillDeltaAbs = Math.Abs(signedDelta),
+                    EscalationSuppressed = true
                 };
                 return true;
             }
@@ -454,6 +489,27 @@ public static class JournalIntegrityGuarantee
         if (initial.Status == JournalParityStatus.PARITY_PENDING_ALIGNMENT)
         {
             AttemptByInstrument.TryRemove(inst, out _);
+            return new JournalIntegrityEnsureResult
+            {
+                InitialCheck = initial,
+                Outcome = JournalIntegrityPhaseOutcome.Ok
+            };
+        }
+
+        if (FeatureFlags.EnableHardFailClosedJournalIntegrity &&
+            PendingAlignmentAuthority.IsPendingAlignment(inst, utcNow) &&
+            (initial.Status == JournalParityStatus.POSITION_MISMATCH ||
+             initial.Status == JournalParityStatus.WORKING_ORDER_MISMATCH))
+        {
+            logEngine?.Invoke("JOURNAL_INTEGRITY_REPAIR_DEFERRED_PENDING_ALIGNMENT", "ENGINE", new
+            {
+                instrument = inst,
+                parity_status = initial.Status.ToString(),
+                authority_state = positionAuthority.ToString(),
+                broker_qty = initial.BrokerPositionQty,
+                journal_qty = initial.JournalOpenQty,
+                note = "journal_lag_after_mapped_fill — repair/escalation deferred until alignment window ends"
+            });
             return new JournalIntegrityEnsureResult
             {
                 InitialCheck = initial,

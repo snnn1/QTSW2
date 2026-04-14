@@ -93,6 +93,12 @@ public sealed class StateConsistencyReleaseEvaluationInput
 
     public bool SnapshotSufficient { get; set; } = true;
     public bool UseInstrumentExecutionAuthority { get; set; }
+
+    /// <summary>
+    /// True when <see cref="PendingAlignmentAuthority.IsPendingAlignment"/> for this instrument — release evaluation may
+    /// treat expected broker-vs-journal qty lag as informational rather than a blocking contradiction.
+    /// </summary>
+    public bool PendingAlignmentActive { get; set; }
 }
 
 /// <summary>P1.5-B: Structured release readiness (single evaluation function per instrument).</summary>
@@ -130,7 +136,7 @@ public sealed class StateConsistencyReleaseReadinessResult
     /// <summary>Per-blocker domain decisions (for audits).</summary>
     public IReadOnlyList<(ReconciliationBlocker Blocker, ReconciliationDecision Decision)>? ResolvedBlockers { get; set; }
 
-    /// <summary>True when pending-adoption counts exist but classifier produced no diagnostics/blockers (modeling gap).</summary>
+    /// <summary>True when pending-adoption counts exist but classifier produced no diagnostics/blockers (modeling gap). Informational — does not by itself veto <see cref="ReleaseReady"/>.</summary>
     public bool LegacyClassifierGap { get; set; }
 }
 
@@ -228,15 +234,17 @@ public static class StateConsistencyReleaseEvaluator
                 or ReconciliationDecision.ESCALATE
                 or ReconciliationDecision.ALTERNATE_LANE;
 
+        // Phase 2 policy: classifier-backed blockers (resolved ADOPT/RETRY/ESCALATE/ALTERNATE_LANE) hold release.
+        // Legacy "pending adoption count without diagnostics" is observability only — not a structural release veto.
         var legacyClassifierGap = (blockers == null || blockers.Count == 0) &&
                                   (i.BlockingCandidateDiagnostics == null ||
                                    i.BlockingCandidateDiagnostics.Count == 0) &&
                                   i.PendingAdoptionCandidateCount > 0;
         r.LegacyClassifierGap = legacyClassifierGap;
-        var hasStructuralBlocker = resolved.Any(x => BlocksReleaseByDecision(x.Decision)) || legacyClassifierGap;
+        var hasStructuralBlocker = resolved.Any(x => BlocksReleaseByDecision(x.Decision));
         if (legacyClassifierGap)
         {
-            r.Contradictions.Add("release_blocker_legacy_count_without_classifier");
+            r.Contradictions.Add("info_legacy_classifier_gap_pending_adoption");
             if (i.AdoptablePendingAdoptionCandidateCount > 0)
                 r.PendingAdoptionExists = true;
         }
@@ -252,9 +260,15 @@ public static class StateConsistencyReleaseEvaluator
 
         var posDiff = Math.Abs(i.BrokerPositionQty - i.JournalOpenQty);
         r.UnexplainedBrokerPositionQty = posDiff;
-        r.BrokerPositionExplainable = posDiff == 0;
-        if (!r.BrokerPositionExplainable)
-            r.Contradictions.Add($"position_qty_delta_{posDiff}");
+        var positionToleratedPending = i.PendingAlignmentActive && ieaOk && posDiff > 0;
+        r.BrokerPositionExplainable = posDiff == 0 || positionToleratedPending;
+        if (posDiff > 0)
+        {
+            if (positionToleratedPending)
+                r.Contradictions.Add($"info_pending_alignment_position_qty_delta_{posDiff}");
+            else
+                r.Contradictions.Add($"position_qty_delta_{posDiff}");
+        }
 
         int ieaWorking = ieaOk ? i.IeaOwnedPlusAdoptedWorking : 0;
         var unexplainedW = ieaOk ? Math.Max(0, i.BrokerWorkingCount - ieaWorking) : i.BrokerWorkingCount;
@@ -273,7 +287,7 @@ public static class StateConsistencyReleaseEvaluator
             r.Contradictions.Add($"unexplained_working_{unexplainedW}");
 
         r.IsExplainable = r.BrokerPositionExplainable && r.BrokerWorkingExplainable && r.LocalStateCoherent &&
-                          r.UnexplainedBrokerPositionQty == 0 && r.UnexplainedBrokerWorkingCount == 0;
+                          r.UnexplainedBrokerWorkingCount == 0;
 
         if (r.BlockerInvariantViolation)
             r.IsExplainable = false;

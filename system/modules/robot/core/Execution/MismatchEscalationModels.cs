@@ -322,6 +322,31 @@ public static class MismatchEscalationPolicy
 
     /// <summary>After forced convergence, block expensive reconciliation briefly (anti-oscillation).</summary>
     public const int RECONCILIATION_CONVERGENCE_HYSTERESIS_MS = 1500;
+
+    /// <summary>
+    /// Phase 3: TTL for <see cref="MismatchEscalationCoordinator"/> convergence arming — expected transient broker/registry/journal alignment.
+    /// </summary>
+    public const int MISMATCH_CONVERGENCE_WINDOW_MS = 4500;
+}
+
+/// <summary>Phase 3: result of canonical unexplained exposure probe (release-readiness aligned) for convergence escape hatch.</summary>
+public readonly struct MismatchConvergenceCanonicalProbeResult
+{
+    public bool HasUnexplainedBrokerExposure { get; init; }
+    public int UnexplainedBrokerPositionQty { get; init; }
+    public int UnexplainedBrokerWorkingCount { get; init; }
+}
+
+/// <summary>Phase 3: which mismatch kinds bypass convergence suppression on first escalation (fail-closed).</summary>
+public static class MismatchConvergenceEscalationPolicy
+{
+    /// <summary>Always allow first-detect escalation when present — never suppress solely due to convergence window.</summary>
+    public static bool IsSeriousMismatchType(MismatchType t) =>
+        t == MismatchType.NET_POSITION_MISMATCH ||
+        t == MismatchType.STRUCTURAL_MULTI_INTENT ||
+        t == MismatchType.UNCLASSIFIED_CRITICAL_MISMATCH ||
+        t == MismatchType.LIFECYCLE_BROKER_DIVERGENCE ||
+        t == MismatchType.UNKNOWN_EXECUTION_PERSISTENT;
 }
 
 /// <summary>

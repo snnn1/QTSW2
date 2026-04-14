@@ -15,7 +15,12 @@ public static class JournalParityPendingLedger
         new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Process / engine session boundary: empty pending (R1 — not persistent).</summary>
-    public static void Clear() => ByInstrument.Clear();
+    public static void Clear()
+    {
+        ByInstrument.Clear();
+        PostFillAlignmentGate.Clear();
+        QuantExecutionControlStore.Clear();
+    }
 
     /// <summary>
     /// Trusted execution path only (I3). Idempotent per <paramref name="executionDedupeKey"/> (I1).
@@ -33,13 +38,17 @@ public static class JournalParityPendingLedger
         if (string.IsNullOrEmpty(inst) || string.IsNullOrEmpty(key)) return;
         var inner = ByInstrument.GetOrAdd(inst,
             _ => new ConcurrentDictionary<string, JournalParityPendingEntry>(StringComparer.Ordinal));
-        inner.TryAdd(key, new JournalParityPendingEntry
-        {
-            ExecutionDedupeKey = key,
-            SignedQuantity = signedQuantity,
-            IntentId = intentId?.Trim() ?? "",
-            RecordedUtc = utcNow
-        });
+        if (!inner.TryAdd(key, new JournalParityPendingEntry
+            {
+                ExecutionDedupeKey = key,
+                SignedQuantity = signedQuantity,
+                IntentId = intentId?.Trim() ?? "",
+                RecordedUtc = utcNow
+            }))
+            return;
+
+        PostFillAlignmentGate.ArmTrustedMappedFill(inst, Math.Abs(signedQuantity), "mapped_trusted_fill", utcNow);
+        QuantExecutionControlStore.NotifyMappedTrustedFill(inst, signedQuantity, utcNow);
     }
 
     /// <summary>Remove when journal has persisted the matching fill (idempotent).</summary>
@@ -57,6 +66,17 @@ public static class JournalParityPendingLedger
     /// <summary>Test hook: remove entry without journal callback.</summary>
     public static void TryRemoveForTests(string instrument, string executionDedupeKey) =>
         TryRemove(instrument, executionDedupeKey);
+
+    /// <summary>
+    /// True when at least one trusted fill is still in the in-memory pending ledger (journal not yet aligned for that key).
+    /// Used by <see cref="PendingAlignmentAuthority"/>.
+    /// </summary>
+    public static bool HasPendingTrustedFillEntries(string instrument)
+    {
+        var inst = instrument?.Trim() ?? "";
+        if (string.IsNullOrEmpty(inst)) return false;
+        return ByInstrument.TryGetValue(inst, out var inner) && inner.Count > 0;
+    }
 
     internal static List<JournalParityPendingEntry> SnapshotOrdered(string instrument)
     {

@@ -1,0 +1,266 @@
+{
+  "schema_version": "2",
+  "generated_at_utc": "2026-04-12T17:18:41.483887+00:00",
+  "run_root": "C:\\Users\\jakej\\QTSW2\\runs\\c64154750e1d4a8cabfcfc8a0f4e48c5",
+  "verdict": {
+    "explainable": false,
+    "primary_issue": "INSTRUMENT_MISMATCH",
+    "confidence": "MEDIUM"
+  },
+  "broker_truth": {
+    "positions": {
+      "MNG": 2
+    }
+  },
+  "system_truth": {
+    "positions": {
+      "M2K": {
+        "submitted": true,
+        "filled": false
+      }
+    }
+  },
+  "unexplained_positions": [
+    {
+      "instrument": "MNG",
+      "qty": 2,
+      "reason": "NO_EXECUTION_JOURNAL"
+    }
+  ],
+  "section_a": {
+    "files_matched_json_jsonl": 24,
+    "files_scanned_relative": [
+      "KEY_EVENTS.jsonl",
+      "data\\risk_latches\\risk_latch_Playback101_MNG.json",
+      "decisions\\mismatch_execution_block_decisions.jsonl",
+      "derived\\execution_summaries\\summary_20260412171748.json",
+      "events\\execution_events\\2026-04-08\\MNG_C6415475.jsonl",
+      "logs\\health\\_ENGINE_.jsonl",
+      "logs\\health\\_ENGINE___ENGINE__.jsonl",
+      "logs\\health\\_M2K_.jsonl",
+      "logs\\health\\_MNG_.jsonl",
+      "logs\\hydration\\hydration_2026-04-08.jsonl",
+      "logs\\range_building\\range_building_2026-04-08.jsonl",
+      "logs\\ranges\\ranges_2026-04-08.jsonl",
+      "logs\\robot\\robot_CL.jsonl",
+      "logs\\robot\\robot_ENGINE.jsonl",
+      "logs\\robot\\robot_GC.jsonl",
+      "logs\\robot\\robot_M2K.jsonl",
+      "logs\\robot\\robot_MNG.jsonl",
+      "logs\\robot\\robot_NG.jsonl",
+      "logs\\robot\\robot_NQ.jsonl",
+      "logs\\robot\\robot_RTY.jsonl",
+      "state\\execution_journals\\2026-04-08_RTY2_330657abe6175bc4.json",
+      "state\\execution_journals\\2026-04-08_RTY2_6e1b04adf77c8746.json",
+      "state\\stream_journals\\2026-04-08_RTY2.json",
+      "summary.json"
+    ]
+  },
+  "section_b": {
+    "broker_positions_from_execution_events": [
+      {
+        "instrument": "MNG",
+        "broker_position_qty": 2.0,
+        "broker_direction": null,
+        "source_file": "events\\execution_events\\2026-04-08\\MNG_C6415475.jsonl:14",
+        "line_hint": "BROKER_AHEAD"
+      }
+    ]
+  },
+  "section_c": {
+    "execution_journal_rows": [
+      {
+        "instrument": "M2K",
+        "stream": "RTY2",
+        "intent_id": "330657abe6175bc4",
+        "broker_order_id": "220dc72e5cbb45f89a1a6e9729f5b4c2",
+        "entry_submitted": true,
+        "entry_filled": false,
+        "source_file": "state\\execution_journals\\2026-04-08_RTY2_330657abe6175bc4.json"
+      },
+      {
+        "instrument": "M2K",
+        "stream": "RTY2",
+        "intent_id": "6e1b04adf77c8746",
+        "broker_order_id": "bf17d6a614dd4143a5e947a115d1a067",
+        "entry_submitted": true,
+        "entry_filled": false,
+        "source_file": "state\\execution_journals\\2026-04-08_RTY2_6e1b04adf77c8746.json"
+      }
+    ]
+  },
+  "section_h": {
+    "instruments": [
+      {
+        "instrument": "M2K",
+        "execution_source": "SYSTEM",
+        "has_execution_journal": true,
+        "entry_evidence_count": 4,
+        "entry_evidence_sample": [
+          "logs\\robot\\robot_M2K.jsonl:8 event=INTENT_LIFECYCLE_TRANSITION newState=ENTRY_SUBMITTED",
+          "logs\\robot\\robot_M2K.jsonl:9 event=ORDER_SUBMIT_SUCCESS",
+          "logs\\robot\\robot_M2K.jsonl:14 event=INTENT_LIFECYCLE_TRANSITION newState=ENTRY_SUBMITTED",
+          "logs\\robot\\robot_M2K.jsonl:15 event=ORDER_SUBMIT_SUCCESS"
+        ]
+      },
+      {
+        "instrument": "MNG",
+        "execution_source": "EXTERNAL",
+        "has_execution_journal": false,
+        "entry_evidence_count": 0,
+        "entry_evidence_sample": []
+      }
+    ]
+  },
+  "section_i": {
+    "broker_order_map": [
+      {
+        "broker_order_id": "220dc72e5cbb45f89a1a6e9729f5b4c2",
+        "intent_id": "330657abe6175bc4",
+        "instrument": "M2K",
+        "stream": "RTY2"
+      },
+      {
+        "broker_order_id": "bf17d6a614dd4143a5e947a115d1a067",
+        "intent_id": "6e1b04adf77c8746",
+        "instrument": "M2K",
+        "stream": "RTY2"
+      }
+    ],
+    "execution_journal_links": [
+      {
+        "instrument": "M2K",
+        "stream": "RTY2",
+        "intent_id": "330657abe6175bc4",
+        "broker_order_id": "220dc72e5cbb45f89a1a6e9729f5b4c2",
+        "entry_submitted": true,
+        "entry_filled": false,
+        "source_file": "state\\execution_journals\\2026-04-08_RTY2_330657abe6175bc4.json",
+        "linkage_status": "LINKED"
+      },
+      {
+        "instrument": "M2K",
+        "stream": "RTY2",
+        "intent_id": "6e1b04adf77c8746",
+        "broker_order_id": "bf17d6a614dd4143a5e947a115d1a067",
+        "entry_submitted": true,
+        "entry_filled": false,
+        "source_file": "state\\execution_journals\\2026-04-08_RTY2_6e1b04adf77c8746.json",
+        "linkage_status": "LINKED"
+      }
+    ],
+    "broker_position_linkage": [
+      {
+        "instrument": "MNG",
+        "linkage_status": "UNLINKED",
+        "execution_journal_rows_with_broker_id": 0
+      }
+    ]
+  },
+  "section_j": {
+    "timeline_top_events": [
+      {
+        "rank": 1,
+        "ts_utc": "2026-04-08T16:00:00+00:00",
+        "event_type": "RANGE_LOCK_OUTCOME",
+        "instrument": "M2K",
+        "source_file": "KEY_EVENTS.jsonl:7"
+      },
+      {
+        "rank": 2,
+        "ts_utc": "2026-04-12T16:06:17.470222+00:00",
+        "event_type": "ORDER_SUBMIT_SUCCESS",
+        "instrument": "M2K",
+        "source_file": "logs\\robot\\robot_M2K.jsonl:9"
+      },
+      {
+        "rank": 3,
+        "ts_utc": "2026-04-12T16:06:17.470222+00:00",
+        "event_type": "INTENT_LIFECYCLE_TRANSITION",
+        "instrument": "M2K",
+        "source_file": "logs\\robot\\robot_M2K.jsonl:8"
+      },
+      {
+        "rank": 4,
+        "ts_utc": "2026-04-12T16:06:17.470222+00:00",
+        "event_type": "INTENT_LIFECYCLE_TRANSITION",
+        "instrument": "M2K",
+        "source_file": "logs\\robot\\robot_M2K.jsonl:11"
+      },
+      {
+        "rank": 5,
+        "ts_utc": "2026-04-12T16:06:17.497583+00:00",
+        "event_type": "ORDER_SUBMIT_SUCCESS",
+        "instrument": "M2K",
+        "source_file": "logs\\robot\\robot_M2K.jsonl:15"
+      },
+      {
+        "rank": 6,
+        "ts_utc": "2026-04-12T16:06:17.497583+00:00",
+        "event_type": "INTENT_LIFECYCLE_TRANSITION",
+        "instrument": "M2K",
+        "source_file": "logs\\robot\\robot_M2K.jsonl:14"
+      },
+      {
+        "rank": 7,
+        "ts_utc": "2026-04-12T16:06:17.497583+00:00",
+        "event_type": "INTENT_LIFECYCLE_TRANSITION",
+        "instrument": "M2K",
+        "source_file": "logs\\robot\\robot_M2K.jsonl:17"
+      },
+      {
+        "rank": 8,
+        "ts_utc": "2026-04-12T16:06:59.018982+00:00",
+        "event_type": "MISMATCH_DETECTED",
+        "instrument": "MNG",
+        "source_file": "events\\execution_events\\2026-04-08\\MNG_C6415475.jsonl:1"
+      },
+      {
+        "rank": 9,
+        "ts_utc": "2026-04-12T16:06:59.018982+00:00",
+        "event_type": "MISMATCH_BLOCK_ENTER",
+        "instrument": "MNG",
+        "source_file": "KEY_EVENTS.jsonl:8"
+      },
+      {
+        "rank": 10,
+        "ts_utc": "2026-04-12T16:07:04.052791+00:00",
+        "event_type": "MISMATCH_FAIL_CLOSED",
+        "instrument": "MNG",
+        "source_file": "events\\execution_events\\2026-04-08\\MNG_C6415475.jsonl:12"
+      }
+    ]
+  },
+  "section_k": {
+    "instruments_execution_journals": [
+      "M2K"
+    ],
+    "instruments_execution_events": [
+      "MNG"
+    ],
+    "instruments_key_events": [
+      "CL",
+      "GC",
+      "M2K",
+      "MNG",
+      "NG",
+      "NQ"
+    ],
+    "flag": "INSTRUMENT_MISMATCH"
+  },
+  "section_l": {
+    "position_not_adopted_tags": [
+      "INSTRUMENT_MISMATCH",
+      "NO_EXECUTION_JOURNAL",
+      "TIMING_MISMATCH"
+    ],
+    "timing_mismatch_details": [
+      "TIMING_MISMATCH intent=330657ab... submitted=2026-04-12 observed=2026-04-08 state\\execution_journals\\2026-04-08_RTY2_330657abe6175bc4.json:1",
+      "TIMING_MISMATCH intent=6e1b04ad... submitted=2026-04-12 observed=2026-04-08 state\\execution_journals\\2026-04-08_RTY2_6e1b04adf77c8746.json:1"
+    ]
+  },
+  "section_m": {
+    "preventable": "YES",
+    "preventable_note": "heuristic: YES if INSTRUMENT_MISMATCH or NO_EXECUTION_JOURNAL"
+  }
+}

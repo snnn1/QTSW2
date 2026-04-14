@@ -1,0 +1,351 @@
+// Tier 1 quant execution control store — mapped / unmapped / parity transitions.
+// Run: dotnet run --project modules/robot/harness/Robot.Harness.csproj -- --test QUANT_EXECUTION_CONTROL
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using QTSW2.Robot.Core;
+using QTSW2.Robot.Core.Execution;
+
+namespace QTSW2.Robot.Core.Tests;
+
+public static class QuantExecutionControlStoreTests
+{
+    public static (bool Pass, string? Error) RunAll()
+    {
+        var prevStore = FeatureFlags.QuantExecutionControlStoreEnabled;
+        var prevAlign = FeatureFlags.EnablePostFillAlignmentGate;
+        var prevLag = FeatureFlags.StructuralLayerAllowSubmitDuringPendingAlignmentLag;
+        try
+        {
+            FeatureFlags.QuantExecutionControlStoreEnabled = true;
+            FeatureFlags.EnablePostFillAlignmentGate = true;
+            FeatureFlags.StructuralLayerAllowSubmitDuringPendingAlignmentLag = true;
+
+            var e = Case_MappedFillThenParityOk_ReturnsNormal();
+            if (e != null) return (false, e);
+
+            e = Case_UnmappedExecution_BlocksSubmit_AllowsFlattenBypass();
+            if (e != null) return (false, e);
+
+            e = Case_RegisterAdoptedOrderPath_RecoveredOffersLagProtection();
+            if (e != null) return (false, e);
+
+            e = Case_EvaluateEscalation_PendingRecoveryAndImpossible();
+            if (e != null) return (false, e);
+
+            e = Case_Integration_ApplyEscalation_TransitionsToRecoveryRequiredPhase();
+            if (e != null) return (false, e);
+
+            e = Case_RecoveryRequired_Structural_AllowsProtectiveBlocksEntry();
+            if (e != null) return (false, e);
+
+            // Last: mutates QuantExecutionControlStoreEnabled to false for the assertion.
+            e = Case_StoreDisabled_NoOps();
+            if (e != null) return (false, e);
+
+            return (true, null);
+        }
+        finally
+        {
+            FeatureFlags.QuantExecutionControlStoreEnabled = prevStore;
+            FeatureFlags.EnablePostFillAlignmentGate = prevAlign;
+            FeatureFlags.StructuralLayerAllowSubmitDuringPendingAlignmentLag = prevLag;
+            JournalParityPendingLedger.Clear();
+        }
+    }
+
+    private static string? Case_MappedFillThenParityOk_ReturnsNormal()
+    {
+        JournalParityPendingLedger.Clear();
+        var utc = DateTimeOffset.UtcNow;
+        var inst = "QM1";
+        JournalParityPendingLedger.TryRecordTrustedFill(inst, "qk1", 2, "intent-q", utc);
+
+        var s1 = QuantExecutionControlStore.GetSnapshot(inst);
+        if (s1.Phase != QuantExecutionInstrumentPhase.PendingAlignment)
+            return $"expected PendingAlignment after mapped fill, got {s1.Phase}";
+        if (s1.Expected.ExpectedSignedNetPosition != 2)
+            return $"expected expected net 2, got {s1.Expected.ExpectedSignedNetPosition}";
+
+        PostFillAlignmentGate.ClearOnParityOk(inst);
+
+        var s2 = QuantExecutionControlStore.GetSnapshot(inst);
+        if (s2.Phase != QuantExecutionInstrumentPhase.Normal)
+            return $"expected Normal after parity OK, got {s2.Phase}";
+        return null;
+    }
+
+    private static string? Case_UnmappedExecution_BlocksSubmit_AllowsFlattenBypass()
+    {
+        JournalParityPendingLedger.Clear();
+        var utc = DateTimeOffset.UtcNow;
+        var inst = "QM2";
+        QuantExecutionControlStore.NotifyUnmappedExecution(inst, utc, "TEST_UNMAPPED");
+
+        var root = Path.Combine(Path.GetTempPath(), "quant_um_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var log = new RobotLogger(root);
+            var journal = new ExecutionJournal(root, log);
+            // Flat broker + empty journal → PARITY_OK so the flatten-bypass branch can be reached after quant gate skip.
+            var snap = new AccountSnapshot
+            {
+                Positions = new List<PositionSnapshot> { new() { Instrument = inst, Quantity = 0 } },
+                WorkingOrders = new List<WorkingOrderSnapshot>(),
+                CapturedAtUtc = utc
+            };
+
+            var req = new ExecutionSafetyEvaluationRequest
+            {
+                Instrument = inst,
+                CanonicalInstrument = inst,
+                UtcNow = utc,
+                Journal = journal,
+                AccountSnapshot = snap,
+                UseInstrumentExecutionAuthority = false,
+                IeaOwnedPlusAdoptedWorking = 0,
+                RecoveryExecutionDisallowed = false,
+                JournalIntegrityOrReconciliationRepairActive = false
+            };
+
+            if (ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_ENTRY", false, out var denySnap))
+                return "expected structural deny when unmapped";
+            if (denySnap.Reason != ExecutionStructuralLayer.StructuralBlocker.QuantUnmappedExecution)
+                return "expected quant_unmapped_execution, got " + denySnap.Reason;
+
+            if (!ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_ENTRY", flattenAuthorityBypass: true, out var flatSnap))
+                return "expected structural allow for flatten bypass when unmapped, got " + flatSnap.Reason;
+            return null;
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(root))
+                    Directory.Delete(root, true);
+            }
+            catch
+            {
+                /* best effort */
+            }
+        }
+    }
+
+    private static string? Case_StoreDisabled_NoOps()
+    {
+        JournalParityPendingLedger.Clear();
+        FeatureFlags.QuantExecutionControlStoreEnabled = false;
+        var utc = DateTimeOffset.UtcNow;
+        var inst = "QM3";
+        QuantExecutionControlStore.NotifyUnmappedExecution(inst, utc, "SHOULD_NOT_STICK");
+
+        var s = QuantExecutionControlStore.GetSnapshot(inst);
+        if (s.Phase != QuantExecutionInstrumentPhase.Normal)
+            return "when store disabled, snapshot should remain default Normal";
+        return null;
+    }
+
+    /// <summary>
+    /// Same state transition as InstrumentExecutionAuthority.RegisterAdoptedOrder → NotifyRecoveredReconnect: Recovered + lag protection.
+    /// </summary>
+    private static string? Case_RegisterAdoptedOrderPath_RecoveredOffersLagProtection()
+    {
+        JournalParityPendingLedger.Clear();
+        var utc = DateTimeOffset.UtcNow;
+        var inst = "QM4";
+        QuantExecutionControlStore.NotifyRecoveredReconnect(inst, utc);
+
+        var s = QuantExecutionControlStore.GetSnapshot(inst);
+        if (s.Phase != QuantExecutionInstrumentPhase.Recovered)
+            return $"expected Recovered after NotifyRecoveredReconnect, got {s.Phase}";
+        if (!s.Expected.RecoveryMode)
+            return "expected RecoveryMode true";
+        if (!QuantExecutionControlStore.OffersBookkeepingLagProtection(inst, utc))
+            return "expected OffersBookkeepingLagProtection true for recovered+recovery";
+        return null;
+    }
+
+    private static string? Case_EvaluateEscalation_PendingRecoveryAndImpossible()
+    {
+        JournalParityPendingLedger.Clear();
+        var t0 = DateTimeOffset.Parse("2099-06-15T12:00:00Z");
+        var instPend = "QM_ESC_PEND";
+        var prevWindow = FeatureFlags.PostFillAlignmentWindowMs;
+        FeatureFlags.PostFillAlignmentWindowMs = 1000;
+        try
+        {
+            JournalParityPendingLedger.TryRecordTrustedFill(instPend, "ek", 1, "intent-e", t0);
+            var rWithin = QuantExecutionControlStore.EvaluateEscalation(instPend, t0.AddMilliseconds(100), brokerGrossPositionAbs: 0);
+            if (rWithin.Kind != QuantEscalationKind.StillPendingAlignment)
+                return $"pending within window: expected StillPendingAlignment, got {rWithin.Kind} ({rWithin.Reason})";
+
+            var rExpired = QuantExecutionControlStore.EvaluateEscalation(instPend, t0.AddMilliseconds(2000), brokerGrossPositionAbs: 0);
+            if (rExpired.Kind != QuantEscalationKind.EscalationRequired || rExpired.Reason != "pending_alignment_expired_broker_gross_mismatch")
+                return $"pending expired mismatch: expected escalation pending_alignment_expired_broker_gross_mismatch, got {rExpired.Kind} / {rExpired.Reason}";
+
+            var instRec = "QM_ESC_REC";
+            QuantExecutionControlStore.NotifyRecoveredReconnect(instRec, t0);
+            const int recoveryMs = 5000;
+            var rRecMid = QuantExecutionControlStore.EvaluateEscalation(
+                instRec,
+                t0.AddMilliseconds(1000),
+                brokerGrossPositionAbs: 3,
+                recoveryStabilizationWindowMsOverride: recoveryMs);
+            if (rRecMid.Kind != QuantEscalationKind.RecoveredLagTolerated)
+                return $"recovery within window: expected RecoveredLagTolerated, got {rRecMid.Kind}";
+
+            var rRecLate = QuantExecutionControlStore.EvaluateEscalation(
+                instRec,
+                t0.AddMilliseconds(recoveryMs + 1000),
+                brokerGrossPositionAbs: 3,
+                recoveryStabilizationWindowMsOverride: recoveryMs);
+            if (rRecLate.Kind != QuantEscalationKind.EscalationRequired ||
+                rRecLate.Reason != "recovery_stabilization_window_expired_broker_gross_mismatch")
+                return $"recovery expired: expected recovery_stabilization_window_expired_broker_gross_mismatch, got {rRecLate.Kind} / {rRecLate.Reason}";
+
+            var instSign = "QM_ESC_SIGN";
+            JournalParityPendingLedger.Clear();
+            JournalParityPendingLedger.TryRecordTrustedFill(instSign, "sk", 5, "i", t0);
+            var rSign = QuantExecutionControlStore.EvaluateEscalation(
+                instSign,
+                t0.AddMilliseconds(100),
+                brokerGrossPositionAbs: 5,
+                brokerSignedNetPosition: -5);
+            if (rSign.Kind != QuantEscalationKind.EscalationRequired || rSign.Reason != "impossible_signed_net_direction")
+                return $"impossible sign: got {rSign.Kind} / {rSign.Reason}";
+
+            var instUm = "QM_ESC_UM";
+            QuantExecutionControlStore.NotifyUnmappedExecution(instUm, t0, "x");
+            var rUm = QuantExecutionControlStore.EvaluateEscalation(instUm, t0, brokerGrossPositionAbs: 1);
+            if (rUm.Kind != QuantEscalationKind.NoAction || rUm.Reason != "terminal_phase_handled_elsewhere")
+                return $"unmapped should no-op escalation, got {rUm.Kind} / {rUm.Reason}";
+        }
+        finally
+        {
+            FeatureFlags.PostFillAlignmentWindowMs = prevWindow;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Engine-style chain: Tier-1 evaluation returns EscalationRequired → apply → durable <see cref="QuantExecutionInstrumentPhase.RecoveryRequired"/>.
+    /// </summary>
+    private static string? Case_Integration_ApplyEscalation_TransitionsToRecoveryRequiredPhase()
+    {
+        JournalParityPendingLedger.Clear();
+        QuantExecutionControlStore.Clear();
+        var t0 = DateTimeOffset.Parse("2099-07-01T12:00:00Z");
+        var prev = FeatureFlags.PostFillAlignmentWindowMs;
+        FeatureFlags.PostFillAlignmentWindowMs = 500;
+        try
+        {
+            var inst1 = "QM_INT_PEND";
+            JournalParityPendingLedger.TryRecordTrustedFill(inst1, "k1", 1, "i", t0);
+            var ap1 = QuantExecutionControlStore.EvaluateEscalationAndApplyIfRequired(inst1, t0.AddSeconds(2), 0, null);
+            if (ap1.Kind != QuantEscalationKind.EscalationRequired)
+                return "integration pending: expected EscalationRequired";
+            var s1 = QuantExecutionControlStore.GetSnapshot(inst1);
+            if (s1.Phase != QuantExecutionInstrumentPhase.RecoveryRequired)
+                return $"integration pending: expected RecoveryRequired, got {s1.Phase}";
+            if (s1.RecoveryRequiredReason != "pending_alignment_expired_broker_gross_mismatch")
+                return "integration pending: wrong reason " + s1.RecoveryRequiredReason;
+
+            var ap1b = QuantExecutionControlStore.EvaluateEscalation(inst1, t0.AddSeconds(3), 0, null);
+            if (ap1b.Kind != QuantEscalationKind.NoAction || ap1b.Reason != "already_recovery_required")
+                return "integration pending: second eval should already_recovery_required";
+
+            var inst2 = "QM_INT_REC";
+            QuantExecutionControlStore.NotifyRecoveredReconnect(inst2, t0);
+            var ap2 = QuantExecutionControlStore.EvaluateEscalationAndApplyIfRequired(
+                inst2,
+                t0.AddMilliseconds(6500),
+                3,
+                null,
+                recoveryStabilizationWindowMsOverride: 5000);
+            if (ap2.Kind != QuantEscalationKind.EscalationRequired)
+                return "integration rec: expected EscalationRequired";
+            var s2 = QuantExecutionControlStore.GetSnapshot(inst2);
+            if (s2.Phase != QuantExecutionInstrumentPhase.RecoveryRequired)
+                return $"integration rec: expected RecoveryRequired, got {s2.Phase}";
+            if (s2.RecoveryRequiredReason != "recovery_stabilization_window_expired_broker_gross_mismatch")
+                return "integration rec: wrong reason " + s2.RecoveryRequiredReason;
+        }
+        finally
+        {
+            FeatureFlags.PostFillAlignmentWindowMs = prev;
+        }
+
+        return null;
+    }
+
+    private static string? Case_RecoveryRequired_Structural_AllowsProtectiveBlocksEntry()
+    {
+        JournalParityPendingLedger.Clear();
+        QuantExecutionControlStore.Clear();
+        var t0 = DateTimeOffset.Parse("2099-07-02T12:00:00Z");
+        var prev = FeatureFlags.PostFillAlignmentWindowMs;
+        FeatureFlags.PostFillAlignmentWindowMs = 100;
+        try
+        {
+            var inst = "QM_ST_RR";
+            JournalParityPendingLedger.TryRecordTrustedFill(inst, "sk", 1, "i", t0);
+            QuantExecutionControlStore.EvaluateEscalationAndApplyIfRequired(inst, t0.AddSeconds(1), 0, null);
+            if (QuantExecutionControlStore.GetSnapshot(inst).Phase != QuantExecutionInstrumentPhase.RecoveryRequired)
+                return "structural: setup RecoveryRequired failed";
+
+            var root = Path.Combine(Path.GetTempPath(), "quant_rr_struct_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            try
+            {
+                var log = new RobotLogger(root);
+                var journal = new ExecutionJournal(root, log);
+                var snap = new AccountSnapshot
+                {
+                    Positions = new List<PositionSnapshot> { new() { Instrument = inst, Quantity = 0 } },
+                    WorkingOrders = new List<WorkingOrderSnapshot>(),
+                    CapturedAtUtc = t0
+                };
+                var req = new ExecutionSafetyEvaluationRequest
+                {
+                    Instrument = inst,
+                    CanonicalInstrument = inst,
+                    UtcNow = t0,
+                    Journal = journal,
+                    AccountSnapshot = snap,
+                    UseInstrumentExecutionAuthority = false,
+                    IeaOwnedPlusAdoptedWorking = 0,
+                    RecoveryExecutionDisallowed = false,
+                    JournalIntegrityOrReconciliationRepairActive = false
+                };
+
+                if (ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_ENTRY", false, out var deny))
+                    return "structural: expected deny SUBMIT_ENTRY when RecoveryRequired";
+                if (deny.Reason != ExecutionStructuralLayer.StructuralBlocker.QuantRecoveryRequired)
+                    return "structural: wrong deny reason " + deny.Reason;
+
+                if (!ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_PROTECTIVE_STOP", false, out var okProt))
+                    return "structural: expected allow protective, got " + okProt.Reason;
+                return null;
+            }
+            finally
+            {
+                try
+                {
+                    if (Directory.Exists(root))
+                        Directory.Delete(root, true);
+                }
+                catch
+                {
+                    /* best effort */
+                }
+            }
+        }
+        finally
+        {
+            FeatureFlags.PostFillAlignmentWindowMs = prev;
+        }
+    }
+}

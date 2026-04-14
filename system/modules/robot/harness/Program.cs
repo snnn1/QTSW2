@@ -52,6 +52,10 @@ if (argsList.Contains("--help") || argsList.Contains("-h"))
 // --test PHASE5_HARDENING: run Phase 5 hardening tests (kill switch, RiskGate, hysteresis)
 // --test SESSION_IDENTITY_GATE: session trading date vs engine latch (no retry / CRITICAL once)
 // --test SCENARIO_HARNESS_SIX: run first six execution replay scenarios (happy path + early stress; distinct from CHAOS)
+// --test EXECUTION_SAFETY_PROTECTIVE_INTEGRATION: SUBMIT_PROTECTIVE_STOP through adapter safety gate (EPA+structural+overlay) with pending-alignment lag
+// --test STRUCTURAL_LAG_BYPASS: pending ledger + parity mismatch + repair latch → structural allow (flag); recovery still denies
+// --test QUANT_EXECUTION_CONTROL: Tier 1 quant store — mapped fill / parity OK / unmapped structural deny + flatten bypass
+// --test STRUCTURAL_PHASE3_DEMOTION: parity_not_ok + repair latch submit demotion flags (diagnostics-only deny path)
 // --test AUTHORITY_CONTRADICTIONS: mismatch vs flatten truth, recovery vs structural RI, broker vs journal parity
 // --test CHAOS: run chaos scenarios (stop cancel, mismatch, queue poison, forced flatten)
 // --test RANDOM_STRESS: run randomized event stress test (default 60s, use --stress-duration 300 for 5 min)
@@ -344,6 +348,18 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
         Console.WriteLine(pass ? "PASS: Reconciliation contract refactor tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
+    else if (testName.Equals("MISMATCH_CONVERGENCE_CONTRACT", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = MismatchConvergenceContractTests.RunAll();
+        Console.WriteLine(pass ? "PASS: Mismatch convergence contract tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("MISMATCH_CONVERGENCE_BRIDGE_PROBE", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = MismatchConvergenceBridgeProbeTests.RunAll();
+        Console.WriteLine(pass ? "PASS: Mismatch convergence bridge probe tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
     else if (testName.Equals("JOURNAL_REOPEN_EXPOSURE_REHYDRATE", StringComparison.OrdinalIgnoreCase))
     {
         var (pass, err) = JournalReopenAndExposureRehydrateTests.RunAll();
@@ -403,6 +419,30 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
     {
         RunScenarioHarnessSix();
         return;
+    }
+    else if (testName.Equals("EXECUTION_SAFETY_PROTECTIVE_INTEGRATION", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = TryExecutionSafetyGateProtectiveIntegrationTests.RunAll();
+        Console.WriteLine(pass ? "PASS: Execution safety protective integration tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("STRUCTURAL_LAG_BYPASS", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = StructuralLagBypassTests.RunAll();
+        Console.WriteLine(pass ? "PASS: Structural lag bypass tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("QUANT_EXECUTION_CONTROL", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = QuantExecutionControlStoreTests.RunAll();
+        Console.WriteLine(pass ? "PASS: Quant execution control store tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("STRUCTURAL_PHASE3_DEMOTION", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = StructuralPhase3DemotionTests.RunAll();
+        Console.WriteLine(pass ? "PASS: Structural Phase 3 demotion tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
     }
     else if (testName.Equals("AUTHORITY_CONTRADICTIONS", StringComparison.OrdinalIgnoreCase))
     {

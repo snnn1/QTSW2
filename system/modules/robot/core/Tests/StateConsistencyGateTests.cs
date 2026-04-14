@@ -12,6 +12,12 @@ public static class StateConsistencyGateTests
 {
     public static (bool Pass, string? Error) RunStateConsistencyGateTests()
     {
+        var prevMismatchBlock = FeatureFlags.ControlPlaneMismatchExecutionBlockAuthority;
+        var prevParityFlatten = FeatureFlags.ControlPlaneParityHardFlattenFromTryEnsureJournalIntegrity;
+        FeatureFlags.ControlPlaneMismatchExecutionBlockAuthority = true;
+        FeatureFlags.ControlPlaneParityHardFlattenFromTryEnsureJournalIntegrity = true;
+        try
+        {
         var t0 = DateTimeOffset.UtcNow;
         var snap = new AccountSnapshot
         {
@@ -583,5 +589,11 @@ public static class StateConsistencyGateTests
             return (false, "17: gate should not release while not release-ready");
 
         return (true, null);
+        }
+        finally
+        {
+            FeatureFlags.ControlPlaneMismatchExecutionBlockAuthority = prevMismatchBlock;
+            FeatureFlags.ControlPlaneParityHardFlattenFromTryEnsureJournalIntegrity = prevParityFlatten;
+        }
     }
 }

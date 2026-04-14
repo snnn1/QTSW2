@@ -53,6 +53,13 @@ public sealed partial class NinjaTraderLiveAdapter
             _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_EMERGENCY_LIVE", state: "ENGINE",
                 new { instrument, note = "LIVE adapter: Calling Account.Flatten for unmatched position policy" }));
             account.Flatten(new List<Instrument> { ntInstrument });
+            lock (_flattenRecognitionLock)
+            {
+                _lastFlattenInstrument = ntInstrument.MasterInstrument?.Name ?? instrument;
+                _lastFlattenUtc = utcNow;
+            }
+            _log.Write(RobotEvents.ExecutionBase(utcNow, "", instrument, "FLATTEN_RECOGNITION_ARMED",
+                new { instrument, source = "FlattenEmergencyReal" }));
             return FlattenResult.SuccessResult(utcNow);
         }
         catch (Exception ex)
@@ -121,6 +128,13 @@ public sealed partial class NinjaTraderLiveAdapter
         try
         {
             account.Flatten(new List<Instrument> { ntInst });
+            lock (_flattenRecognitionLock)
+            {
+                _lastFlattenInstrument = ntInst.MasterInstrument?.Name ?? inst;
+                _lastFlattenUtc = utcNow;
+            }
+            _log.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "FLATTEN_RECOGNITION_ARMED",
+                new { instrument = inst, source = "TryTriggerHardFlatten" }));
         }
         catch (Exception ex)
         {
@@ -133,6 +147,19 @@ public sealed partial class NinjaTraderLiveAdapter
         _log.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "EXECUTION_LOCKED_UNSAFE_STATE",
             new { instrument = inst, reason }));
         return true;
+    }
+
+    /// <inheritdoc cref="IExecutionAdapter.TryRecognizeSelfInitiatedFlattenCloseFill"/>
+    public bool TryRecognizeSelfInitiatedFlattenCloseFill(string instrument, DateTimeOffset utcNow)
+    {
+        var inst = instrument?.Trim() ?? "";
+        if (string.IsNullOrEmpty(inst)) return false;
+        lock (_flattenRecognitionLock)
+        {
+            if (string.IsNullOrEmpty(_lastFlattenInstrument)) return false;
+            if (!ExecutionInstrumentResolver.IsSameInstrument(_lastFlattenInstrument, inst)) return false;
+            return (utcNow - _lastFlattenUtc).TotalSeconds < FLATTEN_RECOGNITION_WINDOW_SECONDS;
+        }
     }
 }
 #endif

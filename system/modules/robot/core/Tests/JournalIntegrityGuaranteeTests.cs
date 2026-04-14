@@ -27,6 +27,9 @@ public static class JournalIntegrityGuaranteeTests
             e = Case_UnknownOrder_UntaggedWorking();
             if (e != null) return (false, e);
             JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_OrphanUntaggedWorking_DeferredWhenPendingAlignment();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
             e = Case_PositionMismatch();
             if (e != null) return (false, e);
             JournalIntegrityGuarantee.ResetAttemptsForTests();
@@ -83,6 +86,18 @@ public static class JournalIntegrityGuaranteeTests
             JournalIntegrityGuarantee.ResetAttemptsForTests();
             e = Case_ParityPending_EnsureIntegrityNoRepair();
             if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_PostFillGate_LedgerKeyApplied_GateExplainsBrokerAhead();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_PostFillGate_JournalCatchUpParityOk();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_PostFillGate_TimeoutReturnsPositionMismatch();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_PostFillGate_Disabled_NoPendingFromEmptyLedger();
+            if (e != null) return (false, e);
             return (true, null);
         }
         finally
@@ -138,6 +153,34 @@ public static class JournalIntegrityGuaranteeTests
         var r = JournalParityChecker.CheckJournalParity("ES", snap, tmp.Journal, reg, "ES", utc);
         if (r.Status != JournalParityStatus.UNKNOWN_ORDER_PRESENT || r.OrphanOrdersDetected < 1)
             return "untagged working should be UNKNOWN_ORDER_PRESENT with orphan count";
+        return null;
+    }
+
+    private static string? Case_OrphanUntaggedWorking_DeferredWhenPendingAlignment()
+    {
+        JournalParityPendingLedger.Clear();
+        var utc = DateTimeOffset.UtcNow;
+        JournalParityPendingLedger.TryRecordTrustedFill("ES", "e1", 1, "intent-a", utc);
+        var snap = new AccountSnapshot
+        {
+            Positions = new List<PositionSnapshot>(),
+            WorkingOrders = new List<WorkingOrderSnapshot>
+            {
+                new()
+                {
+                    Instrument = "ES",
+                    Quantity = 1,
+                    Tag = "external",
+                    OcoGroup = ""
+                }
+            }
+        };
+        using var tmp = NewTempJournal();
+        var reg = new TestRegistryView(true, 0);
+        var r = JournalParityChecker.CheckJournalParity("ES", snap, tmp.Journal, reg, "ES", utc);
+        if (r.Status != JournalParityStatus.PARITY_PENDING_ALIGNMENT || r.OrphanOrdersDetected < 1 ||
+            string.IsNullOrEmpty(r.PendingAlignmentCause))
+            return "orphan + pending ledger should classify PARITY_PENDING_ALIGNMENT, not UNKNOWN_ORDER_PRESENT";
         return null;
     }
 
@@ -495,6 +538,114 @@ public static class JournalIntegrityGuaranteeTests
         if (r.Status != JournalParityStatus.POSITION_MISMATCH)
             return "pending_h: empty ledger cannot pending-align";
         return null;
+    }
+
+    /// <summary>
+    /// Ledger dedupe key applied (I5) removes pending ledger rows from classification; post-fill gate still explains
+    /// broker-ahead / journal-lag within the window.
+    /// </summary>
+    private static string? Case_PostFillGate_LedgerKeyApplied_GateExplainsBrokerAhead()
+    {
+        JournalParityPendingLedger.Clear();
+        var utc = DateTimeOffset.Parse("2099-02-10T12:00:00Z");
+        var snap = new AccountSnapshot
+        {
+            Positions = new List<PositionSnapshot> { new() { Instrument = "ES", Quantity = 1 } },
+            WorkingOrders = new List<WorkingOrderSnapshot>()
+        };
+        using var tmp = NewTempJournal();
+        var reg = new TestRegistryView(false, 0);
+        JournalParityPendingLedger.TryRecordTrustedFill("ES", "kGate1", 1, "intent-gate", utc);
+        tmp.Journal.RegisterParityPendingFillPersisted("kGate1");
+        var r = JournalParityChecker.CheckJournalParity("ES", snap, tmp.Journal, reg, "ES", utc);
+        if (r.Status != JournalParityStatus.PARITY_PENDING_ALIGNMENT || !r.EscalationSuppressed ||
+            string.IsNullOrEmpty(r.PendingAlignmentCause))
+            return "postfill_gate: expected PARITY_PENDING_ALIGNMENT from gate when ledger rows are filtered by applied key";
+        return null;
+    }
+
+    private static string? Case_PostFillGate_JournalCatchUpParityOk()
+    {
+        JournalParityPendingLedger.Clear();
+        var utc = DateTimeOffset.Parse("2099-02-11T12:00:00Z");
+        var td = "2099-02-11";
+        using var tmp = NewTempJournal();
+        var reg = new TestRegistryView(false, 0);
+        JournalParityPendingLedger.TryRecordTrustedFill("ES", "kCatch", 1, "ic", utc);
+        tmp.Journal.RegisterParityPendingFillPersisted("kCatch");
+        var snap = new AccountSnapshot
+        {
+            Positions = new List<PositionSnapshot> { new() { Instrument = "ES", Quantity = 1 } },
+            WorkingOrders = new List<WorkingOrderSnapshot>()
+        };
+        var r1 = JournalParityChecker.CheckJournalParity("ES", snap, tmp.Journal, reg, "ES", utc);
+        if (r1.Status != JournalParityStatus.PARITY_PENDING_ALIGNMENT)
+            return "postfill_catchup: expected PARITY_PENDING_ALIGNMENT while journal lags and ledger key is applied";
+        WriteMinimalNonRecoveredOpenRow(tmp.ProjectRoot, td, "TEST", "seed-gate-catchup", "ES", 1, "Long");
+        var r2 = JournalParityChecker.CheckJournalParity("ES", snap, tmp.Journal, reg, "ES", utc);
+        if (r2.Status != JournalParityStatus.PARITY_OK)
+            return "postfill_catchup: after journal persists open qty, should reach PARITY_OK and clear post-fill gate";
+        return null;
+    }
+
+    private static string? Case_PostFillGate_TimeoutReturnsPositionMismatch()
+    {
+        JournalParityPendingLedger.Clear();
+        var prevMs = FeatureFlags.PostFillAlignmentWindowMs;
+        var prevGate = FeatureFlags.EnablePostFillAlignmentGate;
+        FeatureFlags.PostFillAlignmentWindowMs = 150;
+        FeatureFlags.EnablePostFillAlignmentGate = true;
+        try
+        {
+            var utc0 = DateTimeOffset.Parse("2099-02-12T12:00:00Z");
+            var snap = new AccountSnapshot
+            {
+                Positions = new List<PositionSnapshot> { new() { Instrument = "ES", Quantity = 1 } },
+                WorkingOrders = new List<WorkingOrderSnapshot>()
+            };
+            using var tmp = NewTempJournal();
+            var reg = new TestRegistryView(false, 0);
+            JournalParityPendingLedger.TryRecordTrustedFill("ES", "kTimeout", 1, "intent-to", utc0);
+            tmp.Journal.RegisterParityPendingFillPersisted("kTimeout");
+            var late = utc0.AddMilliseconds(400);
+            var r = JournalParityChecker.CheckJournalParity("ES", snap, tmp.Journal, reg, "ES", late);
+            if (r.Status != JournalParityStatus.POSITION_MISMATCH)
+                return "postfill_timeout: after gate expiry should return POSITION_MISMATCH";
+            return null;
+        }
+        finally
+        {
+            FeatureFlags.PostFillAlignmentWindowMs = prevMs;
+            FeatureFlags.EnablePostFillAlignmentGate = prevGate;
+        }
+    }
+
+    private static string? Case_PostFillGate_Disabled_NoPendingFromEmptyLedger()
+    {
+        JournalParityPendingLedger.Clear();
+        var prevGate = FeatureFlags.EnablePostFillAlignmentGate;
+        FeatureFlags.EnablePostFillAlignmentGate = false;
+        try
+        {
+            var utc = DateTimeOffset.Parse("2099-02-13T12:00:00Z");
+            var snap = new AccountSnapshot
+            {
+                Positions = new List<PositionSnapshot> { new() { Instrument = "ES", Quantity = 1 } },
+                WorkingOrders = new List<WorkingOrderSnapshot>()
+            };
+            using var tmp = NewTempJournal();
+            var reg = new TestRegistryView(false, 0);
+            JournalParityPendingLedger.TryRecordTrustedFill("ES", "kOff", 1, "intent-off", utc);
+            tmp.Journal.RegisterParityPendingFillPersisted("kOff");
+            var r = JournalParityChecker.CheckJournalParity("ES", snap, tmp.Journal, reg, "ES", utc);
+            if (r.Status != JournalParityStatus.POSITION_MISMATCH)
+                return "postfill_flag_off: with gate disabled, filtered ledger cannot pending-align";
+            return null;
+        }
+        finally
+        {
+            FeatureFlags.EnablePostFillAlignmentGate = prevGate;
+        }
     }
 
     private static string? Case_ParityPending_EnsureIntegrityNoRepair()

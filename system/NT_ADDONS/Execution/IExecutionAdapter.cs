@@ -150,6 +150,11 @@ public interface IExecutionAdapter
     bool TryTriggerHardFlatten(string instrument, string reason, DateTimeOffset utcNow);
 
     /// <summary>
+    /// True when an untagged fill should be treated as a recent self-initiated Account.Flatten close (recognition window).
+    /// </summary>
+    bool TryRecognizeSelfInitiatedFlattenCloseFill(string instrument, DateTimeOffset utcNow);
+
+    /// <summary>
     /// True when the adapter is safe to drive real or simulated submission paths (NT context wired; SIM verified when applicable).
     /// Used to gate pre-hydration and bracket submission during startup before DataLoaded wiring completes.
     /// </summary>

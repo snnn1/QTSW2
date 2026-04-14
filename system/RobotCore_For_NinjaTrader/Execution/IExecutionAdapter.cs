@@ -240,6 +240,12 @@ public interface IExecutionAdapter
     /// Returns true if one-shot satisfied or already consumed; false if NT context missing.
     /// </summary>
     bool TryTriggerHardFlatten(string instrument, string reason, DateTimeOffset utcNow);
+
+    /// <summary>
+    /// When execution updates show an untagged fill, returns true if it should be treated as the broker close from a recent
+    /// self-initiated <c>Account.Flatten</c> / hard-flatten (within the adapter recognition window) rather than unmapped fail-closed handling.
+    /// </summary>
+    bool TryRecognizeSelfInitiatedFlattenCloseFill(string instrument, DateTimeOffset utcNow);
 }
 
 /// <summary>

@@ -15,7 +15,14 @@ namespace QTSW2.Robot.Core.Execution;
 /// <summary>
 /// Periodic mismatch audits + P1.5 instrument-scoped state-consistency gate:
 /// engage → gate-safe reconciliation → release readiness → stability window → release.
+/// Phase A: when <see cref="FeatureFlags.ControlPlaneMismatchExecutionBlockAuthority"/> is false, internal state and logs
+/// continue, but execution block authority is not published and <see cref="IsInstrumentBlockedByMismatch"/> is always false.
 /// </summary>
+/// <remarks>
+/// Escalation layering: <see cref="PendingAlignmentAuthority"/> suppresses lag-explained categories during alignment windows;
+/// release-path journal integrity stays parity-only while pending; hard flatten / execution lock remain last resort for structural
+/// or persistent divergence outside those windows.
+/// </remarks>
 public sealed class MismatchEscalationCoordinator
 {
     private readonly Func<AccountSnapshot> _getSnapshot;
@@ -52,6 +59,19 @@ public sealed class MismatchEscalationCoordinator
     private ulong _nextConvergenceEpisodeId;
 
     private readonly ConcurrentDictionary<string, MismatchInstrumentState> _stateByInstrument = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Phase 3: expected-transient convergence windows (independent of gate state).</summary>
+    private readonly ConcurrentDictionary<string, MismatchConvergenceEntry> _convergenceByInstrument =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private readonly Func<string, DateTimeOffset, MismatchConvergenceCanonicalProbeResult>? _probeCanonicallyUnexplainedExposure;
+
+    private sealed class MismatchConvergenceEntry
+    {
+        public string Cause = "";
+        public DateTimeOffset ArmedAtUtc;
+        public DateTimeOffset ExpiresAtUtc;
+    }
 
     /// <summary>Coalesce identical gate telemetry when expensive reconciliation is skipped (same signatures + skip reason).</summary>
     private readonly Dictionary<string, (int Hash, DateTimeOffset Utc)> _quietGateTelemetry = new(StringComparer.OrdinalIgnoreCase);
@@ -95,6 +115,24 @@ public sealed class MismatchEscalationCoordinator
     private int _mismatchRegistryMissingCount;
     private int _mismatchProtectiveDivergenceCount;
 
+    /// <summary>Harness: first-detect escalations skipped due to Phase 3 convergence window + clean canonical probe.</summary>
+    internal int TestConvergenceFirstEscalationSuppressedCount { get; private set; }
+
+    /// <summary>Harness: Phase 3.1 invariant — convergence + clean canonical probe must not pair with episode extension or authority transition.</summary>
+    internal int TestMismatchEvalInvariantViolationCount { get; private set; }
+
+    private sealed class MismatchEvalScratchRow
+    {
+        public bool EpisodeExtended;
+        public bool AuthorityPublished;
+    }
+
+    /// <summary>Per audit tick: instruments processed this cycle; used for convergence invariant logging.</summary>
+    private readonly Dictionary<string, MismatchEvalScratchRow> _mismatchEvalScratch =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private bool _mismatchEvalInvariantCycleActive;
+
     private readonly record struct GateReconciliationResultTelemetry(
         bool ExpensiveInvoked,
         bool ThrottleSuppressedExpensive,
@@ -130,7 +168,8 @@ public sealed class MismatchEscalationCoordinator
         Action<string, bool, string?, DateTimeOffset>? onMismatchExecutionBlockAuthorityChanged = null,
         Func<string, bool>? isInstrumentInEngineScope = null,
         Func<string, int>? getPendingExecutionWorkloadForInstrument = null,
-        Func<string?>? getRunIdForMismatchDiagnostics = null)
+        Func<string?>? getRunIdForMismatchDiagnostics = null,
+        Func<string, DateTimeOffset, MismatchConvergenceCanonicalProbeResult>? probeCanonicallyUnexplainedExposure = null)
     {
         _getSnapshot = getSnapshot ?? throw new ArgumentNullException(nameof(getSnapshot));
         _getActiveInstruments = getActiveInstruments ?? (() => Array.Empty<string>());
@@ -151,6 +190,7 @@ public sealed class MismatchEscalationCoordinator
         _isInstrumentInEngineScope = isInstrumentInEngineScope;
         _getPendingExecutionWorkloadForInstrument = getPendingExecutionWorkloadForInstrument;
         _getRunIdForMismatchDiagnostics = getRunIdForMismatchDiagnostics;
+        _probeCanonicallyUnexplainedExposure = probeCanonicallyUnexplainedExposure;
         _stableWindowMs = stateConsistencyStableWindowMs > 0
             ? stateConsistencyStableWindowMs
             : MismatchEscalationPolicy.GATE_RELEASE_QUIET_WINDOW_MS;
@@ -174,21 +214,239 @@ public sealed class MismatchEscalationCoordinator
         }
     }
 
+    /// <summary>Phase 3: Arm a convergence window (e.g. recovery adoption, operator hook). Suppresses premature first escalation when probe is clean.</summary>
+    public void ArmConvergence(string instrument, string cause, DateTimeOffset utcNow)
+    {
+        if (string.IsNullOrWhiteSpace(instrument)) return;
+        ArmConvergenceCore(instrument.Trim(), string.IsNullOrWhiteSpace(cause) ? "unspecified" : cause.Trim(), utcNow);
+    }
+
+    private void ArmConvergenceCore(string inst, string cause, DateTimeOffset utcNow)
+    {
+        _convergenceByInstrument[inst] = new MismatchConvergenceEntry
+        {
+            Cause = cause,
+            ArmedAtUtc = utcNow,
+            ExpiresAtUtc = utcNow.AddMilliseconds(MismatchEscalationPolicy.MISMATCH_CONVERGENCE_WINDOW_MS)
+        };
+    }
+
+    private static bool ShouldArmConvergenceFromExecutionTriggerDetails(MismatchExecutionTriggerDetails d) =>
+        d.FillDelta != 0 || d.EntryToProtectivesTransition;
+
+    private static string BuildExecutionTriggerConvergenceCause(MismatchExecutionTriggerDetails d)
+    {
+        if (d.FillDelta != 0 && d.EntryToProtectivesTransition)
+            return "execution_fill_and_protective_transition";
+        if (d.EntryToProtectivesTransition)
+            return "protective_transition";
+        if (d.FillDelta != 0)
+            return "execution_fill";
+        return "execution_trigger";
+    }
+
+    private void TryRemoveExpiredConvergence(string inst, DateTimeOffset utcNow)
+    {
+        if (!_convergenceByInstrument.TryGetValue(inst, out var e)) return;
+        if (utcNow > e.ExpiresAtUtc)
+            _convergenceByInstrument.TryRemove(inst, out _);
+    }
+
+    private bool TryGetActiveConvergence(string inst, DateTimeOffset utcNow, out MismatchConvergenceEntry entry)
+    {
+        TryRemoveExpiredConvergence(inst, utcNow);
+        if (!_convergenceByInstrument.TryGetValue(inst, out var e) || utcNow > e.ExpiresAtUtc)
+        {
+            entry = null!;
+            return false;
+        }
+
+        entry = e;
+        return true;
+    }
+
+    private bool ShouldSuppressFirstMismatchEscalationForConvergence(
+        string inst,
+        DateTimeOffset utcNow,
+        MismatchObservation obs,
+        out MismatchConvergenceCanonicalProbeResult probeResult,
+        out string suppressionReason,
+        out MismatchConvergenceEntry? convEntry)
+    {
+        probeResult = default;
+        suppressionReason = "";
+        convEntry = null;
+        if (_probeCanonicallyUnexplainedExposure == null)
+            return false;
+        if (!TryGetActiveConvergence(inst, utcNow, out var conv))
+            return false;
+        if (MismatchConvergenceEscalationPolicy.IsSeriousMismatchType(obs.MismatchType))
+            return false;
+
+        try
+        {
+            probeResult = _probeCanonicallyUnexplainedExposure(inst, utcNow);
+        }
+        catch
+        {
+            return false;
+        }
+
+        if (probeResult.HasUnexplainedBrokerExposure)
+            return false;
+
+        convEntry = conv;
+        suppressionReason = "convergence_window_transient_mismatch_no_canonical_unexplained_exposure";
+        return true;
+    }
+
+    private void EmitConvergenceSuppressedFirstEscalation(
+        string inst,
+        DateTimeOffset utcNow,
+        MismatchObservation obs,
+        in MismatchConvergenceCanonicalProbeResult probe,
+        string suppressionReason,
+        MismatchConvergenceEntry conv)
+    {
+        if (_log == null) return;
+        var payload = new
+        {
+            instrument = inst,
+            convergence_state = "armed",
+            convergence_cause = conv.Cause,
+            convergence_armed_at_utc = conv.ArmedAtUtc.ToString("o"),
+            convergence_expires_at_utc = conv.ExpiresAtUtc.ToString("o"),
+            suppression_reason = suppressionReason,
+            mismatch_type = obs.MismatchType.ToString(),
+            unexplained_broker_position_qty = probe.UnexplainedBrokerPositionQty,
+            unexplained_broker_working_count = probe.UnexplainedBrokerWorkingCount,
+            has_unexplained_broker_exposure = probe.HasUnexplainedBrokerExposure,
+            observation_summary = obs.Summary,
+            run_id = _getRunIdForMismatchDiagnostics?.Invoke() ?? ""
+        };
+        _log.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "RECONCILIATION_MISMATCH_FIRST_ESCALATION_SUPPRESSED_FOR_CONVERGENCE",
+            payload));
+        if (IsInstrumentInEngineScopeForDiagnostics(inst))
+            EmitCanonical(inst, "RECONCILIATION_MISMATCH_FIRST_ESCALATION_SUPPRESSED_FOR_CONVERGENCE", utcNow, payload, "INFO");
+    }
+
     public bool IsInstrumentBlockedByMismatch(string instrument)
     {
         if (string.IsNullOrWhiteSpace(instrument)) return false;
+        // Phase A: mismatch state is observational — do not deny execution via this authority unless control-plane restored.
+        if (!FeatureFlags.ControlPlaneMismatchExecutionBlockAuthority) return false;
         return _stateByInstrument.TryGetValue(instrument.Trim(), out var s) && s.Blocked;
     }
 
     private void PublishMismatchExecutionBlockAuthorityIfChanged(string inst, MismatchInstrumentState state, bool wasBlocked,
         DateTimeOffset utcNow)
     {
+        if (!FeatureFlags.ControlPlaneMismatchExecutionBlockAuthority) return;
         if (wasBlocked == state.Blocked) return;
+        NoteMismatchEvalAuthorityPublished(inst);
         _onMismatchExecutionBlockAuthorityChanged?.Invoke(
             inst,
             state.Blocked,
             string.IsNullOrEmpty(state.BlockReason) ? null : state.BlockReason,
             utcNow);
+    }
+
+    private void NoteMismatchEvalAuthorityPublished(string instrument)
+    {
+        if (!_mismatchEvalInvariantCycleActive || string.IsNullOrWhiteSpace(instrument)) return;
+        var key = instrument.Trim();
+        if (!_mismatchEvalScratch.TryGetValue(key, out var row)) return;
+        row.AuthorityPublished = true;
+    }
+
+    private void NoteMismatchEvalEpisodeExtended(string instrument)
+    {
+        if (!_mismatchEvalInvariantCycleActive || string.IsNullOrWhiteSpace(instrument)) return;
+        var key = instrument.Trim();
+        if (!_mismatchEvalScratch.TryGetValue(key, out var row)) return;
+        row.EpisodeExtended = true;
+    }
+
+    /// <summary>
+    /// Phase 3.1: one structured line per instrument per mismatch audit. When convergence is armed and the canonical
+    /// exposure probe is clean, reconciliation episode extension and mismatch execution-block authority publication
+    /// must not occur in the same evaluation (logged assert).
+    /// </summary>
+    private void EmitMismatchEvaluationInvariant(string inst, DateTimeOffset utcNow)
+    {
+        if (!_mismatchEvalInvariantCycleActive) return;
+
+        var convergenceActive = TryGetActiveConvergence(inst, utcNow, out _);
+        var probeFn = _probeCanonicallyUnexplainedExposure;
+        var canonicalProbeAvailable = false;
+        var canonicalExposureOk = false;
+        if (probeFn != null)
+        {
+            try
+            {
+                var pr = probeFn(inst, utcNow);
+                canonicalProbeAvailable = true;
+                canonicalExposureOk = !pr.HasUnexplainedBrokerExposure;
+            }
+            catch
+            {
+                canonicalProbeAvailable = false;
+            }
+        }
+
+        _stateByInstrument.TryGetValue(inst, out var state);
+        var episodeExists = state?.ConvergenceEpisode.EpisodeId != 0;
+
+        _mismatchEvalScratch.TryGetValue(inst, out var scratch);
+        var episodeExtended = scratch?.EpisodeExtended ?? false;
+        var authorityPublished = scratch?.AuthorityPublished ?? false;
+
+        var assertionApplicable = convergenceActive && canonicalProbeAvailable && canonicalExposureOk;
+        var invariantViolated = assertionApplicable && (episodeExtended || authorityPublished);
+        if (invariantViolated)
+            TestMismatchEvalInvariantViolationCount++;
+
+        var invariantOk = !invariantViolated;
+
+        if (_log == null) return;
+
+        var payload = new
+        {
+            instrument = inst,
+            convergence_active = convergenceActive,
+            canonical_exposure_ok = canonicalExposureOk,
+            canonical_probe_available = canonicalProbeAvailable,
+            episode_exists = episodeExists,
+            episode_extended = episodeExtended,
+            authority_published = authorityPublished,
+            assertion_applicable = assertionApplicable,
+            convergence_invariant_ok = invariantOk,
+            run_id = _getRunIdForMismatchDiagnostics?.Invoke() ?? "",
+            ts_utc = utcNow.ToString("o")
+        };
+
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECONCILIATION_MISMATCH_EVAL_INVARIANT",
+            state: "ENGINE", payload));
+
+        if (invariantViolated)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RECONCILIATION_MISMATCH_EVAL_INVARIANT_VIOLATION",
+                state: "ENGINE",
+                new
+                {
+                    instrument = inst,
+                    convergence_active = convergenceActive,
+                    canonical_exposure_ok = canonicalExposureOk,
+                    episode_exists = episodeExists,
+                    episode_extended = episodeExtended,
+                    authority_published = authorityPublished,
+                    expected_when_convergence_and_canonical_clean = "episode_extended=false and authority_published=false",
+                    run_id = _getRunIdForMismatchDiagnostics?.Invoke() ?? "",
+                    ts_utc = utcNow.ToString("o")
+                }));
+            if (IsInstrumentInEngineScopeForDiagnostics(inst))
+                EmitCanonical(inst, "RECONCILIATION_MISMATCH_EVAL_INVARIANT_VIOLATION", utcNow, payload, "WARN");
+        }
     }
 
     public string? GetBlockReason(string instrument)
@@ -214,6 +472,10 @@ public sealed class MismatchEscalationCoordinator
     {
         if (string.IsNullOrWhiteSpace(instrument)) return;
         var inst = instrument.Trim();
+
+        if (ShouldArmConvergenceFromExecutionTriggerDetails(details))
+            ArmConvergenceCore(inst, BuildExecutionTriggerConvergenceCause(details), utcNow);
+
         if (!_stateByInstrument.TryGetValue(inst, out var state)) return;
         if (_isInstrumentInEngineScope != null && !_isInstrumentInEngineScope(inst) &&
             state.GateLifecyclePhase == GateLifecyclePhase.None)
@@ -314,44 +576,61 @@ public sealed class MismatchEscalationCoordinator
                 }
 
                 var deferredMismatchPendingIeA = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                _mismatchEvalInvariantCycleActive = true;
+                _mismatchEvalScratch.Clear();
                 foreach (var inst in instrumentsSet)
+                    _mismatchEvalScratch[inst] = new MismatchEvalScratchRow();
+
+                try
                 {
-                    var pendingIeA = _getPendingExecutionWorkloadForInstrument?.Invoke(inst) ?? 0;
-                    if (pendingIeA > 0)
+                    foreach (var inst in instrumentsSet)
                     {
-                        deferredMismatchPendingIeA.Add(inst);
-                        _log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "MISMATCH_EVAL_SKIPPED_PENDING_EXECUTION", state: "ENGINE",
+                        var pendingIeA = _getPendingExecutionWorkloadForInstrument?.Invoke(inst) ?? 0;
+                        if (pendingIeA > 0)
+                        {
+                            deferredMismatchPendingIeA.Add(inst);
+                            _log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "MISMATCH_EVAL_SKIPPED_PENDING_EXECUTION", state: "ENGINE",
+                                new
+                                {
+                                    instrument = inst,
+                                    pending_execution_count = pendingIeA,
+                                    run_id = _getRunIdForMismatchDiagnostics?.Invoke() ?? "",
+                                    ts_utc = utcNow.ToString("o")
+                                }));
+                            continue;
+                        }
+
+                        _log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "MISMATCH_EVAL_START", state: "ENGINE",
                             new
                             {
                                 instrument = inst,
-                                pending_execution_count = pendingIeA,
+                                pending_execution_count = 0,
                                 run_id = _getRunIdForMismatchDiagnostics?.Invoke() ?? "",
                                 ts_utc = utcNow.ToString("o")
                             }));
-                        continue;
+
+                        if (obsByInstrument.TryGetValue(inst, out var obs))
+                            ProcessMismatchPresent(obs);
+                        else
+                            ProcessMismatchSignalAbsent(inst, utcNow);
                     }
 
-                    _log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "MISMATCH_EVAL_START", state: "ENGINE",
-                        new
-                        {
-                            instrument = inst,
-                            pending_execution_count = 0,
-                            run_id = _getRunIdForMismatchDiagnostics?.Invoke() ?? "",
-                            ts_utc = utcNow.ToString("o")
-                        }));
+                    // Gate advancement (stable window → release, restabilization) must run even when mismatch eval is
+                    // deferred for pending IEA work — otherwise StablePendingRelease can stall forever with queued executions.
+                    foreach (var inst in instrumentsSet.Where(IsGateActiveForInstrument))
+                    {
+                        obsByInstrument.TryGetValue(inst, out var gateObs);
+                        AdvanceStateConsistencyGate(inst, snapshot, utcNow, gateObs);
+                    }
 
-                    if (obsByInstrument.TryGetValue(inst, out var obs))
-                        ProcessMismatchPresent(obs);
-                    else
-                        ProcessMismatchSignalAbsent(inst, utcNow);
+                    foreach (var inst in instrumentsSet)
+                        EmitMismatchEvaluationInvariant(inst, utcNow);
                 }
-
-                // Gate advancement (stable window → release, restabilization) must run even when mismatch eval is
-                // deferred for pending IEA work — otherwise StablePendingRelease can stall forever with queued executions.
-                foreach (var inst in instrumentsSet.Where(IsGateActiveForInstrument))
+                finally
                 {
-                    obsByInstrument.TryGetValue(inst, out var gateObs);
-                    AdvanceStateConsistencyGate(inst, snapshot, utcNow, gateObs);
+                    _mismatchEvalInvariantCycleActive = false;
+                    _mismatchEvalScratch.Clear();
                 }
 
                 _lastAuditUtc = utcNow;
@@ -906,8 +1185,24 @@ public sealed class MismatchEscalationCoordinator
         state.LastSeenUtc = utcNow;
         state.LastSummary = obs.Summary;
 
+        TryRemoveExpiredConvergence(inst, utcNow);
+
+        if (state.EscalationState == MismatchEscalationState.NONE &&
+            PendingAlignmentAuthority.IsPendingAlignment(inst, utcNow) &&
+            PendingAlignmentAuthority.IsJournalLagExplainedMismatchType(obs.MismatchType))
+            return;
+
         if (state.EscalationState == MismatchEscalationState.NONE)
         {
+            if (ShouldSuppressFirstMismatchEscalationForConvergence(inst, utcNow, obs, out var probeResult,
+                    out var suppressionReason, out var convEntry) &&
+                convEntry != null)
+            {
+                TestConvergenceFirstEscalationSuppressedCount++;
+                EmitConvergenceSuppressedFirstEscalation(inst, utcNow, obs, probeResult, suppressionReason, convEntry);
+                return;
+            }
+
             var wasBlocked = state.Blocked;
             state.EscalationState = MismatchEscalationState.DETECTED;
             state.MismatchType = obs.MismatchType;
@@ -1061,6 +1356,74 @@ public sealed class MismatchEscalationCoordinator
         }
     }
 
+    /// <summary>
+    /// When fail-closed but the mismatch observation is absent and release invariants pass, clear the gate and
+    /// mismatch execution block authority — avoids a permanent deadlock without skipping structural release checks.
+    /// </summary>
+    private bool TryExitFailClosedWhenSafe(string inst, AccountSnapshot snapshot, DateTimeOffset utcNow,
+        MismatchObservation? latestObs)
+    {
+        if (!_stateByInstrument.TryGetValue(inst, out var state))
+            return false;
+        if (state.EscalationState != MismatchEscalationState.FAIL_CLOSED &&
+            state.GateLifecyclePhase != GateLifecyclePhase.FailClosed)
+            return false;
+
+        var obsForSig = CoalesceGateObservation(inst, state, latestObs, utcNow);
+        if (obsForSig.Present)
+            return false;
+
+        StateConsistencyReleaseReadinessResult readiness;
+        try
+        {
+            readiness = _evaluateReleaseReadiness?.Invoke(inst, snapshot, utcNow)
+                        ?? StateConsistencyReleaseEvaluator.Indeterminate(inst);
+        }
+        catch (Exception ex)
+        {
+            _log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_ERROR", state: "ENGINE",
+                new { error = ex.Message, context = "TryExitFailClosedWhenSafe", instrument = inst }));
+            return false;
+        }
+
+        if (!readiness.SnapshotSufficient || !readiness.ReleaseReady)
+            return false;
+
+        var wasBlockedRelease = state.Blocked;
+        state.Blocked = false;
+        state.BlockReason = "";
+        state.EscalationState = MismatchEscalationState.NONE;
+        state.GateLifecyclePhase = GateLifecyclePhase.None;
+        state.LastReleaseUtc = utcNow;
+        state.FirstConsistentUtc = default;
+        state.ReleaseQuietFingerprintKey = "";
+        state.ConsecutiveCleanPassCount = 0;
+        state.MismatchStillPresent = false;
+        state.GateProgress.Reset();
+        state.ConvergenceEpisode.Clear();
+        state.ReconciliationHysteresisUntilUtc = default;
+        state.HysteresisMismatchTypeAtFreeze = null;
+        state.PostForcedConvergenceFingerprint = 0;
+        state.ForcedConvergenceSucceeded = false;
+        _mismatchClearedCount++;
+        _hedgedNetFlatEscalationInvoked.TryRemove(inst, out _);
+        _gateReleaseProgressLastEmit.Remove(inst);
+        _gateMaxDwellLastEmit.Remove(inst);
+
+        var releasedPayload = new
+        {
+            gate = ToGatePayload(state, inst, utcNow, obsForSig, null, readiness),
+            release_source = "fail_closed_safe_recovery",
+            release_ready = readiness.ReleaseReady
+        };
+        _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_RELEASED", releasedPayload));
+        EmitCanonical(inst, "STATE_CONSISTENCY_GATE_RELEASED", utcNow, releasedPayload, "INFO");
+        _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "RECONCILIATION_MISMATCH_CLEARED",
+            ToGatePayload(state, inst, utcNow, obsForSig, null, null)));
+        PublishMismatchExecutionBlockAuthorityIfChanged(inst, state, wasBlockedRelease, utcNow);
+        return true;
+    }
+
     private void AdvanceStateConsistencyGate(string inst, AccountSnapshot snapshot, DateTimeOffset utcNow,
         MismatchObservation? latestObs)
     {
@@ -1068,13 +1431,18 @@ public sealed class MismatchEscalationCoordinator
             return;
         if (state.GateLifecyclePhase == GateLifecyclePhase.None)
             return;
-        if (state.EscalationState == MismatchEscalationState.FAIL_CLOSED)
+        if (state.EscalationState == MismatchEscalationState.FAIL_CLOSED ||
+            state.GateLifecyclePhase == GateLifecyclePhase.FailClosed)
+        {
+            if (TryExitFailClosedWhenSafe(inst, snapshot, utcNow, latestObs))
+                return;
             return;
+        }
 
         var obsForSig = CoalesceGateObservation(inst, state, latestObs, utcNow);
         var gp = state.GateProgress;
 
-        EnsureConvergenceEpisodeStarted(state, obsForSig, utcNow);
+        EnsureConvergenceEpisodeStarted(inst, state, obsForSig, utcNow);
 
         if (gp.ProgressHardStopped && utcNow >= gp.ProgressHardStopUntilUtc)
         {
@@ -1241,6 +1609,7 @@ public sealed class MismatchEscalationCoordinator
                 var epRun = state.ConvergenceEpisode;
                 epRun.LastActionAttempted = "gate_recovery_runner_and_adoption_scan";
                 epRun.AttemptCount++;
+                NoteMismatchEvalEpisodeExtended(inst);
             }
 
             try
@@ -2023,7 +2392,8 @@ public sealed class MismatchEscalationCoordinator
         gp.ThrottleBaselineInitialized = true;
     }
 
-    private void EnsureConvergenceEpisodeStarted(MismatchInstrumentState state, MismatchObservation obs, DateTimeOffset utcNow)
+    private void EnsureConvergenceEpisodeStarted(string instrument, MismatchInstrumentState state, MismatchObservation obs,
+        DateTimeOffset utcNow)
     {
         if (state.GateLifecyclePhase == GateLifecyclePhase.None)
             return;
@@ -2032,11 +2402,15 @@ public sealed class MismatchEscalationCoordinator
         if (ep.EpisodeId == 0)
         {
             ep.StartNew(++_nextConvergenceEpisodeId, utcNow, key);
+            NoteMismatchEvalEpisodeExtended(instrument);
             return;
         }
 
         if (!string.Equals(ep.EpisodeIntentKey, key, StringComparison.Ordinal))
+        {
             ep.StartNew(++_nextConvergenceEpisodeId, utcNow, key);
+            NoteMismatchEvalEpisodeExtended(instrument);
+        }
     }
 
     private void TryInvokeForcedConvergenceIfLimitsExceeded(
@@ -2098,6 +2472,7 @@ public sealed class MismatchEscalationCoordinator
         if (result.AlignedWithBroker)
         {
             ep.StartNew(++_nextConvergenceEpisodeId, utcNow, obsForSig.IntentIdsCsv);
+            NoteMismatchEvalEpisodeExtended(inst);
             state.ForcedConvergenceSucceeded = true;
             state.PostForcedConvergenceFingerprint = result.PostAlignmentFingerprint != 0
                 ? result.PostAlignmentFingerprint
@@ -2173,6 +2548,21 @@ public sealed class MismatchEscalationCoordinator
     {
         TestGateResultEmitCount = 0;
         TestGateResultSuppressCount = 0;
+    }
+
+    internal void ResetConvergenceTestCountersForTest()
+    {
+        TestConvergenceFirstEscalationSuppressedCount = 0;
+        TestMismatchEvalInvariantViolationCount = 0;
+    }
+
+    internal bool HasActiveConvergenceForTest(string instrument, DateTimeOffset utcNow) =>
+        !string.IsNullOrWhiteSpace(instrument) && TryGetActiveConvergence(instrument.Trim(), utcNow, out _);
+
+    internal void ClearConvergenceForTest(string instrument)
+    {
+        if (!string.IsNullOrWhiteSpace(instrument))
+            _convergenceByInstrument.TryRemove(instrument.Trim(), out _);
     }
 
     public void EmitMetrics(DateTimeOffset utcNow)
