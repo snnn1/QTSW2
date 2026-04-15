@@ -47,6 +47,13 @@ public sealed class QuantExpectedInstrumentState
     /// <summary>End of bounded PENDING_ALIGNMENT window (wall clock).</summary>
     public DateTimeOffset? PendingAlignmentExpiresUtc { get; set; }
 
+    /// <summary>
+    /// Set by <see cref="QuantExecutionControlStore.NotifyProtectiveStopSubmitted"/> after a protective stop submit succeeds.
+    /// <see cref="QuantExecutionInstrumentPhase.PendingAlignment"/> can begin at mapped fill time before submit; protective coverage
+    /// convergence requires this timestamp &gt;= <see cref="LastMappedFillUtc"/> for the current episode.
+    /// </summary>
+    public DateTimeOffset? LastProtectiveStopSubmitUtc { get; set; }
+
     /// <summary>True after reconnect adoption without full history.</summary>
     public bool RecoveryMode { get; set; }
 

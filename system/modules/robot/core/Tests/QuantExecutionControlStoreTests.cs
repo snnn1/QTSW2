@@ -40,6 +40,12 @@ public static class QuantExecutionControlStoreTests
             e = Case_RecoveryRequired_Structural_AllowsProtectiveBlocksEntry();
             if (e != null) return (false, e);
 
+            e = Case_MappedFill_DoesNotMutateRecoveryRequiredUnmappedOrLocked();
+            if (e != null) return (false, e);
+
+            e = Case_RepeatedMappedFills_TakeLaterPendingAlignmentExpiry();
+            if (e != null) return (false, e);
+
             // Last: mutates QuantExecutionControlStoreEnabled to false for the assertion.
             e = Case_StoreDisabled_NoOps();
             if (e != null) return (false, e);
@@ -272,6 +278,99 @@ public static class QuantExecutionControlStoreTests
                 return $"integration rec: expected RecoveryRequired, got {s2.Phase}";
             if (s2.RecoveryRequiredReason != "recovery_stabilization_window_expired_broker_gross_mismatch")
                 return "integration rec: wrong reason " + s2.RecoveryRequiredReason;
+        }
+        finally
+        {
+            FeatureFlags.PostFillAlignmentWindowMs = prev;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Phase 4B contract: mapped fill does not transition <see cref="QuantExecutionInstrumentPhase.RecoveryRequired"/> to
+    /// <see cref="QuantExecutionInstrumentPhase.PendingAlignment"/> (no post-fill convergence softening). Unmapped and
+    /// execution-locked entries are likewise immutable on mapped fill.
+    /// </summary>
+    private static string? Case_MappedFill_DoesNotMutateRecoveryRequiredUnmappedOrLocked()
+    {
+        JournalParityPendingLedger.Clear();
+        QuantExecutionControlStore.Clear();
+        var t0 = DateTimeOffset.Parse("2099-08-10T12:00:00Z");
+        var prev = FeatureFlags.PostFillAlignmentWindowMs;
+        FeatureFlags.PostFillAlignmentWindowMs = 500;
+        try
+        {
+            var instRr = "QM_RR_MAP";
+            JournalParityPendingLedger.TryRecordTrustedFill(instRr, "k1", 1, "i", t0);
+            QuantExecutionControlStore.EvaluateEscalationAndApplyIfRequired(instRr, t0.AddSeconds(2), 0, null);
+            var snapRr = QuantExecutionControlStore.GetSnapshot(instRr);
+            if (snapRr.Phase != QuantExecutionInstrumentPhase.RecoveryRequired)
+                return $"RR setup: expected RecoveryRequired, got {snapRr.Phase}";
+            var netBefore = snapRr.Expected.ExpectedSignedNetPosition;
+            var reasonBefore = snapRr.RecoveryRequiredReason;
+
+            QuantExecutionControlStore.NotifyMappedTrustedFill(instRr, 5, t0.AddMinutes(1));
+            var afterRr = QuantExecutionControlStore.GetSnapshot(instRr);
+            if (afterRr.Phase != QuantExecutionInstrumentPhase.RecoveryRequired)
+                return $"after mapped fill on RR: expected RecoveryRequired, got {afterRr.Phase}";
+            if (afterRr.Expected.ExpectedSignedNetPosition != netBefore)
+                return $"RR: expected expected net unchanged ({netBefore}), got {afterRr.Expected.ExpectedSignedNetPosition}";
+            if (afterRr.RecoveryRequiredReason != reasonBefore)
+                return "RR: RecoveryRequiredReason should not change from mapped fill";
+
+            var instUm = "QM_UM_MAP";
+            QuantExecutionControlStore.NotifyUnmappedExecution(instUm, t0, "TEST_UM");
+            QuantExecutionControlStore.NotifyMappedTrustedFill(instUm, 2, t0.AddSeconds(1));
+            var afterUm = QuantExecutionControlStore.GetSnapshot(instUm);
+            if (afterUm.Phase != QuantExecutionInstrumentPhase.UnmappedExecution)
+                return $"unmapped: expected UnmappedExecution after mapped fill, got {afterUm.Phase}";
+
+            var instLk = "QM_LK_MAP";
+            QuantExecutionControlStore.NotifyExecutionLocked(instLk, "TEST_LOCK", t0);
+            QuantExecutionControlStore.NotifyMappedTrustedFill(instLk, 2, t0.AddSeconds(1));
+            var afterLk = QuantExecutionControlStore.GetSnapshot(instLk);
+            if (afterLk.Phase != QuantExecutionInstrumentPhase.ExecutionLocked)
+                return $"locked: expected ExecutionLocked after mapped fill, got {afterLk.Phase}";
+        }
+        finally
+        {
+            FeatureFlags.PostFillAlignmentWindowMs = prev;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Documented contract: successive PendingAlignment mapped fills set <see cref="QuantExpectedInstrumentState.PendingAlignmentExpiresUtc"/>
+    /// to the later of (previous expiry) and (this fill's utcNow + windowMs).
+    /// </summary>
+    private static string? Case_RepeatedMappedFills_TakeLaterPendingAlignmentExpiry()
+    {
+        QuantExecutionControlStore.Clear();
+        var t0 = DateTimeOffset.Parse("2099-08-11T12:00:00Z");
+        var prev = FeatureFlags.PostFillAlignmentWindowMs;
+        FeatureFlags.PostFillAlignmentWindowMs = 5000;
+        try
+        {
+            const string inst = "QM_REP_FILL";
+            QuantExecutionControlStore.NotifyMappedTrustedFill(inst, 1, t0);
+            var e1 = QuantExecutionControlStore.GetSnapshot(inst).Expected.PendingAlignmentExpiresUtc;
+            var expectFirst = t0.AddMilliseconds(5000);
+            if (e1 != expectFirst)
+                return $"first fill: expected expiry {expectFirst}, got {e1}";
+
+            var tSecond = t0.AddMilliseconds(1000);
+            QuantExecutionControlStore.NotifyMappedTrustedFill(inst, 1, tSecond);
+            var e2 = QuantExecutionControlStore.GetSnapshot(inst).Expected.PendingAlignmentExpiresUtc;
+            var expectSecond = tSecond.AddMilliseconds(5000);
+            if (e2 != expectSecond)
+                return $"second fill: expected expiry {expectSecond} (later deadline), got {e2}";
+
+            if (!QuantExecutionControlStore.IsPostFillAlignmentWindowActive(inst, t0.AddMilliseconds(5500)))
+                return "at t0+5500ms window should still be active (extended past first fill's t0+5000)";
+            if (QuantExecutionControlStore.IsPostFillAlignmentWindowActive(inst, t0.AddMilliseconds(6500)))
+                return "at t0+6500ms window should be inactive (after extended expiry t0+6000)";
         }
         finally
         {

@@ -1803,7 +1803,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 log: _log,
                 eventWriter: _eventWriter,
                 runInstrumentGateReconciliation: (inst, utc, cycle) => RunInstrumentGateReconciliation(inst, utc, cycle),
-                evaluateReleaseReadiness: (inst, snap, utc) => EvaluateStateConsistencyReleaseReadiness(inst, snap, utc),
+                evaluateReleaseReadiness: (inst, snap, utc, forceFull) =>
+                    EvaluateStateConsistencyReleaseReadiness(inst, snap, utc, forceFull),
                 stateConsistencyStableWindowMs: stableWindowMs,
                 runtimeAudit: _runtimeAudit,
                 runForcedBrokerAlignment: RunForcedBrokerAlignment,

@@ -45,7 +45,7 @@ public static class HistoricalReplay
 
             Console.WriteLine($"[Replay] Processing date: {currentDate:yyyy-MM-dd}");
 
-            // SessionCloseResolver parity: call SetSessionCloseResolved at trading day boundaries (source=HARNESS_CONFIG)
+            // SessionCloseResolver parity: seed SetSessionCloseResolved at trading day boundaries from spec (replay harness).
             var tradingDayStr = currentDate.ToString("yyyy-MM-dd");
             var marketCloseTime = spec.entry_cutoff?.market_close_time ?? "16:00";
             var marketReopenTime = spec.entry_cutoff?.market_reopen_time ?? "17:00";
@@ -64,8 +64,8 @@ public static class HistoricalReplay
                 NextSessionBeginUtc = nextSessionBeginUtc,
                 BufferSeconds = bufferSeconds
             };
-            engine.SetSessionCloseResolved(tradingDayStr, "S1", sessionCloseResult, "HARNESS_CONFIG");
-            engine.SetSessionCloseResolved(tradingDayStr, "S2", sessionCloseResult, "HARNESS_CONFIG");
+            engine.SetSessionCloseResolved(tradingDayStr, "S1", sessionCloseResult);
+            engine.SetSessionCloseResolved(tradingDayStr, "S2", sessionCloseResult);
             
             // Update timetable trading_date for this date if using replay timetable
             // The engine will reload the timetable when we tick with the historical date

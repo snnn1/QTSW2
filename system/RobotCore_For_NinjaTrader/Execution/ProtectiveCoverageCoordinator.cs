@@ -192,6 +192,14 @@ public sealed class ProtectiveCoverageCoordinator
         var inst = result.Instrument;
         if (string.IsNullOrWhiteSpace(inst)) return;
 
+        // Phase 4A: pending broker visibility — diagnostic only; no block, no recovery, no failure metrics
+        if (result.Status == ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE)
+        {
+            _log?.Write(RobotEvents.ExecutionBase(result.AuditUtc, "", inst, "PROTECTIVE_PENDING_CONVERGENCE", ToPayload(result)));
+            EmitCanonical(inst, ExecutionEventTypes.PROTECTIVE_PENDING_CONVERGENCE, result.AuditUtc, ToPayload(result), "INFO");
+            return;
+        }
+
         // Diagnostic: log audit context for protective_missing_stop and critical failures
         if (ProtectiveCoverageAudit.IsCritical(result.Status) || result.Status == ProtectiveAuditStatus.PROTECTIVE_MISSING_STOP)
         {
@@ -414,6 +422,7 @@ public sealed class ProtectiveCoverageCoordinator
     {
         return status switch
         {
+            ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE => "PROTECTIVE_PENDING_CONVERGENCE",
             ProtectiveAuditStatus.PROTECTIVE_MISSING_STOP => "PROTECTIVE_MISSING_STOP",
             ProtectiveAuditStatus.PROTECTIVE_STOP_QTY_MISMATCH => "PROTECTIVE_STOP_QTY_MISMATCH",
             ProtectiveAuditStatus.PROTECTIVE_STOP_PRICE_INVALID => "PROTECTIVE_STOP_PRICE_INVALID",

@@ -36,7 +36,14 @@ public enum ProtectiveAuditStatus
     PROTECTIVE_RECOVERY_IN_PROGRESS,
 
     /// <summary>Emergency risk action already underway.</summary>
-    PROTECTIVE_FLATTEN_IN_PROGRESS
+    PROTECTIVE_FLATTEN_IN_PROGRESS,
+
+    /// <summary>
+    /// Phase 4A: Broker position present but no Working/Accepted protective stop in snapshot yet, while Tier-1
+    /// <see cref="QuantExecutionControlStore"/> reports bounded post-fill alignment (mapped fill path).
+    /// Non-critical diagnostic — not a substitute for broker-visible coverage after the alignment window expires.
+    /// </summary>
+    PROTECTIVE_PENDING_CONVERGENCE
 }
 
 /// <summary>Per-instrument protective recovery state machine.</summary>

@@ -110,6 +110,9 @@ namespace NinjaTrader.NinjaScript.Strategies
         // BE path diagnostic: once per minute when in position — confirms BE check runs, shows active_intent_count.
         private readonly Dictionary<string, DateTimeOffset> _lastBePathActiveLogUtc = new Dictionary<string, DateTimeOffset>();
         private const int BE_PATH_ACTIVE_RATE_LIMIT_SECONDS = 60;
+        /// <summary>Phase 4B: throttle BE_PENDING_CONVERGENCE / OWNERSHIP_PENDING_CONVERGENCE during Tier-1 alignment window.</summary>
+        private readonly Dictionary<string, DateTimeOffset> _lastBePendingConvergenceLogUtc = new Dictionary<string, DateTimeOffset>();
+        private const int BE_PENDING_CONVERGENCE_LOG_SECONDS = 10;
 
         // SessionCloseResolver: last trading date we resolved for (Realtime only, once per day)
         private string? _lastSessionCloseResolvedTradingDay;
@@ -2228,18 +2231,68 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // HARDENING: If we have exposure but 0 intents for BE, the filter excluded them (e.g., execution instrument mismatch)
                 if (activeCount == 0 && hasExposure)
                 {
-                    _engine.LogEngineEvent(now, "BE_FILTER_EXCLUDED_ACTIVE_EXPOSURE", new Dictionary<string, object>
+                    if (QuantExecutionControlStore.IsPostFillAlignmentWindowActive(executionInstrument, now))
+                    {
+                        _engine.LogEngineEvent(now, "OWNERSHIP_PENDING_CONVERGENCE", new Dictionary<string, object>
+                        {
+                            { "chart_instrument", instrumentName },
+                            { "execution_instrument", executionInstrument },
+                            { "resolved_active_intent_count", 0 },
+                            { "tick_price", tickPrice },
+                            { "note", "Tier-1 PendingAlignment window — not classified as unowned exposure (journal/intent may lag)" }
+                        });
+                    }
+                    else
+                    {
+                        _engine.LogEngineEvent(now, "BE_FILTER_EXCLUDED_ACTIVE_EXPOSURE", new Dictionary<string, object>
+                        {
+                            { "chart_instrument", instrumentName },
+                            { "execution_instrument", executionInstrument },
+                            { "resolved_active_intent_count", 0 },
+                            { "tick_price", tickPrice },
+                            { "stand_down_reason", "exposure_exists_but_no_intent_found" },
+                            { "note", "CRITICAL: Account has exposure but BE filter returned 0 intents. Likely execution instrument mismatch (chart vs intent)." }
+                        });
+                    }
+                }
+            }
+
+            // Phase 4B: During Tier-1 post-fill alignment, defer BE when no intents resolved yet (transient journal lag).
+            var postFillAlignment = QuantExecutionControlStore.IsPostFillAlignmentWindowActive(executionInstrument, now);
+            var skipBeForPostFillConvergence = false;
+            if (postFillAlignment)
+            {
+                var gateAi = _adapter?.GetActiveIntentsForBEMonitoring(executionInstrument);
+                if (gateAi == null || gateAi.Count == 0)
+                    skipBeForPostFillConvergence = true;
+            }
+
+            if (skipBeForPostFillConvergence)
+            {
+                if (_engine != null &&
+                    (!_lastBePendingConvergenceLogUtc.TryGetValue(executionInstrument, out var lastPc) ||
+                     (now - lastPc).TotalSeconds >= BE_PENDING_CONVERGENCE_LOG_SECONDS))
+                {
+                    _lastBePendingConvergenceLogUtc[executionInstrument] = now;
+                    _engine.LogEngineEvent(now, "BE_PENDING_CONVERGENCE", new Dictionary<string, object>
+                    {
+                        { "chart_instrument", instrumentName },
+                        { "execution_instrument", executionInstrument },
+                        { "tick_price", tickPrice },
+                        { "note", "Tier-1 PendingAlignment window — BE evaluation deferred until intents resolve" }
+                    });
+                    _engine.LogEngineEvent(now, "OWNERSHIP_PENDING_CONVERGENCE", new Dictionary<string, object>
                     {
                         { "chart_instrument", instrumentName },
                         { "execution_instrument", executionInstrument },
                         { "resolved_active_intent_count", 0 },
                         { "tick_price", tickPrice },
-                        { "stand_down_reason", "exposure_exists_but_no_intent_found" },
-                        { "note", "CRITICAL: Account has exposure but BE filter returned 0 intents. Likely execution instrument mismatch (chart vs intent)." }
+                        { "note", "Bounded post-fill convergence — not treating as ownership failure" }
                     });
                 }
             }
-
+            else
+            {
             // Phase 3: Delegate BE to adapter (IEA when enabled, else adapter's legacy path).
             // DrainNtActions already ran above (before hasExposure check) so protectives are processed on every tick.
             // EvaluateBreakEven may call account.Change - must run in strategy thread context.
@@ -2267,6 +2320,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 DateTimeOffset? tickTimeFromEvent = null;
                 try { if (e.Time != default) tickTimeFromEvent = new DateTimeOffset(e.Time, TimeSpan.Zero); } catch { }
                 _adapter?.EvaluateBreakEven(tickPrice, tickTimeFromEvent, executionInstrument);
+            }
             }
         }
 

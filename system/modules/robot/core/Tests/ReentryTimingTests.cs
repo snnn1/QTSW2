@@ -41,7 +41,7 @@ public static class ReentryTimingTests
             var utcNow = new DateTimeOffset(2026, 3, 15, 22, 0, 0, TimeSpan.Zero); // 17:00 CT (CDT)
 
             // 1. Holiday: HasSession=false -> (null, false)
-            engine.SetSessionCloseResolved(tradingDay, "S1", new SessionCloseResult { HasSession = false }, "TEST");
+            engine.SetSessionCloseResolved(tradingDay, "S1", new SessionCloseResult { HasSession = false });
             var (holidayUtc, holidaySession) = engine.GetReentryAllowedUtc(tradingDay, "S1", utcNow);
             if (holidaySession)
                 return (false, "Holiday (HasSession=false) should return hasSession=false");
@@ -59,7 +59,7 @@ public static class ReentryTimingTests
                 NextSessionBeginUtc = nextSessionBeginUtc,
                 ResolvedSessionCloseUtc = nextSessionBeginUtc.AddHours(-4), // 4h before reopen
                 FlattenTriggerUtc = nextSessionBeginUtc.AddHours(-4).AddSeconds(-300)
-            }, "TEST");
+            });
             var (resolverUtc, resolverSession) = engine.GetReentryAllowedUtc(tradingDay, "S1", utcNow);
             if (!resolverSession)
                 return (false, "Resolver result with HasSession=true should return hasSession=true");
@@ -74,7 +74,7 @@ public static class ReentryTimingTests
                 NextSessionBeginUtc = delayedOpenUtc,
                 ResolvedSessionCloseUtc = new DateTimeOffset(2026, 3, 15, 21, 0, 0, TimeSpan.Zero),
                 FlattenTriggerUtc = new DateTimeOffset(2026, 3, 15, 20, 55, 0, TimeSpan.Zero)
-            }, "TEST");
+            });
             var beforeDelayed = new DateTimeOffset(2026, 3, 16, 14, 0, 0, TimeSpan.Zero);
             var (beforeUtc, _) = engine.GetReentryAllowedUtc(tradingDay, "S2", beforeDelayed);
             if (beforeUtc.HasValue && beforeDelayed < beforeUtc.Value)

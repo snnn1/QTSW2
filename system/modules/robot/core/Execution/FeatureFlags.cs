@@ -35,6 +35,13 @@ public static class FeatureFlags
     public static bool ControlPlaneParityHardFlattenFromTryEnsureJournalIntegrity { get; set; } = false;
 
     /// <summary>
+    /// When true (default), <see cref="MismatchEscalationCoordinator.TryExitFailClosedWhenSafe"/> requires multiple fresh
+    /// account snapshots with full (non-cached) release readiness, stability across a bounded quiet window, and a mandatory
+    /// post-release recheck before trusting <c>fail_closed_safe_recovery</c> release.
+    /// </summary>
+    public static bool FailClosedStrictReleaseConfirmationEnabled { get; set; } = true;
+
+    /// <summary>
     /// Phase A / Phase 3: when false (default), <see cref="MismatchEscalationCoordinator"/> does not publish mismatch
     /// execution block authority and <see cref="MismatchEscalationCoordinator.IsInstrumentBlockedByMismatch"/> is always false —
     /// mismatch stays observational (logs, metrics, gate events). Do not re-enable submit-time denial here unless proven necessary;

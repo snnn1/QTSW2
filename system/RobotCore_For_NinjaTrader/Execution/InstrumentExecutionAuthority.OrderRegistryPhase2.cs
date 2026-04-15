@@ -218,6 +218,7 @@ public sealed partial class InstrumentExecutionAuthority
         var recoveryRequestsEmitted = 0;
         var supervisoryRequestsEmitted = 0;
         var divergenceEventsLogged = 0;
+        var postFillAlign = QuantExecutionControlStore.IsPostFillAlignmentWindowActive(ExecutionInstrumentKey, utcNow);
 
         if (Log != null && (utcNow - _lastVerifyRegistryThreadAttrUtc).TotalSeconds >= 60)
         {
@@ -377,27 +378,57 @@ public sealed partial class InstrumentExecutionAuthority
 
             divergenceEventsLogged++;
             _orderRegistry.IncrementIntegrityFailure();
-            Log?.Write(RobotEvents.ExecutionBase(utcNow, "", ExecutionInstrumentKey, "REGISTRY_BROKER_DIVERGENCE", new
+            if (postFillAlign)
             {
-                broker_order_id = brokerId,
-                direction = "broker_has_registry_missing",
-                note = "Broker has live order but registry does not — adopting to restore consistency",
-                iea_instance_id = InstanceId
-            }));
-            if (TryAdoptBrokerOrderIfNotInRegistry(o))
-            {
-                Log?.Write(RobotEvents.ExecutionBase(utcNow, "", ExecutionInstrumentKey, "REGISTRY_BROKER_DIVERGENCE_ADOPTED", new
+                Log?.Write(RobotEvents.ExecutionBase(utcNow, "", ExecutionInstrumentKey, "REGISTRY_PENDING_CONVERGENCE", new
                 {
                     broker_order_id = brokerId,
-                    note = "Order adopted into registry",
+                    direction = "broker_has_registry_missing",
+                    note = "Tier-1 PendingAlignment window — broker order not yet in registry; adopting without hard divergence escalation",
                     iea_instance_id = InstanceId
                 }));
             }
+            else
+            {
+                Log?.Write(RobotEvents.ExecutionBase(utcNow, "", ExecutionInstrumentKey, "REGISTRY_BROKER_DIVERGENCE", new
+                {
+                    broker_order_id = brokerId,
+                    direction = "broker_has_registry_missing",
+                    note = "Broker has live order but registry does not — adopting to restore consistency",
+                    iea_instance_id = InstanceId
+                }));
+            }
+            if (TryAdoptBrokerOrderIfNotInRegistry(o))
+            {
+                if (postFillAlign)
+                {
+                    Log?.Write(RobotEvents.ExecutionBase(utcNow, "", ExecutionInstrumentKey, "REGISTRY_PENDING_CONVERGENCE", new
+                    {
+                        broker_order_id = brokerId,
+                        direction = "broker_has_registry_missing",
+                        phase = "adopted",
+                        note = "Order adopted into registry during alignment window",
+                        iea_instance_id = InstanceId
+                    }));
+                }
+                else
+                {
+                    Log?.Write(RobotEvents.ExecutionBase(utcNow, "", ExecutionInstrumentKey, "REGISTRY_BROKER_DIVERGENCE_ADOPTED", new
+                    {
+                        broker_order_id = brokerId,
+                        note = "Order adopted into registry",
+                        iea_instance_id = InstanceId
+                    }));
+                }
+            }
 #if NINJATRADER
-            recoveryRequestsEmitted++;
-            supervisoryRequestsEmitted++;
-            RequestRecovery(ExecutionInstrumentKey, "REGISTRY_BROKER_DIVERGENCE", new { broker_order_id = brokerId, direction = "broker_has_registry_missing" }, utcNow);
-            RequestSupervisoryAction(ExecutionInstrumentKey, SupervisoryTriggerReason.REPEATED_REGISTRY_DIVERGENCE, SupervisorySeverity.MEDIUM, new { broker_order_id = brokerId, direction = "broker_has_registry_missing" }, utcNow);
+            if (!postFillAlign)
+            {
+                recoveryRequestsEmitted++;
+                supervisoryRequestsEmitted++;
+                RequestRecovery(ExecutionInstrumentKey, "REGISTRY_BROKER_DIVERGENCE", new { broker_order_id = brokerId, direction = "broker_has_registry_missing" }, utcNow);
+                RequestSupervisoryAction(ExecutionInstrumentKey, SupervisoryTriggerReason.REPEATED_REGISTRY_DIVERGENCE, SupervisorySeverity.MEDIUM, new { broker_order_id = brokerId, direction = "broker_has_registry_missing" }, utcNow);
+            }
 #endif
         }
 

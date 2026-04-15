@@ -2516,6 +2516,7 @@ public sealed partial class NinjaTraderSimAdapter
                     note = "Idempotent: stop already existed; ensured correct qty/price"
                 }));
 
+                QuantExecutionControlStore.NotifyProtectiveStopSubmitted(instrument, utcNow);
                 return OrderSubmissionResult.SuccessResult(existingStop.OrderId, utcNow, utcNow);
             }
 
@@ -2772,6 +2773,7 @@ public sealed partial class NinjaTraderSimAdapter
                 note = "Protective stop order added to _orderMap for tracking"
             }));
 
+            QuantExecutionControlStore.NotifyProtectiveStopSubmitted(instrument, utcNow);
             return OrderSubmissionResult.SuccessResult(order.OrderId, utcNow, utcNow);
         }
         catch (Exception ex)

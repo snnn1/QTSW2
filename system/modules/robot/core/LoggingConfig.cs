@@ -86,6 +86,13 @@ public sealed class LoggingConfig
     public bool enable_health_sink { get; set; } = true;
 
     /// <summary>
+    /// When true, do not let a NinjaTrader TradingHours-only HOLIDAY result suppress trading if timetable indicates
+    /// the session is active. The engine logs conflict telemetry and overrides HOLIDAY using internal close/reopen times.
+    /// Default false preserves legacy behavior.
+    /// </summary>
+    public bool prefer_internal_calendar_over_nt_holiday { get; set; } = false;
+
+    /// <summary>
     /// True when diagnostics logging is on (matches RobotCore: log_profile DIAGNOSTIC, or legacy flags).
     /// </summary>
     public bool DiagnosticsEnabled =>

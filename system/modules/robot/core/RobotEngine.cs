@@ -14,6 +14,7 @@ namespace QTSW2.Robot.Core;
 using QTSW2.Robot.Core.Diagnostics;
 using QTSW2.Robot.Core.Execution;
 using QTSW2.Robot.Core.Notifications;
+using QTSW2.Robot.Core.SessionAuthority;
 
 /// <summary>
 /// Connection recovery state for disconnect/reconnect handling.
@@ -384,6 +385,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     // SessionCloseResolver: cache per (tradingDay, sessionClass)
     private readonly Dictionary<(string tradingDay, string sessionClass), SessionCloseResult> _sessionCloseResults = new();
+
+    /// <summary>Optional <c>configs/robot/session_calendar.json</c> — when rows exist for (day, calendar_group), authority for session close supersedes NT cache in <see cref="GetSessionCloseResultOrFallback"/>.</summary>
+    private readonly SessionPolicyService? _sessionPolicyService;
+    private readonly string _sessionCalendarPath;
+    private DateOnly? _internalCalendarPolicyMaterializedForDay;
+    private readonly Dictionary<(string tradingDay, string sessionClass), SessionCloseResult> _internalCalendarSessionClose = new();
     private readonly HashSet<(string tradingDay, string sessionClass)> _sessionCloseEmittedKeys = new();
 
     // Session index per sessionClass for re-entry gate (S1, S2)
@@ -771,6 +778,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         _specPath = Path.Combine(_root, "configs", "analyzer_robot_parity.json");
         _timetablePath = customTimetablePath ?? Path.Combine(_root, "data", "timetable", "timetable_current.json");
+        _sessionCalendarPath = Path.Combine(_root, "configs", "robot", "session_calendar.json");
+        _sessionPolicyService = SessionPolicyService.TryLoad(_sessionCalendarPath);
         var policyFromEnv = Environment.GetEnvironmentVariable("QTSW2_EXECUTION_POLICY_PATH");
         _executionPolicyPath = string.IsNullOrWhiteSpace(policyFromEnv)
             ? Path.Combine(_root, "configs", "execution_policy.json")
@@ -1765,7 +1774,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 log: _log,
                 eventWriter: _eventWriter,
                 runInstrumentGateReconciliation: (inst, utc, cycle) => RunInstrumentGateReconciliation(inst, utc, cycle),
-                evaluateReleaseReadiness: (inst, snap, utc) => EvaluateStateConsistencyReleaseReadiness(inst, snap, utc),
+                evaluateReleaseReadiness: (inst, snap, utc, forceFull) =>
+                    EvaluateStateConsistencyReleaseReadiness(inst, snap, utc, forceFull),
                 stateConsistencyStableWindowMs: stableWindowMs,
                 runtimeAudit: _runtimeAudit,
                 runForcedBrokerAlignment: RunForcedBrokerAlignment,
@@ -3224,6 +3234,53 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         if (sessionClass != "S1" && sessionClass != "S2") return;
 
         var r = result ?? new SessionCloseResult();
+        var holidayOverrideApplied = false;
+        var utcNow = DateTimeOffset.UtcNow;
+        if (!r.HasSession && string.Equals(r.FailureReason, "HOLIDAY", StringComparison.Ordinal))
+        {
+            var (hasConflict, sessionTotalStreams, sessionEnabledStreams, sessionCalendarBlockedStreams, timetableTradingDay, activeTradingDay) =
+                DetectNtHolidayConflict(tradingDay, sessionClass);
+            if (hasConflict)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_HOLIDAY_CONFLICT", state: "ENGINE",
+                    new Dictionary<string, object?>
+                    {
+                        ["trading_day"] = tradingDay,
+                        ["session_class"] = sessionClass,
+                        ["failure_reason"] = r.FailureReason ?? "UNKNOWN",
+                        ["timetable_trading_day"] = timetableTradingDay,
+                        ["active_trading_day"] = activeTradingDay,
+                        ["session_total_streams"] = sessionTotalStreams,
+                        ["session_enabled_streams"] = sessionEnabledStreams,
+                        ["session_calendar_blocked_streams"] = sessionCalendarBlockedStreams,
+                        ["prefer_internal_calendar_over_nt_holiday"] = _loggingConfig.prefer_internal_calendar_over_nt_holiday,
+                        ["note"] = "NinjaTrader TradingHours marked HOLIDAY while timetable indicates session activity"
+                    }));
+
+                if (_loggingConfig.prefer_internal_calendar_over_nt_holiday)
+                {
+                    var overridden = BuildInternalSessionCloseOverride(tradingDay);
+                    if (overridden != null)
+                    {
+                        r = overridden;
+                        holidayOverrideApplied = true;
+                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_HOLIDAY_OVERRIDDEN", state: "ENGINE",
+                            new Dictionary<string, object?>
+                            {
+                                ["trading_day"] = tradingDay,
+                                ["session_class"] = sessionClass,
+                                ["override_source"] = "INTERNAL_SPEC",
+                                ["resolved_session_close_utc"] = overridden.ResolvedSessionCloseUtc?.ToString("o"),
+                                ["flatten_trigger_utc"] = overridden.FlattenTriggerUtc?.ToString("o"),
+                                ["next_session_begin_utc"] = overridden.NextSessionBeginUtc?.ToString("o"),
+                                ["buffer_seconds"] = overridden.BufferSeconds,
+                                ["note"] = "Overrode NinjaTrader HOLIDAY using internal close/reopen contract"
+                            }));
+                    }
+                }
+            }
+        }
+
         bool shouldEmit;
         lock (_engineLock)
         {
@@ -3234,7 +3291,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         if (!shouldEmit) return; // Already emitted for this (tradingDay, sessionClass)
 
-        var utcNow = DateTimeOffset.UtcNow;
         if (r.HasSession)
         {
             TryEmitSessionFlattenVisibility(tradingDay, sessionClass, "NT_CACHE", true,
@@ -3248,7 +3304,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     flatten_trigger_utc = r.FlattenTriggerUtc?.ToString("o"),
                     resolved_session_close_utc = r.ResolvedSessionCloseUtc?.ToString("o"),
                     buffer_seconds = r.BufferSeconds,
-                    resolution_source = "LIVE_RESOLVER"
+                    resolution_source = holidayOverrideApplied ? "INTERNAL_OVERRIDE" : "LIVE_RESOLVER"
                 }));
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_RESOLUTION_SUCCESS", state: "ENGINE",
                 new { trading_day = tradingDay, session_class = sessionClass, bars_count = r.BarsCount, bars_instrument = r.BarsInstrument ?? "N/A" }));
@@ -3298,6 +3354,84 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             {
                 System.Diagnostics.Trace.TraceError($"[SessionClose] {r.FailureReason}: {r.ExceptionType ?? "N/A"} {r.ExceptionMessage ?? ""}\n{r.StackTraceTruncated ?? ""}");
             }
+        }
+    }
+
+    private (bool hasConflict, int sessionTotalStreams, int sessionEnabledStreams, int sessionCalendarBlockedStreams, string timetableTradingDay, string activeTradingDay)
+        DetectNtHolidayConflict(string tradingDay, string sessionClass)
+    {
+        lock (_engineLock)
+        {
+            var activeTradingDay = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
+            if (!string.Equals(activeTradingDay, tradingDay, StringComparison.Ordinal))
+                return (false, 0, 0, 0, "", activeTradingDay);
+
+            if (_lastTimetable?.streams == null || _lastTimetable.streams.Count == 0)
+                return (false, 0, 0, 0, "", activeTradingDay);
+
+            var timetableTradingDay = _lastTimetable.GetSessionTradingDateForHashCompatibility();
+            var total = 0;
+            var enabled = 0;
+            var calendarBlocked = 0;
+            foreach (var row in _lastTimetable.streams)
+            {
+                var rowSession = string.IsNullOrWhiteSpace(row.session)
+                    ? TimetableStream.DeriveSessionFromStreamId(row.stream ?? "")
+                    : row.session;
+                if (!string.Equals(rowSession, sessionClass, StringComparison.Ordinal))
+                    continue;
+                total++;
+                if (row.enabled)
+                    enabled++;
+                var reason = row.block_reason ?? "";
+                if (!row.enabled && reason.StartsWith("calendar_filter_blocked", StringComparison.OrdinalIgnoreCase))
+                    calendarBlocked++;
+            }
+
+            var hasConflict = total > 0 && enabled > 0;
+            return (hasConflict, total, enabled, calendarBlocked, timetableTradingDay, activeTradingDay);
+        }
+    }
+
+    private SessionCloseResult? BuildInternalSessionCloseOverride(string tradingDay)
+    {
+        if (!DateOnly.TryParse(tradingDay, out var td))
+            return null;
+
+        TimeService? timeService;
+        string marketCloseTime;
+        string marketReopenTime;
+        string barsInstrument;
+        lock (_engineLock)
+        {
+            timeService = _time;
+            marketCloseTime = string.IsNullOrWhiteSpace(_spec?.entry_cutoff?.market_close_time) ? EMERGENCY_MARKET_CLOSE_DEFAULT : _spec.entry_cutoff.market_close_time;
+            marketReopenTime = string.IsNullOrWhiteSpace(_spec?.entry_cutoff?.market_reopen_time) ? "17:00" : _spec.entry_cutoff.market_reopen_time;
+            barsInstrument = _executionInstrument ?? "N/A";
+        }
+        if (timeService == null)
+            return null;
+
+        try
+        {
+            var closeChicago = timeService.ConstructChicagoTime(td, marketCloseTime);
+            var closeUtc = timeService.ConvertChicagoToUtc(closeChicago);
+            var reopenChicago = timeService.ConstructChicagoTime(td, marketReopenTime);
+            var reopenUtc = timeService.ConvertChicagoToUtc(reopenChicago);
+            return new SessionCloseResult
+            {
+                HasSession = true,
+                FailureReason = null,
+                BufferSeconds = SESSION_CLOSE_FALLBACK_BUFFER_SECONDS,
+                ResolvedSessionCloseUtc = closeUtc,
+                FlattenTriggerUtc = closeUtc.AddSeconds(-SESSION_CLOSE_FALLBACK_BUFFER_SECONDS),
+                NextSessionBeginUtc = reopenUtc,
+                BarsInstrument = barsInstrument
+            };
+        }
+        catch
+        {
+            return null;
         }
     }
 
@@ -3357,8 +3491,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     private static int SessionFlattenSourcePriority(string source) => source switch
     {
-        "NT_CACHE" => 3,
+        "INTERNAL_CALENDAR" => 5,
         "OVERRIDE" => 4,
+        "NT_CACHE" => 3,
         "SPEC" => 2,
         "DEFAULT_1600" => 1,
         _ => 0
@@ -3493,6 +3628,71 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// </summary>
     private const string EMERGENCY_MARKET_CLOSE_DEFAULT = "16:00";
 
+    private void EnsureInternalCalendarPolicyMaterializedForActiveDay(string tradingDay, DateTimeOffset utcNow)
+    {
+        if (_sessionPolicyService == null || _time == null || !_activeTradingDate.HasValue)
+            return;
+        if (!DateOnly.TryParse(tradingDay, out var td))
+            return;
+        if (td != _activeTradingDate.Value)
+            return;
+        TryMaterializeInternalCalendarPolicy(utcNow);
+    }
+
+    /// <summary>
+    /// One row per (S1,S2) when <c>session_calendar.json</c> defines an override for the locked trading day and this engine's calendar group.
+    /// Idempotent per <see cref="_internalCalendarPolicyMaterializedForDay"/>.
+    /// </summary>
+    private void TryMaterializeInternalCalendarPolicy(DateTimeOffset utcNow)
+    {
+        if (_sessionPolicyService == null || _time == null || !_activeTradingDate.HasValue)
+            return;
+        var day = _activeTradingDate.Value;
+        if (_internalCalendarPolicyMaterializedForDay == day)
+            return;
+        _internalCalendarPolicyMaterializedForDay = day;
+        lock (_engineLock)
+        {
+            _internalCalendarSessionClose.Clear();
+        }
+
+        var calendarGroup = CalendarGroupResolver.Resolve(_executionInstrument, _masterInstrumentName);
+        var dayStr = day.ToString("yyyy-MM-dd");
+        var barsInstrument = _executionInstrument ?? "N/A";
+
+        foreach (var sessionClass in new[] { "S1", "S2" })
+        {
+            if (!_sessionPolicyService.TryBuildSessionClose(day, calendarGroup, _time, _spec, SESSION_CLOSE_FALLBACK_BUFFER_SECONDS, barsInstrument, out var mat))
+                continue;
+
+            lock (_engineLock)
+            {
+                _internalCalendarSessionClose[(dayStr, sessionClass)] = mat;
+            }
+
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: dayStr, eventType: "SESSION_POLICY_MATERIALIZED", state: "ENGINE",
+                new Dictionary<string, object?>
+                {
+                    ["session_class"] = sessionClass,
+                    ["calendar_group"] = calendarGroup,
+                    ["session_calendar_path"] = _sessionCalendarPath,
+                    ["has_session"] = mat.HasSession,
+                    ["note"] = "session_calendar.json row applied; precedes NT session-close cache for this (trading_day, session_class)"
+                }));
+
+            if (mat.HasSession)
+            {
+                TryEmitSessionFlattenVisibility(dayStr, sessionClass, "INTERNAL_CALENDAR", true,
+                    mat.ResolvedSessionCloseUtc, mat.FlattenTriggerUtc, mat.BufferSeconds, utcNow);
+            }
+            else
+            {
+                TryEmitSessionFlattenVisibility(dayStr, sessionClass, "INTERNAL_CALENDAR", false,
+                    null, null, 0, utcNow, mat.FailureReason);
+            }
+        }
+    }
+
     /// <summary>
     /// Get session close from cache, or compute fallback. Ensures forced flatten can trigger even when
     /// ResolveAndSetSessionCloseIfNeeded never ran.
@@ -3506,6 +3706,16 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private SessionCloseResult? GetSessionCloseResultOrFallback(string tradingDay, string sessionClass, DateTimeOffset utcNow, out bool usedFallback)
     {
         usedFallback = false;
+        EnsureInternalCalendarPolicyMaterializedForActiveDay(tradingDay, utcNow);
+
+        SessionCloseResult? internalCal;
+        lock (_engineLock)
+        {
+            _internalCalendarSessionClose.TryGetValue((tradingDay, sessionClass), out internalCal);
+        }
+        if (internalCal != null)
+            return internalCal;
+
         if (TryGetSessionCloseResult(tradingDay, sessionClass, out var cached) && cached != null)
         {
             TryEmitSessionFlattenVisibility(tradingDay, sessionClass, "NT_CACHE", cached.HasSession,
@@ -4779,6 +4989,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             StandDown();
             return;
         }
+
+        TryMaterializeInternalCalendarPolicy(utcNow);
 
         // Execution arming set from published timetable only (matrix-derived at publish; no separate eligibility file).
         var sessionTradingDate = _activeTradingDate!.Value;

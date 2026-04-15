@@ -1,6 +1,13 @@
 # Build and deploy Robot.Core + dependencies + strategy to NinjaTrader
 # Run from project root
 # NinjaTrader uses pre-built Robot.Core.dll (not source). Do NOT copy AddOns source.
+#
+# Optional: -ClearNinjaTraderCache  Deletes NinjaTrader.Custom.dll / NinjaTrader.Vendor.dll under Custom\bin
+#           so NT forces a full recompile on next start. Off by default.
+
+param(
+    [switch]$ClearNinjaTraderCache
+)
 
 $ErrorActionPreference = "Stop"
 $projectRoot = if ($PSScriptRoot) { $PSScriptRoot } else { $PWD }
@@ -45,26 +52,30 @@ Write-Host "[3/4] Copying RobotSimStrategy.cs to Strategies..." -ForegroundColor
 if ($LASTEXITCODE -ne 0) { exit 1 }
 Write-Host ""
 
-# Step 4: Clear NinjaTrader cache so it recompiles and loads new DLLs
-Write-Host "[4/4] Clearing NinjaTrader cache (NinjaTrader must be closed)..." -ForegroundColor Cyan
-$ntCustom = $null
-foreach ($base in @(
-    (Join-Path $env:USERPROFILE "OneDrive\Documents\NinjaTrader 8\bin\Custom"),
-    (Join-Path $env:USERPROFILE "Documents\NinjaTrader 8\bin\Custom")
-)) { if (Test-Path $base) { $ntCustom = $base; break } }
-if ($ntCustom) {
-    $custom = Join-Path $ntCustom "NinjaTrader.Custom.dll"
-    $vendor = Join-Path $ntCustom "NinjaTrader.Vendor.dll"
-    foreach ($f in @($custom, $vendor)) {
-        if (Test-Path $f) {
-            try {
-                Remove-Item $f -Force -ErrorAction Stop
-                Write-Host "  Deleted $(Split-Path $f -Leaf)"
-            } catch {
-                Write-Host "  [WARN] Could not delete $(Split-Path $f -Leaf) - close NinjaTrader and delete manually" -ForegroundColor Yellow
+# Step 4 (optional): Clear NinjaTrader cache so it recompiles (only when -ClearNinjaTraderCache)
+if ($ClearNinjaTraderCache) {
+    Write-Host "[4/4] Clearing NinjaTrader cache (NinjaTrader must be closed)..." -ForegroundColor Cyan
+    $ntCustom = $null
+    foreach ($base in @(
+        (Join-Path $env:USERPROFILE "OneDrive\Documents\NinjaTrader 8\bin\Custom"),
+        (Join-Path $env:USERPROFILE "Documents\NinjaTrader 8\bin\Custom")
+    )) { if (Test-Path $base) { $ntCustom = $base; break } }
+    if ($ntCustom) {
+        $custom = Join-Path $ntCustom "NinjaTrader.Custom.dll"
+        $vendor = Join-Path $ntCustom "NinjaTrader.Vendor.dll"
+        foreach ($f in @($custom, $vendor)) {
+            if (Test-Path $f) {
+                try {
+                    Remove-Item $f -Force -ErrorAction Stop
+                    Write-Host "  Deleted $(Split-Path $f -Leaf)"
+                } catch {
+                    Write-Host "  [WARN] Could not delete $(Split-Path $f -Leaf) - close NinjaTrader and delete manually" -ForegroundColor Yellow
+                }
             }
         }
     }
+} else {
+    Write-Host "[4/4] Skipping Custom cache clear (default). Use -ClearNinjaTraderCache if you need to delete NinjaTrader.Custom.dll / NinjaTrader.Vendor.dll." -ForegroundColor DarkGray
 }
 Write-Host ""
-Write-Host "[OK] Deploy complete. Start NinjaTrader to load the new strategy and DLLs." -ForegroundColor Green
+Write-Host "[OK] Deploy complete. Restart NinjaTrader if it was running so it loads new DLLs." -ForegroundColor Green

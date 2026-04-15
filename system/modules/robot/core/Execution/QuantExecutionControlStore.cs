@@ -29,7 +29,32 @@ public static class QuantExecutionControlStore
         ByInstrument.Clear();
     }
 
+    /// <summary>
+    /// Phase 4A / Tier 1: record successful protective stop submission (new or idempotent). Not implied by
+    /// <see cref="NotifyMappedTrustedFill"/> — that runs earlier on the fill path before submit completes.
+    /// </summary>
+    public static void NotifyProtectiveStopSubmitted(string instrument, DateTimeOffset utcNow)
+    {
+        if (!FeatureFlags.QuantExecutionControlStoreEnabled) return;
+        var inst = Norm(instrument);
+        if (string.IsNullOrEmpty(inst)) return;
+        if (!ByInstrument.TryGetValue(inst, out var e)) return;
+        if (e.Phase is QuantExecutionInstrumentPhase.UnmappedExecution or QuantExecutionInstrumentPhase.ExecutionLocked)
+            return;
+        e.Expected.LastProtectiveStopSubmitUtc = utcNow;
+    }
+
     /// <summary>Rule 1 — mapped fill: update expected immediately, enter PENDING_ALIGNMENT with bounded expiry.</summary>
+    /// <remarks>
+    /// <para><b>RecoveryRequired:</b> Durable Tier-1 recovery is not cleared or softened by new mapped fills — phase and
+    /// <see cref="RecoveryRequiredReason"/> stay fixed until explicitly cleared elsewhere (same contract as
+    /// <see cref="NotifyRecoveredReconnect"/> for RecoveryRequired).</para>
+    /// <para><b>Repeated fills (PendingAlignment):</b> Each mapped fill sets a new candidate deadline
+    /// <c>utcNow + PostFillAlignmentWindowMs</c>. The stored <see cref="QuantExpectedInstrumentState.PendingAlignmentExpiresUtc"/>
+    /// is the <b>later</b> of that candidate and the previous expiry. This is intentional: active staggered fills keep a single
+    /// rolling alignment horizon so transient lag does not race a fixed clock from the first fill only. There is no additional cap
+    /// beyond wall-clock monotonicity and parity/escalation transitions.</para>
+    /// </remarks>
     public static void NotifyMappedTrustedFill(string instrument, int signedDelta, DateTimeOffset utcNow)
     {
         if (!FeatureFlags.QuantExecutionControlStoreEnabled) return;
@@ -54,7 +79,8 @@ public static class QuantExecutionControlStore
             },
             (_, e) =>
             {
-                if (e.Phase is QuantExecutionInstrumentPhase.UnmappedExecution or QuantExecutionInstrumentPhase.ExecutionLocked)
+                if (e.Phase is QuantExecutionInstrumentPhase.UnmappedExecution or QuantExecutionInstrumentPhase.ExecutionLocked
+                    or QuantExecutionInstrumentPhase.RecoveryRequired)
                     return e;
                 e.Expected.ExpectedSignedNetPosition += signedDelta;
                 e.Expected.LastMappedFillUtc = utcNow;
@@ -180,9 +206,30 @@ public static class QuantExecutionControlStore
             ExpectedWorkingOrderCount = s.ExpectedWorkingOrderCount,
             LastMappedFillUtc = s.LastMappedFillUtc,
             PendingAlignmentExpiresUtc = s.PendingAlignmentExpiresUtc,
+            LastProtectiveStopSubmitUtc = s.LastProtectiveStopSubmitUtc,
             RecoveryMode = s.RecoveryMode,
             RecoveryEnteredUtc = s.RecoveryEnteredUtc
         };
+
+    /// <summary>
+    /// Phase 4B: shared bounded post-fill gate for BE, mismatch escalation deferral, registry diagnostics, and ownership —
+    /// same wall clock as <see cref="NotifyMappedTrustedFill"/> / <see cref="QuantExpectedInstrumentState.PendingAlignmentExpiresUtc"/>.
+    /// Does not require protective submit (unlike protective coverage); <see cref="QuantExecutionInstrumentPhase.UnmappedExecution"/>
+    /// and <see cref="QuantExecutionInstrumentPhase.ExecutionLocked"/> never return true here.
+    /// </summary>
+    public static bool IsPostFillAlignmentWindowActive(string instrument, DateTimeOffset utcNow)
+    {
+        if (!FeatureFlags.QuantExecutionControlStoreEnabled) return false;
+        var inst = Norm(instrument);
+        if (string.IsNullOrEmpty(inst) || !ByInstrument.TryGetValue(inst, out var e)) return false;
+        if (e.Phase != QuantExecutionInstrumentPhase.PendingAlignment) return false;
+        if (!e.Expected.LastMappedFillUtc.HasValue) return false;
+        var expiry = e.Expected.PendingAlignmentExpiresUtc;
+        if (expiry.HasValue)
+            return utcNow <= expiry.Value;
+        var windowMs = FeatureFlags.PostFillAlignmentWindowMs > 0 ? FeatureFlags.PostFillAlignmentWindowMs : 5000;
+        return (utcNow - e.Expected.LastMappedFillUtc.Value).TotalMilliseconds <= windowMs;
+    }
 
     /// <summary>
     /// Tier 1 bookkeeping deferral: allow structural submit to tolerate journal/parity lag when phase says so.

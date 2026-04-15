@@ -35,7 +35,8 @@ public sealed class MismatchEscalationCoordinator
     private readonly ExecutionEventWriter? _eventWriter;
     private readonly RuntimeAuditHub? _runtimeAudit;
     private readonly Func<string, DateTimeOffset, int, GateReconciliationResult?>? _runInstrumentGateReconciliation;
-    private readonly Func<string, AccountSnapshot, DateTimeOffset, StateConsistencyReleaseReadinessResult>? _evaluateReleaseReadiness;
+    private readonly Func<string, AccountSnapshot, DateTimeOffset, bool, StateConsistencyReleaseReadinessResult>?
+        _evaluateReleaseReadiness;
     private readonly Func<ReconciliationForcedConvergenceContext, ReconciliationForcedConvergenceResult>? _runForcedBrokerAlignment;
     private readonly Action<string, ReconciliationForcedConvergenceContext, ReconciliationForcedConvergenceResult>?
         _onForcedConvergenceFailure;
@@ -102,6 +103,12 @@ public sealed class MismatchEscalationCoordinator
     /// <summary>Throttle <see cref="MaybeEmitGateMaxDwellExceeded"/> (critical dwell alert).</summary>
     private readonly Dictionary<string, DateTimeOffset> _gateMaxDwellLastEmit = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>Throttle <see cref="EmitMismatchPendingConvergence"/> while Tier-1 alignment window defers first escalation.</summary>
+    private readonly Dictionary<string, DateTimeOffset> _mismatchPendingConvergenceLastEmit =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private const int MismatchPendingConvergenceLogSeconds = 3;
+
     private int _mismatchDetectedCount;
     private int _mismatchPersistentCount;
     private int _mismatchFailClosedCount;
@@ -157,7 +164,8 @@ public sealed class MismatchEscalationCoordinator
         RobotLogger? log,
         ExecutionEventWriter? eventWriter = null,
         Func<string, DateTimeOffset, int, GateReconciliationResult?>? runInstrumentGateReconciliation = null,
-        Func<string, AccountSnapshot, DateTimeOffset, StateConsistencyReleaseReadinessResult>? evaluateReleaseReadiness = null,
+        Func<string, AccountSnapshot, DateTimeOffset, bool, StateConsistencyReleaseReadinessResult>?
+            evaluateReleaseReadiness = null,
         int stateConsistencyStableWindowMs = 0,
         RuntimeAuditHub? runtimeAudit = null,
         Func<ReconciliationForcedConvergenceContext, ReconciliationForcedConvergenceResult>? runForcedBrokerAlignment = null,
@@ -1147,6 +1155,25 @@ public sealed class MismatchEscalationCoordinator
         EmitCanonical(inst, "STATE_CONSISTENCY_GATE_RELEASE_BLOCKED_AFTER_FLAT", utcNow, payload, "WARN");
     }
 
+    private void EmitMismatchPendingConvergence(string inst, DateTimeOffset utcNow, MismatchObservation obs)
+    {
+        if (_mismatchPendingConvergenceLastEmit.TryGetValue(inst, out var last) &&
+            (utcNow - last).TotalSeconds < MismatchPendingConvergenceLogSeconds)
+            return;
+        _mismatchPendingConvergenceLastEmit[inst] = utcNow;
+
+        var payload = new
+        {
+            instrument = inst,
+            mismatch_type = obs.MismatchType.ToString(),
+            summary = obs.Summary,
+            gate_escalation_deferred = true,
+            note = "Tier-1 PendingAlignment window — first mismatch gate engagement deferred"
+        };
+        _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "MISMATCH_PENDING_CONVERGENCE", payload));
+        EmitCanonical(inst, "MISMATCH_PENDING_CONVERGENCE", utcNow, payload, "INFO");
+    }
+
     /// <summary>P1.5-H: Clean signal absent does not clear gate; only stability release clears.</summary>
     private void ProcessMismatchSignalAbsent(string instrument, DateTimeOffset utcNow)
     {
@@ -1186,6 +1213,13 @@ public sealed class MismatchEscalationCoordinator
         state.LastSummary = obs.Summary;
 
         TryRemoveExpiredConvergence(inst, utcNow);
+
+        if (state.EscalationState == MismatchEscalationState.NONE &&
+            QuantExecutionControlStore.IsPostFillAlignmentWindowActive(inst, utcNow))
+        {
+            EmitMismatchPendingConvergence(inst, utcNow, obs);
+            return;
+        }
 
         if (state.EscalationState == MismatchEscalationState.NONE &&
             PendingAlignmentAuthority.IsPendingAlignment(inst, utcNow) &&
@@ -1359,6 +1393,8 @@ public sealed class MismatchEscalationCoordinator
     /// <summary>
     /// When fail-closed but the mismatch observation is absent and release invariants pass, clear the gate and
     /// mismatch execution block authority — avoids a permanent deadlock without skipping structural release checks.
+    /// When <see cref="FeatureFlags.FailClosedStrictReleaseConfirmationEnabled"/>, requires multi-snapshot stability,
+    /// full (non-cached) release readiness, and a mandatory post-release recheck; re-engages fail-closed if the recheck fails.
     /// </summary>
     private bool TryExitFailClosedWhenSafe(string inst, AccountSnapshot snapshot, DateTimeOffset utcNow,
         MismatchObservation? latestObs)
@@ -1374,20 +1410,29 @@ public sealed class MismatchEscalationCoordinator
             return false;
 
         StateConsistencyReleaseReadinessResult readiness;
-        try
+        if (FeatureFlags.FailClosedStrictReleaseConfirmationEnabled)
         {
-            readiness = _evaluateReleaseReadiness?.Invoke(inst, snapshot, utcNow)
-                        ?? StateConsistencyReleaseEvaluator.Indeterminate(inst);
+            if (_evaluateReleaseReadiness == null ||
+                !TryEvaluateFailClosedStrictSnapshots(inst, utcNow, out readiness))
+                return false;
         }
-        catch (Exception ex)
+        else
         {
-            _log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_ERROR", state: "ENGINE",
-                new { error = ex.Message, context = "TryExitFailClosedWhenSafe", instrument = inst }));
-            return false;
-        }
+            try
+            {
+                readiness = _evaluateReleaseReadiness?.Invoke(inst, snapshot, utcNow, false)
+                            ?? StateConsistencyReleaseEvaluator.Indeterminate(inst);
+            }
+            catch (Exception ex)
+            {
+                _log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_ERROR", state: "ENGINE",
+                    new { error = ex.Message, context = "TryExitFailClosedWhenSafe", instrument = inst }));
+                return false;
+            }
 
-        if (!readiness.SnapshotSufficient || !readiness.ReleaseReady)
-            return false;
+            if (!readiness.SnapshotSufficient || !readiness.ReleaseReady)
+                return false;
+        }
 
         var wasBlockedRelease = state.Blocked;
         state.Blocked = false;
@@ -1421,7 +1466,142 @@ public sealed class MismatchEscalationCoordinator
         _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "RECONCILIATION_MISMATCH_CLEARED",
             ToGatePayload(state, inst, utcNow, obsForSig, null, null)));
         PublishMismatchExecutionBlockAuthorityIfChanged(inst, state, wasBlockedRelease, utcNow);
+
+        if (FeatureFlags.FailClosedStrictReleaseConfirmationEnabled && _evaluateReleaseReadiness != null)
+        {
+            AccountSnapshot postSnap;
+            try
+            {
+                postSnap = _getSnapshot();
+            }
+            catch (Exception ex)
+            {
+                _log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_ERROR", state: "ENGINE",
+                    new { error = ex.Message, context = "TryExitFailClosedWhenSafe_post_snapshot", instrument = inst }));
+                ReengageFailClosedAfterPostReleaseRecheckFailed(inst, utcNow,
+                    StateConsistencyReleaseEvaluator.Indeterminate(inst, "post_release_snapshot_failed"));
+                return false;
+            }
+
+            StateConsistencyReleaseReadinessResult postR;
+            try
+            {
+                postR = _evaluateReleaseReadiness.Invoke(inst, postSnap, DateTimeOffset.UtcNow, true);
+            }
+            catch (Exception ex)
+            {
+                _log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_ERROR", state: "ENGINE",
+                    new { error = ex.Message, context = "TryExitFailClosedWhenSafe_post_readiness", instrument = inst }));
+                ReengageFailClosedAfterPostReleaseRecheckFailed(inst, utcNow,
+                    StateConsistencyReleaseEvaluator.Indeterminate(inst, "post_release_readiness_exception"));
+                return false;
+            }
+
+            if (!postR.SnapshotSufficient || !postR.ReleaseReady)
+            {
+                ReengageFailClosedAfterPostReleaseRecheckFailed(inst, utcNow, postR);
+                return false;
+            }
+        }
+
         return true;
+    }
+
+    /// <summary>
+    /// Full release readiness (forceFullEvaluation) on <see cref="MismatchEscalationPolicy.FAIL_CLOSED_STRICT_SNAPSHOT_COUNT"/>
+    /// fresh snapshots; stability key must match across all passes; gaps cover bounded quiet window.
+    /// </summary>
+    private bool TryEvaluateFailClosedStrictSnapshots(string inst, DateTimeOffset utcNow,
+        out StateConsistencyReleaseReadinessResult lastReadiness)
+    {
+        lastReadiness = StateConsistencyReleaseEvaluator.Indeterminate(inst);
+        if (_evaluateReleaseReadiness == null)
+            return false;
+
+        var n = MismatchEscalationPolicy.FAIL_CLOSED_STRICT_SNAPSHOT_COUNT;
+        var gapMs = MismatchEscalationPolicy.FAIL_CLOSED_STRICT_SNAPSHOT_GAP_MS;
+        string? prevKey = null;
+
+        for (var i = 0; i < n; i++)
+        {
+            AccountSnapshot snap;
+            try
+            {
+                snap = _getSnapshot();
+            }
+            catch (Exception ex)
+            {
+                _log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_ERROR", state: "ENGINE",
+                    new { error = ex.Message, context = "TryEvaluateFailClosedStrictSnapshots", instrument = inst, pass = i }));
+                return false;
+            }
+
+            StateConsistencyReleaseReadinessResult r;
+            try
+            {
+                r = _evaluateReleaseReadiness.Invoke(inst, snap, DateTimeOffset.UtcNow, true);
+            }
+            catch (Exception ex)
+            {
+                _log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_ERROR", state: "ENGINE",
+                    new { error = ex.Message, context = "TryEvaluateFailClosedStrictSnapshots_eval", instrument = inst, pass = i }));
+                return false;
+            }
+
+            if (!r.SnapshotSufficient || !r.ReleaseReady)
+            {
+                lastReadiness = r;
+                return false;
+            }
+
+            var key = BuildFailClosedStrictStabilityKey(r);
+            if (prevKey != null && !string.Equals(prevKey, key, StringComparison.Ordinal))
+                return false;
+            prevKey = key;
+            lastReadiness = r;
+
+            if (i < n - 1 && gapMs > 0)
+                Thread.Sleep(gapMs);
+        }
+
+        return true;
+    }
+
+    private static string BuildFailClosedStrictStabilityKey(StateConsistencyReleaseReadinessResult r) =>
+        string.Join("|",
+            r.DiagnosticBrokerPositionQty,
+            r.DiagnosticJournalOpenQty,
+            r.DiagnosticBrokerWorkingCount,
+            r.DiagnosticIeaOwnedPlusAdoptedWorking);
+
+    private void ReengageFailClosedAfterPostReleaseRecheckFailed(string inst, DateTimeOffset utcNow,
+        StateConsistencyReleaseReadinessResult postReadiness)
+    {
+        if (!_stateByInstrument.TryGetValue(inst, out var state))
+            return;
+
+        var wasBlockedBeforeReengage = state.Blocked;
+        state.EscalationState = MismatchEscalationState.FAIL_CLOSED;
+        state.GateLifecyclePhase = GateLifecyclePhase.FailClosed;
+        state.Blocked = true;
+        state.BlockReason =
+            $"{MismatchEscalationPolicy.BLOCK_REASON_POST_RELEASE_RECHECK_FAILED}:{postReadiness.Summary}";
+        _mismatchFailClosedCount++;
+
+        var payload = new
+        {
+            instrument = inst,
+            post_release_summary = postReadiness.Summary,
+            post_release_contradictions = postReadiness.Contradictions != null
+                ? string.Join(";", postReadiness.Contradictions)
+                : "",
+            note = "Gate had released via fail_closed_safe_recovery; mandatory post-readiness recheck failed — re-engaged FAIL_CLOSED"
+        };
+        _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_FAIL_CLOSED_POST_RELEASE_RECHECK_FAILED",
+            payload));
+        EmitCanonical(inst, "STATE_CONSISTENCY_GATE_FAIL_CLOSED_POST_RELEASE_RECHECK_FAILED", utcNow, payload, "CRITICAL");
+
+        PublishMismatchExecutionBlockAuthorityIfChanged(inst, state, wasBlockedBeforeReengage, utcNow);
     }
 
     private void AdvanceStateConsistencyGate(string inst, AccountSnapshot snapshot, DateTimeOffset utcNow,
@@ -1522,7 +1702,7 @@ public sealed class MismatchEscalationCoordinator
         StateConsistencyReleaseReadinessResult readinessProbe;
         try
         {
-            readinessProbe = _evaluateReleaseReadiness?.Invoke(inst, snapshot, utcNow)
+            readinessProbe = _evaluateReleaseReadiness?.Invoke(inst, snapshot, utcNow, false)
                              ?? StateConsistencyReleaseEvaluator.Indeterminate(inst);
         }
         catch (Exception ex)
@@ -1648,7 +1828,7 @@ public sealed class MismatchEscalationCoordinator
         {
             try
             {
-                readiness = _evaluateReleaseReadiness?.Invoke(inst, snapshot, utcNow)
+                readiness = _evaluateReleaseReadiness?.Invoke(inst, snapshot, utcNow, false)
                             ?? StateConsistencyReleaseEvaluator.Indeterminate(inst);
             }
             catch (Exception ex)

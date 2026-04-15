@@ -46,6 +46,7 @@ public static class ExecutionEventTypes
     public const string PROTECTIVE_EMERGENCY_FLATTEN_TRIGGERED = "PROTECTIVE_EMERGENCY_FLATTEN_TRIGGERED";
     public const string PROTECTIVE_FLATTEN_COMPLETED = "PROTECTIVE_FLATTEN_COMPLETED";
     public const string PROTECTIVE_INSTRUMENT_BLOCKED = "PROTECTIVE_INSTRUMENT_BLOCKED";
+    public const string PROTECTIVE_PENDING_CONVERGENCE = "PROTECTIVE_PENDING_CONVERGENCE";
 
     // MISMATCH family
     public const string MISMATCH_DETECTED = "MISMATCH_DETECTED";
@@ -53,6 +54,10 @@ public static class ExecutionEventTypes
     public const string MISMATCH_FAIL_CLOSED = "MISMATCH_FAIL_CLOSED";
     public const string MISMATCH_CLEARED = "MISMATCH_CLEARED";
     public const string MISMATCH_BLOCKED = "MISMATCH_BLOCKED";
+    public const string MISMATCH_PENDING_CONVERGENCE = "MISMATCH_PENDING_CONVERGENCE";
+    public const string BE_PENDING_CONVERGENCE = "BE_PENDING_CONVERGENCE";
+    public const string OWNERSHIP_PENDING_CONVERGENCE = "OWNERSHIP_PENDING_CONVERGENCE";
+    public const string REGISTRY_PENDING_CONVERGENCE = "REGISTRY_PENDING_CONVERGENCE";
 
     // SUPERVISORY family
     public const string QUEUE_POISON_DETECTED = "QUEUE_POISON_DETECTED";
@@ -110,11 +115,16 @@ public static class ExecutionEventFamilies
         [ExecutionEventTypes.PROTECTIVE_EMERGENCY_FLATTEN_TRIGGERED] = ExecutionEventFamily.PROTECTIVE,
         [ExecutionEventTypes.PROTECTIVE_FLATTEN_COMPLETED] = ExecutionEventFamily.PROTECTIVE,
         [ExecutionEventTypes.PROTECTIVE_INSTRUMENT_BLOCKED] = ExecutionEventFamily.PROTECTIVE,
+        [ExecutionEventTypes.PROTECTIVE_PENDING_CONVERGENCE] = ExecutionEventFamily.PROTECTIVE,
         [ExecutionEventTypes.MISMATCH_DETECTED] = ExecutionEventFamily.MISMATCH,
         [ExecutionEventTypes.MISMATCH_PERSISTENT] = ExecutionEventFamily.MISMATCH,
         [ExecutionEventTypes.MISMATCH_FAIL_CLOSED] = ExecutionEventFamily.MISMATCH,
         [ExecutionEventTypes.MISMATCH_CLEARED] = ExecutionEventFamily.MISMATCH,
         [ExecutionEventTypes.MISMATCH_BLOCKED] = ExecutionEventFamily.MISMATCH,
+        [ExecutionEventTypes.MISMATCH_PENDING_CONVERGENCE] = ExecutionEventFamily.MISMATCH,
+        [ExecutionEventTypes.BE_PENDING_CONVERGENCE] = ExecutionEventFamily.PROTECTIVE,
+        [ExecutionEventTypes.OWNERSHIP_PENDING_CONVERGENCE] = ExecutionEventFamily.EXECUTION,
+        [ExecutionEventTypes.REGISTRY_PENDING_CONVERGENCE] = ExecutionEventFamily.ORDER,
         [ExecutionEventTypes.QUEUE_POISON_DETECTED] = ExecutionEventFamily.SUPERVISORY,
         [ExecutionEventTypes.COMMAND_STALLED] = ExecutionEventFamily.SUPERVISORY,
         [ExecutionEventTypes.INSTRUMENT_FROZEN] = ExecutionEventFamily.SUPERVISORY,

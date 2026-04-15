@@ -1,5 +1,6 @@
 // Gap 3: Protective Coverage Audit — pure audit logic only.
 // Broker-truth based. Reads AccountSnapshot; produces ProtectiveAuditResult.
+// Phase 4A: Bounded post-fill convergence — complements broker snapshot with Tier-1 mapped-fill window (see IsWithinBoundedPostFillConvergenceWindow).
 // No remediation. No side effects.
 
 using System;
@@ -10,7 +11,7 @@ namespace QTSW2.Robot.Core.Execution;
 
 /// <summary>
 /// Pure audit: for one instrument with non-flat broker position, verify protective coverage.
-/// Uses broker position and broker working orders as truth.
+/// Uses broker position and broker working orders as primary truth; Tier-1 control store supplies a bounded pending-valid window after mapped fills.
 /// </summary>
 public static class ProtectiveCoverageAudit
 {
@@ -108,9 +109,17 @@ public static class ProtectiveCoverageAudit
             }
         }
 
-        // Missing stop: critical
+        // Missing stop: critical unless bounded post-fill convergence (mapped fill → PendingAlignment window)
         if (robotProtectiveStops.Count == 0)
         {
+            if (IsWithinBoundedPostFillConvergenceWindow(instrument, utcNow))
+            {
+                result.Status = ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE;
+                result.Detail =
+                    "No broker-visible protective stop in snapshot; bounded convergence: PendingAlignment + LastProtectiveStopSubmitUtc >= LastMappedFillUtc (QuantExecutionControlStore)";
+                return result;
+            }
+
             result.Status = ProtectiveAuditStatus.PROTECTIVE_MISSING_STOP;
             result.Detail = $"Broker position {brokerQty} has no protective stop";
             return result;
@@ -196,5 +205,57 @@ public static class ProtectiveCoverageAudit
                status == ProtectiveAuditStatus.PROTECTIVE_STOP_PRICE_INVALID ||
                status == ProtectiveAuditStatus.PROTECTIVE_CONFLICTING_ORDERS ||
                status == ProtectiveAuditStatus.PROTECTIVE_UNRESOLVED_POSITION;
+    }
+
+    /// <summary>
+    /// Tier-1 bounded window after a <b>mapped trusted fill</b>: <see cref="JournalParityPendingLedger.TryRecordTrustedFill"/>
+    /// calls <see cref="QuantExecutionControlStore.NotifyMappedTrustedFill"/>, which sets
+    /// <see cref="QuantExecutionInstrumentPhase.PendingAlignment"/>, <see cref="QuantExpectedInstrumentState.LastMappedFillUtc"/>,
+    /// and <see cref="QuantExpectedInstrumentState.PendingAlignmentExpiresUtc"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para><see cref="QuantExecutionInstrumentPhase.PendingAlignment"/> is entered on mapped trusted fill before protective submit
+    /// completes — it does <b>not</b> alone imply submit. Convergence additionally requires
+    /// <see cref="QuantExpectedInstrumentState.LastProtectiveStopSubmitUtc"/> &gt;= <see cref="QuantExpectedInstrumentState.LastMappedFillUtc"/>
+    /// (adapter calls <see cref="QuantExecutionControlStore.NotifyProtectiveStopSubmitted"/> after successful stop submit).</para>
+    /// <para>Does not apply to <see cref="QuantExecutionInstrumentPhase.UnmappedExecution"/>,
+    /// <see cref="QuantExecutionInstrumentPhase.ExecutionLocked"/>, or <see cref="QuantExecutionInstrumentPhase.RecoveryRequired"/> —
+    /// those phases are never <c>PendingAlignment</c> for this audit, and <see cref="QuantExecutionControlStore.NotifyMappedTrustedFill"/>
+    /// does not move an instrument from RecoveryRequired into PendingAlignment (durable recovery is not softened by mapped fills).
+    /// Repeated PendingAlignment fills extend <see cref="QuantExpectedInstrumentState.PendingAlignmentExpiresUtc"/> per store remarks.</para>
+    /// </remarks>
+    private static bool IsWithinBoundedPostFillConvergenceWindow(string instrument, DateTimeOffset utcNow)
+    {
+        if (!FeatureFlags.QuantExecutionControlStoreEnabled)
+            return false;
+
+        var snap = QuantExecutionControlStore.GetSnapshot(instrument);
+        if (snap.Phase != QuantExecutionInstrumentPhase.PendingAlignment)
+            return false;
+
+        if (!snap.Expected.LastMappedFillUtc.HasValue)
+            return false;
+
+        var expiry = snap.Expected.PendingAlignmentExpiresUtc;
+        bool withinAlignmentWindow;
+        if (expiry.HasValue)
+            withinAlignmentWindow = utcNow <= expiry.Value;
+        else
+        {
+            var windowMs = FeatureFlags.PostFillAlignmentWindowMs > 0 ? FeatureFlags.PostFillAlignmentWindowMs : 5000;
+            withinAlignmentWindow =
+                (utcNow - snap.Expected.LastMappedFillUtc.Value).TotalMilliseconds <= windowMs;
+        }
+
+        if (!withinAlignmentWindow)
+            return false;
+
+        if (!snap.Expected.LastProtectiveStopSubmitUtc.HasValue)
+            return false;
+
+        if (snap.Expected.LastProtectiveStopSubmitUtc.Value < snap.Expected.LastMappedFillUtc.Value)
+            return false;
+
+        return true;
     }
 }

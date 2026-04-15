@@ -61,7 +61,7 @@ public static class StateConsistencyGateTests
                 RunnerInvoked = true,
                 OutcomeStatus = ReconciliationOutcomeStatus.Partial
             },
-            evaluateReleaseReadiness: (_, _, _) => NotReady("ES", "hold"),
+            evaluateReleaseReadiness: (_, _, _, _) => NotReady("ES", "hold"),
             stateConsistencyStableWindowMs: 500);
 
         coord1.ProcessObservationForTest(new MismatchObservation
@@ -91,7 +91,7 @@ public static class StateConsistencyGateTests
             isRecoveryInProgress: _ => false,
             log: null,
             runInstrumentGateReconciliation: (_, _, _) => new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Success },
-            evaluateReleaseReadiness: (_, _, _) => Ready("ES"),
+            evaluateReleaseReadiness: (_, _, _, _) => Ready("ES"),
             stateConsistencyStableWindowMs: 100);
 
         coord2.ProcessObservationForTest(new MismatchObservation
@@ -136,7 +136,7 @@ public static class StateConsistencyGateTests
             isRecoveryInProgress: _ => false,
             log: null,
             runInstrumentGateReconciliation: (_, _, _) => new GateReconciliationResult { RunnerInvoked = true },
-            evaluateReleaseReadiness: (_, _, _) => readyToggle ? Ready("YM") : NotReady("YM", "relapse"),
+            evaluateReleaseReadiness: (_, _, _, _) => readyToggle ? Ready("YM") : NotReady("YM", "relapse"),
             stateConsistencyStableWindowMs: 500);
 
         coord4.ProcessObservationForTest(new MismatchObservation
@@ -197,7 +197,7 @@ public static class StateConsistencyGateTests
             isRecoveryInProgress: _ => false,
             log: null,
             runInstrumentGateReconciliation: (_, _, _) => new GateReconciliationResult { RunnerInvoked = true },
-            evaluateReleaseReadiness: (_, _, _) => NotReady("NQ", "nq_clean"),
+            evaluateReleaseReadiness: (_, _, _, _) => NotReady("NQ", "nq_clean"),
             stateConsistencyStableWindowMs: 100);
 
         coord6.ProcessObservationForTest(new MismatchObservation
@@ -250,7 +250,7 @@ public static class StateConsistencyGateTests
             isRecoveryInProgress: _ => false,
             log: null,
             runInstrumentGateReconciliation: (_, _, _) => new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Success },
-            evaluateReleaseReadiness: (_, _, _) => Ready("GC"),
+            evaluateReleaseReadiness: (_, _, _, _) => Ready("GC"),
             stateConsistencyStableWindowMs: 50);
         coord9.ProcessObservationForTest(new MismatchObservation
         {
@@ -291,7 +291,7 @@ public static class StateConsistencyGateTests
             isRecoveryInProgress: _ => false,
             log: null,
             runInstrumentGateReconciliation: (_, _, _) => new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Success },
-            evaluateReleaseReadiness: (_, _, _) => NotReady("HG", "not_clean"),
+            evaluateReleaseReadiness: (_, _, _, _) => NotReady("HG", "not_clean"),
             stateConsistencyStableWindowMs: 50);
         coord10.ProcessObservationForTest(new MismatchObservation
         {
@@ -325,7 +325,7 @@ public static class StateConsistencyGateTests
             isRecoveryInProgress: _ => false,
             log: null,
             runInstrumentGateReconciliation: (_, _, _) => new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Success },
-            evaluateReleaseReadiness: (_, _, _) => Ready("SI"),
+            evaluateReleaseReadiness: (_, _, _, _) => Ready("SI"),
             stateConsistencyStableWindowMs: 200);
         coord11.ProcessObservationForTest(new MismatchObservation
         {
@@ -359,7 +359,7 @@ public static class StateConsistencyGateTests
             isRecoveryInProgress: _ => false,
             log: null,
             runInstrumentGateReconciliation: (_, _, _) => new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Success },
-            evaluateReleaseReadiness: (_, _, _) => Ready("MZ"),
+            evaluateReleaseReadiness: (_, _, _, _) => Ready("MZ"),
             stateConsistencyStableWindowMs: 100);
         var tMz0 = t0.AddMinutes(30);
         coord12.ProcessObservationForTest(new MismatchObservation
@@ -424,7 +424,7 @@ public static class StateConsistencyGateTests
             log: null,
             runInstrumentGateReconciliation: (_, _, _) =>
                 new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Success },
-            evaluateReleaseReadiness: (_, _, _) => Ready("ST1"),
+            evaluateReleaseReadiness: (_, _, _, _) => Ready("ST1"),
             stateConsistencyStableWindowMs: 50);
         coord13.ProcessObservationForTest(new MismatchObservation
         {
@@ -456,7 +456,7 @@ public static class StateConsistencyGateTests
             log: null,
             runInstrumentGateReconciliation: (_, _, _) =>
                 new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Success },
-            evaluateReleaseReadiness: (_, _, _) => Ready("ST2"),
+            evaluateReleaseReadiness: (_, _, _, _) => Ready("ST2"),
             stateConsistencyStableWindowMs: 80);
         coord14.ProcessObservationForTest(new MismatchObservation
         {
@@ -490,7 +490,7 @@ public static class StateConsistencyGateTests
             log: null,
             runInstrumentGateReconciliation: (_, _, _) =>
                 new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Success },
-            evaluateReleaseReadiness: (_, _, _) => ready15 ? Ready("ST3") : NotReady("ST3", "relapse"),
+            evaluateReleaseReadiness: (_, _, _, _) => ready15 ? Ready("ST3") : NotReady("ST3", "relapse"),
             stateConsistencyStableWindowMs: 200);
         coord15.ProcessObservationForTest(new MismatchObservation
         {
@@ -524,7 +524,7 @@ public static class StateConsistencyGateTests
             log: null,
             runInstrumentGateReconciliation: (_, _, _) =>
                 new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Success },
-            evaluateReleaseReadiness: (_, _, _) => Ready("ST4"),
+            evaluateReleaseReadiness: (_, _, _, _) => Ready("ST4"),
             stateConsistencyStableWindowMs: 50);
         coord16.ProcessObservationForTest(new MismatchObservation
         {
@@ -562,7 +562,7 @@ public static class StateConsistencyGateTests
             log: null,
             runInstrumentGateReconciliation: (_, _, _) =>
                 new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Success },
-            evaluateReleaseReadiness: (_, _, _) => MclLike("ST5"),
+            evaluateReleaseReadiness: (_, _, _, _) => MclLike("ST5"),
             stateConsistencyStableWindowMs: 50);
         coord17.ProcessObservationForTest(new MismatchObservation
         {

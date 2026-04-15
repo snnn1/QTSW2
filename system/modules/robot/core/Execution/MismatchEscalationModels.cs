@@ -248,6 +248,9 @@ public static class MismatchEscalationPolicy
     /// <summary>Block reason for persistent mismatch. Distinguishable from protective, queue poison, supervisory.</summary>
     public const string BLOCK_REASON_PERSISTENT_MISMATCH = "PERSISTENT_RECONCILIATION_MISMATCH";
 
+    /// <summary>Re-engaged after <c>STATE_CONSISTENCY_GATE_RELEASED</c> when mandatory post-release readiness recheck fails.</summary>
+    public const string BLOCK_REASON_POST_RELEASE_RECHECK_FAILED = "POST_RELEASE_RECHECK_FAILED";
+
     /// <summary>
     /// Block new risk immediately on first mismatch detection (before persistence threshold).
     /// Escalation still advances to PERSISTENT_MISMATCH for logging/metrics; block reason then upgrades.
@@ -262,6 +265,12 @@ public static class MismatchEscalationPolicy
 
     /// <summary>Release requires this many milliseconds with an unchanged <see cref="MismatchInstrumentState.ReleaseQuietFingerprintKey"/> while release invariants hold.</summary>
     public const int GATE_RELEASE_QUIET_WINDOW_MS = 1_000;
+
+    /// <summary>Fail-closed safe recovery: consecutive fresh snapshots required (full release readiness, no cache).</summary>
+    public const int FAIL_CLOSED_STRICT_SNAPSHOT_COUNT = 3;
+
+    /// <summary>Wall-clock spacing between strict fail-closed snapshot reads; (count-1) gaps span the bounded quiet window.</summary>
+    public const int FAIL_CLOSED_STRICT_SNAPSHOT_GAP_MS = 500;
 
     /// <summary>Fail-safe: log if gate has been engaged this long without release; does not auto-release.</summary>
     public const int GATE_MAX_DWELL_ALERT_MS = 30_000;

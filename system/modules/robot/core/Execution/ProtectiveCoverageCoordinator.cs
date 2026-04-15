@@ -192,6 +192,14 @@ public sealed class ProtectiveCoverageCoordinator
 
         var state = GetOrAddState(inst);
 
+        // Phase 4A: pending broker visibility — diagnostic only; no block, no recovery, no failure metrics
+        if (result.Status == ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE)
+        {
+            _log?.Write(RobotEvents.ExecutionBase(result.AuditUtc, "", inst, "PROTECTIVE_PENDING_CONVERGENCE", ToPayload(result)));
+            EmitCanonical(inst, ExecutionEventTypes.PROTECTIVE_PENDING_CONVERGENCE, result.AuditUtc, ToPayload(result), "INFO");
+            return;
+        }
+
         // Clean or suppress (flatten/recovery in progress)
         if (result.Status == ProtectiveAuditStatus.PROTECTIVE_OK ||
             result.Status == ProtectiveAuditStatus.PROTECTIVE_FLATTEN_IN_PROGRESS ||
@@ -391,6 +399,7 @@ public sealed class ProtectiveCoverageCoordinator
             ProtectiveAuditStatus.PROTECTIVE_TARGET_QTY_MISMATCH => "PROTECTIVE_TARGET_QTY_MISMATCH",
             ProtectiveAuditStatus.PROTECTIVE_CONFLICTING_ORDERS => "PROTECTIVE_CONFLICTING_ORDERS",
             ProtectiveAuditStatus.PROTECTIVE_UNRESOLVED_POSITION => "PROTECTIVE_AUDIT_FAILED",
+            ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE => "PROTECTIVE_PENDING_CONVERGENCE",
             _ => "PROTECTIVE_AUDIT_FAILED"
         };
     }

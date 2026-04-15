@@ -13,6 +13,11 @@ public static class ProtectiveCoverageAuditTests
     public static (bool Pass, string? Error) RunProtectiveAuditTests()
     {
         var utcNow = DateTimeOffset.UtcNow;
+        QuantExecutionControlStore.Clear();
+        var prevQ = FeatureFlags.QuantExecutionControlStoreEnabled;
+        var prevWin = FeatureFlags.PostFillAlignmentWindowMs;
+        FeatureFlags.QuantExecutionControlStoreEnabled = true;
+        FeatureFlags.PostFillAlignmentWindowMs = 5000;
 
         // 1. Long position, valid stop and target -> PROTECTIVE_OK
         var snap = new AccountSnapshot
@@ -93,6 +98,50 @@ public static class ProtectiveCoverageAuditTests
             return (false, "IsCritical(PROTECTIVE_MISSING_STOP) should be true");
         if (ProtectiveCoverageAudit.IsCritical(ProtectiveAuditStatus.PROTECTIVE_OK))
             return (false, "IsCritical(PROTECTIVE_OK) should be false");
+        if (ProtectiveCoverageAudit.IsCritical(ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE))
+            return (false, "IsCritical(PROTECTIVE_PENDING_CONVERGENCE) should be false");
+
+        // 8. Phase 4A: PendingAlignment alone (mapped fill) does not suppress — submit must be recorded first
+        QuantExecutionControlStore.Clear();
+        var t0 = DateTimeOffset.UtcNow;
+        QuantExecutionControlStore.NotifyMappedTrustedFill("MNQ", 1, t0);
+        snap = new AccountSnapshot
+        {
+            Positions = new List<PositionSnapshot> { new() { Instrument = "MNQ", Quantity = 1, AveragePrice = 21000m } },
+            WorkingOrders = new List<WorkingOrderSnapshot>()
+        };
+        r = ProtectiveCoverageAudit.Audit("MNQ", snap, null, false, false, false, t0);
+        if (r.Status != ProtectiveAuditStatus.PROTECTIVE_MISSING_STOP)
+            return (false, $"Mapped fill without protective submit notify: expected PROTECTIVE_MISSING_STOP, got {r.Status}");
+
+        // 8b. PendingAlignment + NotifyProtectiveStopSubmit + no broker-visible stop -> PROTECTIVE_PENDING_CONVERGENCE
+        QuantExecutionControlStore.Clear();
+        QuantExecutionControlStore.NotifyMappedTrustedFill("MNQ", 1, t0);
+        var tSubmit = t0.AddMilliseconds(2);
+        QuantExecutionControlStore.NotifyProtectiveStopSubmitted("MNQ", tSubmit);
+        r = ProtectiveCoverageAudit.Audit("MNQ", snap, null, false, false, false, tSubmit.AddMilliseconds(1));
+        if (r.Status != ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE)
+            return (false, $"Pending convergence: expected PROTECTIVE_PENDING_CONVERGENCE, got {r.Status}");
+
+        // 9. After alignment window expires -> PROTECTIVE_MISSING_STOP (same snapshot, later time; submit was recorded in 8b store — cleared below for 10)
+        QuantExecutionControlStore.Clear();
+        QuantExecutionControlStore.NotifyMappedTrustedFill("MNQ", 1, t0);
+        QuantExecutionControlStore.NotifyProtectiveStopSubmitted("MNQ", t0.AddMilliseconds(2));
+        var afterExpiry = t0.AddMilliseconds(FeatureFlags.PostFillAlignmentWindowMs + 500);
+        r = ProtectiveCoverageAudit.Audit("MNQ", snap, null, false, false, false, afterExpiry);
+        if (r.Status != ProtectiveAuditStatus.PROTECTIVE_MISSING_STOP)
+            return (false, $"After convergence window: expected PROTECTIVE_MISSING_STOP, got {r.Status}");
+
+        // 10. UnmappedExecution does not get convergence tolerance
+        QuantExecutionControlStore.Clear();
+        QuantExecutionControlStore.NotifyUnmappedExecution("MNQ", t0, "TEST");
+        r = ProtectiveCoverageAudit.Audit("MNQ", snap, null, false, false, false, t0);
+        if (r.Status != ProtectiveAuditStatus.PROTECTIVE_MISSING_STOP)
+            return (false, $"Unmapped phase: expected PROTECTIVE_MISSING_STOP, got {r.Status}");
+
+        QuantExecutionControlStore.Clear();
+        FeatureFlags.QuantExecutionControlStoreEnabled = prevQ;
+        FeatureFlags.PostFillAlignmentWindowMs = prevWin;
 
         // Phase 3: Coordinator recovery state and block tests
         var phase3Result = RunProtectiveCoordinatorPhase3Tests();
