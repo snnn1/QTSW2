@@ -69,6 +69,22 @@
     <Compile Include="..\modules\robot\core\Execution\PositionAuthorityInstrumentEvaluator.cs" Link="Execution\PositionAuthorityInstrumentEvaluator.cs" />
     <Compile Include="..\modules\robot\core\Execution\HardFailClosedExecutionModel.cs" Link="Execution\HardFailClosedExecutionModel.cs" />
     <Compile Include="..\modules\robot\core\Execution\FeatureFlags.cs" Link="Execution\FeatureFlags.cs" />
+    <Compile Include="..\modules\robot\core\Execution\InstrumentOwnershipLedger.cs" Link="Execution\InstrumentOwnershipLedger.cs" />
+    <Compile Include="..\modules\robot\core\Execution\InstrumentOwnershipModels.cs" Link="Execution\InstrumentOwnershipModels.cs" />
+    <Compile Include="..\modules\robot\core\Execution\OrphanFillJournal.cs" Link="Execution\OrphanFillJournal.cs" />
+    <Compile Include="..\modules\robot\core\Execution\OwnershipEventJournal.cs" Link="Execution\OwnershipEventJournal.cs" />
+    <Compile Include="..\modules\robot\core\Execution\ReconciliationClassifier.cs" Link="Execution\ReconciliationClassifier.cs" />
+    <Compile Include="..\modules\robot\core\Execution\ReconciliationRepairExecutor.cs" Link="Execution\ReconciliationRepairExecutor.cs" />
+    <Compile Include="..\modules\robot\core\Execution\ReconciliationVerdict.cs" Link="Execution\ReconciliationVerdict.cs" />
+    <Compile Include="..\modules\robot\core\Execution\UnifiedExecutionAuthority.cs" Link="Execution\UnifiedExecutionAuthority.cs" />
+    <Compile Include="..\modules\robot\core\Execution\AuthoritativeStateEmitter.cs" Link="Execution\AuthoritativeStateEmitter.cs" />
+    <Compile Include="..\modules\robot\core\Execution\AuthoritativeStateSnapshot.cs" Link="Execution\AuthoritativeStateSnapshot.cs" />
+    <Compile Include="..\modules\robot\core\Execution\AuthorityDecisionModels.cs" Link="Execution\AuthorityDecisionModels.cs" />
+    <Compile Include="..\modules\robot\core\SessionAuthority\SessionPolicyService.cs" Link="SessionAuthority\SessionPolicyService.cs" />
+    <Compile Include="..\modules\robot\core\SessionAuthority\SessionCalendarDocument.cs" Link="SessionAuthority\SessionCalendarDocument.cs" />
+    <Compile Include="..\modules\robot\core\SessionAuthority\CalendarGroupResolver.cs" Link="SessionAuthority\CalendarGroupResolver.cs" />
+    <Compile Include="..\modules\robot\core\SessionAuthorityTimetableGate.cs" Link="SessionAuthorityTimetableGate.cs" />
+    <Compile Include="..\modules\robot\core\Models.SessionAuthorityContract.cs" Link="Models.SessionAuthorityContract.cs" />
     <Compile Include="..\modules\robot\core\Execution\QuantExecutionControlModels.cs" Link="Execution\QuantExecutionControlModels.cs" />
     <Compile Include="..\modules\robot\core\Execution\QuantExecutionControlStore.cs" Link="Execution\QuantExecutionControlStore.cs" />
     <Compile Include="..\modules\robot\core\Execution\Qtsw2OrderUpdateHydrationPolicy.cs" Link="Execution\Qtsw2OrderUpdateHydrationPolicy.cs" />

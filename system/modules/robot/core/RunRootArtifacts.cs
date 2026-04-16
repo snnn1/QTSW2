@@ -14,6 +14,7 @@ public static class RunRootArtifacts
     public const string NotesFileName = "NOTES.md";
     public const string KeyEventsFileName = "KEY_EVENTS.jsonl";
     public const string SummaryFileName = "summary.json";
+    public const string AuditManifestFileName = "AUDIT_MANIFEST.json";
     public const string LatestRunPointerFileName = "LATEST_RUN.txt";
 
     private static readonly string NotesTemplate =
@@ -27,6 +28,9 @@ public static class RunRootArtifacts
     {
         try
         {
+            var bootstrapTradingDate = DateTimeOffset.UtcNow.ToString("yyyy-MM-dd");
+            RobotRunArtifactPaths.EnsureAuditDirectories(persistenceBase, bootstrapTradingDate);
+
             var notes = Path.Combine(persistenceBase, NotesFileName);
             if (!File.Exists(notes))
                 File.WriteAllText(notes, NotesTemplate);
@@ -39,6 +43,60 @@ public static class RunRootArtifacts
         catch
         {
             // best-effort: do not block engine start
+        }
+    }
+
+    public static void WriteAuditManifestJson(
+        string persistenceBase,
+        string? fullRunId,
+        DateTimeOffset engineStartUtc,
+        string? tradingDate,
+        bool isolatedPlayback,
+        bool canonicalOwnershipLedgerEnabled,
+        bool unifiedExecutionAuthorityShadowEnabled,
+        bool unifiedExecutionAuthorityEnabled,
+        bool reconciliationRepairExecutorEnabled,
+        bool structuralLayerUseLedgerOwnership)
+    {
+        try
+        {
+            var td = string.IsNullOrWhiteSpace(tradingDate)
+                ? engineStartUtc.ToString("yyyy-MM-dd")
+                : tradingDate.Trim();
+            RobotRunArtifactPaths.EnsureAuditDirectories(persistenceBase, td);
+
+            var dto = new Dictionary<string, object?>
+            {
+                ["run_id"] = fullRunId ?? "",
+                ["trading_date"] = td,
+                ["engine_start_utc"] = engineStartUtc.ToString("o"),
+                ["persistence_base"] = Path.GetFullPath(persistenceBase),
+                ["isolated_playback"] = isolatedPlayback,
+                ["audit_scope"] = RobotRunArtifactPaths.AuditScopeLabel(persistenceBase),
+                ["trusted_sources"] = new Dictionary<string, object?>
+                {
+                    ["engine_log"] = Path.Combine(RobotRunArtifactPaths.LogsRobot(persistenceBase), "robot_ENGINE.jsonl"),
+                    ["instrument_logs_glob"] = Path.Combine(RobotRunArtifactPaths.LogsRobot(persistenceBase), "robot_*.jsonl"),
+                    ["ownership_events"] = Path.Combine(RobotRunArtifactPaths.EventsOwnershipEventsTradingDate(persistenceBase, td), "events.jsonl"),
+                    ["ownership_snapshots"] = Path.Combine(RobotRunArtifactPaths.EventsOwnershipSnapshotsTradingDate(persistenceBase, td), "ownership_snapshots.jsonl"),
+                    ["orphan_fills"] = Path.Combine(RobotRunArtifactPaths.EventsOrphanFillsTradingDate(persistenceBase, td), "orphan_fills.jsonl"),
+                    ["execution_events_dir"] = RobotRunArtifactPaths.EventsExecutionEventsTradingDate(persistenceBase, td)
+                },
+                ["shadow_flags"] = new Dictionary<string, object?>
+                {
+                    ["canonical_ownership_ledger_enabled"] = canonicalOwnershipLedgerEnabled,
+                    ["unified_execution_authority_shadow_enabled"] = unifiedExecutionAuthorityShadowEnabled,
+                    ["unified_execution_authority_enabled"] = unifiedExecutionAuthorityEnabled,
+                    ["reconciliation_repair_executor_enabled"] = reconciliationRepairExecutorEnabled,
+                    ["structural_layer_use_ledger_ownership"] = structuralLayerUseLedgerOwnership
+                }
+            };
+
+            File.WriteAllText(Path.Combine(persistenceBase, AuditManifestFileName), JsonUtil.Serialize(dto));
+        }
+        catch
+        {
+            // best-effort: audits can still fall back to path conventions
         }
     }
 

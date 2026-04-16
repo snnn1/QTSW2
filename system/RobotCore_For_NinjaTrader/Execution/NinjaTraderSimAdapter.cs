@@ -190,6 +190,21 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     /// <summary>In-memory pending fill observations for reconciliation only (not a position ledger).</summary>
     public void SetPendingFillBridge(PendingFillBridge? bridge) => _pendingFillBridge = bridge;
 
+    /// <summary>Canonical ownership ledger. Receives shadow writes when enabled via feature flag.</summary>
+    private InstrumentOwnershipLedger? _ownershipLedger;
+
+    public void SetOwnershipLedger(InstrumentOwnershipLedger? ledger) => _ownershipLedger = ledger;
+
+    /// <summary>Durable orphan fill journal under the active run root.</summary>
+    private OrphanFillJournal? _orphanFillJournal;
+
+    public void SetOrphanFillJournal(OrphanFillJournal? journal) => _orphanFillJournal = journal;
+
+    /// <summary>Unified execution authority. Shadow-eval or activation mode via feature flags.</summary>
+    private UnifiedExecutionAuthority? _unifiedAuthority;
+
+    public void SetUnifiedExecutionAuthority(UnifiedExecutionAuthority? uea) => _unifiedAuthority = uea;
+
     /// <summary>Wires execution/fill activity to <see cref="MismatchEscalationCoordinator.NotifyExecutionTrigger"/> (optional).</summary>
     public void SetMismatchExecutionTriggerCallback(Action<string, DateTimeOffset, MismatchExecutionTriggerDetails>? callback) =>
         _onMismatchExecutionTrigger = callback;
@@ -365,6 +380,28 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         }
         catch { }
         return "UNKNOWN";
+    }
+
+    private string GetLedgerAccountName()
+    {
+        var account = GetCoordinationAccountName();
+        return string.IsNullOrWhiteSpace(account) || string.Equals(account, "UNKNOWN", StringComparison.OrdinalIgnoreCase)
+            ? "default"
+            : account.Trim();
+    }
+
+    private string GetAuditTradingDate(DateTimeOffset utcNow)
+    {
+        try
+        {
+            var getActive = _getActiveTradingDateString;
+            var tradingDate = getActive?.Invoke();
+            if (!string.IsNullOrWhiteSpace(tradingDate))
+                return tradingDate.Trim();
+        }
+        catch { }
+
+        return utcNow.ToString("yyyy-MM-dd");
     }
 
     private string GetHostChartInstrumentName()
@@ -1808,6 +1845,14 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         }
 
         var repair = _journalIntegrityRepairActiveForInstrumentCallback?.Invoke(trimmed) == true;
+
+        InstrumentOwnershipSnapshot? ledgerSnap = null;
+        if (FeatureFlags.StructuralLayerUseLedgerOwnership && _ownershipLedger != null)
+        {
+            try { ledgerSnap = _ownershipLedger.GetOwnershipSnapshot(GetLedgerAccountName(), trimmed); }
+            catch { }
+        }
+
         return new ExecutionSafetyEvaluationRequest
         {
             Instrument = trimmed,
@@ -1821,7 +1866,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             IeaOwnedPlusAdoptedWorking = GetIeaOwnedPlusAdoptedWorkingForParity(),
             Coordinator = _coordinator,
             RecoveryExecutionDisallowed = _isRecoveryExecutionAllowedCallback != null && !_isRecoveryExecutionAllowedCallback(),
-            JournalIntegrityOrReconciliationRepairActive = repair
+            JournalIntegrityOrReconciliationRepairActive = repair,
+            LedgerOwnershipSnapshot = ledgerSnap
         };
     }
 
@@ -1980,6 +2026,26 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
 #if !NINJATRADER
         return true;
 #else
+        if (FeatureFlags.UnifiedExecutionAuthorityEnabled && _unifiedAuthority != null)
+        {
+            var ueaReq = BuildUeaRequest(intentId, instrument, blockedWhat, utcNow);
+            var ueaDecision = _unifiedAuthority.Evaluate(ueaReq);
+            if (!ueaDecision.Allowed)
+            {
+                failure = OrderSubmissionResult.FailureResult(
+                    $"UEA_DENIED:{ueaDecision.DenyGate}:{ueaDecision.DenyReason}", utcNow);
+                _log?.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument?.Trim() ?? "", "UEA_ACTIVE_DENY",
+                    new
+                    {
+                        gate = ueaDecision.DenyGate,
+                        reason = ueaDecision.DenyReason,
+                        blocked_what = blockedWhat
+                    }));
+                return false;
+            }
+            return true;
+        }
+
         var protectiveStructuralFirst = string.Equals(blockedWhat, "SUBMIT_PROTECTIVE_STOP", StringComparison.Ordinal);
         if (!ExecutionPermissionAuthority.TryAdapterOrderSubmitPreflight(
                 _isGlobalKillSwitchActive,
@@ -1993,6 +2059,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             var inst = instrument?.Trim() ?? "";
             EmitExecutionBlockedEpa(blockedWhat, intentId, inst, epaDeny, utcNow);
             failure = OrderSubmissionResult.FailureResult($"EXECUTION_BLOCKED_EPA:{epaDeny}", utcNow);
+            RunUeaShadowEval(intentId, instrument, blockedWhat, utcNow, oldAllowed: false, oldDenyReason: $"EPA:{epaDeny}");
             return false;
         }
 
@@ -2012,6 +2079,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             };
             EmitExecutionBlockedUnsafeState(blockedWhat, intentId, bad, utcNow);
             failure = OrderSubmissionResult.FailureResult("EXECUTION_BLOCKED_UNSAFE_STATE:account_snapshot_failed", utcNow);
+            RunUeaShadowEval(intentId, instrument, blockedWhat, utcNow, oldAllowed: false, oldDenyReason: "account_snapshot_failed");
             return false;
         }
 
@@ -2023,6 +2091,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             {
                 EmitExecutionBlockedPositionAuthority(blockedWhat, intentId, structSnap, utcNow);
                 failure = OrderSubmissionResult.FailureResult($"EXECUTION_BLOCKED_POSITION_AUTHORITY:{structSnap.AuthorityState}", utcNow);
+                RunUeaShadowEval(intentId, instrument, blockedWhat, utcNow, oldAllowed: false, oldDenyReason: $"POSITION_AUTHORITY:{structSnap.AuthorityState}");
                 return false;
             }
 
@@ -2030,6 +2099,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
                 TryEmitCriticalUnsafeStateDetected(instrument, structSnap.Reason ?? "", utcNow);
             EmitExecutionBlockedUnsafeState(blockedWhat, intentId, structSnap, utcNow);
             failure = OrderSubmissionResult.FailureResult($"EXECUTION_BLOCKED_UNSAFE_STATE:{structSnap.Reason}", utcNow);
+            RunUeaShadowEval(intentId, instrument, blockedWhat, utcNow, oldAllowed: false, oldDenyReason: $"UNSAFE_STATE:{structSnap.Reason}");
             return false;
         }
 
@@ -2037,11 +2107,79 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         {
             EmitExecutionBlockedOverlay(blockedWhat, intentId, structSnap.Instrument, overlay.BlockReason, overlay.Detail, utcNow);
             failure = OrderSubmissionResult.FailureResult($"EXECUTION_BLOCKED_OVERLAY:{overlay.BlockReason}", utcNow);
+            RunUeaShadowEval(intentId, instrument, blockedWhat, utcNow, oldAllowed: false, oldDenyReason: $"OVERLAY:{overlay.BlockReason}");
             return false;
         }
 
+        RunUeaShadowEval(intentId, instrument, blockedWhat, utcNow, oldAllowed: true, oldDenyReason: null);
         return true;
 #endif
+    }
+
+    private AuthorityEvaluationRequest BuildUeaRequest(string intentId, string instrument, string blockedWhat, DateTimeOffset utcNow)
+    {
+        var submitIntent = string.Equals(blockedWhat, "SUBMIT_PROTECTIVE_STOP", StringComparison.Ordinal)
+            ? SubmitIntent.RiskCoverage
+            : SubmitIntent.RiskIncreasing;
+
+        return new AuthorityEvaluationRequest
+        {
+            Instrument = instrument?.Trim() ?? "",
+            IntentId = intentId,
+            SubmitIntent = submitIntent,
+            SubmitPath = blockedWhat,
+            UtcNow = utcNow,
+            GlobalKillSwitchActive = _isGlobalKillSwitchActive,
+            MismatchExecutionBlocked = _isMismatchExecutionBlocked,
+            InstrumentFrozenOrEpaBlocked = _isInstrumentFrozenOrEpaBlocked,
+            BuildSafetyRequest = (inst, iid, t) => BuildExecutionSafetyEvaluationRequest(inst, iid, t),
+            OwnershipLedger = _ownershipLedger,
+            AccountName = GetLedgerAccountName()
+        };
+    }
+
+    private void RunUeaShadowEval(string intentId, string instrument, string blockedWhat, DateTimeOffset utcNow,
+        bool oldAllowed, string? oldDenyReason)
+    {
+        if (!FeatureFlags.UnifiedExecutionAuthorityShadowEnabled || _unifiedAuthority == null) return;
+
+        try
+        {
+            var ueaReq = BuildUeaRequest(intentId, instrument, blockedWhat, utcNow);
+            var ueaDecision = _unifiedAuthority.Evaluate(ueaReq);
+
+            _log?.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument?.Trim() ?? "", "UEA_SHADOW_EVALUATED",
+                new
+                {
+                    old_allowed = oldAllowed,
+                    old_deny_reason = oldDenyReason,
+                    uea_allowed = ueaDecision.Allowed,
+                    uea_deny_gate = ueaDecision.DenyGate,
+                    uea_deny_reason = ueaDecision.DenyReason,
+                    blocked_what = blockedWhat,
+                    account_name = ueaReq.AccountName
+                }));
+
+            if (oldAllowed != ueaDecision.Allowed)
+            {
+                _log?.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument?.Trim() ?? "", "UEA_SHADOW_DISAGREEMENT",
+                    new
+                    {
+                        old_allowed = oldAllowed,
+                        old_deny_reason = oldDenyReason,
+                        uea_allowed = ueaDecision.Allowed,
+                        uea_deny_gate = ueaDecision.DenyGate,
+                        uea_deny_reason = ueaDecision.DenyReason,
+                        blocked_what = blockedWhat,
+                        note = "Old path and UEA disagree on order submission decision"
+                    }));
+            }
+        }
+        catch (Exception ex)
+        {
+            _log?.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument?.Trim() ?? "", "UEA_SHADOW_ERROR",
+                new { error = ex.Message, blocked_what = blockedWhat }));
+        }
     }
 
     /// <summary>

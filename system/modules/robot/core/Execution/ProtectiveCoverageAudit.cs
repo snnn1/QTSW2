@@ -97,14 +97,16 @@ public static class ProtectiveCoverageAudit
         result.StopQty = totalStopQty;
         result.TargetQty = totalTargetQty;
 
-        // Conflicting: multiple stops for same exposure without clear association
+        // Conflicting: multiple stops for same exposure without clear association.
+        // Exception: CL1+CL2-style multi-intent — multiple stops with distinct tags are OK when total stop qty
+        // matches broker exposure and total target qty matches (single-wave protectives still sum to position).
         if (robotProtectiveStops.Count > 1 && absQty > 0)
         {
             var distinctIntents = robotProtectiveStops.Select(o => GetIntentIdFromTag(o.Tag)).Where(id => id != null).Distinct().Count();
-            if (distinctIntents > 1)
+            if (distinctIntents > 1 && !(totalStopQty == absQty && robotProtectiveTargets.Count > 0 && totalTargetQty == absQty))
             {
                 result.Status = ProtectiveAuditStatus.PROTECTIVE_CONFLICTING_ORDERS;
-                result.Detail = $"Multiple stops ({robotProtectiveStops.Count}) from different intents";
+                result.Detail = $"Multiple stops ({robotProtectiveStops.Count}) from different intents (stop qty sum {totalStopQty} vs abs {absQty})";
                 return result;
             }
         }

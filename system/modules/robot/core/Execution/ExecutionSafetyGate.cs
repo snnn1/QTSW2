@@ -277,6 +277,14 @@ public sealed class ExecutionSafetyEvaluationRequest
 
     /// <summary>Override <see cref="ExecutionSafetyGate.MaxBrokerSnapshotAgeMilliseconds"/> when &gt; 0.</summary>
     public int MaxBrokerSnapshotAgeMs { get; set; }
+
+    /// <summary>
+    /// Phase 8: Optional ledger ownership snapshot. When present and
+    /// <see cref="FeatureFlags.StructuralLayerUseLedgerOwnership"/> is on, <see cref="ExecutionStructuralLayer"/>
+    /// derives position authority from <see cref="InstrumentOwnershipSnapshot.LedgerSignedNetQty"/> instead of
+    /// journal-based <see cref="PositionAuthorityDerivation"/>.
+    /// </summary>
+    public InstrumentOwnershipSnapshot? LedgerOwnershipSnapshot { get; set; }
 }
 
 /// <summary>Payload for POSITION_AUTHORITY_EVALUATED (emitted by adapter after local derivation).</summary>

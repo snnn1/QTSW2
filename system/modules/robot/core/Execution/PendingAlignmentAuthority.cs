@@ -13,6 +13,7 @@ namespace QTSW2.Robot.Core.Execution;
 /// while <see cref="IsPendingAlignment"/> is true for explainable mismatch categories
 /// (<see cref="IsJournalLagExplainedMismatchType"/>).
 /// </remarks>
+[Obsolete("P8: Targeted for deprecation once InstrumentOwnershipLedger dual-run is proven.")]
 public static class PendingAlignmentAuthority
 {
     /// <summary>

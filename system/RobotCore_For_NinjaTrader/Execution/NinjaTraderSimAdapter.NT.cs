@@ -3509,6 +3509,15 @@ public sealed partial class NinjaTraderSimAdapter
             EmitUnmappedFill(instrument, "INTENT_NOT_FOUND", fillPrice, fillQuantity, utcNow, order?.OrderId, order, tag: encodedTag);
             LogOrphanFill(intentId, encodedTag, orderType, instrument, fillPrice, fillQuantity, 
                 utcNow, reason: "INTENT_NOT_FOUND");
+            var orphanSlotId = RecordOrphanFillIfEnabled(
+                instrument,
+                order?.OrderId?.ToString() ?? "",
+                intentId,
+                fillPrice,
+                fillQuantity,
+                utcNow,
+                OrphanReason.UnknownOrder,
+                SlotDirection.Long);
             
             // Stand down stream if known, otherwise block instrument
             // Try to get stream from orderInfo if available, but likely unknown
@@ -3533,9 +3542,13 @@ public sealed partial class NinjaTraderSimAdapter
             }
             else
             {
+            bool flattenOk = false;
+            string? flattenErr = null;
             try
             {
                 var flattenResult = Flatten(intentId, instrument, utcNow);
+                flattenOk = flattenResult.Success;
+                flattenErr = flattenResult.ErrorMessage;
                 
                 LogCriticalEngineWithIeaContext(utcNow, "", "ORPHAN_FILL_CRITICAL", "ENGINE",
                     new
@@ -3578,6 +3591,7 @@ public sealed partial class NinjaTraderSimAdapter
             }
             catch (Exception ex)
             {
+                flattenErr = ex.Message;
                 LogCriticalEngineWithIeaContext(utcNow, "", "ORPHAN_FILL_FLATTEN_EXCEPTION", "ENGINE",
                     new
                     {
@@ -3603,6 +3617,7 @@ public sealed partial class NinjaTraderSimAdapter
                     notificationService.EnqueueNotification($"INTENT_NOT_FOUND_FLATTEN_EXCEPTION:{intentId}", title, message, priority: 3); // Highest priority
                 }
             }
+            NotifyOrphanFlattenResult(instrument, orphanSlotId, flattenOk, flattenErr, utcNow);
             }
             
             return false;
@@ -3617,6 +3632,9 @@ public sealed partial class NinjaTraderSimAdapter
         {
             LogOrphanFill(intentId, encodedTag, orderType, instrument, fillPrice, fillQuantity, 
                 utcNow, stream, "MISSING_TRADING_DATE");
+            RecordOrphanFillIfEnabled(instrument, order?.OrderId?.ToString() ?? "", intentId,
+                fillPrice, fillQuantity, utcNow, OrphanReason.IntentLostAfterContext,
+                ParseSlotDirection(direction), OrphanActionTaken.NoAction);
             _standDownStreamCallback?.Invoke(stream, utcNow, $"ORPHAN_FILL:MISSING_TRADING_DATE:{intentId}");
             return false;
         }
@@ -3625,6 +3643,9 @@ public sealed partial class NinjaTraderSimAdapter
         {
             LogOrphanFill(intentId, encodedTag, orderType, instrument, fillPrice, fillQuantity, 
                 utcNow, reason: "MISSING_STREAM");
+            RecordOrphanFillIfEnabled(instrument, order?.OrderId?.ToString() ?? "", intentId,
+                fillPrice, fillQuantity, utcNow, OrphanReason.IntentLostAfterContext,
+                ParseSlotDirection(direction), OrphanActionTaken.NoAction);
             _standDownStreamCallback?.Invoke("", utcNow, $"ORPHAN_FILL:MISSING_STREAM:{intentId}");
             return false;
         }
@@ -3633,6 +3654,9 @@ public sealed partial class NinjaTraderSimAdapter
         {
             LogOrphanFill(intentId, encodedTag, orderType, instrument, fillPrice, fillQuantity, 
                 utcNow, stream, "MISSING_DIRECTION");
+            RecordOrphanFillIfEnabled(instrument, order?.OrderId?.ToString() ?? "", intentId,
+                fillPrice, fillQuantity, utcNow, OrphanReason.IntentLostAfterContext,
+                SlotDirection.Long, OrphanActionTaken.NoAction);
             _standDownStreamCallback?.Invoke(stream, utcNow, $"ORPHAN_FILL:MISSING_DIRECTION:{intentId}");
             return false;
         }
@@ -3648,6 +3672,9 @@ public sealed partial class NinjaTraderSimAdapter
         {
             LogOrphanFill(intentId, encodedTag, orderType, instrument, fillPrice, fillQuantity, 
                 utcNow, stream, "MISSING_MULTIPLIER");
+            RecordOrphanFillIfEnabled(instrument, order?.OrderId?.ToString() ?? "", intentId,
+                fillPrice, fillQuantity, utcNow, OrphanReason.ContextResolutionFailed,
+                ParseSlotDirection(direction), OrphanActionTaken.NoAction);
             _standDownStreamCallback?.Invoke(stream, utcNow, $"ORPHAN_FILL:MISSING_MULTIPLIER:{intentId}");
             return false;
         }
@@ -3734,6 +3761,56 @@ public sealed partial class NinjaTraderSimAdapter
                     note = "Failed to write orphan fill log - continuing"
                 }));
         }
+    }
+
+    private string? RecordOrphanFillIfEnabled(string instrument, string brokerOrderId, string intentId,
+        decimal fillPrice, int fillQuantity, DateTimeOffset utcNow, OrphanReason reason,
+        SlotDirection direction, OrphanActionTaken actionTaken = OrphanActionTaken.FlattenAttempted)
+    {
+        if (!FeatureFlags.CanonicalOwnershipLedgerEnabled) return null;
+
+        var result = _ownershipLedger?.RecordOrphanFill(
+            GetLedgerAccountName(), instrument.Trim(), brokerOrderId, direction, fillQuantity, utcNow, reason);
+        var orphanSlotId = result?.OrphanSlotId ?? $"ORPHAN_{brokerOrderId}_{utcNow.Ticks}";
+        var tradingDate = GetAuditTradingDate(utcNow);
+
+        _orphanFillJournal?.RecordOrphanFill(new OrphanFillRecord
+        {
+            BrokerOrderId = brokerOrderId,
+            IntentIdIfKnown = intentId,
+            Instrument = instrument.Trim(),
+            FillPrice = fillPrice,
+            FillQty = fillQuantity,
+            FillUtc = utcNow.ToString("o"),
+            TradingDate = tradingDate,
+            OrphanReason = reason,
+            ActionTaken = actionTaken,
+            OwnershipLedgerSlotId = orphanSlotId,
+            RecordedUtc = utcNow.ToString("o"),
+            Direction = direction
+        });
+
+        return orphanSlotId;
+    }
+
+    private void NotifyOrphanFlattenResult(string instrument, string? orphanSlotId,
+        bool flattenSucceeded, string? flattenError, DateTimeOffset utcNow)
+    {
+        if (!FeatureFlags.CanonicalOwnershipLedgerEnabled || string.IsNullOrEmpty(orphanSlotId)) return;
+
+        _ownershipLedger?.UpdateOrphanFlattenResult(
+            GetLedgerAccountName(), instrument.Trim(), orphanSlotId!, flattenSucceeded, utcNow);
+
+        var td = GetAuditTradingDate(utcNow);
+        var action = flattenSucceeded ? OrphanActionTaken.FlattenSucceeded : OrphanActionTaken.FlattenFailed;
+        _orphanFillJournal?.RecordOrphanFlattenResult(td, orphanSlotId!, action, flattenError, utcNow);
+    }
+
+    private static SlotDirection ParseSlotDirection(string? direction)
+    {
+        return string.Equals(direction, "Short", StringComparison.OrdinalIgnoreCase)
+            ? SlotDirection.Short
+            : SlotDirection.Long;
     }
 
     /// <summary>Build dedup key for non-IEA path. Same format as IEA: executionId or orderId|ticks|qty|mpos.</summary>
@@ -4265,6 +4342,14 @@ public sealed partial class NinjaTraderSimAdapter
                             context.CanonicalInstrument,
                             brokerOrderInstrumentKey: instrumentForResolve,
                             parityPendingDedupeKey: adoptParityKey);
+                        if (FeatureFlags.CanonicalOwnershipLedgerEnabled && _ownershipLedger != null)
+                        {
+                            var dir = string.Equals(context.Direction, "Short", StringComparison.OrdinalIgnoreCase)
+                                ? SlotDirection.Short : SlotDirection.Long;
+                            _ownershipLedger.RecordMappedEntryFill(
+                                GetLedgerAccountName(), context.ExecutionInstrument.Trim(),
+                                context.IntentId, context.Stream, dir, fillQtyAdopt, utcNow, 0);
+                        }
                         _log.Write(RobotEvents.ExecutionBase(utcNow, adoptedRecord.IntentId, instrumentForResolve, "ADOPTED_ORDER_FILL_JOURNALED", new
                         {
                             broker_order_id = brokerOrderIdStr,
@@ -4566,6 +4651,14 @@ public sealed partial class NinjaTraderSimAdapter
                     allocContext.CanonicalInstrument,
                     brokerOrderInstrumentKey: orderInfo.Instrument,
                     parityPendingDedupeKey: parityKeyAlloc);
+                if (FeatureFlags.CanonicalOwnershipLedgerEnabled && _ownershipLedger != null)
+                {
+                    var dir = string.Equals(allocContext.Direction, "Short", StringComparison.OrdinalIgnoreCase)
+                        ? SlotDirection.Short : SlotDirection.Long;
+                    _ownershipLedger.RecordMappedEntryFill(
+                        GetLedgerAccountName(), allocContext.ExecutionInstrument.Trim(),
+                        allocContext.IntentId, allocContext.Stream, dir, allocQty, utcNow, executionSeq);
+                }
                 entryFillJournalRecordedQty += allocQty;
                 var exposureInstrument = allocContext.CanonicalInstrument ?? allocIntent.Instrument ?? allocContext.ExecutionInstrument;
                 _coordinator?.OnEntryFill(allocContext.IntentId, allocQty, allocContext.Stream, exposureInstrument, allocContext.Direction ?? "", utcNow);
@@ -4874,6 +4967,12 @@ public sealed partial class NinjaTraderSimAdapter
                 fillQuantity,  // DELTA ONLY - not filledTotal
                 orderTypeForContext, // Use tag-based order type (ground truth)
                 utcNow);
+            if (FeatureFlags.CanonicalOwnershipLedgerEnabled && _ownershipLedger != null)
+            {
+                _ownershipLedger.RecordMappedExitFill(
+                    GetLedgerAccountName(), context.ExecutionInstrument.Trim(),
+                    context.IntentId, fillQuantity, utcNow, executionSeq);
+            }
             
             // Log exit fill event - UNIFY FILL EVENTS: Use EXECUTION_FILLED (canonical) with order_type for ledger/PnL
             // P1: Enriched payload with execution_instrument_key, side, account, session_class
@@ -5010,6 +5109,9 @@ public sealed partial class NinjaTraderSimAdapter
             // Unknown exit type - orphan it
             LogOrphanFill(intentId, encodedTag, orderInfo.OrderType, orderInfo.Instrument, fillPrice, fillQuantity,
                 utcNow, context.Stream, "UNKNOWN_EXIT_TYPE");
+            RecordOrphanFillIfEnabled(orderInfo.Instrument, order?.OrderId?.ToString() ?? "", intentId,
+                fillPrice, fillQuantity, utcNow, OrphanReason.IntentLostAfterContext,
+                ParseSlotDirection(context.Direction), OrphanActionTaken.NoAction);
             
             _log.Write(RobotEvents.EngineBase(utcNow, context.TradingDate, "EXECUTION_UNKNOWN_EXIT_TYPE", "ENGINE",
                 new

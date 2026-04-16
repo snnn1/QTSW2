@@ -44,6 +44,15 @@ public sealed class MismatchEscalationCoordinator
     private readonly Action<string, DateTimeOffset>? _onHedgedNetFlatPersistentEscalation;
     /// <summary>G1: When mismatch <see cref="MismatchInstrumentState.Blocked"/> transitions, notifies engine/EPA to own durable authority (not parallel enforcement).</summary>
     private readonly Action<string, bool, string?, DateTimeOffset>? _onMismatchExecutionBlockAuthorityChanged;
+    /// <summary>
+    /// Phase 8b: When provided and <see cref="FeatureFlags.StructuralLayerUseLedgerOwnership"/> is on,
+    /// use ledger-derived net qty instead of journal-derived qty for mismatch qty comparison.
+    /// </summary>
+    private Func<string, InstrumentOwnershipSnapshot?>? _getLedgerSnapshot;
+
+    /// <summary>Wire the ledger snapshot provider for Phase 8b ledger-aware mismatch detection.</summary>
+    public void SetLedgerSnapshotProvider(Func<string, InstrumentOwnershipSnapshot?>? provider) => _getLedgerSnapshot = provider;
+
     /// <summary>When set, mismatch audits and canonical events apply only to instruments managed by this <see cref="RobotEngine"/> (non-committed streams).</summary>
     private readonly Func<string, bool>? _isInstrumentInEngineScope;
     /// <summary>When non-null and returns &gt;0 for an instrument, mismatch gate work is deferred until IEA execution queue drains for that instrument.</summary>
@@ -341,15 +350,12 @@ public sealed class MismatchEscalationCoordinator
     public bool IsInstrumentBlockedByMismatch(string instrument)
     {
         if (string.IsNullOrWhiteSpace(instrument)) return false;
-        // Phase A: mismatch state is observational — do not deny execution via this authority unless control-plane restored.
-        if (!FeatureFlags.ControlPlaneMismatchExecutionBlockAuthority) return false;
         return _stateByInstrument.TryGetValue(instrument.Trim(), out var s) && s.Blocked;
     }
 
     private void PublishMismatchExecutionBlockAuthorityIfChanged(string inst, MismatchInstrumentState state, bool wasBlocked,
         DateTimeOffset utcNow)
     {
-        if (!FeatureFlags.ControlPlaneMismatchExecutionBlockAuthority) return;
         if (wasBlocked == state.Blocked) return;
         NoteMismatchEvalAuthorityPublished(inst);
         _onMismatchExecutionBlockAuthorityChanged?.Invoke(

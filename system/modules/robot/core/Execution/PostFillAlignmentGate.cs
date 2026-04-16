@@ -4,11 +4,13 @@ using System.Collections.Concurrent;
 namespace QTSW2.Robot.Core.Execution;
 
 /// <summary>
-/// Bounded post-fill alignment window: when a mapped trusted fill arms this gate, broker-vs-journal deltas
-/// within the accumulated expected magnitude and before expiry classify as <see cref="JournalParityStatus.PARITY_PENDING_ALIGNMENT"/>
-/// even if <see cref="JournalParityPendingLedger"/> entries were already removed (e.g. journal persisted dedupe key first).
-/// In-process only; cleared on session boundary with <see cref="JournalParityPendingLedger.Clear"/>.
+/// [DEPRECATED — P8 refactor] Bounded post-fill alignment window: when a mapped trusted fill arms this gate,
+/// broker-vs-journal deltas within the accumulated expected magnitude and before expiry classify as
+/// <see cref="JournalParityStatus.PARITY_PENDING_ALIGNMENT"/> even if <see cref="JournalParityPendingLedger"/>
+/// entries were already removed. In-process only; cleared on session boundary.
+/// Targeted for deprecation once <see cref="InstrumentOwnershipLedger"/> dual-run is proven.
 /// </summary>
+[Obsolete("P8: Targeted for deprecation once InstrumentOwnershipLedger dual-run is proven.")]
 public static class PostFillAlignmentGate
 {
     private sealed class GateState

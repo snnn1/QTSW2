@@ -1338,14 +1338,22 @@ public sealed partial class NinjaTraderSimAdapter
         decimal fillPrice, 
         int fillQuantity, 
         DateTimeOffset utcNow, 
-        out IntentContext context)
+        out IntentContext context,
+        out bool flattenAttempted,
+        out bool flattenSucceeded,
+        out string? flattenError)
     {
         context = default;
+        flattenAttempted = false;
+        flattenSucceeded = false;
+        flattenError = null;
         
         if (!_intentMap.TryGetValue(intentId, out var intent))
         {
             LogOrphanFill(intentId, encodedTag, orderType, instrument, fillPrice, fillQuantity, 
                 utcNow, reason: "INTENT_NOT_FOUND");
+            RecordOrphanFillIfEnabled(instrument, "", intentId, fillPrice, fillQuantity,
+                utcNow, OrphanReason.UnknownOrder, SlotDirection.Long);
             
             // Stand down stream if known, otherwise block instrument
             // Try to get stream from orderInfo if available, but likely unknown
@@ -1354,9 +1362,12 @@ public sealed partial class NinjaTraderSimAdapter
             // CRITICAL FIX: Flatten position immediately (fail-closed)
             // Entry fill happened but intent not found - position exists but is unprotected
             // Must flatten to prevent unprotected position accumulation
+            flattenAttempted = true;
             try
             {
                 var flattenResult = Flatten(intentId, instrument, utcNow);
+                flattenSucceeded = flattenResult.Success;
+                flattenError = flattenResult.ErrorMessage;
                 
                 _log.Write(RobotEvents.EngineBase(utcNow, "", "ORPHAN_FILL_CRITICAL", "ENGINE",
                     new
@@ -1399,6 +1410,8 @@ public sealed partial class NinjaTraderSimAdapter
             }
             catch (Exception ex)
             {
+                flattenSucceeded = false;
+                flattenError = ex.Message;
                 _log.Write(RobotEvents.EngineBase(utcNow, "", "ORPHAN_FILL_FLATTEN_EXCEPTION", "ENGINE",
                     new
                     {
@@ -1437,6 +1450,9 @@ public sealed partial class NinjaTraderSimAdapter
         {
             LogOrphanFill(intentId, encodedTag, orderType, instrument, fillPrice, fillQuantity, 
                 utcNow, stream, "MISSING_TRADING_DATE");
+            RecordOrphanFillIfEnabled(instrument, order?.OrderId?.ToString() ?? "", intentId,
+                fillPrice, fillQuantity, utcNow, OrphanReason.IntentLostAfterContext,
+                ParseSlotDirection(direction), OrphanActionTaken.NoAction);
             _standDownStreamCallback?.Invoke(stream, utcNow, $"ORPHAN_FILL:MISSING_TRADING_DATE:{intentId}");
             return false;
         }
@@ -1445,6 +1461,9 @@ public sealed partial class NinjaTraderSimAdapter
         {
             LogOrphanFill(intentId, encodedTag, orderType, instrument, fillPrice, fillQuantity, 
                 utcNow, reason: "MISSING_STREAM");
+            RecordOrphanFillIfEnabled(instrument, order?.OrderId?.ToString() ?? "", intentId,
+                fillPrice, fillQuantity, utcNow, OrphanReason.IntentLostAfterContext,
+                ParseSlotDirection(direction), OrphanActionTaken.NoAction);
             _standDownStreamCallback?.Invoke("", utcNow, $"ORPHAN_FILL:MISSING_STREAM:{intentId}");
             return false;
         }
@@ -1453,6 +1472,9 @@ public sealed partial class NinjaTraderSimAdapter
         {
             LogOrphanFill(intentId, encodedTag, orderType, instrument, fillPrice, fillQuantity, 
                 utcNow, stream, "MISSING_DIRECTION");
+            RecordOrphanFillIfEnabled(instrument, order?.OrderId?.ToString() ?? "", intentId,
+                fillPrice, fillQuantity, utcNow, OrphanReason.IntentLostAfterContext,
+                SlotDirection.Long, OrphanActionTaken.NoAction);
             _standDownStreamCallback?.Invoke(stream, utcNow, $"ORPHAN_FILL:MISSING_DIRECTION:{intentId}");
             return false;
         }
@@ -1468,6 +1490,9 @@ public sealed partial class NinjaTraderSimAdapter
         {
             LogOrphanFill(intentId, encodedTag, orderType, instrument, fillPrice, fillQuantity, 
                 utcNow, stream, "MISSING_MULTIPLIER");
+            RecordOrphanFillIfEnabled(instrument, order?.OrderId?.ToString() ?? "", intentId,
+                fillPrice, fillQuantity, utcNow, OrphanReason.ContextResolutionFailed,
+                ParseSlotDirection(direction), OrphanActionTaken.NoAction);
             _standDownStreamCallback?.Invoke(stream, utcNow, $"ORPHAN_FILL:MISSING_MULTIPLIER:{intentId}");
             return false;
         }
@@ -1831,9 +1856,12 @@ public sealed partial class NinjaTraderSimAdapter
                             note = "CRITICAL: Fill happened but order not in tracking map after retries. Flattening position immediately (fail-closed) to prevent unprotected accumulation."
                         }));
                     
+                    bool flattenOk1 = false; string? flattenErr1 = null;
                     try
                     {
                         var flattenResult = Flatten(intentId, instrument, utcNow);
+                        flattenOk1 = flattenResult.Success;
+                        flattenErr1 = flattenResult.ErrorMessage;
                         
                         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "UNKNOWN_ORDER_FILL_FLATTENED",
                             new
@@ -1847,7 +1875,6 @@ public sealed partial class NinjaTraderSimAdapter
                                 note = "Position flattened due to untracked order fill (fail-closed behavior)"
                             }));
                         
-                        // Alert if flatten succeeded (info) or failed (critical)
                         var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
                         if (notificationService != null)
                         {
@@ -1855,18 +1882,19 @@ public sealed partial class NinjaTraderSimAdapter
                             {
                                 var title = $"Unknown Order Fill - Position Flattened - {instrument}";
                                 var message = $"Fill occurred for order not found in tracking map and position was flattened automatically. Intent: {intentId}, Broker Order ID: {order.OrderId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}";
-                                notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL_FLATTENED:{intentId}", title, message, priority: 1); // Info priority
+                                notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL_FLATTENED:{intentId}", title, message, priority: 1);
                             }
                             else
                             {
                                 var title = $"CRITICAL: Unknown Order Fill - Flatten FAILED - {instrument}";
                                 var message = $"Fill occurred for order not found in tracking map but flatten operation FAILED - MANUAL INTERVENTION REQUIRED. Intent: {intentId}, Broker Order ID: {order.OrderId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}, Error: {flattenResult.ErrorMessage}";
-                                notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL_FLATTEN_FAILED:{intentId}", title, message, priority: 3); // Highest priority
+                                notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL_FLATTEN_FAILED:{intentId}", title, message, priority: 3);
                             }
                         }
                     }
                     catch (Exception ex)
                     {
+                        flattenErr1 = ex.Message;
                         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "UNKNOWN_ORDER_FILL_FLATTEN_FAILED",
                             new
                             {
@@ -1877,7 +1905,11 @@ public sealed partial class NinjaTraderSimAdapter
                                 note = "CRITICAL: Failed to flatten untracked order fill position - manual intervention required"
                             }));
                     }
-                    
+
+                    var orphanDir = (order.OrderAction == OrderAction.Buy || order.OrderAction == OrderAction.BuyToCover)
+                        ? SlotDirection.Long : SlotDirection.Short;
+                    var orphanSlotId1 = RecordOrphanFillIfEnabled(instrument, order.OrderId ?? "", intentId, fillPrice, fillQuantity, utcNow, OrphanReason.UnknownOrder, orphanDir);
+                    NotifyOrphanFlattenResult(instrument, orphanSlotId1, flattenOk1, flattenErr1, utcNow);
                     return; // Fail-closed: don't process untracked fill
                 }
             }
@@ -1899,9 +1931,12 @@ public sealed partial class NinjaTraderSimAdapter
                         note = "CRITICAL: Fill happened but order not in tracking map. Flattening position immediately (fail-closed) to prevent unprotected accumulation."
                     }));
                 
+                bool flattenOk2 = false; string? flattenErr2 = null;
                 try
                 {
                     var flattenResult = Flatten(intentId, instrument, utcNow);
+                    flattenOk2 = flattenResult.Success;
+                    flattenErr2 = flattenResult.ErrorMessage;
                     
                     _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "UNKNOWN_ORDER_FILL_FLATTENED",
                         new
@@ -1917,6 +1952,7 @@ public sealed partial class NinjaTraderSimAdapter
                 }
                 catch (Exception ex)
                 {
+                    flattenErr2 = ex.Message;
                     _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "UNKNOWN_ORDER_FILL_FLATTEN_FAILED",
                         new
                         {
@@ -1929,16 +1965,19 @@ public sealed partial class NinjaTraderSimAdapter
                             note = "CRITICAL: Failed to flatten untracked order fill position - manual intervention required"
                         }));
                     
-                    // Critical alert for flatten failure
                     var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
                     if (notificationService != null)
                     {
                         var title = $"CRITICAL: Unknown Order Fill - Flatten FAILED - {instrument}";
                         var message = $"Fill occurred for order not found in tracking map but flatten operation FAILED - MANUAL INTERVENTION REQUIRED. Intent: {intentId}, Broker Order ID: {order.OrderId}, Fill Price: {fillPrice}, Quantity: {fillQuantity}, Error: {ex.Message}";
-                        notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL_FLATTEN_FAILED:{intentId}", title, message, priority: 3); // Highest priority
+                        notificationService.EnqueueNotification($"UNKNOWN_ORDER_FILL_FLATTEN_FAILED:{intentId}", title, message, priority: 3);
                     }
                 }
-                
+
+                var orphanDir2 = (order.OrderAction == OrderAction.Buy || order.OrderAction == OrderAction.BuyToCover)
+                    ? SlotDirection.Long : SlotDirection.Short;
+                var orphanSlotId2 = RecordOrphanFillIfEnabled(instrument, order.OrderId ?? "", intentId, fillPrice, fillQuantity, utcNow, OrphanReason.UnknownOrder, orphanDir2);
+                NotifyOrphanFlattenResult(instrument, orphanSlotId2, flattenOk2, flattenErr2, utcNow);
                 return; // Fail-closed: don't process untracked fill
             }
         }
@@ -1977,10 +2016,17 @@ public sealed partial class NinjaTraderSimAdapter
         // CRITICAL: Resolve intent context before any journal call
         IntentContext context;
         if (!ResolveIntentContextOrFailClosed(intentId, encodedTag, orderTypeForContext, orderInfo.Instrument,
-            fillPrice, fillQuantity, utcNow, out context))
+            fillPrice, fillQuantity, utcNow, out context,
+            out var ctxFlattenAttempted, out var ctxFlattenOk, out var ctxFlattenErr))
         {
-            // Context resolution failed - orphan fill logged and execution blocked
-            // Do NOT call journal with empty strings
+            // Context resolution failed -- flatten attempted inside ResolveIntentContextOrFailClosed.
+            // Record orphan to ledger so the exposure is tracked even if flatten fails.
+            var ctxFailDir = (order.OrderAction == OrderAction.Buy || order.OrderAction == OrderAction.BuyToCover)
+                ? SlotDirection.Long : SlotDirection.Short;
+            var ctxOrphanSlotId = RecordOrphanFillIfEnabled(orderInfo.Instrument, order.OrderId ?? "", intentId,
+                fillPrice, fillQuantity, utcNow, OrphanReason.ContextResolutionFailed, ctxFailDir);
+            if (ctxFlattenAttempted)
+                NotifyOrphanFlattenResult(orderInfo.Instrument, ctxOrphanSlotId, ctxFlattenOk, ctxFlattenErr, utcNow);
             return; // Fail-closed
         }
 
@@ -2054,7 +2100,16 @@ public sealed partial class NinjaTraderSimAdapter
                 context.CanonicalInstrument,
                 brokerOrderInstrumentKey: null,
                 parityPendingDedupeKey: parityKey);
-            
+
+            if (FeatureFlags.CanonicalOwnershipLedgerEnabled && _ownershipLedger != null)
+            {
+                var dir = string.Equals(context.Direction, "Short", StringComparison.OrdinalIgnoreCase)
+                    ? SlotDirection.Short : SlotDirection.Long;
+                _ownershipLedger.RecordMappedEntryFill(
+                    GetLedgerAccountName(), context.ExecutionInstrument.Trim(),
+                    context.IntentId, context.Stream, dir, fillQuantity, utcNow, 0);
+            }
+
             // Log fill event
             if (filledTotal < orderInfo.Quantity)
             {
@@ -2121,11 +2176,17 @@ public sealed partial class NinjaTraderSimAdapter
                         action_taken = "FLATTENING_POSITION",
                         note = "Entry order filled but intent lost after context resolution - flattening position"
                     }));
-                
-                // Emergency flatten to prevent unprotected position
+
+                var orphanDirCtx = string.Equals(context.Direction, "Short", StringComparison.OrdinalIgnoreCase)
+                    ? SlotDirection.Short : SlotDirection.Long;
+                var orphanSlotIdCtx = RecordOrphanFillIfEnabled(orderInfo.Instrument, order.OrderId ?? "", intentId, fillPrice, fillQuantity, utcNow, OrphanReason.IntentLostAfterContext, orphanDirCtx);
+
+                bool flattenOkCtx = false; string? flattenErrCtx = null;
                 try
                 {
                     var flattenResult = Flatten(intentId, orderInfo.Instrument, utcNow);
+                    flattenOkCtx = flattenResult.Success;
+                    flattenErrCtx = flattenResult.ErrorMessage;
                     
                     _log.Write(RobotEvents.EngineBase(utcNow, context.TradingDate, "INTENT_NOT_FOUND_FLATTENED", "ENGINE",
                         new
@@ -2140,21 +2201,19 @@ public sealed partial class NinjaTraderSimAdapter
                             note = "Position flattened due to missing intent - protective orders could not be placed"
                         }));
                     
-                    // Stand down stream
                     _standDownStreamCallback?.Invoke(context.Stream, utcNow, $"INTENT_NOT_FOUND:{intentId}");
                     
-                    // Raise high-priority alert
                     var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
                     if (notificationService != null)
                     {
                         var title = $"CRITICAL: Intent Not Found - {orderInfo.Instrument}";
                         var message = $"Entry order filled but intent was not registered. Position flattened. Stream: {context.Stream}, Intent: {intentId}";
-                        notificationService.EnqueueNotification($"INTENT_NOT_FOUND:{intentId}", title, message, priority: 2); // Emergency priority
+                        notificationService.EnqueueNotification($"INTENT_NOT_FOUND:{intentId}", title, message, priority: 2);
                     }
                 }
                 catch (Exception ex)
                 {
-                    // Log flatten failure but don't throw - we've already logged the error
+                    flattenErrCtx = ex.Message;
                     _log.Write(RobotEvents.EngineBase(utcNow, context.TradingDate, "INTENT_NOT_FOUND_FLATTEN_FAILED", "ENGINE",
                         new
                         {
@@ -2166,6 +2225,7 @@ public sealed partial class NinjaTraderSimAdapter
                             note = "Failed to flatten position after intent not found - manual intervention may be required"
                         }));
                 }
+                NotifyOrphanFlattenResult(orderInfo.Instrument, orphanSlotIdCtx, flattenOkCtx, flattenErrCtx, utcNow);
             }
         }
         else if (orderTypeForContext == "STOP" || orderTypeForContext == "TARGET")
@@ -2219,7 +2279,14 @@ public sealed partial class NinjaTraderSimAdapter
                 fillQuantity,  // DELTA ONLY - not filledTotal
                 orderTypeForContext, // Use tag-based order type (ground truth)
                 utcNow);
-            
+
+            if (FeatureFlags.CanonicalOwnershipLedgerEnabled && _ownershipLedger != null)
+            {
+                _ownershipLedger.RecordMappedExitFill(
+                    GetLedgerAccountName(), context.ExecutionInstrument.Trim(),
+                    context.IntentId, fillQuantity, utcNow, 0);
+            }
+
             // Log exit fill event
             // CRITICAL FIX: Use orderTypeForContext (from tag) for logging - it's the ground truth
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "EXECUTION_EXIT_FILL",
@@ -2332,6 +2399,9 @@ public sealed partial class NinjaTraderSimAdapter
             // Unknown exit type - orphan it
             LogOrphanFill(intentId, encodedTag, orderInfo.OrderType, orderInfo.Instrument, fillPrice, fillQuantity,
                 utcNow, context.Stream, "UNKNOWN_EXIT_TYPE");
+            RecordOrphanFillIfEnabled(orderInfo.Instrument, order?.OrderId?.ToString() ?? "", intentId,
+                fillPrice, fillQuantity, utcNow, OrphanReason.IntentLostAfterContext,
+                ParseSlotDirection(context.Direction), OrphanActionTaken.NoAction);
             
             _log.Write(RobotEvents.EngineBase(utcNow, context.TradingDate, "EXECUTION_UNKNOWN_EXIT_TYPE", "ENGINE",
                 new
@@ -3941,7 +4011,7 @@ public sealed partial class NinjaTraderSimAdapter
     /// Check ALL instruments for flat positions and cancel entry stop orders.
     /// Called periodically to detect manual position closures that bypass robot code.
     /// </summary>
-    private void CheckAllInstrumentsForFlatPositions(DateTimeOffset utcNow)
+    partial void OnCheckAllInstrumentsForFlatPositions(DateTimeOffset utcNow)
     {
         if (_ntAccount == null)
         {
@@ -3986,6 +4056,61 @@ public sealed partial class NinjaTraderSimAdapter
         }
     }
     
+    /// <summary>
+    /// Record an orphan fill to both the ownership ledger and the orphan fill journal.
+    /// Returns the orphan slot ID (or null if feature disabled) so the caller can
+    /// wire <see cref="InstrumentOwnershipLedger.UpdateOrphanFlattenResult"/> after the flatten attempt.
+    /// </summary>
+    private string? RecordOrphanFillIfEnabled(string instrument, string brokerOrderId, string intentId,
+        decimal fillPrice, int fillQuantity, DateTimeOffset utcNow, OrphanReason reason,
+        SlotDirection direction, OrphanActionTaken actionTaken = OrphanActionTaken.FlattenAttempted)
+    {
+        if (!FeatureFlags.CanonicalOwnershipLedgerEnabled) return null;
+
+        var result = _ownershipLedger?.RecordOrphanFill(
+            GetLedgerAccountName(), instrument.Trim(), brokerOrderId, direction, fillQuantity, utcNow, reason);
+        var orphanSlotId = result?.OrphanSlotId ?? $"ORPHAN_{brokerOrderId}_{utcNow.Ticks}";
+
+        var tradingDate = GetAuditTradingDate(utcNow);
+        _orphanFillJournal?.RecordOrphanFill(new OrphanFillRecord
+        {
+            BrokerOrderId = brokerOrderId,
+            IntentIdIfKnown = intentId,
+            Instrument = instrument.Trim(),
+            FillPrice = fillPrice,
+            FillQty = fillQuantity,
+            FillUtc = utcNow.ToString("o"),
+            TradingDate = tradingDate,
+            OrphanReason = reason,
+            ActionTaken = actionTaken,
+            OwnershipLedgerSlotId = orphanSlotId,
+            RecordedUtc = utcNow.ToString("o"),
+            Direction = direction
+        });
+
+        return orphanSlotId;
+    }
+
+    private void NotifyOrphanFlattenResult(string instrument, string? orphanSlotId,
+        bool flattenSucceeded, string? flattenError, DateTimeOffset utcNow)
+    {
+        if (!FeatureFlags.CanonicalOwnershipLedgerEnabled || string.IsNullOrEmpty(orphanSlotId)) return;
+
+        _ownershipLedger?.UpdateOrphanFlattenResult(
+            GetLedgerAccountName(), instrument.Trim(), orphanSlotId!, flattenSucceeded, utcNow);
+
+        var td = GetAuditTradingDate(utcNow);
+        var action = flattenSucceeded ? OrphanActionTaken.FlattenSucceeded : OrphanActionTaken.FlattenFailed;
+        _orphanFillJournal?.RecordOrphanFlattenResult(td, orphanSlotId!, action, flattenError, utcNow);
+    }
+
+    private static SlotDirection ParseSlotDirection(string? direction)
+    {
+        return string.Equals(direction, "Short", StringComparison.OrdinalIgnoreCase)
+            ? SlotDirection.Short
+            : SlotDirection.Long;
+    }
+
     /// <summary>
     /// Check if position is flat and cancel all entry stop orders for the instrument.
     /// Called after execution updates to detect manual position closures.

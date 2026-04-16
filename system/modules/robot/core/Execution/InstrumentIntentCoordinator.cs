@@ -250,6 +250,55 @@ public sealed class InstrumentIntentCoordinator
         
         return true;
     }
+
+    /// <summary>
+    /// Multi-stream same execution instrument (e.g. CL1+CL2 on MCL): validate one protective order quantity against
+    /// the sum of remaining exposures for the listed intents (lexicographic order, deterministic).
+    /// </summary>
+    public bool CanSubmitAggregatedProtectiveExit(IReadOnlyList<string> intentIdsLexOrder, int protectiveQty)
+    {
+        if (intentIdsLexOrder == null || intentIdsLexOrder.Count == 0)
+        {
+            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "INTENT_AGGREGATED_EXIT_VALIDATION_FAILED", state: "ENGINE",
+                new { reason = "EMPTY_INTENT_LIST", protective_qty = protectiveQty }));
+            return false;
+        }
+
+        var sumRem = 0;
+        foreach (var id in intentIdsLexOrder)
+        {
+            if (!_exposures.TryGetValue(id, out var exposure))
+            {
+                _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "INTENT_AGGREGATED_EXIT_VALIDATION_FAILED", state: "ENGINE",
+                    new { intent_id = id, protective_qty = protectiveQty, reason = "NO_EXPOSURE_FOUND" }));
+                return false;
+            }
+
+            if (exposure.State != IntentExposureState.ACTIVE)
+            {
+                _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "INTENT_AGGREGATED_EXIT_VALIDATION_FAILED", state: "ENGINE",
+                    new { intent_id = id, protective_qty = protectiveQty, reason = "INTENT_NOT_ACTIVE", state = exposure.State.ToString() }));
+                return false;
+            }
+
+            sumRem += exposure.RemainingExposure;
+        }
+
+        if (protectiveQty > sumRem)
+        {
+            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "INTENT_AGGREGATED_EXIT_VALIDATION_FAILED", state: "ENGINE",
+                new
+                {
+                    protective_qty = protectiveQty,
+                    sum_remaining_exposure = sumRem,
+                    intent_ids = string.Join(",", intentIdsLexOrder),
+                    reason = "WOULD_OVER_CLOSE_AGGREGATED"
+                }));
+            return false;
+        }
+
+        return true;
+    }
     
     /// <summary>
     /// Responsibility 4: Emergency fallback on protective failure.

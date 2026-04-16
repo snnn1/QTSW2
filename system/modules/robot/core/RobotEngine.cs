@@ -119,6 +119,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// Returns empty string if trading date is not yet set.
     /// </summary>
     private string TradingDateString => _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
+    private string OwnershipAccountKey => string.IsNullOrWhiteSpace(_accountName) ? "default" : _accountName.Trim();
 
     /// <summary>
     /// Convert UTC to Chicago timezone. For strategy layer (e.g. SessionCloseResolver).
@@ -271,11 +272,121 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             RunPendingForceReconcile(utcNow);
             if (!IsBrokerConnected) return;
             _reconciliationRunner?.RunPeriodicThrottle(utcNow);
+            RunLedgerReconciliationShadow(utcNow);
         }
         finally
         {
             if (rt != 0)
                 _runtimeAudit?.CpuEnd(rt, RuntimeAuditSubsystem.ReconciliationThrottle);
+        }
+    }
+
+    /// <summary>
+    /// Phase 5a: Run the new classifier alongside the old runner, compare verdicts, log disagreements.
+    /// No mutations. Gated behind <see cref="FeatureFlags.CanonicalOwnershipLedgerEnabled"/>.
+    /// Phase 5b: If <see cref="FeatureFlags.ReconciliationRepairExecutorEnabled"/>, also execute repairs
+    /// for non-stale verdicts with hard mismatch tier.
+    /// </summary>
+    private void RunLedgerReconciliationShadow(DateTimeOffset utcNow)
+    {
+        if (_reconciliationClassifier == null || _ownershipLedger == null) return;
+        if (!FeatureFlags.CanonicalOwnershipLedgerEnabled) return;
+
+        try
+        {
+            var accountSnapshot = _executionAdapter.GetAccountSnapshot(utcNow);
+            if (accountSnapshot == null) return;
+
+            var accountName = OwnershipAccountKey;
+            var instrumentsInScope = _ownershipLedger.SnapshotAll(accountName)
+                .Select(s => s.ExecutionInstrumentKey)
+                .ToList();
+
+            var verdicts = _reconciliationClassifier.Classify(accountSnapshot, accountName, instrumentsInScope, utcNow);
+
+            foreach (var v in verdicts)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+                    eventType: "RECONCILIATION_CLASSIFIER_SHADOW_VERDICT", state: "ENGINE",
+                    new
+                    {
+                        instrument = v.Instrument,
+                        broker_qty = v.BrokerQty,
+                        ledger_qty = v.LedgerQty,
+                        journal_open_qty = v.JournalOpenQty,
+                        mismatch_tier = v.MismatchTier.ToString(),
+                        mismatch_age_ms = v.MismatchAgeMs,
+                        is_stale = v.IsStale,
+                        confidence = v.Confidence.ToString(),
+                        ownership_version = v.OwnershipVersion,
+                        active_slots = v.ActiveSlotCount,
+                        orphan_slots = v.OrphanSlotCount,
+                        sub_type = v.SubType.ToString()
+                    }));
+
+                if (v.MismatchTier == MismatchTier.HardMismatch)
+                    _stateEmitter?.NotifyImmediateTrigger(SnapshotTrigger.ReconciliationVerdict);
+            }
+
+            var runnerQty = _lastRunnerQtyByInstrument;
+            if (runnerQty != null)
+            {
+                foreach (var v in verdicts)
+                {
+                    var classifierMismatch = v.MismatchTier != MismatchTier.Convergence;
+                    runnerQty.TryGetValue(v.Instrument, out var rq);
+                    var runnerMismatch = rq.AccountQty != rq.JournalQty;
+
+                    if (classifierMismatch != runnerMismatch)
+                    {
+                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+                            eventType: "RECONCILIATION_CLASSIFIER_DISAGREEMENT", state: "ENGINE",
+                            new
+                            {
+                                instrument = v.Instrument,
+                                classifier_tier = v.MismatchTier.ToString(),
+                                classifier_broker_qty = v.BrokerQty,
+                                classifier_ledger_qty = v.LedgerQty,
+                                runner_account_qty = rq.AccountQty,
+                                runner_journal_qty = rq.JournalQty,
+                                classifier_says_mismatch = classifierMismatch,
+                                runner_says_mismatch = runnerMismatch
+                            }));
+                    }
+                }
+            }
+
+            // Phase 5b: Repair executor -- only if flag is on and classifier verdicts exist
+            if (FeatureFlags.ReconciliationRepairExecutorEnabled && _reconciliationRepairExecutor != null)
+            {
+                var repairableVerdicts = verdicts
+                    .Where(v => !v.IsStale && v.MismatchTier == MismatchTier.HardMismatch)
+                    .ToList();
+
+                if (repairableVerdicts.Count > 0)
+                {
+                    _reconciliationRepairExecutor.ExecuteRepairs(repairableVerdicts, utcNow);
+
+                    foreach (var rv in repairableVerdicts)
+                    {
+                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+                            eventType: "RECONCILIATION_REPAIR_EXECUTOR_ACTION", state: "ENGINE",
+                            new
+                            {
+                                instrument = rv.Instrument,
+                                broker_qty = rv.BrokerQty,
+                                ledger_qty = rv.LedgerQty,
+                                mismatch_tier = rv.MismatchTier.ToString()
+                            }));
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+                eventType: "RECONCILIATION_CLASSIFIER_SHADOW_ERROR", state: "ENGINE",
+                new { error = ex.Message }));
         }
     }
 
@@ -400,9 +511,22 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private ExecutionJournal _executionJournal;
     /// <summary>Transient fill observations so mismatch assembly does not classify <see cref="MismatchType.BROKER_AHEAD"/> while journal disk read lags <see cref="ExecutionJournal.RecordEntryFill"/>.</summary>
     private readonly PendingFillBridge _pendingFillBridge;
+    /// <summary>Canonical ownership ledger (P1 refactor). Dual-run alongside existing stores when feature flag is enabled.</summary>
+    private InstrumentOwnershipLedger? _ownershipLedger;
+    /// <summary>Unified execution authority (P2 refactor). Facade over existing gates.</summary>
+    private UnifiedExecutionAuthority? _unifiedAuthority;
+    /// <summary>Durable orphan fill journal (P4 refactor).</summary>
+    private OrphanFillJournal? _orphanFillJournal;
+    /// <summary>Durable ownership event journal (P6). Monotonic sequence for all ownership mutations.</summary>
+    private OwnershipEventJournal? _ownershipEventJournal;
+    /// <summary>Authoritative state snapshot emitter (P5 refactor).</summary>
+    private AuthoritativeStateEmitter? _stateEmitter;
     private InstrumentIntentCoordinator? _intentExposureCoordinator;
     private ExecutionEventWriter _eventWriter = null!;
     private ReconciliationRunner? _reconciliationRunner;
+    private ReconciliationClassifier? _reconciliationClassifier;
+    private ReconciliationRepairExecutor? _reconciliationRepairExecutor;
+    private volatile Dictionary<string, (int AccountQty, int JournalQty)>? _lastRunnerQtyByInstrument;
     private ProtectiveCoverageCoordinator? _protectiveCoordinator;
     private MismatchEscalationCoordinator? _mismatchCoordinator;
     private KillSwitch? _killSwitch;
@@ -1200,6 +1324,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             Directory.CreateDirectory(RobotRunArtifactPaths.StateExecutionJournals(_persistenceBase));
             Directory.CreateDirectory(RobotRunArtifactPaths.DecisionsDir(_persistenceBase));
             Directory.CreateDirectory(Path.Combine(_persistenceBase, "events", "execution_events"));
+            Directory.CreateDirectory(Path.Combine(_persistenceBase, "events", "ownership_events"));
+            Directory.CreateDirectory(Path.Combine(_persistenceBase, "events", "ownership_snapshots"));
+            Directory.CreateDirectory(Path.Combine(_persistenceBase, "events", "orphan_fills"));
             Directory.CreateDirectory(RobotRunArtifactPaths.LogsRobot(_persistenceBase));
             Directory.CreateDirectory(RobotRunArtifactPaths.LogsHealth(_persistenceBase));
             Directory.CreateDirectory(RobotRunArtifactPaths.LogsHydration(_persistenceBase));
@@ -1237,12 +1364,121 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }));
     }
 
+    private void ApplyIsolatedPlaybackAuditShadowDefaults(DateTimeOffset utcNow)
+    {
+        if (!_isolatedPlaybackPersistence) return;
+
+        var canonicalWas = FeatureFlags.CanonicalOwnershipLedgerEnabled;
+        var ueaShadowWas = FeatureFlags.UnifiedExecutionAuthorityShadowEnabled;
+        var ueaActiveWas = FeatureFlags.UnifiedExecutionAuthorityEnabled;
+        var repairWas = FeatureFlags.ReconciliationRepairExecutorEnabled;
+        var structuralLedgerWas = FeatureFlags.StructuralLayerUseLedgerOwnership;
+
+        FeatureFlags.CanonicalOwnershipLedgerEnabled = true;
+        FeatureFlags.UnifiedExecutionAuthorityShadowEnabled = true;
+        FeatureFlags.UnifiedExecutionAuthorityEnabled = false;
+        FeatureFlags.ReconciliationRepairExecutorEnabled = false;
+        FeatureFlags.StructuralLayerUseLedgerOwnership = false;
+
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "PLAYBACK_AUDIT_SHADOW_FLAGS_APPLIED", state: "ENGINE",
+            new
+            {
+                canonical_ownership_ledger_enabled = FeatureFlags.CanonicalOwnershipLedgerEnabled,
+                unified_execution_authority_shadow_enabled = FeatureFlags.UnifiedExecutionAuthorityShadowEnabled,
+                unified_execution_authority_enabled = FeatureFlags.UnifiedExecutionAuthorityEnabled,
+                reconciliation_repair_executor_enabled = FeatureFlags.ReconciliationRepairExecutorEnabled,
+                structural_layer_use_ledger_ownership = FeatureFlags.StructuralLayerUseLedgerOwnership,
+                previous_canonical_ownership_ledger_enabled = canonicalWas,
+                previous_unified_execution_authority_shadow_enabled = ueaShadowWas,
+                previous_unified_execution_authority_enabled = ueaActiveWas,
+                previous_reconciliation_repair_executor_enabled = repairWas,
+                previous_structural_layer_use_ledger_ownership = structuralLedgerWas,
+                note = "Isolated playback audit mode: shadow artifact writers are enabled; activation/repair/read-path flags are forced off."
+            }));
+    }
+
+    private void InitializeOwnershipAuditArtifacts(DateTimeOffset utcNow)
+    {
+        _stateEmitter?.Dispose();
+        _stateEmitter = null;
+        _ownershipLedger = null;
+        _orphanFillJournal = null;
+        _ownershipEventJournal = null;
+        _reconciliationClassifier = null;
+        _reconciliationRepairExecutor = null;
+
+        if (FeatureFlags.CanonicalOwnershipLedgerEnabled)
+        {
+            _ownershipLedger = new InstrumentOwnershipLedger(
+                _log,
+                onClassAEvent: HandleOwnershipClassAEvent,
+                onClassBEvent: HandleOwnershipClassBEvent);
+            _orphanFillJournal = new OrphanFillJournal(_persistenceBase, _log, () => TradingDateString);
+            _ownershipEventJournal = new OwnershipEventJournal(_persistenceBase, _log);
+            _ownershipLedger.SetEventJournal(_ownershipEventJournal, TradingDateString);
+            _stateEmitter = new AuthoritativeStateEmitter(
+                _ownershipLedger,
+                () => _executionAdapter?.GetAccountSnapshot(DateTimeOffset.UtcNow) ?? new AccountSnapshot(),
+                () => _ownershipLedger.SnapshotAll(OwnershipAccountKey).Select(s => s.ExecutionInstrumentKey).ToList(),
+                _persistenceBase,
+                _log,
+                account: OwnershipAccountKey,
+                getSupervisoryState: inst => _mismatchCoordinator?.GetGateLifecyclePhase(inst).ToString(),
+                getMismatchEscalationState: inst => _mismatchCoordinator?.GetBlockReason(inst),
+                isInstrumentFrozen: inst => _frozenInstruments.Contains(inst),
+                isKillSwitchActive: () => _killSwitch?.IsEnabled() ?? false,
+                getAccountName: () => OwnershipAccountKey,
+                getTradingDate: () => TradingDateString);
+            _stateEmitter.StartPeriodicTimer();
+            _reconciliationClassifier = new ReconciliationClassifier(_ownershipLedger, _log);
+            if (FeatureFlags.ReconciliationRepairExecutorEnabled && _executionAdapter != null)
+                _reconciliationRepairExecutor = new ReconciliationRepairExecutor(_executionJournal, _executionAdapter, _log);
+        }
+
+        _unifiedAuthority = (FeatureFlags.CanonicalOwnershipLedgerEnabled ||
+                             FeatureFlags.UnifiedExecutionAuthorityShadowEnabled ||
+                             FeatureFlags.UnifiedExecutionAuthorityEnabled)
+            ? new UnifiedExecutionAuthority(_log, _ownershipLedger)
+            : null;
+
+        RunRootArtifacts.WriteAuditManifestJson(
+            _persistenceBase,
+            _runId,
+            _engineStartUtc == default ? utcNow : _engineStartUtc,
+            TradingDateString,
+            _isolatedPlaybackPersistence,
+            FeatureFlags.CanonicalOwnershipLedgerEnabled,
+            FeatureFlags.UnifiedExecutionAuthorityShadowEnabled,
+            FeatureFlags.UnifiedExecutionAuthorityEnabled,
+            FeatureFlags.ReconciliationRepairExecutorEnabled,
+            FeatureFlags.StructuralLayerUseLedgerOwnership);
+
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "AUDIT_ARTIFACT_PATHS_RESOLVED", state: "ENGINE",
+            new
+            {
+                persistence_base = _persistenceBase,
+                manifest = Path.Combine(_persistenceBase, RunRootArtifacts.AuditManifestFileName),
+                robot_engine_log = Path.Combine(RobotRunArtifactPaths.LogsRobot(_persistenceBase), "robot_ENGINE.jsonl"),
+                robot_instrument_glob = Path.Combine(RobotRunArtifactPaths.LogsRobot(_persistenceBase), "robot_*.jsonl"),
+                ownership_events_dir = Path.Combine(_persistenceBase, "events", "ownership_events"),
+                ownership_snapshots_dir = Path.Combine(_persistenceBase, "events", "ownership_snapshots"),
+                orphan_fills_dir = Path.Combine(_persistenceBase, "events", "orphan_fills"),
+                canonical_ownership_ledger_enabled = FeatureFlags.CanonicalOwnershipLedgerEnabled,
+                unified_execution_authority_shadow_enabled = FeatureFlags.UnifiedExecutionAuthorityShadowEnabled,
+                unified_execution_authority_enabled = FeatureFlags.UnifiedExecutionAuthorityEnabled,
+                reconciliation_repair_executor_enabled = FeatureFlags.ReconciliationRepairExecutorEnabled,
+                structural_layer_use_ledger_ownership = FeatureFlags.StructuralLayerUseLedgerOwnership
+            }));
+    }
+
     public void Start()
     {
         // CRITICAL: Set run_id before any Start-path logs (RebindPersistenceIfNeeded → ApplyOptionalRunIdFromEnvironment refines from env after this)
         AssignRunIdAtSessionStart(out var runIdAssignmentSource);
         _engineStartUtc = _playbackStartTimeUtc ?? DateTimeOffset.UtcNow;
         RebindPersistenceIfNeeded(_engineStartUtc);
+        ApplyIsolatedPlaybackAuditShadowDefaults(_engineStartUtc);
+        InitializeOwnershipAuditArtifacts(_engineStartUtc);
         LogEvent(RobotEvents.EngineBase(_engineStartUtc, tradingDate: "", eventType: "RUN_ID_ASSIGNED", state: "ENGINE",
             new
             {
@@ -1386,8 +1622,20 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         : Path.Combine(_root, _executionPolicyPath);
                     absolutePolicyPath = Path.GetFullPath(absolutePolicyPath);
                     
+                    ExecutionPolicy._singleOwnerDefaultApplied = false;
                     _executionPolicy = ExecutionPolicy.LoadFromFile(absolutePolicyPath);
-                    
+
+                    if (ExecutionPolicy._singleOwnerDefaultApplied)
+                    {
+                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+                            eventType: "EXECUTION_POLICY_SINGLEOWNER_DEFAULT", state: "ENGINE",
+                            new
+                            {
+                                note = "structural_multi_intent_policy defaulted to SingleOwner (was Allow prior to P7). " +
+                                       "Set structural_multi_intent_policy explicitly if Allow behavior is required."
+                            }));
+                    }
+
                     // Compute file hash for audit trail
                     var policyFileHash = "";
                     try
@@ -1696,6 +1944,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 onQuantityMismatch: LogReconciliationQuantityMismatchDiagnostics,
                 onReconciliationPassComplete: qtyByInstrument =>
                 {
+                    _lastRunnerQtyByInstrument = qtyByInstrument;
                     var resolvedUtc = DateTimeOffset.UtcNow;
                     foreach (var kv in qtyByInstrument)
                     {
@@ -1797,10 +2046,22 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 getRunIdForMismatchDiagnostics: () => _runId,
                 probeCanonicallyUnexplainedExposure: (inst, utc) => ProbeMismatchConvergenceCanonicalExposure(inst, utc));
 
-            // P2 Phase 1: gate probe for aggregation guard + stream containment after blocked instrument flatten
+            // Phase 8b: wire ledger-aware mismatch detection when enabled
+            if (FeatureFlags.CanonicalOwnershipLedgerEnabled && _ownershipLedger != null)
+            {
+                _mismatchCoordinator.SetLedgerSnapshotProvider(
+                    inst => _ownershipLedger.GetOwnershipSnapshot(OwnershipAccountKey, inst));
+            }
+
             if (_executionAdapter is NinjaTraderSimAdapter simP2)
             {
                 simP2.SetPendingFillBridge(_pendingFillBridge);
+                if (FeatureFlags.CanonicalOwnershipLedgerEnabled)
+                {
+                    simP2.SetOwnershipLedger(_ownershipLedger);
+                    simP2.SetOrphanFillJournal(_orphanFillJournal);
+                }
+                simP2.SetUnifiedExecutionAuthority(_unifiedAuthority);
                 simP2.SetMismatchExecutionTriggerCallback((inst, utc, d) =>
                 {
                     _releaseReconRedundancy.NotifyExecutionActivity();
@@ -2177,6 +2438,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
             // Stop health monitor
             _healthMonitor?.Stop();
+            _stateEmitter?.Dispose();
+            _stateEmitter = null;
 
             // Release reference to async logging service (Fix B) - singleton will dispose when all references released
             _loggingService?.Release();
@@ -2212,6 +2475,18 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 isolatedInstruments,
                 summarySnap);
         }
+
+        RunRootArtifacts.WriteAuditManifestJson(
+            _persistenceBase,
+            _runId,
+            _engineStartUtc,
+            TradingDateString,
+            _isolatedPlaybackPersistence,
+            FeatureFlags.CanonicalOwnershipLedgerEnabled,
+            FeatureFlags.UnifiedExecutionAuthorityShadowEnabled,
+            FeatureFlags.UnifiedExecutionAuthorityEnabled,
+            FeatureFlags.ReconciliationRepairExecutorEnabled,
+            FeatureFlags.StructuralLayerUseLedgerOwnership);
     }
 
     /// <summary>Tick with explicit Historical flag. Use this when caller knows State (e.g. strategy).</summary>
@@ -4257,6 +4532,326 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     utcNow,
                     "journal_recovery");
             }
+        }
+
+        if (FeatureFlags.CanonicalOwnershipLedgerEnabled && _ownershipLedger != null)
+            RestoreOwnershipLedgerFromJournal(openByInstrument, utcNow);
+    }
+
+    private void RestoreOwnershipLedgerFromJournal(
+        Dictionary<string, List<(string TradingDate, string Stream, string IntentId, ExecutionJournalEntry Entry)>> openByInstrument,
+        DateTimeOffset utcNow)
+    {
+        if (_ownershipLedger == null) return;
+
+        var td = TradingDateString;
+        if (string.IsNullOrEmpty(td)) td = utcNow.ToString("yyyy-MM-dd");
+        _ownershipLedger.SetEventJournal(_ownershipEventJournal, td);
+
+        var accountName = OwnershipAccountKey;
+
+        // Phase 6c: Prefer the ownership event journal for restore when available.
+        // It provides true monotonic durable sequence and includes transfers + orphans.
+        // Falls back to the interim timestamp ordering (Phase 1c) if the event journal is empty.
+        bool restoredFromEventJournal = false;
+        if (_ownershipEventJournal != null)
+        {
+            try
+            {
+                var events = _ownershipEventJournal.ReadEvents(td);
+                if (events.Count > 0)
+                {
+                    restoredFromEventJournal = true;
+                    var groupedByInstrument = events.GroupBy(e => e.Instrument?.Trim() ?? "", StringComparer.OrdinalIgnoreCase);
+
+                    foreach (var group in groupedByInstrument)
+                    {
+                        long seq = 0;
+                        var rows = new List<JournalRestoreRow>();
+                        foreach (var evt in group.OrderBy(e => e.OwnershipEventSequence))
+                        {
+                            if (evt.Kind == OwnershipEventKind.MappedEntryFill ||
+                                evt.Kind == OwnershipEventKind.MappedExitFill ||
+                                evt.Kind == OwnershipEventKind.OrphanFill)
+                            {
+                                rows.Add(new JournalRestoreRow
+                                {
+                                    IntentId = evt.IntentId,
+                                    Stream = "",
+                                    Direction = evt.Direction == SlotDirection.Short ? "Short" : "Long",
+                                    EntryFilledQty = evt.Kind == OwnershipEventKind.MappedEntryFill || evt.Kind == OwnershipEventKind.OrphanFill
+                                        ? evt.Qty : 0,
+                                    ExitFilledQty = evt.Kind == OwnershipEventKind.MappedExitFill ? evt.Qty : 0,
+                                    ExecutionSequence = seq++,
+                                    IsOrphan = evt.Kind == OwnershipEventKind.OrphanFill
+                                });
+                            }
+                            else if (evt.Kind == OwnershipEventKind.OwnershipTransfer)
+                            {
+                                rows.Add(new JournalRestoreRow
+                                {
+                                    IntentId = evt.IntentId,
+                                    Stream = "",
+                                    Direction = evt.Direction == SlotDirection.Short ? "Short" : "Long",
+                                    RowType = JournalRowType.Transfer,
+                                    FromIntentId = evt.FromIntentId,
+                                    ToIntentId = evt.ToIntentId,
+                                    TransferQty = evt.Qty,
+                                    ExecutionSequence = seq++
+                                });
+                            }
+                        }
+
+                        if (rows.Count > 0)
+                        {
+                            _ownershipLedger.RestoreFromJournal(accountName, group.Key, rows, utcNow);
+
+                            var isConsistent = _ownershipLedger.AssertDeterministicRestore(accountName, group.Key, rows);
+                            if (!isConsistent)
+                            {
+                                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+                                    eventType: "OWNERSHIP_RESTORE_DETERMINISM_FAILURE", state: "ENGINE",
+                                    new { instrument = group.Key, row_count = rows.Count, source = "event_journal" }));
+                            }
+                        }
+                    }
+
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+                        eventType: "OWNERSHIP_RESTORED_FROM_EVENT_JOURNAL", state: "ENGINE",
+                        new { event_count = events.Count }));
+                }
+            }
+            catch (Exception ex)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+                    eventType: "OWNERSHIP_EVENT_JOURNAL_RESTORE_ERROR", state: "ENGINE",
+                    new { error = ex.Message }));
+            }
+        }
+
+        // Fallback: interim timestamp ordering from Phase 1c (for first run or pre-event-journal trading dates)
+        if (!restoredFromEventJournal)
+        {
+            foreach (var kv in openByInstrument)
+            {
+                var instrument = kv.Key;
+                var sorted = kv.Value
+                    .Select(t => (t.TradingDate, t.Stream, t.IntentId, t.Entry,
+                        Seq: ParseRestoreSequence(t.Entry,
+                            string.Equals(t.Entry.IntentType, ExecutionJournal.IntentTypeRecovered, StringComparison.OrdinalIgnoreCase))))
+                    .OrderBy(t => t.Seq)
+                    .ThenBy(t => t.TradingDate, StringComparer.Ordinal)
+                    .ThenBy(t => t.Stream, StringComparer.Ordinal)
+                    .ThenBy(t => t.IntentId, StringComparer.Ordinal)
+                    .ToList();
+
+                long seq = 0;
+                var rows = new List<JournalRestoreRow>();
+                foreach (var (_, stream, intentId, entry, _) in sorted)
+                {
+                    var isOrphan = string.Equals(entry.IntentType, ExecutionJournal.IntentTypeRecovered, StringComparison.OrdinalIgnoreCase);
+                    rows.Add(new JournalRestoreRow
+                    {
+                        IntentId = intentId,
+                        Stream = stream,
+                        Direction = entry.Direction,
+                        EntryFilledQty = entry.EntryFilledQuantityTotal,
+                        ExitFilledQty = entry.ExitFilledQuantityTotal,
+                        ExecutionSequence = seq++,
+                        IsOrphan = isOrphan
+                    });
+                }
+
+                if (rows.Count > 0)
+                {
+                    _ownershipLedger.RestoreFromJournal(accountName, instrument, rows, utcNow);
+
+                    var isConsistent = _ownershipLedger.AssertDeterministicRestore(accountName, instrument, rows);
+                    if (!isConsistent)
+                    {
+                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+                            eventType: "OWNERSHIP_RESTORE_DETERMINISM_FAILURE", state: "ENGINE",
+                            new
+                            {
+                                instrument,
+                                row_count = rows.Count,
+                                source = "interim_timestamp_fallback",
+                                note = "CRITICAL: non-deterministic restore from interim ordering"
+                            }));
+                    }
+                }
+            }
+        }
+
+        // Phase 3: Restore still-open orphan fills from the orphan journal.
+        // Deduplication by BrokerOrderId against entries already in the ledger.
+        int orphansRestored = 0;
+        if (_orphanFillJournal != null)
+        {
+            try
+            {
+                var td = TradingDateString ?? utcNow.ToString("yyyy-MM-dd");
+                var openOrphans = _orphanFillJournal.ReadOrphanFills(td);
+
+                var knownBrokerOrderIds = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var kv in openByInstrument)
+                    foreach (var (_, _, _, entry) in kv.Value)
+                        if (!string.IsNullOrEmpty(entry.BrokerOrderId))
+                            knownBrokerOrderIds.Add(entry.BrokerOrderId);
+
+                foreach (var orphan in openOrphans)
+                {
+                    if (knownBrokerOrderIds.Contains(orphan.BrokerOrderId))
+                        continue;
+
+                    var dir = orphan.Direction != default ? orphan.Direction : SlotDirection.Long;
+                    _ownershipLedger.RecordOrphanFill(
+                        accountName, orphan.Instrument.Trim(), orphan.BrokerOrderId,
+                        dir, orphan.FillQty, utcNow, orphan.OrphanReason);
+                    knownBrokerOrderIds.Add(orphan.BrokerOrderId);
+                    orphansRestored++;
+                }
+            }
+            catch (Exception ex)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+                    eventType: "ORPHAN_FILL_RESTORE_ERROR", state: "ENGINE",
+                    new { error = ex.Message, note = "Failed to restore orphan fills from journal" }));
+            }
+        }
+
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "OWNERSHIP_LEDGER_RESTORED", state: "ENGINE",
+            new
+            {
+                instrument_count = openByInstrument.Count,
+                total_rows = openByInstrument.Values.Sum(v => v.Count),
+                orphans_restored = orphansRestored,
+                note = "Canonical ownership ledger restored from journal (dual-run)"
+            }));
+
+        _stateEmitter?.EmitRestoreBaseline();
+    }
+
+    /// <summary>
+    /// INTERIM: Parse a deterministic ordering key from journal entry timestamps.
+    /// Uses EntryFilledAtUtc for normal entries, RecoveryTimestampUtc for orphan/recovered entries.
+    /// Returns UTC ticks, or long.MaxValue if unparseable (sorts last).
+    /// Will be replaced by durable OwnershipEventSequence in Phase 6.
+    /// </summary>
+    private static long ParseRestoreSequence(ExecutionJournalEntry entry, bool isOrphan)
+    {
+        var ts = isOrphan ? entry.RecoveryTimestampUtc : entry.EntryFilledAtUtc;
+        if (!string.IsNullOrEmpty(ts) && DateTimeOffset.TryParse(ts, null,
+                System.Globalization.DateTimeStyles.RoundtripKind, out var dto))
+            return dto.UtcTicks;
+        if (!string.IsNullOrEmpty(entry.EntryFilledAtUtc) && DateTimeOffset.TryParse(entry.EntryFilledAtUtc, null,
+                System.Globalization.DateTimeStyles.RoundtripKind, out var dto2))
+            return dto2.UtcTicks;
+        return long.MaxValue;
+    }
+
+    private static readonly HashSet<OwnershipEventKind> _immediateSnapshotKinds = new()
+    {
+        OwnershipEventKind.OrphanFill,
+        OwnershipEventKind.InvariantViolation,
+        OwnershipEventKind.ExitOverflow,
+        OwnershipEventKind.OwnershipConflictRejected,
+        OwnershipEventKind.TransferRejected
+    };
+
+    private static readonly HashSet<OwnershipEventKind> _coalescedSnapshotKinds = new()
+    {
+        OwnershipEventKind.MappedEntryFill,
+        OwnershipEventKind.MappedExitFill
+    };
+
+    private void HandleOwnershipClassAEvent(OwnershipEvent evt)
+    {
+        try
+        {
+            LogEvent(RobotEvents.EngineBase(evt.Utc, tradingDate: TradingDateString,
+                eventType: $"OWNERSHIP_CLASS_A_{evt.Kind}", state: "ENGINE",
+                new
+                {
+                    kind = evt.Kind.ToString(),
+                    instrument = evt.ExecutionInstrumentKey,
+                    intent_id = evt.IntentId,
+                    qty_delta = evt.QtyDelta,
+                    direction = evt.Direction.ToString(),
+                    ownership_version = evt.OwnershipVersion,
+                    detail = evt.Detail
+                }));
+
+            if (_immediateSnapshotKinds.Contains(evt.Kind))
+            {
+                var trigger = evt.Kind switch
+                {
+                    OwnershipEventKind.OrphanFill => SnapshotTrigger.OrphanFill,
+                    OwnershipEventKind.ExitOverflow => SnapshotTrigger.ExitOverflow,
+                    OwnershipEventKind.OwnershipConflictRejected => SnapshotTrigger.OwnershipConflictRejected,
+                    OwnershipEventKind.TransferRejected => SnapshotTrigger.TransferRejected,
+                    _ => SnapshotTrigger.SupervisorEscalation
+                };
+                _stateEmitter?.NotifyImmediateTrigger(trigger);
+            }
+            else if (_coalescedSnapshotKinds.Contains(evt.Kind))
+            {
+                _stateEmitter?.NotifyCoalescedTrigger(SnapshotTrigger.Fill);
+            }
+
+            PersistClassAEvent(evt);
+        }
+        catch (Exception ex)
+        {
+            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "OWNERSHIP_CLASS_A_HANDLER_ERROR", "ENGINE",
+                new { error = ex.Message, kind = evt.Kind.ToString() }));
+        }
+    }
+
+    private void HandleOwnershipClassBEvent(OwnershipEvent evt)
+    {
+        LogEvent(RobotEvents.EngineBase(evt.Utc, tradingDate: TradingDateString,
+            eventType: $"OWNERSHIP_CLASS_B_{evt.Kind}", state: "ENGINE",
+            new
+            {
+                kind = evt.Kind.ToString(),
+                instrument = evt.ExecutionInstrumentKey,
+                ownership_version = evt.OwnershipVersion,
+                detail = evt.Detail
+            }));
+    }
+
+    private void PersistClassAEvent(OwnershipEvent evt)
+    {
+        try
+        {
+            var td = TradingDateString;
+            if (string.IsNullOrEmpty(td)) td = evt.Utc.ToString("yyyy-MM-dd");
+            var dir = System.IO.Path.Combine(_persistenceBase, "events", "ownership_events", td);
+            System.IO.Directory.CreateDirectory(dir);
+            var filePath = System.IO.Path.Combine(dir, "class_a.jsonl");
+            var json = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                kind = evt.Kind.ToString(),
+                event_class = evt.EventClass.ToString(),
+                account = evt.Account,
+                instrument = evt.ExecutionInstrumentKey,
+                ownership_version = evt.OwnershipVersion,
+                intent_id = evt.IntentId,
+                from_intent_id = evt.FromIntentId,
+                to_intent_id = evt.ToIntentId,
+                qty_delta = evt.QtyDelta,
+                direction = evt.Direction.ToString(),
+                orphan_reason = evt.OrphanReason.ToString(),
+                utc = evt.Utc.ToString("o"),
+                detail = evt.Detail
+            });
+            System.IO.File.AppendAllText(filePath, json + Environment.NewLine);
+        }
+        catch (Exception ex)
+        {
+            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "OWNERSHIP_CLASS_A_PERSIST_ERROR", "ENGINE",
+                new { error = ex.Message }));
         }
     }
 

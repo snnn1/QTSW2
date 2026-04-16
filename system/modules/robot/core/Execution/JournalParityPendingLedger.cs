@@ -6,9 +6,12 @@ using System.Linq;
 namespace QTSW2.Robot.Core.Execution;
 
 /// <summary>
-/// In-process only: explains broker vs journal timing gaps for <see cref="JournalParityStatus.PARITY_PENDING_ALIGNMENT"/>.
+/// [DEPRECATED — P8 refactor] In-process only: explains broker vs journal timing gaps for
+/// <see cref="JournalParityStatus.PARITY_PENDING_ALIGNMENT"/>.
 /// Cleared on new <see cref="RobotEngine"/> session; never persisted (recovery mode must not use pending).
+/// Targeted for deprecation once <see cref="InstrumentOwnershipLedger"/> dual-run is proven.
 /// </summary>
+[Obsolete("P8: Targeted for deprecation once InstrumentOwnershipLedger dual-run is proven.")]
 public static class JournalParityPendingLedger
 {
     private static readonly ConcurrentDictionary<string, ConcurrentDictionary<string, JournalParityPendingEntry>> ByInstrument =

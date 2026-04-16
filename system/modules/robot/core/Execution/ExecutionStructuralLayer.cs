@@ -166,11 +166,23 @@ public static class ExecutionStructuralLayer
             req.UtcNow,
             req.SnapshotTakenUtc);
 
-        var (realOpen, recoveredOpen, _) = req.Journal.GetPositionAuthorityOpenQuantitiesForInstrument(inst, canonical);
-        var derived = PositionAuthorityDerivation.DerivePositionAuthority(
-            parity.BrokerPositionQty,
-            realOpen,
-            recoveredOpen);
+        // Phase 8: when ledger ownership is available and the flag is on, derive authority from ledger
+        DerivedPositionAuthority derived;
+        int realOpen, recoveredOpen;
+        if (FeatureFlags.StructuralLayerUseLedgerOwnership && req.LedgerOwnershipSnapshot != null)
+        {
+            var snap = req.LedgerOwnershipSnapshot;
+            realOpen = Math.Abs(snap.LedgerSignedNetQty);
+            recoveredOpen = 0;
+            derived = PositionAuthorityDerivation.DerivePositionAuthority(
+                parity.BrokerPositionQty, realOpen, recoveredOpen);
+        }
+        else
+        {
+            (realOpen, recoveredOpen, _) = req.Journal.GetPositionAuthorityOpenQuantitiesForInstrument(inst, canonical);
+            derived = PositionAuthorityDerivation.DerivePositionAuthority(
+                parity.BrokerPositionQty, realOpen, recoveredOpen);
+        }
         var authorityState = derived.ToString();
 
         var recoveryExecutionBlocked = req.RecoveryExecutionDisallowed;

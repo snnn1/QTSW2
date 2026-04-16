@@ -56,7 +56,7 @@ public static class CalendarGroupResolver
             return null;
         var trimmed = instrument.Trim();
         var space = trimmed.IndexOf(' ');
-        var token = space >= 0 ? trimmed[..space] : trimmed;
+        var token = space >= 0 ? trimmed.Substring(0, space) : trimmed;
         if (string.IsNullOrEmpty(token))
             return null;
         return token.ToUpperInvariant();

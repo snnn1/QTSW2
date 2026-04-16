@@ -39,11 +39,52 @@ public static class RobotRunArtifactPaths
         return Path.Combine(persistenceBase ?? "", "events", "execution_events", td);
     }
 
+    /// <summary>Directory for durable ownership events for one trading date: .../events/ownership_events/{td}/</summary>
+    public static string EventsOwnershipEventsTradingDate(string persistenceBase, string tradingDate)
+    {
+        var td = string.IsNullOrWhiteSpace(tradingDate)
+            ? DateTimeOffset.UtcNow.ToString("yyyy-MM-dd")
+            : tradingDate.Trim();
+        return Path.Combine(persistenceBase ?? "", "events", "ownership_events", td);
+    }
+
+    /// <summary>Directory for ownership snapshot JSONL: .../events/ownership_snapshots/{td}/</summary>
+    public static string EventsOwnershipSnapshotsTradingDate(string persistenceBase, string tradingDate)
+    {
+        var td = string.IsNullOrWhiteSpace(tradingDate)
+            ? DateTimeOffset.UtcNow.ToString("yyyy-MM-dd")
+            : tradingDate.Trim();
+        return Path.Combine(persistenceBase ?? "", "events", "ownership_snapshots", td);
+    }
+
+    /// <summary>Directory for orphan fill JSONL: .../events/orphan_fills/{td}/</summary>
+    public static string EventsOrphanFillsTradingDate(string persistenceBase, string tradingDate)
+    {
+        var td = string.IsNullOrWhiteSpace(tradingDate)
+            ? DateTimeOffset.UtcNow.ToString("yyyy-MM-dd")
+            : tradingDate.Trim();
+        return Path.Combine(persistenceBase ?? "", "events", "orphan_fills", td);
+    }
+
     public static string DerivedExecutionSummaries(string persistenceBase)
         => Path.Combine(persistenceBase ?? "", "derived", "execution_summaries");
 
     public static string DecisionsDir(string persistenceBase)
         => Path.Combine(persistenceBase ?? "", "decisions");
+
+    /// <summary>Create the run directories that audits treat as canonical sources.</summary>
+    public static void EnsureAuditDirectories(string persistenceBase, string tradingDate)
+    {
+        Directory.CreateDirectory(LogsRobot(persistenceBase));
+        Directory.CreateDirectory(EventsExecutionEventsTradingDate(persistenceBase, tradingDate));
+        Directory.CreateDirectory(EventsOwnershipEventsTradingDate(persistenceBase, tradingDate));
+        Directory.CreateDirectory(EventsOwnershipSnapshotsTradingDate(persistenceBase, tradingDate));
+        Directory.CreateDirectory(EventsOrphanFillsTradingDate(persistenceBase, tradingDate));
+        Directory.CreateDirectory(StateStreamJournals(persistenceBase));
+        Directory.CreateDirectory(StateExecutionJournals(persistenceBase));
+        Directory.CreateDirectory(DerivedExecutionSummaries(persistenceBase));
+        Directory.CreateDirectory(DecisionsDir(persistenceBase));
+    }
 
     /// <summary>True when <paramref name="persistenceBase"/> is under a <c>runs/&lt;id&gt;/</c> tree (isolated run artifacts).</summary>
     public static bool IsRunScopedPersistence(string? persistenceBase)

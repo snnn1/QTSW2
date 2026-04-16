@@ -8,6 +8,9 @@ namespace QTSW2.Robot.Core;
 
 public sealed class ExecutionPolicy
 {
+    /// <summary>P7: Set true when ParseStructuralMultiIntentPolicy defaulted to SingleOwner. Log at startup for migration visibility.</summary>
+    internal static bool _singleOwnerDefaultApplied;
+
     public string schema { get; set; } = "";
     
     // PHASE 4: Case-insensitive dictionaries (normalized at load time)
@@ -108,16 +111,27 @@ public sealed class ExecutionPolicy
         return policy;
     }
 
+    /// <summary>
+    /// P7 migration note: default changed from <c>Allow</c> to <c>SingleOwner</c> as part of
+    /// the 5-Layer Conformance Refactor. Configs without an explicit <c>structural_multi_intent_policy</c>
+    /// will now default to <c>SingleOwner</c> which may reject previously valid multi-intent flows.
+    /// Set the config field explicitly if <c>Allow</c> behavior is required.
+    /// </summary>
     private static StructuralMultiIntentPolicy ParseStructuralMultiIntentPolicy(string? raw)
     {
-        if (string.IsNullOrWhiteSpace(raw)) return StructuralMultiIntentPolicy.Allow;
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            _singleOwnerDefaultApplied = true;
+            return StructuralMultiIntentPolicy.SingleOwner;
+        }
         var u = raw.Trim().ToUpperInvariant().Replace("-", "_");
         return u switch
         {
+            "SINGLE_OWNER" or "SINGLEOWNER" => StructuralMultiIntentPolicy.SingleOwner,
             "ALLOW" => StructuralMultiIntentPolicy.Allow,
             "BLOCK" or "BLOCK_NEW_ENTRIES" or "BLOCKNEWENTRIES" => StructuralMultiIntentPolicy.BlockNewEntries,
             "AUTO_OFFSET" or "AUTO_OFFSET_REQUEST" or "AUTOOFFSET" => StructuralMultiIntentPolicy.AutoOffsetRequest,
-            _ => StructuralMultiIntentPolicy.Allow
+            _ => StructuralMultiIntentPolicy.SingleOwner
         };
     }
 

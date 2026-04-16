@@ -1,3 +1,5 @@
+using System;
+
 namespace QTSW2.Robot.Core.Execution;
 
 /// <summary>Runtime toggles for staged robot behaviors (defaults are production-safe).</summary>
@@ -42,12 +44,13 @@ public static class FeatureFlags
     public static bool FailClosedStrictReleaseConfirmationEnabled { get; set; } = true;
 
     /// <summary>
-    /// Phase A / Phase 3: when false (default), <see cref="MismatchEscalationCoordinator"/> does not publish mismatch
-    /// execution block authority and <see cref="MismatchEscalationCoordinator.IsInstrumentBlockedByMismatch"/> is always false —
-    /// mismatch stays observational (logs, metrics, gate events). Do not re-enable submit-time denial here unless proven necessary;
-    /// Tier-1 quant escalation + structural Phase 3 demotions own submit policy evolution.
+    /// [DEPRECATED — P6 refactor] Mismatch execution block is now a first-class authority input
+    /// via <see cref="MismatchEscalationCoordinator.IsInstrumentBlockedByMismatch"/> feeding
+    /// <see cref="UnifiedExecutionAuthority"/> Gate 2. This flag is retained only for backwards
+    /// compatibility — it no longer gates the coordinator's block publication or query.
     /// </summary>
-    public static bool ControlPlaneMismatchExecutionBlockAuthority { get; set; } = false;
+    [Obsolete("P6: Mismatch block is now unconditionally published. Remove after dual-run validation.")]
+    public static bool ControlPlaneMismatchExecutionBlockAuthority { get; set; } = true;
 
     /// <summary>
     /// When true (default), <see cref="ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure"/> does not deny solely for
@@ -62,6 +65,13 @@ public static class FeatureFlags
     /// from mapped/unmapped fills and parity-OK transitions. When false, the store no-ops and structural checks ignore it (rollback).
     /// </summary>
     public static bool QuantExecutionControlStoreEnabled { get; set; } = true;
+
+    /// <summary>
+    /// When true (default), aggregated entry fills on one broker order (e.g. CL1+CL2 → MCL) submit a single protective
+    /// wave on the lexicographic lead intent with combined quantity; peer intents delegate idempotency to the lead.
+    /// Disabling restores per-intent protective submission (legacy; may trip PROTECTIVE_CONFLICTING_ORDERS audit).
+    /// </summary>
+    public static bool AggregatedProtectiveSingleWaveEnabled { get; set; } = true;
 
     /// <summary>
     /// Max wall-clock time after first <see cref="QuantExecutionControlStore.NotifyRecoveredReconnect"/> before
@@ -83,4 +93,43 @@ public static class FeatureFlags
     /// Default false preserves legacy hard-deny until rollout.
     /// </summary>
     public static bool StructuralLayerPhase3DemoteRepairActiveSubmitDeny { get; set; } = false;
+
+    /// <summary>
+    /// When true, <see cref="InstrumentOwnershipLedger"/> receives write calls alongside existing journal/coordinator paths.
+    /// Comparison assertions verify ledger snapshot vs existing composite ownership query.
+    /// Does not change any read paths — existing stores remain authoritative until proven.
+    /// </summary>
+    public static bool CanonicalOwnershipLedgerEnabled { get; set; } = false;
+
+    /// <summary>
+    /// Wall-clock window (ms) for transient mismatch classification. Broker/ledger qty mismatches younger than
+    /// this window are classified TRANSIENT_MISMATCH and not escalated. Aligned with <see cref="PostFillAlignmentWindowMs"/>.
+    /// </summary>
+    public static int TransientMismatchWindowMs { get; set; } = 5000;
+
+    /// <summary>
+    /// Phase 4a shadow: when true, <see cref="UnifiedExecutionAuthority.Evaluate"/> runs in parallel with the
+    /// existing gate chain on every order submit. The old path still decides; disagreements are logged as
+    /// UEA_SHADOW_DISAGREEMENT. No behavior change.
+    /// </summary>
+    public static bool UnifiedExecutionAuthorityShadowEnabled { get; set; } = false;
+
+    /// <summary>
+    /// Phase 4a2 activation: when true (requires shadow parity proof), <see cref="UnifiedExecutionAuthority.Evaluate"/>
+    /// replaces the old gate chain for order submit decisions. The old path is bypassed.
+    /// </summary>
+    public static bool UnifiedExecutionAuthorityEnabled { get; set; } = false;
+
+    /// <summary>
+    /// Phase 5b activation: when true, <see cref="ReconciliationRepairExecutor.ExecuteRepairs"/> is called for
+    /// non-stale classifier verdicts. Requires classifier parity proof, orphan restore correctness, and
+    /// transfer durability validation before enabling.
+    /// </summary>
+    public static bool ReconciliationRepairExecutorEnabled { get; set; } = false;
+
+    /// <summary>
+    /// Phase 8: when true, <see cref="ExecutionStructuralLayer"/> derives ownership from
+    /// <see cref="InstrumentOwnershipLedger"/> snapshots instead of journal-based position authority.
+    /// </summary>
+    public static bool StructuralLayerUseLedgerOwnership { get; set; } = false;
 }

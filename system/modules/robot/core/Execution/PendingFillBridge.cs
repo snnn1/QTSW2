@@ -4,10 +4,17 @@ using System.Collections.Generic;
 namespace QTSW2.Robot.Core.Execution;
 
 /// <summary>
-/// Transient in-memory bridge between execution fill handling and mismatch assembly when
+/// [DEPRECATED — P8 refactor] Transient in-memory bridge between execution fill handling and mismatch assembly when
 /// <see cref="ExecutionJournal.GetOpenJournalEntriesByInstrument"/> lags durable journal state.
 /// Not a second ledger: short TTL, capped by broker-vs-journal gap, cleared when journal aligns.
+/// 
+/// Deprecation gate criteria (all must pass before removal):
+/// 1. Ledger dual-run comparison assertions pass for 5+ full trading sessions with zero discrepancies.
+/// 2. RestoreFromJournal determinism test passes at every reconciliation tick.
+/// 3. No UnexplainedQty persists beyond PostFillAlignmentWindowMs during dual-run.
+/// 4. Event-triggered snapshots confirm fill → ledger write → snapshot without gap.
 /// </summary>
+[Obsolete("P8: Targeted for deprecation once InstrumentOwnershipLedger dual-run is proven. See gate criteria above.")]
 public sealed class PendingFillBridge
 {
     private readonly object _lock = new();
