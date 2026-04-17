@@ -28,7 +28,7 @@ public sealed class ReconciliationClassifier
     }
 
     /// <summary>
-    /// Classify reconciliation verdicts for all instruments with ownership or broker exposure.
+    /// Classify reconciliation verdicts for the caller's engine-scoped instruments.
     /// Each verdict operates on a consistent (AccountSnapshot, OwnershipSnapshot@version_V) pair.
     /// </summary>
     public IReadOnlyList<ReconciliationVerdict> Classify(
@@ -51,8 +51,6 @@ public sealed class ReconciliationClassifier
         }
 
         var allInstruments = new HashSet<string>(instrumentsInScope, StringComparer.OrdinalIgnoreCase);
-        foreach (var k in brokerQtyByInstrument.Keys)
-            allInstruments.Add(k);
 
         foreach (var instrument in allInstruments)
         {
@@ -60,7 +58,8 @@ public sealed class ReconciliationClassifier
             var versionAtStart = snapshot.OwnershipVersion;
             brokerQtyByInstrument.TryGetValue(instrument, out var brokerQty);
 
-            var unexplainedQty = snapshot.ComputeUnexplainedQty(brokerQty);
+            var brokerSignedQty = NormalizeBrokerSignedQty(brokerQty, snapshot);
+            var unexplainedQty = snapshot.ComputeUnexplainedQty(brokerSignedQty);
             var mismatchAgeMs = snapshot.ComputeMismatchAgeMs();
 
             MismatchTier tier;
@@ -100,6 +99,7 @@ public sealed class ReconciliationClassifier
             {
                 Instrument = instrument,
                 BrokerQty = brokerQty,
+                BrokerSignedQty = brokerSignedQty,
                 LedgerQty = snapshot.LedgerSignedNetQty,
                 JournalOpenQty = snapshot.Slots.Where(s => s.State != SlotState.Closed).Sum(s => s.Remaining),
                 OwnershipVersion = versionAtStart,
@@ -115,5 +115,26 @@ public sealed class ReconciliationClassifier
         }
 
         return verdicts;
+    }
+
+    private static int NormalizeBrokerSignedQty(int brokerQty, InstrumentOwnershipSnapshot snapshot)
+    {
+        if (brokerQty <= 0) return brokerQty;
+
+        if (snapshot.LedgerSignedNetQty < 0)
+            return -Math.Abs(brokerQty);
+
+        if (snapshot.LedgerSignedNetQty > 0)
+            return Math.Abs(brokerQty);
+
+        var directions = snapshot.Slots
+            .Where(s => s.State != SlotState.Closed && s.Remaining > 0)
+            .Select(s => s.Direction)
+            .Distinct()
+            .ToList();
+
+        return directions.Count == 1 && directions[0] == SlotDirection.Short
+            ? -Math.Abs(brokerQty)
+            : brokerQty;
     }
 }

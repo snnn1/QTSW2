@@ -36,6 +36,25 @@ public static class ProtectiveCoverageAuditTests
         if (r.Status != ProtectiveAuditStatus.PROTECTIVE_OK)
             return (false, $"Valid stop+target: expected PROTECTIVE_OK, got {r.Status}");
 
+        // 1b. Multi-stream same instrument: distinct intents may aggregate stop/target coverage.
+        snap = new AccountSnapshot
+        {
+            Positions = new List<PositionSnapshot>
+            {
+                new() { Instrument = "MCL", Quantity = 4, AveragePrice = 95m }
+            },
+            WorkingOrders = new List<WorkingOrderSnapshot>
+            {
+                new() { Instrument = "MCL", Tag = "QTSW2:intentA:STOP", StopPrice = 94m, Quantity = 2 },
+                new() { Instrument = "MCL", Tag = "QTSW2:intentB:STOP", StopPrice = 94m, Quantity = 2 },
+                new() { Instrument = "MCL", Tag = "QTSW2:intentA:TARGET", Price = 96m, Quantity = 2 },
+                new() { Instrument = "MCL", Tag = "QTSW2:intentB:TARGET", Price = 96m, Quantity = 2 }
+            }
+        };
+        r = ProtectiveCoverageAudit.Audit("MCL", snap, null, false, false, false, utcNow);
+        if (r.Status != ProtectiveAuditStatus.PROTECTIVE_OK)
+            return (false, $"Multi-stream aggregate protectives: expected PROTECTIVE_OK, got {r.Status}");
+
         // 2. Long position, no stop -> PROTECTIVE_MISSING_STOP
         snap = new AccountSnapshot
         {

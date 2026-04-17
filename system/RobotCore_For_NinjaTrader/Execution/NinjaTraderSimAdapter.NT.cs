@@ -216,6 +216,36 @@ public sealed partial class NinjaTraderSimAdapter
 
     object IIEAOrderExecutor.GetAccount() => _ntAccount!;
 
+    private static List<Order> SnapshotAccountOrders(Account? account)
+    {
+        var snapshot = new List<Order>();
+        if (account?.Orders == null) return snapshot;
+
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            snapshot.Clear();
+            try
+            {
+                foreach (Order order in account.Orders)
+                {
+                    if (order != null) snapshot.Add(order);
+                }
+                return snapshot;
+            }
+            catch (InvalidOperationException) when (attempt == 0)
+            {
+                // NinjaTrader mutates Account.Orders while order/execution callbacks are active.
+            }
+            catch (InvalidOperationException)
+            {
+                snapshot.Clear();
+                return snapshot;
+            }
+        }
+
+        return snapshot;
+    }
+
     OrderSubmissionResult IIEAOrderExecutor.SubmitProtectiveStop(string intentId, string instrument, string direction, decimal stopPrice, int quantity, string? ocoGroup, DateTimeOffset utcNow) =>
         SubmitProtectiveStop(intentId, instrument, direction, stopPrice, quantity, ocoGroup, utcNow);
 
@@ -228,11 +258,12 @@ public sealed partial class NinjaTraderSimAdapter
     bool IIEAOrderExecutor.HasWorkingProtectivesForIntent(string intentId)
     {
         var account = _ntAccount as Account;
-        if (account?.Orders == null) return false;
+        var orders = SnapshotAccountOrders(account);
+        if (orders.Count == 0) return false;
         var stopTag = RobotOrderIds.EncodeStopTag(intentId);
         var targetTag = RobotOrderIds.EncodeTargetTag(intentId);
         bool hasStop = false, hasTarget = false;
-        foreach (Order o in account.Orders)
+        foreach (Order o in orders)
         {
             var tag = GetOrderTag(o);
             if (string.Equals(tag, stopTag, StringComparison.OrdinalIgnoreCase) &&
@@ -255,12 +286,13 @@ public sealed partial class NinjaTraderSimAdapter
     (decimal? stopPrice, decimal? targetPrice, int? stopQty, int? targetQty) IIEAOrderExecutor.GetWorkingProtectiveState(string intentId)
     {
         var account = _ntAccount as Account;
-        if (account?.Orders == null) return (null, null, null, null);
+        var orders = SnapshotAccountOrders(account);
+        if (orders.Count == 0) return (null, null, null, null);
         var stopTag = RobotOrderIds.EncodeStopTag(intentId);
         var targetTag = RobotOrderIds.EncodeTargetTag(intentId);
         decimal? stopPrice = null, targetPrice = null;
         int? stopQty = null, targetQty = null;
-        foreach (Order o in account.Orders)
+        foreach (Order o in orders)
         {
             var tag = GetOrderTag(o);
             if ((o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted)) continue;
@@ -327,10 +359,11 @@ public sealed partial class NinjaTraderSimAdapter
             brokerSigned += leg.SignedQuantity;
         var robotTags = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var account = _ntAccount as Account;
-        if (account?.Orders != null)
+        var orders = SnapshotAccountOrders(account);
+        if (orders.Count > 0)
         {
             var instRoot = (executionInstrumentKey ?? "").Split(' ').FirstOrDefault() ?? executionInstrumentKey;
-            foreach (var o in account.Orders)
+            foreach (var o in orders)
             {
                 if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted) continue;
                 if (!ExecutionInstrumentResolver.IsSameInstrument(o.Instrument?.MasterInstrument?.Name ?? o.Instrument?.FullName ?? "", instRoot))
@@ -834,10 +867,12 @@ public sealed partial class NinjaTraderSimAdapter
     /// <summary>Compute protective status from broker orders. Broker-truth based.</summary>
     private ProtectiveStatus ComputeProtectiveStatusFromBroker(Account? account, string instrument, int brokerPositionQty)
     {
-        if (account?.Orders == null || brokerPositionQty == 0) return ProtectiveStatus.NONE;
+        if (brokerPositionQty == 0) return ProtectiveStatus.NONE;
+        var orders = SnapshotAccountOrders(account);
+        if (orders.Count == 0) return ProtectiveStatus.NONE;
         var instRoot = (instrument ?? "").Split(' ').FirstOrDefault() ?? instrument;
         int stopCount = 0, targetCount = 0, totalProtectiveQty = 0;
-        foreach (var o in account.Orders)
+        foreach (var o in orders)
         {
             if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted) continue;
             if (!ExecutionInstrumentResolver.IsSameInstrument(o.Instrument?.MasterInstrument?.Name ?? o.Instrument?.FullName ?? "", instRoot)) continue;
@@ -866,10 +901,11 @@ public sealed partial class NinjaTraderSimAdapter
             var exposure = ((IIEAOrderExecutor)this).GetBrokerCanonicalExposure(instrument);
             brokerQty = exposure.ReconciliationAbsQuantityTotal;
             account = _ntAccount as Account;
-            if (account?.Orders != null)
+            var orders = SnapshotAccountOrders(account);
+            if (orders.Count > 0)
             {
                 var instRoot = (instrument ?? "").Split(' ').FirstOrDefault() ?? instrument;
-                brokerWorkingCount = account.Orders.Count(o =>
+                brokerWorkingCount = orders.Count(o =>
                     (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted) &&
                     ExecutionInstrumentResolver.IsSameInstrument(o.Instrument?.MasterInstrument?.Name ?? o.Instrument?.FullName ?? "", instRoot));
             }
@@ -920,9 +956,10 @@ public sealed partial class NinjaTraderSimAdapter
     {
         if (_iea == null) return;
         var account = _ntAccount as Account;
-        if (account?.Orders == null) return;
+        var orders = SnapshotAccountOrders(account);
+        if (orders.Count == 0) return;
         var instRoot = (instrument ?? "").Split(' ').FirstOrDefault() ?? instrument ?? "";
-        foreach (var o in account.Orders)
+        foreach (var o in orders)
         {
             if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted) continue;
             if (!ExecutionInstrumentResolver.IsSameInstrument(o.Instrument?.MasterInstrument?.Name ?? o.Instrument?.FullName ?? "", instRoot))
@@ -964,10 +1001,11 @@ public sealed partial class NinjaTraderSimAdapter
             var exposure = ((IIEAOrderExecutor)this).GetBrokerCanonicalExposure(instrument);
             brokerQty = exposure.ReconciliationAbsQuantityTotal;
             var account = _ntAccount as Account;
-            if (account?.Orders != null)
+            var orders = SnapshotAccountOrders(account);
+            if (orders.Count > 0)
             {
                 var instRoot = (instrument ?? "").Split(' ').FirstOrDefault() ?? instrument;
-                brokerWorkingCount = account.Orders.Count(o =>
+                brokerWorkingCount = orders.Count(o =>
                     (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted) &&
                     ExecutionInstrumentResolver.IsSameInstrument(o.Instrument?.MasterInstrument?.Name ?? o.Instrument?.FullName ?? "", instRoot));
             }
@@ -1130,10 +1168,11 @@ public sealed partial class NinjaTraderSimAdapter
             var exposure = ((IIEAOrderExecutor)this).GetBrokerCanonicalExposure(instrument);
             brokerQty = exposure.ReconciliationAbsQuantityTotal;
             var account = _ntAccount as Account;
-            if (account?.Orders != null)
+            var orders = SnapshotAccountOrders(account);
+            if (orders.Count > 0)
             {
                 var instRoot = (instrument ?? "").Split(' ').FirstOrDefault() ?? instrument;
-                brokerWorkingCount = account.Orders.Count(o =>
+                brokerWorkingCount = orders.Count(o =>
                     (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted) &&
                     ExecutionInstrumentResolver.IsSameInstrument(o.Instrument?.MasterInstrument?.Name ?? o.Instrument?.FullName ?? "", instRoot));
             }
@@ -3311,7 +3350,7 @@ public sealed partial class NinjaTraderSimAdapter
                         executionInstrumentKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(accountName, order.Instrument, _ieaEngineExecutionInstrument);
                         if (!string.IsNullOrEmpty(ocoGroupId))
                         {
-                            foreach (Order o in account.Orders)
+                            foreach (Order o in SnapshotAccountOrders(account))
                             {
                                 if (o.OrderId != siblingOrderId && string.Equals(o.Oco as string, ocoGroupId, StringComparison.OrdinalIgnoreCase) && o.OrderState == OrderState.Filled)
                                 {
@@ -5430,7 +5469,7 @@ public sealed partial class NinjaTraderSimAdapter
             
             // Idempotent: if stop already exists, ensure it matches desired stop/qty
             var stopTag = RobotOrderIds.EncodeStopTag(intentId);
-            var existingStop = account.Orders.FirstOrDefault(o =>
+            var existingStop = SnapshotAccountOrders(account).FirstOrDefault(o =>
                 GetOrderTag(o) == stopTag &&
                 (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted));
 
@@ -5876,7 +5915,7 @@ public sealed partial class NinjaTraderSimAdapter
         {
             // Idempotent: if target already exists, ensure it matches desired target/qty
             var targetTag = RobotOrderIds.EncodeTargetTag(intentId);
-            var existingTarget = account.Orders.FirstOrDefault(o =>
+            var existingTarget = SnapshotAccountOrders(account).FirstOrDefault(o =>
                 GetOrderTag(o) == targetTag &&
                 (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted));
 
@@ -6465,7 +6504,7 @@ public sealed partial class NinjaTraderSimAdapter
             Order? stopOrder = null;
             try
             {
-                stopOrder = account.Orders.FirstOrDefault(o =>
+                stopOrder = SnapshotAccountOrders(account).FirstOrDefault(o =>
                     (o.OrderId == stopOrderId || GetOrderTag(o) == pending.RawTag) &&
                     (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted));
             }
@@ -6633,7 +6672,7 @@ public sealed partial class NinjaTraderSimAdapter
         {
             // Find existing stop order (robot-owned tag envelope)
             var stopTag = RobotOrderIds.EncodeStopTag(intentId);
-            var stopOrder = account.Orders.FirstOrDefault(o =>
+            var stopOrder = SnapshotAccountOrders(account).FirstOrDefault(o =>
                 GetOrderTag(o) == stopTag &&
                 (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted));
 
@@ -6684,7 +6723,7 @@ public sealed partial class NinjaTraderSimAdapter
             var quantity = stopOrder.Quantity;
             var targetPrice = intentTargetPrice3 ?? 0m;
             var targetTag = RobotOrderIds.EncodeTargetTag(intentId);
-            var targetOrder = account.Orders.FirstOrDefault(o =>
+            var targetOrder = SnapshotAccountOrders(account).FirstOrDefault(o =>
                 GetOrderTag(o) == targetTag &&
                 (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted));
             if (targetOrder != null && intentTargetPrice3 == null)
@@ -6852,7 +6891,7 @@ public sealed partial class NinjaTraderSimAdapter
             }
             
             // Get working orders
-            foreach (var order in account.Orders)
+            foreach (var order in SnapshotAccountOrders(account))
             {
                 if (order.OrderState == OrderState.Working || order.OrderState == OrderState.Accepted)
                 {
@@ -6939,7 +6978,7 @@ public sealed partial class NinjaTraderSimAdapter
         if (account == null) return result;
         var stopTag = RobotOrderIds.EncodeStopTag(intentId);
         var targetTag = RobotOrderIds.EncodeTargetTag(intentId);
-        foreach (var order in account.Orders)
+        foreach (var order in SnapshotAccountOrders(account))
         {
             if (order.OrderState != OrderState.Working && order.OrderState != OrderState.Accepted)
                 continue;
@@ -6975,7 +7014,7 @@ public sealed partial class NinjaTraderSimAdapter
             var stopTag = RobotOrderIds.EncodeStopTag(intentId);
             var targetTag = RobotOrderIds.EncodeTargetTag(intentId);
             
-            foreach (var order in account.Orders)
+            foreach (var order in SnapshotAccountOrders(account))
             {
                 if (order.OrderState != OrderState.Working && order.OrderState != OrderState.Accepted)
                 {
@@ -7042,7 +7081,7 @@ public sealed partial class NinjaTraderSimAdapter
             // CRITICAL FIX: Only cancel entry orders, not protective orders
             // Protective orders should be managed via OCO groups (when one fills, OCO cancels the other)
             // If we cancel protective orders here, we could leave positions unprotected
-            foreach (var order in account.Orders)
+            foreach (var order in SnapshotAccountOrders(account))
             {
                 if (order.OrderState != OrderState.Working && order.OrderState != OrderState.Accepted)
                 {
@@ -7764,7 +7803,7 @@ public sealed partial class NinjaTraderSimAdapter
         var orderIdSet = new HashSet<string>(orderIds, StringComparer.OrdinalIgnoreCase);
         var ordersToCancel = new List<Order>();
 
-        foreach (var order in account.Orders)
+        foreach (var order in SnapshotAccountOrders(account))
         {
             if (order.OrderState != OrderState.Working && order.OrderState != OrderState.Accepted)
                 continue;
@@ -7840,7 +7879,7 @@ public sealed partial class NinjaTraderSimAdapter
                     }));
             }
 
-            foreach (var order in account.Orders)
+            foreach (var order in SnapshotAccountOrders(account))
             {
                 if (order.OrderState != OrderState.Working && order.OrderState != OrderState.Accepted)
                     continue;

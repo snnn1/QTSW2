@@ -27,6 +27,8 @@ public sealed class ReconciliationRunner
     private readonly Func<string, string?>? _getCanonicalInstrumentForJournalAggregation;
     private readonly Func<string, int>? _getPendingExecutionWorkloadForInstrument;
     private readonly Func<string?>? _getRunIdForReconciliationDiagnostics;
+    private readonly InstrumentOwnershipLedger? _ownershipLedger;
+    private readonly Func<string>? _getOwnershipAccountKey;
 
     private DateTimeOffset _lastRunUtc = DateTimeOffset.MinValue;
     private const double ThrottleIntervalSeconds = 60.0;
@@ -60,7 +62,9 @@ public sealed class ReconciliationRunner
         ReleaseReconciliationRedundancySuppression? redundancySuppression = null,
         Func<string, string?>? getCanonicalInstrumentForJournalAggregation = null,
         Func<string, int>? getPendingExecutionWorkloadForInstrument = null,
-        Func<string?>? getRunIdForReconciliationDiagnostics = null)
+        Func<string?>? getRunIdForReconciliationDiagnostics = null,
+        InstrumentOwnershipLedger? ownershipLedger = null,
+        Func<string>? getOwnershipAccountKey = null)
     {
         _adapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
         _journal = journal ?? throw new ArgumentNullException(nameof(journal));
@@ -77,6 +81,8 @@ public sealed class ReconciliationRunner
         _getCanonicalInstrumentForJournalAggregation = getCanonicalInstrumentForJournalAggregation;
         _getPendingExecutionWorkloadForInstrument = getPendingExecutionWorkloadForInstrument;
         _getRunIdForReconciliationDiagnostics = getRunIdForReconciliationDiagnostics;
+        _ownershipLedger = ownershipLedger;
+        _getOwnershipAccountKey = getOwnershipAccountKey;
     }
 
     private string? CanonicalInstrumentForJournal(string instTrim) =>
@@ -528,6 +534,8 @@ public sealed class ReconciliationRunner
                 if (_journal.RecordReconciliationComplete(tradingDate, stream, intentId, utcNow,
                         fr.BrokerAbs, journalOpenBefore, "ReconciliationRunner_broker_flat_stable"))
                 {
+                    var ownershipClose = RecordOwnershipBrokerFlatClose(
+                        tradingDate, stream, intentId, instrument, journalOpenBefore, utcNow);
                     journalsReconciled++;
                     if (gateMode && !string.IsNullOrEmpty(gateInst) && MatchesGateInstrument(instrument, gateInst))
                         gateBrokerFlatJournalsClosed++;
@@ -539,6 +547,7 @@ public sealed class ReconciliationRunner
                             instrument,
                             trading_date = tradingDate,
                             completion_reason = CompletionReasons.RECONCILIATION_BROKER_FLAT,
+                            ownership_close_recorded = ownershipClose,
                             note = "Orphaned journal closed; broker position flat (scoped, single-pass)"
                         }));
                 }
@@ -563,6 +572,56 @@ public sealed class ReconciliationRunner
         if (cpuStart != 0) _runtimeAudit?.CpuEnd(cpuStart, RuntimeAuditSubsystem.Reconciliation);
         if (_redundancySuppression != null && !gateMode)
             _redundancySuppression.NotifyPeriodicReconciliationPassCompleted(passSignature, _redundancySuppression.ExecutionActivityGeneration, utcNow);
+    }
+
+    private bool RecordOwnershipBrokerFlatClose(
+        string tradingDate,
+        string stream,
+        string intentId,
+        string instrument,
+        int journalOpenBefore,
+        DateTimeOffset utcNow)
+    {
+        if (_ownershipLedger == null || journalOpenBefore <= 0)
+            return false;
+
+        var account = ResolveOwnershipAccountKey();
+        var result = _ownershipLedger.RecordMappedExitFill(account, instrument, intentId, journalOpenBefore, utcNow, 0);
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "OWNERSHIP_RECONCILIATION_BROKER_FLAT_CLOSE", "ENGINE",
+            new
+            {
+                account,
+                instrument,
+                stream,
+                intent_id = intentId,
+                qty_delta = journalOpenBefore,
+                success = result.Success,
+                error = result.ErrorReason ?? "",
+                ownership_version = result.Snapshot?.OwnershipVersion ?? 0,
+                note = "Broker-flat journal reconciliation mirrored into ownership ledger"
+            }));
+        return result.Success;
+    }
+
+    private string ResolveOwnershipAccountKey()
+    {
+        try
+        {
+            var account = _getOwnershipAccountKey?.Invoke();
+            if (!string.IsNullOrWhiteSpace(account))
+                return account.Trim();
+        }
+        catch { }
+
+        try
+        {
+            var account = _reconciliationAccountName?.Invoke();
+            if (!string.IsNullOrWhiteSpace(account))
+                return account.Trim();
+        }
+        catch { }
+
+        return "default";
     }
 
     private Dictionary<string, (int AccountQty, int JournalQty)> BuildQtyByInstrument(Dictionary<string, int> accountQtyByInstrument)

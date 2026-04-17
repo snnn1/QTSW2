@@ -46,6 +46,59 @@ public sealed partial class InstrumentExecutionAuthority
         }
     }
 
+    private static List<Order> SnapshotAccountOrders(Account? account)
+    {
+        var snapshot = new List<Order>();
+        if (account?.Orders == null) return snapshot;
+
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            snapshot.Clear();
+            try
+            {
+                foreach (Order order in account.Orders)
+                {
+                    if (order != null) snapshot.Add(order);
+                }
+                return snapshot;
+            }
+            catch (InvalidOperationException) when (attempt == 0)
+            {
+                // NinjaTrader mutates Account.Orders while callbacks and worker scans are active.
+            }
+            catch (InvalidOperationException)
+            {
+                snapshot.Clear();
+                return snapshot;
+            }
+        }
+
+        return snapshot;
+    }
+
+    private bool TryGetAccountOrdersSnapshot(out List<Order> orders)
+    {
+        orders = new List<Order>();
+        try
+        {
+            if (Executor?.GetAccount() is not Account account)
+                return false;
+            orders = SnapshotAccountOrders(account);
+            return true;
+        }
+        catch
+        {
+            orders.Clear();
+            return false;
+        }
+    }
+
+    private bool BrokerOrderMatchesExecutionInstrument(Order order)
+    {
+        var brokerInstrument = order.Instrument?.MasterInstrument?.Name ?? "";
+        return AdoptionScanInstrumentGate.BrokerOrderMatchesExecutionInstrument(ExecutionInstrumentKey, brokerInstrument);
+    }
+
     // Phase 3: Trap G - queue serialization (replaces BE-specific lock; queue handles all mutations)
     /// <summary>
     /// Submit stop entry order. Tries aggregation first; falls back to single order.
@@ -420,12 +473,15 @@ public sealed partial class InstrumentExecutionAuthority
                             instrument = intent.Instrument,
                             iea_instance_id = InstanceId
                         }));
-                        Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_QUANTITY_MISMATCH_FAIL_CLOSE",
-                            new { error = stopReason, intent_id = intentId, stop_qty = stopQty, total_filled_quantity = totalFilledQuantity, iea_instance_id = InstanceId }));
-                        Executor.FailClosed(intentId, intent, stopReason, "PROTECTIVE_QUANTITY_MISMATCH_FLATTENED", $"PROTECTIVE_QUANTITY_MISMATCH:{intentId}",
-                            $"CRITICAL: Protective Quantity Mismatch - {intent.Instrument}",
-                            $"Protective stop quantity does not match journal. Position flattened. Stream: {intent.Stream}, Intent: {intentId}. {stopReason}",
-                            null, null, new { stop_qty = stopQty, total_filled_quantity = totalFilledQuantity }, utcNow);
+                        if (!TryEnqueueProtectiveResize(intentId, intent, totalFilledQuantity, "PROTECTIVE_STOP", stopQty, targetQty, stopReason, utcNow))
+                        {
+                            Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_QUANTITY_MISMATCH_FAIL_CLOSE",
+                                new { error = stopReason, intent_id = intentId, stop_qty = stopQty, total_filled_quantity = totalFilledQuantity, iea_instance_id = InstanceId }));
+                            Executor.FailClosed(intentId, intent, stopReason, "PROTECTIVE_QUANTITY_MISMATCH_FLATTENED", $"PROTECTIVE_QUANTITY_MISMATCH:{intentId}",
+                                $"CRITICAL: Protective Quantity Mismatch - {intent.Instrument}",
+                                $"Protective stop quantity does not match journal and resize could not be enqueued. Position flattened. Stream: {intent.Stream}, Intent: {intentId}. {stopReason}",
+                                null, null, new { stop_qty = stopQty, total_filled_quantity = totalFilledQuantity, resize_enqueued = false }, utcNow);
+                        }
                         return;
                     }
                     if (targetQty.HasValue && targetQty.Value != totalFilledQuantity)
@@ -446,12 +502,15 @@ public sealed partial class InstrumentExecutionAuthority
                             instrument = intent.Instrument,
                             iea_instance_id = InstanceId
                         }));
-                        Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_QUANTITY_MISMATCH_FAIL_CLOSE",
-                            new { error = targetReason, intent_id = intentId, target_qty = targetQty, total_filled_quantity = totalFilledQuantity, iea_instance_id = InstanceId }));
-                        Executor.FailClosed(intentId, intent, targetReason, "PROTECTIVE_QUANTITY_MISMATCH_FLATTENED", $"PROTECTIVE_QUANTITY_MISMATCH:{intentId}",
-                            $"CRITICAL: Protective Quantity Mismatch - {intent.Instrument}",
-                            $"Protective target quantity does not match journal. Position flattened. Stream: {intent.Stream}, Intent: {intentId}. {targetReason}",
-                            null, null, new { target_qty = targetQty, total_filled_quantity = totalFilledQuantity }, utcNow);
+                        if (!TryEnqueueProtectiveResize(intentId, intent, totalFilledQuantity, "PROTECTIVE_TARGET", stopQty, targetQty, targetReason, utcNow))
+                        {
+                            Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_QUANTITY_MISMATCH_FAIL_CLOSE",
+                                new { error = targetReason, intent_id = intentId, target_qty = targetQty, total_filled_quantity = totalFilledQuantity, iea_instance_id = InstanceId }));
+                            Executor.FailClosed(intentId, intent, targetReason, "PROTECTIVE_QUANTITY_MISMATCH_FLATTENED", $"PROTECTIVE_QUANTITY_MISMATCH:{intentId}",
+                                $"CRITICAL: Protective Quantity Mismatch - {intent.Instrument}",
+                                $"Protective target quantity does not match journal and resize could not be enqueued. Position flattened. Stream: {intent.Stream}, Intent: {intentId}. {targetReason}",
+                                null, null, new { target_qty = targetQty, total_filled_quantity = totalFilledQuantity, resize_enqueued = false }, utcNow);
+                        }
                         return;
                     }
                     if (OrderMap.TryGetValue(intentId, out var oi))
@@ -552,6 +611,60 @@ public sealed partial class InstrumentExecutionAuthority
             "ENTRY_FILL",
             utcNow);
         Executor.EnqueueNtAction(cmd);
+    }
+
+    private bool TryEnqueueProtectiveResize(
+        string intentId,
+        Intent intent,
+        int totalFilledQuantity,
+        string mismatchLeg,
+        int? currentStopQty,
+        int? currentTargetQty,
+        string reason,
+        DateTimeOffset utcNow)
+    {
+        if (Executor == null || Log == null)
+            return false;
+        if (string.IsNullOrWhiteSpace(intent.Instrument) ||
+            string.IsNullOrWhiteSpace(intent.Direction) ||
+            !intent.StopPrice.HasValue ||
+            !intent.TargetPrice.HasValue ||
+            totalFilledQuantity <= 0)
+            return false;
+
+        QuantExecutionControlStore.NotifyProtectiveResizePending(intent.Instrument, totalFilledQuantity, utcNow);
+
+        var correlationId = $"PROTECTIVE_RESIZE:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
+        var cmd = new NtSubmitProtectivesCommand(
+            correlationId,
+            intentId,
+            intent.Instrument,
+            intent.Direction!,
+            intent.StopPrice.Value,
+            intent.TargetPrice.Value,
+            totalFilledQuantity,
+            null,
+            "PROTECTIVE_RESIZE",
+            utcNow);
+
+        var enqueued = Executor.EnqueueNtAction(cmd);
+        Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, enqueued ? "PROTECTIVE_RESIZE_PENDING" : "PROTECTIVE_RESIZE_ENQUEUE_FAILED", new
+        {
+            intent_id = intentId,
+            stream_key = intent.Stream,
+            instrument = intent.Instrument,
+            mismatch_leg = mismatchLeg,
+            current_stop_qty = currentStopQty,
+            current_target_qty = currentTargetQty,
+            expected_protective_qty = totalFilledQuantity,
+            correlation_id = correlationId,
+            reason,
+            iea_instance_id = InstanceId,
+            note = enqueued
+                ? "Protective quantity changed after a partial fill; resize enqueued for strategy-thread cancel/recreate"
+                : "Protective quantity changed after a partial fill, but resize enqueue failed"
+        }));
+        return enqueued;
     }
 
     /// <summary>Enqueue execution update for serialized processing. Uses EnqueueRecoveryEssential. Runs <see cref="IIEAOrderExecutor.ProcessExecutionUpdate"/> before first-adoption <c>RequestAdoptionScan</c> so the live event updates state first.</summary>
@@ -978,17 +1091,16 @@ public sealed partial class InstrumentExecutionAuthority
         if (Executor == null) return false;
         try
         {
-            if (Executor.GetAccount() is not Account account || account.Orders == null)
+            if (!TryGetAccountOrdersSnapshot(out var accountOrders))
                 return false;
-            var accountTotal = account.Orders.Count;
+            var accountTotal = accountOrders.Count;
             var brokerWorkingExec = 0;
             var qtsw2Same = 0;
-            foreach (Order o in account.Orders)
+            foreach (Order o in accountOrders)
             {
                 if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted)
                     continue;
-                var broName = o.Instrument?.MasterInstrument?.Name ?? "";
-                if (!AdoptionScanInstrumentGate.BrokerOrderMatchesExecutionInstrument(ExecutionInstrumentKey, broName))
+                if (!BrokerOrderMatchesExecutionInstrument(o))
                     continue;
                 brokerWorkingExec++;
                 var tag = Executor.GetOrderTag(o);
@@ -1147,8 +1259,8 @@ public sealed partial class InstrumentExecutionAuthority
     {
         try
         {
-            if (Executor?.GetAccount() is Account a && a.Orders != null)
-                return a.Orders.Count;
+            if (TryGetAccountOrdersSnapshot(out var accountOrders))
+                return accountOrders.Count;
         }
         catch { }
         return -1;
@@ -1158,15 +1270,14 @@ public sealed partial class InstrumentExecutionAuthority
     {
         try
         {
-            if (Executor?.GetAccount() is not Account account || account.Orders == null) return -1;
+            if (!TryGetAccountOrdersSnapshot(out var accountOrders)) return -1;
             var n = 0;
-            foreach (Order o in account.Orders)
+            foreach (Order o in accountOrders)
             {
                 if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted) continue;
                 var tagProbe = Executor.GetOrderTag(o);
                 if (string.IsNullOrEmpty(tagProbe) || !tagProbe.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase)) continue;
-                var broName = o.Instrument?.MasterInstrument?.Name ?? "";
-                if (AdoptionScanInstrumentGate.BrokerOrderMatchesExecutionInstrument(ExecutionInstrumentKey, broName))
+                if (BrokerOrderMatchesExecutionInstrument(o))
                     n++;
             }
             return n;
@@ -1594,8 +1705,7 @@ public sealed partial class InstrumentExecutionAuthority
             return;
         }
 
-        var account = Executor.GetAccount() as Account;
-        if (account?.Orders == null)
+        if (!TryGetAccountOrdersSnapshot(out var accountOrders))
         {
             Log.Write(RobotEvents.EngineBase(NowEvent(), tradingDate: "", eventType: "ADOPTION_SKIP_REASON", state: "DEBUG",
                 new
@@ -1615,7 +1725,7 @@ public sealed partial class InstrumentExecutionAuthority
         }
 
         var adoptionSkipOncePerOrder = new HashSet<string>(StringComparer.Ordinal);
-        var accountOrdersTotal = account.Orders.Count;
+        var accountOrdersTotal = accountOrders.Count;
         tel.AccountOrdersTotal = accountOrdersTotal;
         MaybeLogExpensivePathThread(NowEvent(), "ScanAndAdoptExistingOrders");
 
@@ -1633,15 +1743,16 @@ public sealed partial class InstrumentExecutionAuthority
         }
 
         swPh.Restart();
-        var workingCount = account.Orders.Count(o => o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted);
+        var workingCount = accountOrders.Count(o =>
+            (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted) &&
+            BrokerOrderMatchesExecutionInstrument(o));
         var qtsw2SameInstrumentWorking = 0;
-        foreach (Order o in account.Orders)
+        foreach (Order o in accountOrders)
         {
             if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted) continue;
             var tagProbe = Executor.GetOrderTag(o);
             if (string.IsNullOrEmpty(tagProbe) || !tagProbe.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase)) continue;
-            var broName = o.Instrument?.MasterInstrument?.Name ?? "";
-            if (AdoptionScanInstrumentGate.BrokerOrderMatchesExecutionInstrument(ExecutionInstrumentKey, broName))
+            if (BrokerOrderMatchesExecutionInstrument(o))
                 qtsw2SameInstrumentWorking++;
         }
         swPh.Stop();
@@ -1799,7 +1910,7 @@ public sealed partial class InstrumentExecutionAuthority
         var recoveryRequestsDuringScan = 0;
         var supervisoryRequestsDuringScan = 0;
 
-        foreach (Order o in account.Orders)
+        foreach (Order o in accountOrders)
         {
             var orderIdEarly = o.OrderId?.ToString() ?? "";
             if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted)

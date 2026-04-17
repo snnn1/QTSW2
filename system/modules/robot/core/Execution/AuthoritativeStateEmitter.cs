@@ -137,7 +137,6 @@ public sealed class AuthoritativeStateEmitter : IDisposable
                 }
 
                 var allInstruments = new HashSet<string>(instruments, StringComparer.OrdinalIgnoreCase);
-                foreach (var k in brokerQtyByInstrument.Keys) allInstruments.Add(k);
 
                 var instrumentSnapshots = new List<AuthoritativeInstrumentSnapshot>();
                 foreach (var inst in allInstruments)
@@ -146,7 +145,8 @@ public sealed class AuthoritativeStateEmitter : IDisposable
                     brokerQtyByInstrument.TryGetValue(inst, out var brokerQty);
                     brokerWorkingByInstrument.TryGetValue(inst, out var workingCount);
 
-                    var unexplained = ownerSnap.ComputeUnexplainedQty(brokerQty);
+                    var brokerSignedQty = NormalizeBrokerSignedQty(brokerQty, ownerSnap);
+                    var unexplained = ownerSnap.ComputeUnexplainedQty(brokerSignedQty);
 
                     instrumentSnapshots.Add(new AuthoritativeInstrumentSnapshot
                     {
@@ -218,6 +218,27 @@ public sealed class AuthoritativeStateEmitter : IDisposable
         catch { }
 
         return string.IsNullOrWhiteSpace(_account) ? "default" : _account.Trim();
+    }
+
+    private static int NormalizeBrokerSignedQty(int brokerQty, InstrumentOwnershipSnapshot ownerSnap)
+    {
+        if (brokerQty <= 0) return brokerQty;
+
+        if (ownerSnap.LedgerSignedNetQty < 0)
+            return -Math.Abs(brokerQty);
+
+        if (ownerSnap.LedgerSignedNetQty > 0)
+            return Math.Abs(brokerQty);
+
+        var directions = ownerSnap.Slots
+            .Where(s => s.State != SlotState.Closed && s.Remaining > 0)
+            .Select(s => s.Direction)
+            .Distinct()
+            .ToList();
+
+        return directions.Count == 1 && directions[0] == SlotDirection.Short
+            ? -Math.Abs(brokerQty)
+            : brokerQty;
     }
 
     private string ResolveTradingDate(DateTimeOffset utcNow)

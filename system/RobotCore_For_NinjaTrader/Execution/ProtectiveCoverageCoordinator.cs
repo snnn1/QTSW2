@@ -365,6 +365,8 @@ public sealed class ProtectiveCoverageCoordinator
                 Instrument = inst,
                 BrokerPositionQty = result.BrokerPositionQty,
                 BrokerDirection = result.BrokerDirection,
+                StopQty = result.StopQty,
+                TargetQty = result.TargetQty,
                 Status = result.Status,
                 AuditUtc = result.AuditUtc
             };

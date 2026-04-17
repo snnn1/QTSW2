@@ -44,6 +44,49 @@ public static class QuantExecutionControlStore
         e.Expected.LastProtectiveStopSubmitUtc = utcNow;
     }
 
+    /// <summary>
+    /// Records that an existing protective pair is being resized on the strategy thread after a
+    /// mapped fill increased exposure. This is intentionally bounded by the same post-fill window
+    /// as normal protective convergence; it suppresses audit races, not real stale protection.
+    /// </summary>
+    public static void NotifyProtectiveResizePending(string instrument, int expectedProtectiveQty, DateTimeOffset utcNow)
+    {
+        if (!FeatureFlags.QuantExecutionControlStoreEnabled) return;
+        var inst = Norm(instrument);
+        if (string.IsNullOrEmpty(inst) || expectedProtectiveQty <= 0) return;
+
+        var windowMs = FeatureFlags.PostFillAlignmentWindowMs > 0 ? FeatureFlags.PostFillAlignmentWindowMs : 5000;
+        var expiry = utcNow.AddMilliseconds(windowMs);
+
+        ByInstrument.AddOrUpdate(
+            inst,
+            _ => new Entry
+            {
+                Phase = QuantExecutionInstrumentPhase.PendingAlignment,
+                Expected =
+                {
+                    LastProtectiveResizePendingUtc = utcNow,
+                    PendingProtectiveResizeQty = Math.Abs(expectedProtectiveQty),
+                    PendingAlignmentExpiresUtc = expiry
+                },
+                LockOrUnmappedReason = null
+            },
+            (_, e) =>
+            {
+                if (e.Phase is QuantExecutionInstrumentPhase.UnmappedExecution or QuantExecutionInstrumentPhase.ExecutionLocked)
+                    return e;
+                if (e.Phase != QuantExecutionInstrumentPhase.RecoveryRequired)
+                    e.Phase = QuantExecutionInstrumentPhase.PendingAlignment;
+                e.Expected.LastProtectiveResizePendingUtc = utcNow;
+                e.Expected.PendingProtectiveResizeQty = Math.Abs(expectedProtectiveQty);
+                e.Expected.PendingAlignmentExpiresUtc =
+                    !e.Expected.PendingAlignmentExpiresUtc.HasValue || expiry > e.Expected.PendingAlignmentExpiresUtc.Value
+                        ? expiry
+                        : e.Expected.PendingAlignmentExpiresUtc;
+                return e;
+            });
+    }
+
     /// <summary>Rule 1 — mapped fill: update expected immediately, enter PENDING_ALIGNMENT with bounded expiry.</summary>
     /// <remarks>
     /// <para><b>RecoveryRequired:</b> Durable Tier-1 recovery is not cleared or softened by new mapped fills — phase and
@@ -207,6 +250,8 @@ public static class QuantExecutionControlStore
             LastMappedFillUtc = s.LastMappedFillUtc,
             PendingAlignmentExpiresUtc = s.PendingAlignmentExpiresUtc,
             LastProtectiveStopSubmitUtc = s.LastProtectiveStopSubmitUtc,
+            LastProtectiveResizePendingUtc = s.LastProtectiveResizePendingUtc,
+            PendingProtectiveResizeQty = s.PendingProtectiveResizeQty,
             RecoveryMode = s.RecoveryMode,
             RecoveryEnteredUtc = s.RecoveryEnteredUtc
         };
@@ -229,6 +274,31 @@ public static class QuantExecutionControlStore
             return utcNow <= expiry.Value;
         var windowMs = FeatureFlags.PostFillAlignmentWindowMs > 0 ? FeatureFlags.PostFillAlignmentWindowMs : 5000;
         return (utcNow - e.Expected.LastMappedFillUtc.Value).TotalMilliseconds <= windowMs;
+    }
+
+    /// <summary>
+    /// True while a known protective cancel/recreate resize is legitimately in flight.
+    /// This is a short audit suppressor only; expiration returns the audit to critical behavior.
+    /// </summary>
+    public static bool IsProtectiveResizePendingActive(string instrument, int expectedProtectiveQty, DateTimeOffset utcNow)
+    {
+        if (!FeatureFlags.QuantExecutionControlStoreEnabled) return false;
+        var inst = Norm(instrument);
+        if (string.IsNullOrEmpty(inst) || expectedProtectiveQty <= 0 || !ByInstrument.TryGetValue(inst, out var e)) return false;
+        if (e.Phase is QuantExecutionInstrumentPhase.UnmappedExecution or QuantExecutionInstrumentPhase.ExecutionLocked)
+            return false;
+        if (!e.Expected.LastProtectiveResizePendingUtc.HasValue)
+            return false;
+        if (e.Expected.PendingProtectiveResizeQty.HasValue &&
+            e.Expected.PendingProtectiveResizeQty.Value != Math.Abs(expectedProtectiveQty))
+            return false;
+
+        var expiry = e.Expected.PendingAlignmentExpiresUtc;
+        if (expiry.HasValue)
+            return utcNow <= expiry.Value;
+
+        var windowMs = FeatureFlags.PostFillAlignmentWindowMs > 0 ? FeatureFlags.PostFillAlignmentWindowMs : 5000;
+        return (utcNow - e.Expected.LastProtectiveResizePendingUtc.Value).TotalMilliseconds <= windowMs;
     }
 
     /// <summary>

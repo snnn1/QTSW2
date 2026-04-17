@@ -26,6 +26,12 @@ public static class StructuralMultiIntentAutoOffsetTests
         e = VerifyExecutionPolicyLoadsAutoOffset();
         if (e != null) return (false, e);
 
+        e = VerifyExecutionPolicyLegacySingleOwnerTokenFallsBackToAllow();
+        if (e != null) return (false, e);
+
+        e = VerifyOwnershipLedgerAllowsSameSideMultiStreamEntries();
+        if (e != null) return (false, e);
+
         e = VerifyPolicyRuntimeInvokesGateRecoveryOnlyForAutoOffset();
         if (e != null) return (false, e);
 
@@ -121,6 +127,63 @@ public static class StructuralMultiIntentAutoOffsetTests
         finally
         {
             try { File.Delete(tmp); } catch { /* ignore */ }
+        }
+    }
+
+    private static string? VerifyExecutionPolicyLegacySingleOwnerTokenFallsBackToAllow()
+    {
+        var root = ProjectRootResolver.ResolveProjectRoot();
+        var src = Path.Combine(root, "configs", "execution_policy.json");
+        if (!File.Exists(src)) return $"Missing {src}";
+        var tmp = Path.Combine(Path.GetTempPath(), "QTSW2_exec_pol_" + Guid.NewGuid().ToString("N")[..8] + ".json");
+        try
+        {
+            var txt = File.ReadAllText(src);
+            var patched = txt.Replace("\"use_instrument_execution_authority\"",
+                "\"structural_multi_intent_policy\": \"single_owner\",\n  \"use_instrument_execution_authority\"",
+                StringComparison.Ordinal);
+            File.WriteAllText(tmp, patched);
+            var pol = ExecutionPolicy.LoadFromFile(tmp);
+            if (pol.StructuralMultiIntentPolicy != StructuralMultiIntentPolicy.Allow)
+                return $"ExecutionPolicy: legacy single_owner token should fall back to Allow, got {pol.StructuralMultiIntentPolicy}";
+            return null;
+        }
+        finally
+        {
+            try { File.Delete(tmp); } catch { /* ignore */ }
+        }
+    }
+
+    private static string? VerifyOwnershipLedgerAllowsSameSideMultiStreamEntries()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "QTSW2_owner_multi_stream_" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            Directory.CreateDirectory(root);
+            var emitted = new List<OwnershipEvent>();
+            var ledger = new InstrumentOwnershipLedger(new RobotLogger(root), onClassAEvent: e => emitted.Add(e));
+            var utc = DateTimeOffset.Parse("2026-04-13T14:30:00Z");
+
+            var r1 = ledger.RecordMappedEntryFill("Playback101", "MCL", "intent-a", "MCL1", SlotDirection.Short, 2, utc, 1);
+            var r2 = ledger.RecordMappedEntryFill("Playback101", "MCL", "intent-b", "MCL2", SlotDirection.Short, 2, utc.AddMilliseconds(1), 2);
+
+            if (!r1.Success || !r2.Success)
+                return $"Ledger multi-stream: expected both writes to succeed, got r1={r1.Success}, r2={r2.Success}";
+            if (emitted.Any(e => e.Kind == OwnershipEventKind.OwnershipConflictRejected))
+                return "Ledger multi-stream: unexpected OwnershipConflictRejected for same-side independent streams";
+
+            var snap = ledger.GetOwnershipSnapshot("Playback101", "MCL");
+            if (snap.ActiveSlotCount != 2)
+                return $"Ledger multi-stream: expected 2 active slots, got {snap.ActiveSlotCount}";
+            if (snap.LedgerSignedNetQty != -4)
+                return $"Ledger multi-stream: expected signed net -4, got {snap.LedgerSignedNetQty}";
+            if (!snap.MultiIntentAllowed)
+                return "Ledger multi-stream: snapshot should report MultiIntentAllowed=true";
+            return null;
+        }
+        finally
+        {
+            try { Directory.Delete(root, true); } catch { /* ignore */ }
         }
     }
 

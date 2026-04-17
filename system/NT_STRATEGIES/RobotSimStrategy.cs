@@ -2057,12 +2057,42 @@ namespace NinjaTrader.NinjaScript.Strategies
             return hasExposure;
         }
 
+        private List<Position> GetAccountPositionsSnapshot()
+        {
+            var snapshot = new List<Position>();
+            if (Account?.Positions == null) return snapshot;
+
+            for (var attempt = 0; attempt < 2; attempt++)
+            {
+                snapshot.Clear();
+                try
+                {
+                    foreach (Position pos in Account.Positions)
+                    {
+                        if (pos != null) snapshot.Add(pos);
+                    }
+                    return snapshot;
+                }
+                catch (InvalidOperationException) when (attempt == 0)
+                {
+                    // NinjaTrader can mutate Account.Positions while OnMarketData is enumerating it.
+                }
+                catch (InvalidOperationException)
+                {
+                    snapshot.Clear();
+                    return snapshot;
+                }
+            }
+
+            return snapshot;
+        }
+
         /// <summary>Exposure identity for BE_GATE_BLOCKED. Returns (hasExposure, accountPositionCount, mismatchedInstrumentName). hasExposure = position matching execution or canonical. If account has position in other instrument, mismatchedInstrumentName set for INSTRUMENT_MISMATCH logging.</summary>
         private (bool hasExposure, int accountPositionCount, string? mismatchedInstrumentName) GetExposureState()
         {
             if (Account == null || Instrument == null) return (false, 0, null);
-            var positions = Account.Positions;
-            if (positions == null) return (false, 0, null);
+            var positions = GetAccountPositionsSnapshot();
+            if (positions.Count == 0) return (false, 0, null);
             var count = 0;
             string? firstOtherInstrument = null;
             var executionInstrument = !string.IsNullOrEmpty(_engine?.GetExecutionInstrument())
@@ -2200,8 +2230,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     { "engine_ready", _engineReady },
                     { "note", "OnMarketData(Last) fired. has_account_position uses Account.Positions; strategy_position may be Flat when account has positions." }
                 };
-                if (Account != null && Account.Positions != null)
-                    diagData["account_position_count"] = Account.Positions.Count;
+                diagData["account_position_count"] = accountPositionCount;
                 _engine.LogEngineEvent(DateTimeOffset.UtcNow, "ONMARKETDATA_LAST_DIAG", diagData);
             }
 

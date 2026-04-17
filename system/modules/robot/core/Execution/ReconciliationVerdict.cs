@@ -10,7 +10,10 @@ namespace QTSW2.Robot.Core.Execution;
 public sealed class ReconciliationVerdict
 {
     public string Instrument { get; init; } = "";
+    /// <summary>Raw broker quantity as reported by the adapter. May be absolute on some broker adapters.</summary>
     public int BrokerQty { get; init; }
+    /// <summary>Broker quantity normalized to the ledger's signed direction for mismatch math.</summary>
+    public int BrokerSignedQty { get; init; }
     public int LedgerQty { get; init; }
     /// <summary>
     /// Open quantity derived from ledger slots (not from <see cref="ExecutionJournal"/> directly).
@@ -18,7 +21,7 @@ public sealed class ReconciliationVerdict
     /// open position quantity (sum of non-closed slot remaining). Compare to broker qty for mismatch classification.
     /// </summary>
     public int JournalOpenQty { get; init; }
-    public int UnexplainedQty => BrokerQty - LedgerQty;
+    public int UnexplainedQty => BrokerSignedQty - LedgerQty;
     public long OwnershipVersion { get; init; }
     public MismatchTier MismatchTier { get; init; }
     public double MismatchAgeMs { get; init; }

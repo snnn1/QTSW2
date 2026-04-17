@@ -103,7 +103,7 @@ public static class ProtectiveCoverageAudit
         if (robotProtectiveStops.Count > 1 && absQty > 0)
         {
             var distinctIntents = robotProtectiveStops.Select(o => GetIntentIdFromTag(o.Tag)).Where(id => id != null).Distinct().Count();
-            if (distinctIntents > 1 && !(totalStopQty == absQty && robotProtectiveTargets.Count > 0 && totalTargetQty == absQty))
+            if (distinctIntents > 1 && totalStopQty != absQty)
             {
                 result.Status = ProtectiveAuditStatus.PROTECTIVE_CONFLICTING_ORDERS;
                 result.Detail = $"Multiple stops ({robotProtectiveStops.Count}) from different intents (stop qty sum {totalStopQty} vs abs {absQty})";
@@ -130,6 +130,14 @@ public static class ProtectiveCoverageAudit
         // Stop qty mismatch: under-covered is critical
         if (totalStopQty < absQty)
         {
+            if (IsWithinBoundedProtectiveResizeWindow(instrument, absQty, utcNow))
+            {
+                result.Status = ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE;
+                result.Detail =
+                    $"Stop qty {totalStopQty} < broker exposure {absQty}; bounded convergence: protective resize pending";
+                return result;
+            }
+
             result.Status = ProtectiveAuditStatus.PROTECTIVE_STOP_QTY_MISMATCH;
             result.Detail = $"Stop qty {totalStopQty} < broker exposure {absQty}";
             return result;
@@ -158,6 +166,14 @@ public static class ProtectiveCoverageAudit
 
         if (totalTargetQty < absQty)
         {
+            if (IsWithinBoundedProtectiveResizeWindow(instrument, absQty, utcNow))
+            {
+                result.Status = ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE;
+                result.Detail =
+                    $"Target qty {totalTargetQty} < broker exposure {absQty}; bounded convergence: protective resize pending";
+                return result;
+            }
+
             result.Status = ProtectiveAuditStatus.PROTECTIVE_TARGET_QTY_MISMATCH;
             result.Detail = $"Target qty {totalTargetQty} < broker exposure {absQty}";
             return result;
@@ -259,5 +275,10 @@ public static class ProtectiveCoverageAudit
             return false;
 
         return true;
+    }
+
+    private static bool IsWithinBoundedProtectiveResizeWindow(string instrument, int expectedProtectiveQty, DateTimeOffset utcNow)
+    {
+        return QuantExecutionControlStore.IsProtectiveResizePendingActive(instrument, expectedProtectiveQty, utcNow);
     }
 }

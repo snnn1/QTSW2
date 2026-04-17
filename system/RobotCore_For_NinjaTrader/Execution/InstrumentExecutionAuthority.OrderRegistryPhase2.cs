@@ -206,14 +206,13 @@ public sealed partial class InstrumentExecutionAuthority
     /// <summary>Phase 2: Verify registry integrity vs broker. Emits REGISTRY_BROKER_DIVERGENCE on mismatch.</summary>
     internal void VerifyRegistryIntegrity(DateTimeOffset utcNow)
     {
-        var account = Executor?.GetAccount() as Account;
-        if (account?.Orders == null) return;
+        if (!TryGetAccountOrdersSnapshot(out var accountOrders)) return;
 
         var regCpu = RuntimeAuditHubRef.Active != null ? RuntimeAuditHub.CpuStart() : 0L;
         try
         {
         var sw = Stopwatch.StartNew();
-        var accountOrdersTotal = account.Orders.Count;
+        var accountOrdersTotal = accountOrders.Count;
         var ordersScannedPass1 = 0;
         var recoveryRequestsEmitted = 0;
         var supervisoryRequestsEmitted = 0;
@@ -237,18 +236,19 @@ public sealed partial class InstrumentExecutionAuthority
         }
 
         var brokerOrderIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (Order o in account.Orders)
+        foreach (Order o in accountOrders)
         {
             ordersScannedPass1++;
             if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted) continue;
+            if (!BrokerOrderMatchesExecutionInstrument(o)) continue;
             var id = o.OrderId?.ToString();
             if (!string.IsNullOrEmpty(id)) brokerOrderIds.Add(id);
         }
 
-        static Order? FindOrderByBrokerId(Account acct, string orderId)
+        static Order? FindOrderByBrokerId(IEnumerable<Order> orders, string orderId)
         {
-            if (string.IsNullOrEmpty(orderId) || acct.Orders == null) return null;
-            foreach (Order o in acct.Orders)
+            if (string.IsNullOrEmpty(orderId)) return null;
+            foreach (Order o in orders)
             {
                 if (string.Equals(o.OrderId?.ToString(), orderId, StringComparison.OrdinalIgnoreCase))
                     return o;
@@ -271,7 +271,7 @@ public sealed partial class InstrumentExecutionAuthority
             Order? matched = null;
             foreach (var vid in _orderRegistry.GetBrokerOrderIdVariants(canonical))
             {
-                matched = FindOrderByBrokerId(account, vid);
+                matched = FindOrderByBrokerId(accountOrders, vid);
                 if (matched != null) break;
             }
 
@@ -369,10 +369,11 @@ public sealed partial class InstrumentExecutionAuthority
 
         var ordersScannedPass2 = 0;
         // Broker has live order but registry does not — IEA robustness: adopt immediately to restore consistency
-        foreach (Order o in account.Orders)
+        foreach (Order o in accountOrders)
         {
             ordersScannedPass2++;
             if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted) continue;
+            if (!BrokerOrderMatchesExecutionInstrument(o)) continue;
             var brokerId = o.OrderId?.ToString();
             if (string.IsNullOrEmpty(brokerId) || _orderRegistry.Contains(brokerId)) continue;
 

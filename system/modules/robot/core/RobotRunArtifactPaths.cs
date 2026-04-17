@@ -84,6 +84,10 @@ public static class RobotRunArtifactPaths
         Directory.CreateDirectory(StateExecutionJournals(persistenceBase));
         Directory.CreateDirectory(DerivedExecutionSummaries(persistenceBase));
         Directory.CreateDirectory(DecisionsDir(persistenceBase));
+
+        var orphanFile = Path.Combine(EventsOrphanFillsTradingDate(persistenceBase, tradingDate), "orphan_fills.jsonl");
+        if (!File.Exists(orphanFile))
+            File.WriteAllText(orphanFile, "");
     }
 
     /// <summary>True when <paramref name="persistenceBase"/> is under a <c>runs/&lt;id&gt;/</c> tree (isolated run artifacts).</summary>

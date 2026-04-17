@@ -298,11 +298,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             if (accountSnapshot == null) return;
 
             var accountName = OwnershipAccountKey;
-            var instrumentsInScope = _ownershipLedger.SnapshotAll(accountName)
-                .Select(s => s.ExecutionInstrumentKey)
-                .ToList();
+            var instrumentsInScope = new HashSet<string>(GetEngineScopedExecutionInstrumentKeys(), StringComparer.OrdinalIgnoreCase);
+            foreach (var s in _ownershipLedger.SnapshotAll(accountName))
+            {
+                if (!string.IsNullOrWhiteSpace(s.ExecutionInstrumentKey))
+                    instrumentsInScope.Add(s.ExecutionInstrumentKey.Trim());
+            }
 
-            var verdicts = _reconciliationClassifier.Classify(accountSnapshot, accountName, instrumentsInScope, utcNow);
+            var verdicts = _reconciliationClassifier.Classify(accountSnapshot, accountName, instrumentsInScope.ToList(), utcNow);
 
             foreach (var v in verdicts)
             {
@@ -312,6 +315,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     {
                         instrument = v.Instrument,
                         broker_qty = v.BrokerQty,
+                        broker_signed_qty = v.BrokerSignedQty,
                         ledger_qty = v.LedgerQty,
                         journal_open_qty = v.JournalOpenQty,
                         mismatch_tier = v.MismatchTier.ToString(),
@@ -334,8 +338,77 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 foreach (var v in verdicts)
                 {
                     var classifierMismatch = v.MismatchTier != MismatchTier.Convergence;
-                    runnerQty.TryGetValue(v.Instrument, out var rq);
+                    if (!runnerQty.TryGetValue(v.Instrument, out var rq))
+                    {
+                        if (classifierMismatch)
+                        {
+                            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+                                eventType: "RECONCILIATION_CLASSIFIER_PARITY_DEFERRED", state: "ENGINE",
+                                new
+                                {
+                                    instrument = v.Instrument,
+                                    reason = "runner_quantity_missing",
+                                    classifier_tier = v.MismatchTier.ToString(),
+                                    classifier_broker_qty = v.BrokerQty,
+                                    classifier_broker_signed_qty = v.BrokerSignedQty,
+                                    classifier_ledger_qty = v.LedgerQty,
+                                    classifier_says_mismatch = classifierMismatch
+                                }));
+                        }
+                        continue;
+                    }
                     var runnerMismatch = rq.AccountQty != rq.JournalQty;
+                    var sameBrokerView = Math.Abs(v.BrokerQty) == Math.Abs(rq.AccountQty);
+                    var canonicalLedgerMatchesBroker =
+                        Math.Abs(v.LedgerQty) == Math.Abs(v.BrokerSignedQty) ||
+                        Math.Abs(v.LedgerQty) == Math.Abs(v.BrokerQty) ||
+                        Math.Abs(v.LedgerQty) == Math.Abs(rq.AccountQty);
+
+                    if (classifierMismatch != runnerMismatch && !sameBrokerView)
+                    {
+                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+                            eventType: "RECONCILIATION_CLASSIFIER_PARITY_DEFERRED", state: "ENGINE",
+                            new
+                            {
+                                instrument = v.Instrument,
+                                reason = "runner_snapshot_account_qty_mismatch",
+                                classifier_tier = v.MismatchTier.ToString(),
+                                classifier_broker_qty = v.BrokerQty,
+                                classifier_broker_signed_qty = v.BrokerSignedQty,
+                                classifier_ledger_qty = v.LedgerQty,
+                                runner_account_qty = rq.AccountQty,
+                                runner_journal_qty = rq.JournalQty,
+                                classifier_says_mismatch = classifierMismatch,
+                                runner_says_mismatch = runnerMismatch,
+                                note = "Deferred disagreement because classifier and runner sampled different broker/account quantities, usually at a fill or exit boundary."
+                            }));
+                        continue;
+                    }
+
+                    if (classifierMismatch != runnerMismatch &&
+                        !classifierMismatch &&
+                        sameBrokerView &&
+                        canonicalLedgerMatchesBroker &&
+                        Math.Abs(rq.JournalQty) != Math.Abs(v.LedgerQty))
+                    {
+                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+                            eventType: "RECONCILIATION_CLASSIFIER_PARITY_DEFERRED", state: "ENGINE",
+                            new
+                            {
+                                instrument = v.Instrument,
+                                reason = "legacy_runner_journal_lag_canonical_ledger_matches_broker",
+                                classifier_tier = v.MismatchTier.ToString(),
+                                classifier_broker_qty = v.BrokerQty,
+                                classifier_broker_signed_qty = v.BrokerSignedQty,
+                                classifier_ledger_qty = v.LedgerQty,
+                                runner_account_qty = rq.AccountQty,
+                                runner_journal_qty = rq.JournalQty,
+                                classifier_says_mismatch = classifierMismatch,
+                                runner_says_mismatch = runnerMismatch,
+                                note = "Deferred disagreement because broker/account and canonical ledger agree while the legacy runner journal view is behind or represented differently."
+                            }));
+                        continue;
+                    }
 
                     if (classifierMismatch != runnerMismatch)
                     {
@@ -346,6 +419,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                                 instrument = v.Instrument,
                                 classifier_tier = v.MismatchTier.ToString(),
                                 classifier_broker_qty = v.BrokerQty,
+                                classifier_broker_signed_qty = v.BrokerSignedQty,
                                 classifier_ledger_qty = v.LedgerQty,
                                 runner_account_qty = rq.AccountQty,
                                 runner_journal_qty = rq.JournalQty,
@@ -375,6 +449,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                             {
                                 instrument = rv.Instrument,
                                 broker_qty = rv.BrokerQty,
+                                broker_signed_qty = rv.BrokerSignedQty,
                                 ledger_qty = rv.LedgerQty,
                                 mismatch_tier = rv.MismatchTier.ToString()
                             }));
@@ -1419,7 +1494,16 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             _stateEmitter = new AuthoritativeStateEmitter(
                 _ownershipLedger,
                 () => _executionAdapter?.GetAccountSnapshot(DateTimeOffset.UtcNow) ?? new AccountSnapshot(),
-                () => _ownershipLedger.SnapshotAll(OwnershipAccountKey).Select(s => s.ExecutionInstrumentKey).ToList(),
+                () =>
+                {
+                    var instruments = new HashSet<string>(GetEngineScopedExecutionInstrumentKeys(), StringComparer.OrdinalIgnoreCase);
+                    foreach (var s in _ownershipLedger.SnapshotAll(OwnershipAccountKey))
+                    {
+                        if (!string.IsNullOrWhiteSpace(s.ExecutionInstrumentKey))
+                            instruments.Add(s.ExecutionInstrumentKey.Trim());
+                    }
+                    return instruments.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList();
+                },
                 _persistenceBase,
                 _log,
                 account: OwnershipAccountKey,
@@ -1622,19 +1706,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         : Path.Combine(_root, _executionPolicyPath);
                     absolutePolicyPath = Path.GetFullPath(absolutePolicyPath);
                     
-                    ExecutionPolicy._singleOwnerDefaultApplied = false;
                     _executionPolicy = ExecutionPolicy.LoadFromFile(absolutePolicyPath);
-
-                    if (ExecutionPolicy._singleOwnerDefaultApplied)
-                    {
-                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
-                            eventType: "EXECUTION_POLICY_SINGLEOWNER_DEFAULT", state: "ENGINE",
-                            new
-                            {
-                                note = "structural_multi_intent_policy defaulted to SingleOwner (was Allow prior to P7). " +
-                                       "Set structural_multi_intent_policy explicitly if Allow behavior is required."
-                            }));
-                    }
 
                     // Compute file hash for audit trail
                     var policyFileHash = "";
@@ -1986,7 +2058,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 redundancySuppression: _releaseReconRedundancy,
                 getCanonicalInstrumentForJournalAggregation: s => GetCanonicalInstrument(s),
                 getPendingExecutionWorkloadForInstrument: GetPendingIeAWorkloadForBrokerInstrument,
-                getRunIdForReconciliationDiagnostics: () => _runId);
+                getRunIdForReconciliationDiagnostics: () => _runId,
+                ownershipLedger: _ownershipLedger,
+                getOwnershipAccountKey: () => OwnershipAccountKey);
 
             // Gap 3 Phase 3–5: Protective coverage coordinator (blocks, corrective, emergency flatten escalation)
             _protectiveCoordinator = new ProtectiveCoverageCoordinator(
@@ -8514,8 +8588,50 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         var readiness = EvaluateStateConsistencyReleaseReadiness(inst, snap, utcNow, forceFullEvaluation: true);
         if (!readiness.ReleaseReady)
-            return ReconciliationForcedConvergenceResult.Failed(readiness.Summary ?? "not_release_ready");
+        {
+            if (IsSoftTransitionReleaseReadiness(readiness))
+            {
+                var softFp = BuildForcedConvergenceFingerprint(inst, snap, utcNow);
+                LogEvent(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_FORCED_CONVERGENCE_SOFT_DEFERRED", "ENGINE",
+                    new
+                    {
+                        instrument = inst,
+                        reason = readiness.Summary ?? "soft_transition_release_not_ready",
+                        broker_position_qty = readiness.DiagnosticBrokerPositionQty,
+                        broker_working_count = readiness.DiagnosticBrokerWorkingCount,
+                        journal_open_qty = readiness.DiagnosticJournalOpenQty,
+                        iea_owned_plus_adopted_working = readiness.DiagnosticIeaOwnedPlusAdoptedWorking,
+                        note = "Forced convergence did not fail-close because broker exposure is explainable and remaining blockers are known transition lanes."
+                    }));
+                return ReconciliationForcedConvergenceResult.Succeeded(softFp);
+            }
 
+            if (IsFillBoundaryReleaseReadiness(readiness))
+            {
+                var softFp = BuildForcedConvergenceFingerprint(inst, snap, utcNow);
+                LogEvent(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_FORCED_CONVERGENCE_SOFT_DEFERRED", "ENGINE",
+                    new
+                    {
+                        instrument = inst,
+                        reason = readiness.Summary ?? "fill_boundary_release_not_ready",
+                        broker_position_qty = readiness.DiagnosticBrokerPositionQty,
+                        broker_working_count = readiness.DiagnosticBrokerWorkingCount,
+                        journal_open_qty = readiness.DiagnosticJournalOpenQty,
+                        iea_owned_plus_adopted_working = readiness.DiagnosticIeaOwnedPlusAdoptedWorking,
+                        note = "Forced convergence did not fail-close because the remaining quantity delta is at a fill/order bridge boundary with active broker or IEA evidence."
+                    }));
+                return ReconciliationForcedConvergenceResult.Succeeded(softFp);
+            }
+
+            return ReconciliationForcedConvergenceResult.Failed(readiness.Summary ?? "not_release_ready");
+        }
+
+        var fp = BuildForcedConvergenceFingerprint(inst, snap, utcNow);
+        return ReconciliationForcedConvergenceResult.Succeeded(fp);
+    }
+
+    private ulong BuildForcedConvergenceFingerprint(string inst, AccountSnapshot snap, DateTimeOffset utcNow)
+    {
         MismatchObservation? obs = null;
         try
         {
@@ -8528,8 +8644,60 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // fingerprint still valid with null obs fields
         }
 
-        var fp = GateProgressEvaluator.BuildExternalFingerprint(inst, snap, obs);
-        return ReconciliationForcedConvergenceResult.Succeeded(fp);
+        return GateProgressEvaluator.BuildExternalFingerprint(inst, snap, obs);
+    }
+
+    private static bool IsSoftTransitionReleaseReadiness(StateConsistencyReleaseReadinessResult readiness)
+    {
+        if (readiness.ReleaseReady || !readiness.SnapshotSufficient || !readiness.IsExplainable)
+            return false;
+        if (readiness.BlockerInvariantViolation)
+            return false;
+        if (readiness.UnexplainedBrokerWorkingCount != 0 || !readiness.BrokerWorkingExplainable ||
+            !readiness.BrokerPositionExplainable || !readiness.LocalStateCoherent)
+            return false;
+
+        var resolved = readiness.ResolvedBlockers;
+        if (resolved == null || resolved.Count == 0)
+            return false;
+
+        foreach (var x in resolved)
+        {
+            if (x.Decision == ReconciliationDecision.IGNORE)
+                continue;
+            if (x.Decision == ReconciliationDecision.ESCALATE)
+                return false;
+            if (x.Decision is not (ReconciliationDecision.ADOPT or ReconciliationDecision.RETRY or ReconciliationDecision.ALTERNATE_LANE))
+                return false;
+            if (!IsSoftTransitionBlocker(x.Blocker.ReasonCode))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsSoftTransitionBlocker(ReconciliationBlockerReasonCode reasonCode) =>
+        reasonCode is ReconciliationBlockerReasonCode.BrokerVisibleAdoptableExposure
+            or ReconciliationBlockerReasonCode.TagMismatchExposure
+            or ReconciliationBlockerReasonCode.JournalOnlyBrokerFlat
+            or ReconciliationBlockerReasonCode.AlreadyOwnedElsewhere
+            or ReconciliationBlockerReasonCode.StaleSnapshot;
+
+    private static bool IsFillBoundaryReleaseReadiness(StateConsistencyReleaseReadinessResult readiness)
+    {
+        if (readiness.ReleaseReady || !readiness.SnapshotSufficient || readiness.BlockerInvariantViolation)
+            return false;
+
+        var hasPositionDelta = readiness.Contradictions?.Any(c =>
+            c.StartsWith("position_qty_delta_", StringComparison.OrdinalIgnoreCase) ||
+            c.StartsWith("info_pending_alignment_position_qty_delta_", StringComparison.OrdinalIgnoreCase)) == true;
+        if (!hasPositionDelta)
+            return false;
+
+        return readiness.DiagnosticBrokerWorkingCount > 0 ||
+               readiness.DiagnosticIeaOwnedPlusAdoptedWorking > 0 ||
+               readiness.DiagnosticAdoptDecisionCount > 0 ||
+               readiness.PendingAdoptionExists;
     }
 
     private void OnForcedBrokerConvergenceFailure(string instrument, ReconciliationForcedConvergenceContext ctx,
@@ -8568,7 +8736,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     }
 
     /// <summary>
-    /// Gap 3 Phase 4: Try to submit corrective stop. Deterministic stop-price policy:
+    /// Gap 3 Phase 4: Try to submit corrective protective orders. Deterministic stop-price policy:
     /// 1) Use journal StopPrice if available and sane (protective for direction)
     /// 2) Else use BEStopPrice if sane
     /// 3) Else fail-closed: return NO_SAFE_STOP_PRICE, do not invent a price
@@ -8631,15 +8799,43 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         if (!stopPrice.HasValue)
             return new ProtectiveCorrectiveResult { Submitted = false, FailureReason = "NO_SAFE_STOP_PRICE" };
 
+        decimal? targetPrice = null;
+        if (entry.TargetPrice.HasValue && entryPrice.HasValue)
+        {
+            if (string.Equals(direction, "Long", StringComparison.OrdinalIgnoreCase) &&
+                entry.TargetPrice.Value > entryPrice.Value)
+                targetPrice = entry.TargetPrice.Value;
+            if (string.Equals(direction, "Short", StringComparison.OrdinalIgnoreCase) &&
+                entry.TargetPrice.Value < entryPrice.Value)
+                targetPrice = entry.TargetPrice.Value;
+        }
+
         var utcNow = req.AuditUtc;
-        var result = _executionAdapter.SubmitProtectiveStop(intentId, req.Instrument, direction, stopPrice.Value, qty, null, utcNow);
-        if (result.Success)
+        var shouldSubmitTarget = req.TargetQty <= 0 && targetPrice.HasValue;
+        var recoveryOcoGroup = shouldSubmitTarget
+            ? $"QTSW2:{intentId}_RECOVERY_{utcNow.UtcDateTime.Ticks}"
+            : null;
+
+        var stopResult = _executionAdapter.SubmitProtectiveStop(intentId, req.Instrument, direction, stopPrice.Value, qty, recoveryOcoGroup, utcNow);
+        OrderSubmissionResult? targetResult = null;
+        if (stopResult.Success && shouldSubmitTarget)
+        {
+            targetResult = _executionAdapter.SubmitTargetOrder(intentId, req.Instrument, direction, targetPrice!.Value, qty, recoveryOcoGroup, utcNow);
+        }
+
+        if (stopResult.Success || targetResult?.Success == true)
             TryEnsureJournalIntegrityAfterExecutionActivity(req.Instrument, utcNow);
+
+        var submitted = stopResult.Success && (!shouldSubmitTarget || targetResult?.Success == true);
         return new ProtectiveCorrectiveResult
         {
-            Submitted = result.Success,
+            Submitted = submitted,
             IntentId = intentId,
-            FailureReason = result.Success ? null : (result.ErrorMessage ?? "SUBMIT_FAILED")
+            FailureReason = submitted
+                ? null
+                : (stopResult.Success
+                    ? (targetResult?.ErrorMessage ?? "TARGET_SUBMIT_FAILED")
+                    : (stopResult.ErrorMessage ?? "STOP_SUBMIT_FAILED"))
         };
     }
     

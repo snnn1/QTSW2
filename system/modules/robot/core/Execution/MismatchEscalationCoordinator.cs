@@ -118,6 +118,8 @@ public sealed class MismatchEscalationCoordinator
 
     private const int MismatchPendingConvergenceLogSeconds = 3;
 
+    private const int FailClosedSoftDeferHysteresisMs = 5_000;
+
     private int _mismatchDetectedCount;
     private int _mismatchPersistentCount;
     private int _mismatchFailClosedCount;
@@ -1311,6 +1313,10 @@ public sealed class MismatchEscalationCoordinator
                 (state.PersistenceMs >= MismatchEscalationPolicy.MISMATCH_FAIL_CLOSED_THRESHOLD_MS ||
                  state.RetryCount >= MismatchEscalationPolicy.MISMATCH_MAX_RETRIES))
             {
+                if (TryDeferFailClosedForSoftTransition(inst, state, obs, utcNow, "persistent_mismatch", null,
+                        state.GateProgress))
+                    return;
+
                 state.EscalationState = MismatchEscalationState.FAIL_CLOSED;
                 state.GateLifecyclePhase = GateLifecyclePhase.FailClosed;
                 _mismatchFailClosedCount++;
@@ -1353,6 +1359,139 @@ public sealed class MismatchEscalationCoordinator
         skipReason is "post_alignment_stall" or "throttle_cooldown" or "reconciliation_hysteresis"
             or "reentry_loop_blocked" or "execution_cycle_cap_reached" or "hard_stop_active"
             or "absolute_gate_lifetime_cap" or "skipped";
+
+    private bool TryDeferFailClosedForSoftTransition(string inst, MismatchInstrumentState state, MismatchObservation obs,
+        DateTimeOffset utcNow, string source, string? failureReason, GateReconciliationProgressState? gp)
+    {
+        if (_evaluateReleaseReadiness == null)
+            return false;
+
+        AccountSnapshot snap;
+        try
+        {
+            snap = _getSnapshot();
+        }
+        catch (Exception ex)
+        {
+            _log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_ERROR", state: "ENGINE",
+                new { error = ex.Message, context = "TryDeferFailClosedForSoftTransition_snapshot", instrument = inst }));
+            return false;
+        }
+
+        StateConsistencyReleaseReadinessResult readiness;
+        try
+        {
+            readiness = _evaluateReleaseReadiness.Invoke(inst, snap, utcNow, true);
+        }
+        catch (Exception ex)
+        {
+            _log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_ERROR", state: "ENGINE",
+                new { error = ex.Message, context = "TryDeferFailClosedForSoftTransition_readiness", instrument = inst }));
+            return false;
+        }
+
+        var pendingIeA = _getPendingExecutionWorkloadForInstrument?.Invoke(inst) ?? 0;
+        var releaseReady = readiness.SnapshotSufficient && readiness.ReleaseReady;
+        var softTransition = IsSoftTransitionReleaseReadiness(readiness);
+        var fillBoundary = IsFillBoundaryPositionDelta(readiness, obs, pendingIeA);
+        if (!releaseReady && !softTransition && !fillBoundary)
+            return false;
+
+        state.EscalationState = MismatchEscalationState.PERSISTENT_MISMATCH;
+        if (state.GateLifecyclePhase == GateLifecyclePhase.FailClosed || state.GateLifecyclePhase == GateLifecyclePhase.None)
+            state.GateLifecyclePhase = GateLifecyclePhase.PersistentMismatch;
+        state.Blocked = true;
+        if (string.IsNullOrWhiteSpace(state.BlockReason))
+            state.BlockReason = MismatchEscalationPolicy.BLOCK_REASON_PERSISTENT_MISMATCH;
+        state.ForcedConvergenceSucceeded = true;
+        state.ReconciliationHysteresisUntilUtc = utcNow.AddMilliseconds(FailClosedSoftDeferHysteresisMs);
+        state.HysteresisMismatchTypeAtFreeze = state.MismatchType;
+        state.PostForcedConvergenceFingerprint = GateProgressEvaluator.BuildExternalFingerprint(inst, snap, obs);
+        state.ConvergenceEpisode.StartNew(++_nextConvergenceEpisodeId, utcNow, obs.IntentIdsCsv);
+        if (gp != null)
+            ResetGateThrottle(gp);
+
+        var payload = new
+        {
+            instrument = inst,
+            intent_id = obs.IntentIdsCsv ?? "",
+            source,
+            failure_reason = failureReason,
+            release_ready = readiness.ReleaseReady,
+            soft_transition = softTransition,
+            fill_boundary_position_delta = fillBoundary,
+            readiness_summary = readiness.Summary,
+            broker_position_qty = readiness.DiagnosticBrokerPositionQty,
+            broker_working_count = readiness.DiagnosticBrokerWorkingCount,
+            journal_open_qty = readiness.DiagnosticJournalOpenQty,
+            iea_owned_plus_adopted_working = readiness.DiagnosticIeaOwnedPlusAdoptedWorking,
+            pending_execution_workload = pendingIeA,
+            hysteresis_ms = FailClosedSoftDeferHysteresisMs,
+            note = "Fail-close deferred because broker exposure is either release-ready, a known soft transition, or a fill/order bridge boundary."
+        };
+        _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "RECONCILIATION_FORCED_CONVERGENCE_SOFT_DEFERRED", payload));
+        EmitCanonical(inst, "RECONCILIATION_FORCED_CONVERGENCE_SOFT_DEFERRED", utcNow, payload, "INFO");
+        return true;
+    }
+
+    private static bool IsSoftTransitionReleaseReadiness(StateConsistencyReleaseReadinessResult readiness)
+    {
+        if (readiness.ReleaseReady || !readiness.SnapshotSufficient || !readiness.IsExplainable)
+            return false;
+        if (readiness.BlockerInvariantViolation)
+            return false;
+        if (readiness.UnexplainedBrokerWorkingCount != 0 || !readiness.BrokerWorkingExplainable ||
+            !readiness.BrokerPositionExplainable || !readiness.LocalStateCoherent)
+            return false;
+
+        var resolved = readiness.ResolvedBlockers;
+        if (resolved == null || resolved.Count == 0)
+            return false;
+
+        foreach (var x in resolved)
+        {
+            if (x.Decision == ReconciliationDecision.IGNORE)
+                continue;
+            if (x.Decision == ReconciliationDecision.ESCALATE)
+                return false;
+            if (x.Decision is not (ReconciliationDecision.ADOPT or ReconciliationDecision.RETRY or ReconciliationDecision.ALTERNATE_LANE))
+                return false;
+            if (!IsSoftTransitionBlocker(x.Blocker.ReasonCode))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool IsSoftTransitionBlocker(ReconciliationBlockerReasonCode reasonCode) =>
+        reasonCode is ReconciliationBlockerReasonCode.BrokerVisibleAdoptableExposure
+            or ReconciliationBlockerReasonCode.TagMismatchExposure
+            or ReconciliationBlockerReasonCode.JournalOnlyBrokerFlat
+            or ReconciliationBlockerReasonCode.AlreadyOwnedElsewhere
+            or ReconciliationBlockerReasonCode.StaleSnapshot;
+
+    private static bool IsFillBoundaryPositionDelta(StateConsistencyReleaseReadinessResult readiness,
+        MismatchObservation obs, int pendingExecutionWorkload)
+    {
+        if (readiness.ReleaseReady || !readiness.SnapshotSufficient || readiness.BlockerInvariantViolation)
+            return false;
+
+        var hasPositionDelta = readiness.Contradictions?.Any(c =>
+            c.StartsWith("position_qty_delta_", StringComparison.OrdinalIgnoreCase) ||
+            c.StartsWith("info_pending_alignment_position_qty_delta_", StringComparison.OrdinalIgnoreCase)) == true;
+        if (!hasPositionDelta && readiness.Summary != null)
+            hasPositionDelta = readiness.Summary.IndexOf("position_qty_delta_", StringComparison.OrdinalIgnoreCase) >= 0;
+        if (!hasPositionDelta)
+            return false;
+
+        return pendingExecutionWorkload > 0 ||
+               readiness.DiagnosticBrokerWorkingCount > 0 ||
+               readiness.DiagnosticIeaOwnedPlusAdoptedWorking > 0 ||
+               readiness.DiagnosticAdoptDecisionCount > 0 ||
+               readiness.PendingAdoptionExists ||
+               obs.BrokerWorkingOrderCount > 0 ||
+               obs.LocalWorkingOrderCount > 0;
+    }
 
     private static ulong BuildMaterialReadinessFingerprint(StateConsistencyReleaseReadinessResult r, MismatchType mt)
     {
@@ -2670,6 +2809,10 @@ public sealed class MismatchEscalationCoordinator
             gp.LastExternalFingerprint = fpNow;
             return;
         }
+
+        if (TryDeferFailClosedForSoftTransition(inst, state, obsForSig, utcNow, "forced_convergence",
+                result.FailureReason, gp))
+            return;
 
         var wasBlockedFc = state.Blocked;
         state.EscalationState = MismatchEscalationState.FAIL_CLOSED;

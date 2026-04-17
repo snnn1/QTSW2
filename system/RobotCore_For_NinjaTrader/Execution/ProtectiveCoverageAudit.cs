@@ -97,14 +97,16 @@ public static class ProtectiveCoverageAudit
         result.StopQty = totalStopQty;
         result.TargetQty = totalTargetQty;
 
-        // Conflicting: multiple stops for same exposure without clear association
+        // Multi-stream instruments are supported: distinct intents may each carry their own stop on the
+        // same execution instrument. Treat them as aggregate coverage and only flag conflict when the
+        // aggregate stop quantity cannot exactly cover broker exposure.
         if (robotProtectiveStops.Count > 1 && absQty > 0)
         {
             var distinctIntents = robotProtectiveStops.Select(o => GetIntentIdFromTag(o.Tag)).Where(id => id != null).Distinct().Count();
-            if (distinctIntents > 1)
+            if (distinctIntents > 1 && totalStopQty != absQty)
             {
                 result.Status = ProtectiveAuditStatus.PROTECTIVE_CONFLICTING_ORDERS;
-                result.Detail = $"Multiple stops ({robotProtectiveStops.Count}) from different intents";
+                result.Detail = $"Multiple stops ({robotProtectiveStops.Count}) from different intents (stop qty sum {totalStopQty} vs abs {absQty})";
                 return result;
             }
         }

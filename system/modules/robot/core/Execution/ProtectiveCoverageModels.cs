@@ -102,6 +102,8 @@ public sealed class ProtectiveCorrectiveRequest
     public string Instrument { get; set; } = "";
     public int BrokerPositionQty { get; set; }
     public string BrokerDirection { get; set; } = "";
+    public int StopQty { get; set; }
+    public int TargetQty { get; set; }
     public ProtectiveAuditStatus Status { get; set; }
     public DateTimeOffset AuditUtc { get; set; }
 }

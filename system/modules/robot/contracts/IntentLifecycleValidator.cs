@@ -23,6 +23,7 @@ public static class IntentLifecycleValidator
         { (IntentLifecycleState.ENTRY_FILLED, IntentLifecycleTransition.EXIT_STARTED), IntentLifecycleState.EXIT_PENDING },
         { (IntentLifecycleState.CREATED, IntentLifecycleTransition.EXIT_STARTED), IntentLifecycleState.EXIT_PENDING },
         { (IntentLifecycleState.ENTRY_SUBMITTED, IntentLifecycleTransition.EXIT_STARTED), IntentLifecycleState.EXIT_PENDING },
+        { (IntentLifecycleState.PROTECTIVES_ACTIVE, IntentLifecycleTransition.INTENT_COMPLETED), IntentLifecycleState.TERMINAL },
         { (IntentLifecycleState.EXIT_PENDING, IntentLifecycleTransition.INTENT_COMPLETED), IntentLifecycleState.TERMINAL },
     };
 

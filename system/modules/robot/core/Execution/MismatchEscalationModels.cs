@@ -9,18 +9,11 @@ namespace QTSW2.Robot.Core.Execution;
 
 /// <summary>
 /// Policy when <see cref="MismatchType.STRUCTURAL_MULTI_INTENT"/> is present — not informational-only; controls enforcement beyond logging.
-/// P7 refactor: default changed from Allow to SingleOwner. Multi-intent requires explicit instrument-level opt-in.
+/// Multiple independent streams on the same instrument are allowed by default; stricter handling must be explicit.
 /// </summary>
 public enum StructuralMultiIntentPolicy
 {
-    /// <summary>
-    /// Default: single owner per instrument. A second intent on the same instrument emits
-    /// OWNERSHIP_CONFLICT_REJECTED and escalates to supervisor. Requires explicit config opt-in
-    /// via <c>structural_multi_intent_policy: allow</c> to enable multi-intent.
-    /// </summary>
-    SingleOwner,
-
-    /// <summary>Observe + gate telemetry only — multiple intents allowed on same instrument.</summary>
+    /// <summary>Observe + gate telemetry only (default).</summary>
     Allow,
 
     /// <summary>Block new risk on the instrument (stand down streams / freeze).</summary>

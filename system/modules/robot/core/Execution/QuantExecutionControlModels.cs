@@ -54,6 +54,16 @@ public sealed class QuantExpectedInstrumentState
     /// </summary>
     public DateTimeOffset? LastProtectiveStopSubmitUtc { get; set; }
 
+    /// <summary>
+    /// Set when an already-working protective set must be resized after another mapped fill.
+    /// The protective audit uses this as a bounded suppressor while the strategy-thread resize
+    /// command cancels/recreates the broker orders.
+    /// </summary>
+    public DateTimeOffset? LastProtectiveResizePendingUtc { get; set; }
+
+    /// <summary>Absolute protective quantity expected after the pending resize completes.</summary>
+    public int? PendingProtectiveResizeQty { get; set; }
+
     /// <summary>True after reconnect adoption without full history.</summary>
     public bool RecoveryMode { get; set; }
 

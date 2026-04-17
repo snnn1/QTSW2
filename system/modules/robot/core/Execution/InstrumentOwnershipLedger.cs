@@ -36,18 +36,15 @@ public sealed class InstrumentOwnershipLedger
         _currentTradingDate = tradingDate;
     }
 
-    private InstrumentOwnershipState GetOrCreate(string account, string executionInstrumentKey, bool multiIntentAllowed = false)
+    private InstrumentOwnershipState GetOrCreate(string account, string executionInstrumentKey, bool multiIntentAllowed = true)
     {
         var key = (account.Trim(), executionInstrumentKey.Trim());
         return _states.GetOrAdd(key, _ => new InstrumentOwnershipState(account.Trim(), executionInstrumentKey.Trim(), multiIntentAllowed));
     }
 
     /// <summary>
-    /// Record a mapped entry fill. On <c>SingleOwner</c> policy violation, the fill is still
-    /// recorded (the ledger tracks actual state, not enforces policy) but an
-    /// <see cref="OwnershipEventKind.OwnershipConflictRejected"/> Class-A event is emitted for
-    /// supervisor escalation. Policy enforcement is via <see cref="ExecutionStructuralLayer"/> /
-    /// <see cref="UnifiedExecutionAuthority"/>, not the ledger.
+    /// Record a mapped entry fill. The ownership ledger tracks factual slots and allows multiple
+    /// independent streams to own exposure on the same execution instrument.
     /// </summary>
     public LedgerWriteResult RecordMappedEntryFill(
         string account, string executionInstrument, string intentId, string stream,
@@ -58,25 +55,7 @@ public sealed class InstrumentOwnershipLedger
         var state = GetOrCreate(account, executionInstrument);
         lock (state.Lock)
         {
-            var existingActive = state.Slots.Where(s => s.State == SlotState.Active && s.IntentId != intentId).ToList();
-            if (existingActive.Count > 0 && !state.MultiIntentAllowed)
-            {
-                var snapshot = BuildSnapshotUnderLock(state, utcNow);
-                var conflictEvent = BuildEvent(OwnershipEventKind.OwnershipConflictRejected, OwnershipEventClass.ClassA,
-                    state, intentId, qtyDelta, direction, snapshot, utcNow,
-                    $"SingleOwner violation: active slot exists for {existingActive[0].IntentId}");
-                EmitEvent(conflictEvent);
-
-                var slot = FindOrCreateSlot(state, intentId, stream, direction, executionSequence, utcNow);
-                slot.EntryFilledQty += qtyDelta;
-                slot.LastUpdateUtc = utcNow;
-                FinalizeWrite(state, utcNow);
-                var snap2 = BuildSnapshotUnderLock(state, utcNow);
-                EmitEvent(BuildEvent(OwnershipEventKind.MappedEntryFill, OwnershipEventClass.ClassA,
-                    state, intentId, qtyDelta, direction, snap2, utcNow));
-                RunInvariantChecks(state, snap2);
-                return LedgerWriteResult.Ok(snap2);
-            }
+            state.MultiIntentAllowed = true;
 
             var targetSlot = FindOrCreateSlot(state, intentId, stream, direction, executionSequence, utcNow);
             targetSlot.EntryFilledQty += qtyDelta;
@@ -245,7 +224,7 @@ public sealed class InstrumentOwnershipLedger
         string account, string executionInstrument,
         IReadOnlyList<JournalRestoreRow> journalRows,
         DateTimeOffset utcNow,
-        bool multiIntentAllowed = false)
+        bool multiIntentAllowed = true)
     {
         var state = GetOrCreate(account, executionInstrument, multiIntentAllowed);
         lock (state.Lock)
