@@ -322,6 +322,11 @@ public sealed class StreamJournal
     public string? ReentryIntentId { get; set; }
     
     // Re-entry idempotency markers
+    public bool ReentrySubmitPending { get; set; }
+    public DateTimeOffset? ReentrySubmitPendingAtUtc { get; set; }
+    public DateTimeOffset? ReentrySubmitLastFailureUtc { get; set; }
+    public int ReentrySubmitFailureCount { get; set; }
+    public string? LastReentrySubmitError { get; set; }
     public bool ReentrySubmitted { get; set; }
     public bool ReentryFilled { get; set; }
     public bool ProtectionSubmitted { get; set; }

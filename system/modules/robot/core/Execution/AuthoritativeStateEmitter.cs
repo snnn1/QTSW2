@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -31,6 +32,7 @@ public sealed class AuthoritativeStateEmitter : IDisposable
     private Timer? _periodicTimer;
     private DateTimeOffset _lastCoalescedEmitUtc = DateTimeOffset.MinValue;
     private readonly object _emitLock = new();
+    private static readonly ConcurrentDictionary<string, object> SnapshotFileLocks = new(StringComparer.OrdinalIgnoreCase);
     private bool _disposed;
 
     private const int CoalesceWindowMs = 500;
@@ -195,7 +197,7 @@ public sealed class AuthoritativeStateEmitter : IDisposable
                 Directory.CreateDirectory(dir);
                 var filePath = Path.Combine(dir, "ownership_snapshots.jsonl");
                 var json = JsonSerializer.Serialize(envelope);
-                File.AppendAllText(filePath, json + Environment.NewLine);
+                AppendSnapshotLine(filePath, json);
 
                 _lastCoalescedEmitUtc = utcNow;
             }
@@ -203,6 +205,30 @@ public sealed class AuthoritativeStateEmitter : IDisposable
             {
                 _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "SNAPSHOT_EMITTER_ERROR", "ENGINE",
                     new { error = ex.Message, trigger = trigger.ToString() }));
+            }
+        }
+    }
+
+    private static void AppendSnapshotLine(string filePath, string json)
+    {
+        var fullPath = Path.GetFullPath(filePath);
+        var fileLock = SnapshotFileLocks.GetOrAdd(fullPath, _ => new object());
+
+        lock (fileLock)
+        {
+            for (var attempt = 0; attempt < 5; attempt++)
+            {
+                try
+                {
+                    using var stream = new FileStream(fullPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+                    using var writer = new StreamWriter(stream);
+                    writer.WriteLine(json);
+                    return;
+                }
+                catch (IOException) when (attempt < 4)
+                {
+                    Thread.Sleep(25 * (attempt + 1));
+                }
             }
         }
     }

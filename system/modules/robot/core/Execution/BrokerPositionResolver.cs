@@ -26,6 +26,26 @@ public static class BrokerPositionResolver
     }
 
     /// <summary>
+    /// Convert broker absolute quantity plus side label into the signed quantity used by reconciliation and flatten.
+    /// NinjaTrader account positions expose Quantity as an absolute value and MarketPosition as the side.
+    /// </summary>
+    public static int ApplyMarketPositionSign(int quantity, string? marketPosition)
+    {
+        var absQty = Math.Abs(quantity);
+        if (absQty == 0)
+            return 0;
+
+        if (string.Equals(marketPosition, "Short", StringComparison.OrdinalIgnoreCase))
+            return -absQty;
+        if (string.Equals(marketPosition, "Long", StringComparison.OrdinalIgnoreCase))
+            return absQty;
+        if (string.Equals(marketPosition, "Flat", StringComparison.OrdinalIgnoreCase))
+            return 0;
+
+        return quantity;
+    }
+
+    /// <summary>
     /// Build reconciliation broker quantities: same aggregation as legacy ReconciliationRunner (abs per row, sum by master key).
     /// </summary>
     public static Dictionary<string, int> BuildReconciliationAbsTotalsByCanonicalKey(IReadOnlyList<PositionSnapshot> positions)
@@ -64,6 +84,7 @@ public static class BrokerPositionResolver
             {
                 SignedQuantity = p.Quantity,
                 ContractLabel = string.IsNullOrEmpty(p.ContractLabel) ? rowKey : p.ContractLabel,
+                BrokerMarketPosition = p.MarketPosition,
                 NativeInstrument = null
             });
         }
@@ -90,6 +111,7 @@ public static class BrokerPositionResolver
                 contract_label = leg.ContractLabel ?? "",
                 signed_quantity = leg.SignedQuantity,
                 abs_quantity = Math.Abs(leg.SignedQuantity),
+                broker_market_position = leg.BrokerMarketPosition,
                 has_native_instrument = leg.NativeInstrument != null
             });
         }

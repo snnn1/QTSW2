@@ -458,23 +458,43 @@ public sealed partial class InstrumentExecutionAuthority
                     if (stopQty.HasValue && stopQty.Value != totalFilledQuantity)
                     {
                         var stopReason = $"Protective stop quantity mismatch: stopQty={stopQty}, totalFilledQuantity={totalFilledQuantity}";
-                        Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_DRIFT_DETECTED", new
+                        if (TryEnqueueProtectiveResize(intentId, intent, totalFilledQuantity, "PROTECTIVE_STOP", stopQty, targetQty, stopReason, utcNow))
                         {
-                            drift_type = "stop_quantity_mismatch",
-                            position_qty = totalFilledQuantity,
-                            expected_protective_qty = totalFilledQuantity,
-                            actual_protective_qty = stopQty,
-                            expected_stop_price = intent.StopPrice,
-                            actual_stop_price = existingStop,
-                            expected_target_price = intent.TargetPrice,
-                            actual_target_price = existingTarget,
-                            stream_key = intent.Stream,
-                            intent_id = intentId,
-                            instrument = intent.Instrument,
-                            iea_instance_id = InstanceId
-                        }));
-                        if (!TryEnqueueProtectiveResize(intentId, intent, totalFilledQuantity, "PROTECTIVE_STOP", stopQty, targetQty, stopReason, utcNow))
+                            Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_DRIFT_PENDING_RESIZE", new
+                            {
+                                drift_type = "stop_quantity_mismatch",
+                                position_qty = totalFilledQuantity,
+                                expected_protective_qty = totalFilledQuantity,
+                                actual_protective_qty = stopQty,
+                                expected_stop_price = intent.StopPrice,
+                                actual_stop_price = existingStop,
+                                expected_target_price = intent.TargetPrice,
+                                actual_target_price = existingTarget,
+                                stream_key = intent.Stream,
+                                intent_id = intentId,
+                                instrument = intent.Instrument,
+                                iea_instance_id = InstanceId,
+                                resize_enqueued = true
+                            }));
+                        }
+                        else
                         {
+                            Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_DRIFT_DETECTED", new
+                            {
+                                drift_type = "stop_quantity_mismatch",
+                                position_qty = totalFilledQuantity,
+                                expected_protective_qty = totalFilledQuantity,
+                                actual_protective_qty = stopQty,
+                                expected_stop_price = intent.StopPrice,
+                                actual_stop_price = existingStop,
+                                expected_target_price = intent.TargetPrice,
+                                actual_target_price = existingTarget,
+                                stream_key = intent.Stream,
+                                intent_id = intentId,
+                                instrument = intent.Instrument,
+                                iea_instance_id = InstanceId,
+                                resize_enqueued = false
+                            }));
                             Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_QUANTITY_MISMATCH_FAIL_CLOSE",
                                 new { error = stopReason, intent_id = intentId, stop_qty = stopQty, total_filled_quantity = totalFilledQuantity, iea_instance_id = InstanceId }));
                             Executor.FailClosed(intentId, intent, stopReason, "PROTECTIVE_QUANTITY_MISMATCH_FLATTENED", $"PROTECTIVE_QUANTITY_MISMATCH:{intentId}",
@@ -487,23 +507,43 @@ public sealed partial class InstrumentExecutionAuthority
                     if (targetQty.HasValue && targetQty.Value != totalFilledQuantity)
                     {
                         var targetReason = $"Protective target quantity mismatch: targetQty={targetQty}, totalFilledQuantity={totalFilledQuantity}";
-                        Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_DRIFT_DETECTED", new
+                        if (TryEnqueueProtectiveResize(intentId, intent, totalFilledQuantity, "PROTECTIVE_TARGET", stopQty, targetQty, targetReason, utcNow))
                         {
-                            drift_type = "target_quantity_mismatch",
-                            position_qty = totalFilledQuantity,
-                            expected_protective_qty = totalFilledQuantity,
-                            actual_protective_qty = targetQty,
-                            expected_stop_price = intent.StopPrice,
-                            actual_stop_price = existingStop,
-                            expected_target_price = intent.TargetPrice,
-                            actual_target_price = existingTarget,
-                            stream_key = intent.Stream,
-                            intent_id = intentId,
-                            instrument = intent.Instrument,
-                            iea_instance_id = InstanceId
-                        }));
-                        if (!TryEnqueueProtectiveResize(intentId, intent, totalFilledQuantity, "PROTECTIVE_TARGET", stopQty, targetQty, targetReason, utcNow))
+                            Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_DRIFT_PENDING_RESIZE", new
+                            {
+                                drift_type = "target_quantity_mismatch",
+                                position_qty = totalFilledQuantity,
+                                expected_protective_qty = totalFilledQuantity,
+                                actual_protective_qty = targetQty,
+                                expected_stop_price = intent.StopPrice,
+                                actual_stop_price = existingStop,
+                                expected_target_price = intent.TargetPrice,
+                                actual_target_price = existingTarget,
+                                stream_key = intent.Stream,
+                                intent_id = intentId,
+                                instrument = intent.Instrument,
+                                iea_instance_id = InstanceId,
+                                resize_enqueued = true
+                            }));
+                        }
+                        else
                         {
+                            Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_DRIFT_DETECTED", new
+                            {
+                                drift_type = "target_quantity_mismatch",
+                                position_qty = totalFilledQuantity,
+                                expected_protective_qty = totalFilledQuantity,
+                                actual_protective_qty = targetQty,
+                                expected_stop_price = intent.StopPrice,
+                                actual_stop_price = existingStop,
+                                expected_target_price = intent.TargetPrice,
+                                actual_target_price = existingTarget,
+                                stream_key = intent.Stream,
+                                intent_id = intentId,
+                                instrument = intent.Instrument,
+                                iea_instance_id = InstanceId,
+                                resize_enqueued = false
+                            }));
                             Log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_QUANTITY_MISMATCH_FAIL_CLOSE",
                                 new { error = targetReason, intent_id = intentId, target_qty = targetQty, total_filled_quantity = totalFilledQuantity, iea_instance_id = InstanceId }));
                             Executor.FailClosed(intentId, intent, targetReason, "PROTECTIVE_QUANTITY_MISMATCH_FLATTENED", $"PROTECTIVE_QUANTITY_MISMATCH:{intentId}",

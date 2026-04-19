@@ -1182,6 +1182,27 @@ public sealed class MismatchEscalationCoordinator
         EmitCanonical(inst, "MISMATCH_PENDING_CONVERGENCE", utcNow, payload, "INFO");
     }
 
+    private void EmitMismatchPendingIeaExecution(string inst, DateTimeOffset utcNow, MismatchObservation obs, int pendingIeA)
+    {
+        if (_mismatchPendingConvergenceLastEmit.TryGetValue(inst, out var last) &&
+            (utcNow - last).TotalSeconds < MismatchPendingConvergenceLogSeconds)
+            return;
+        _mismatchPendingConvergenceLastEmit[inst] = utcNow;
+
+        var payload = new
+        {
+            instrument = inst,
+            mismatch_type = obs.MismatchType.ToString(),
+            summary = obs.Summary,
+            pending_execution_count = pendingIeA,
+            gate_escalation_deferred = true,
+            note = "IEA execution queue still has work for this instrument; deferring first mismatch gate engagement until execution updates drain"
+        };
+        _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "MISMATCH_PENDING_IEA_EXECUTION", payload));
+        _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_DEFERRED_PENDING_IEA_EXECUTION", payload));
+        EmitCanonical(inst, "STATE_CONSISTENCY_GATE_DEFERRED_PENDING_IEA_EXECUTION", utcNow, payload, "INFO");
+    }
+
     /// <summary>P1.5-H: Clean signal absent does not clear gate; only stability release clears.</summary>
     private void ProcessMismatchSignalAbsent(string instrument, DateTimeOffset utcNow)
     {
@@ -1221,6 +1242,13 @@ public sealed class MismatchEscalationCoordinator
         state.LastSummary = obs.Summary;
 
         TryRemoveExpiredConvergence(inst, utcNow);
+
+        var pendingIeAForFirstGate = _getPendingExecutionWorkloadForInstrument?.Invoke(inst) ?? 0;
+        if (state.EscalationState == MismatchEscalationState.NONE && pendingIeAForFirstGate > 0)
+        {
+            EmitMismatchPendingIeaExecution(inst, utcNow, obs, pendingIeAForFirstGate);
+            return;
+        }
 
         if (state.EscalationState == MismatchEscalationState.NONE &&
             QuantExecutionControlStore.IsPostFillAlignmentWindowActive(inst, utcNow))
@@ -1299,7 +1327,7 @@ public sealed class MismatchEscalationCoordinator
                 _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "RECONCILIATION_MISMATCH_PERSISTENT", p));
                 _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "RECONCILIATION_MISMATCH_BLOCKED", p));
                 _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH", p));
-                EmitCanonical(inst, "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH", utcNow, p, "ERROR");
+                EmitCanonical(inst, "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH", utcNow, p, "WARN");
                 PublishMismatchExecutionBlockAuthorityIfChanged(inst, state, wasBlocked, utcNow);
             }
             return;
@@ -1791,7 +1819,7 @@ public sealed class MismatchEscalationCoordinator
             _mismatchPersistentCount++;
             var p = ToGatePayload(state, inst, utcNow, obsForSig, null, null);
             _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH", p));
-            EmitCanonical(inst, "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH", utcNow, p, "ERROR");
+            EmitCanonical(inst, "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH", utcNow, p, "WARN");
             PublishMismatchExecutionBlockAuthorityIfChanged(inst, state, wasBlockedA, utcNow);
         }
 

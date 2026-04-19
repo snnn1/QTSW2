@@ -4,6 +4,7 @@
 // Verifies: FlattenInvariantValidator, exposure-reduction invariant, side/qty derivation.
 
 using System;
+using System.Collections.Generic;
 using QTSW2.Robot.Core.Execution;
 
 namespace QTSW2.Robot.Core.Tests;
@@ -73,6 +74,32 @@ public static class IeaFlattenAuthorityTests
         (valid, err) = FlattenInvariantValidator.ValidateFlattenReducesExposure(-4, "SELL", 4);
         if (valid || string.IsNullOrEmpty(err))
             return (false, $"Account short 4 + SELL 4 (intent-corrupted direction) must be invalid: valid={valid}, err={err}");
+
+        // 12. NinjaTrader live account rows expose Quantity as absolute and MarketPosition as side.
+        // Short 2 must become -2 so forced flatten chooses BUY/BuyToCover rather than SELL/SellShort.
+        var signed = BrokerPositionResolver.ApplyMarketPositionSign(2, "Short");
+        if (signed != -2)
+            return (false, $"NT Short quantity 2 should normalize to -2, got {signed}");
+        signed = BrokerPositionResolver.ApplyMarketPositionSign(2, "Long");
+        if (signed != 2)
+            return (false, $"NT Long quantity 2 should normalize to +2, got {signed}");
+        signed = BrokerPositionResolver.ApplyMarketPositionSign(2, "Flat");
+        if (signed != 0)
+            return (false, $"NT Flat quantity 2 should normalize to 0, got {signed}");
+
+        // 13. Snapshot resolver must preserve the signed short leg used by forced-flatten side selection.
+        var exposure = BrokerPositionResolver.ResolveFromSnapshots(new List<PositionSnapshot>
+        {
+            new() { Instrument = "MNG", Quantity = -2, ContractLabel = "MNG 05-26", MarketPosition = "Short" }
+        }, "MNG");
+        if (exposure.ReconciliationAbsQuantityTotal != 2 || exposure.Legs.Count != 1 || exposure.Legs[0].SignedQuantity != -2)
+            return (false, "MNG short exposure should resolve as one signed -2 broker leg");
+        (valid, err) = FlattenInvariantValidator.ValidateFlattenReducesExposure(exposure.Legs[0].SignedQuantity, "BUY", 2);
+        if (!valid || err != null)
+            return (false, $"MNG short forced flatten should accept BUY 2: valid={valid}, err={err}");
+        (valid, err) = FlattenInvariantValidator.ValidateFlattenReducesExposure(exposure.Legs[0].SignedQuantity, "SELL", 2);
+        if (valid || string.IsNullOrEmpty(err))
+            return (false, $"MNG short forced flatten must reject SELL 2: valid={valid}, err={err}");
 
         return (true, null);
     }

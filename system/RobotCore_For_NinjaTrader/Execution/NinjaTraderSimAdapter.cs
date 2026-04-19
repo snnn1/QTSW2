@@ -2131,9 +2131,12 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
 
     private AuthorityEvaluationRequest BuildUeaRequest(string intentId, string instrument, string blockedWhat, DateTimeOffset utcNow)
     {
-        var submitIntent = string.Equals(blockedWhat, "SUBMIT_PROTECTIVE_STOP", StringComparison.Ordinal)
-            ? SubmitIntent.RiskCoverage
-            : SubmitIntent.RiskIncreasing;
+        var submitIntent = blockedWhat switch
+        {
+            "SUBMIT_PROTECTIVE_STOP" => SubmitIntent.RiskCoverage,
+            "SUBMIT_ENTRY" or "SUBMIT_ENTRY_STOP" or "SUBMIT_MARKET_REENTRY" => SubmitIntent.OpeningEntry,
+            _ => SubmitIntent.RiskIncreasing
+        };
 
         return new AuthorityEvaluationRequest
         {

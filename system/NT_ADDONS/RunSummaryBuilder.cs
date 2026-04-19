@@ -12,6 +12,8 @@ namespace QTSW2.Robot.Core;
 /// </summary>
 public static class RunSummaryBuilder
 {
+    private const long RecoveredMismatchWarnThresholdMs = 30_000;
+
     public static RunSummaryDocument Build(
         string persistenceBase,
         string? fullRunId,
@@ -67,13 +69,14 @@ public static class RunSummaryBuilder
             recommended_action = recommendedAction,
             confidence = confidence,
             instruments = instList,
-            trades = execSnap.OrdersFilled,
+            trades = Math.Max(execSnap.OrdersFilled, agg.EntryFilled),
             pnl = null,
             errors = execSnap.OrdersRejected + execSnap.OrdersBlocked,
             key_counts = new RunSummaryKeyCounts
             {
                 mismatch_block_enter = agg.MismatchEnter,
                 mismatch_block_exit = agg.MismatchExit,
+                mismatch_max_duration_ms = agg.MaxResolvedMismatchDurationMs,
                 flatten_confirmed = agg.FlattenConfirmed,
                 recovery_started = agg.RecoveryStarted,
                 recovery_complete = agg.RecoveryComplete,
@@ -107,13 +110,19 @@ public static class RunSummaryBuilder
         public int ProtectiveFailed;
         public int ProtectiveSubmitted;
         public int CommitPersistFailed;
+        public int EntryFilled;
+        public long MaxResolvedMismatchDurationMs;
 
         public readonly Dictionary<string, int> MismatchDepth = new(StringComparer.OrdinalIgnoreCase);
+        public readonly Dictionary<string, DateTimeOffset> MismatchOpenSince = new(StringComparer.OrdinalIgnoreCase);
         public readonly Dictionary<string, bool> FlattenPending = new(StringComparer.OrdinalIgnoreCase);
 
         public bool FlattenActivity;
         public bool TertiaryEntryReject;
         public bool TertiaryExecutionBlock;
+
+        public bool HasMismatchBlocks => MismatchEnter > 0 || MismatchExit > 0;
+        public bool HasLongRecoveredMismatch => MaxResolvedMismatchDurationMs > RecoveredMismatchWarnThresholdMs;
     }
 
     private static void ApplyTertiaryExecutionSummary(ExecutionSummarySnapshot execSnap, KeyEventAggregate agg, bool keyEventsPresent)
@@ -148,9 +157,8 @@ public static class RunSummaryBuilder
     private static bool ComputeWarn(KeyEventAggregate agg)
     {
         if (agg.ExecutionBlocked > 0 || agg.TertiaryExecutionBlock) return true;
-        if (agg.MismatchEnter > 0 && agg.MismatchExit > 0) return true;
+        if (agg.HasLongRecoveredMismatch) return true;
         if (agg.RecoveryComplete > 0) return true;
-        if (agg.ProtectiveSubmitted > 0 && agg.ProtectiveFailed == 0) return true;
         if (agg.FlattenActivity) return true;
         return false;
     }
@@ -166,10 +174,11 @@ public static class RunSummaryBuilder
         foreach (var kv in agg.FlattenPending)
             if (kv.Value) return "FLATTEN_NOT_CONFIRMED";
 
-        if (agg.MismatchEnter > 0 || agg.MismatchExit > 0) return "MISMATCH_BLOCK_OCCURRED";
+        if (agg.HasLongRecoveredMismatch) return "MISMATCH_BLOCK_LONG_RECOVERED";
         if (agg.RecoveryComplete > 0 || agg.RecoveryStarted > 0) return "RECOVERY_OCCURRED";
         if (agg.ExecutionBlocked > 0 || agg.TertiaryExecutionBlock) return "EXECUTION_BLOCKED_OCCURRED";
         if (agg.FlattenActivity) return "FLATTEN_OCCURRED";
+        if (agg.HasMismatchBlocks) return "MISMATCH_BLOCK_RECOVERED";
 
         return "NORMAL_RUN";
     }
@@ -185,8 +194,11 @@ public static class RunSummaryBuilder
         {
             case "NORMAL_RUN":
                 return status == "OK" ? ("CONTINUE", "HIGH") : ("MONITOR", "MEDIUM");
+            case "MISMATCH_BLOCK_RECOVERED":
+                return ("CONTINUE", "HIGH");
             case "RECOVERY_OCCURRED":
             case "MISMATCH_BLOCK_OCCURRED":
+            case "MISMATCH_BLOCK_LONG_RECOVERED":
             case "FLATTEN_OCCURRED":
                 return ("MONITOR", "MEDIUM");
             case "EXECUTION_BLOCKED_OCCURRED":
@@ -224,16 +236,23 @@ public static class RunSummaryBuilder
 
                     d.TryGetValue("instrument", out var instObj);
                     var inst = NormInst(instObj?.ToString());
+                    var tsUtc = TryGetTimestampUtc(d);
 
                     switch (ev)
                     {
                         case "MISMATCH_BLOCK_ENTER":
                             agg.MismatchEnter++;
                             BumpMismatchDepth(agg, inst, +1);
+                            if (!string.IsNullOrEmpty(inst) && tsUtc.HasValue)
+                                agg.MismatchOpenSince[inst] = tsUtc.Value;
                             break;
                         case "MISMATCH_BLOCK_EXIT":
                             agg.MismatchExit++;
+                            TrackResolvedMismatchDuration(agg, inst, tsUtc);
                             BumpMismatchDepth(agg, inst, -1);
+                            break;
+                        case "ENTRY_FILLED":
+                            agg.EntryFilled++;
                             break;
                         case "FLATTEN_CONFIRMED":
                             agg.FlattenConfirmed++;
@@ -360,6 +379,25 @@ public static class RunSummaryBuilder
     private static string NormInst(string? s) =>
         string.IsNullOrWhiteSpace(s) ? "" : s.Trim().ToUpperInvariant();
 
+    private static DateTimeOffset? TryGetTimestampUtc(Dictionary<string, object> d)
+    {
+        if (!d.TryGetValue("ts_utc", out var tsObj) || tsObj == null)
+            return null;
+        return DateTimeOffset.TryParse(tsObj.ToString(), out var ts) ? ts : null;
+    }
+
+    private static void TrackResolvedMismatchDuration(KeyEventAggregate agg, string inst, DateTimeOffset? exitUtc)
+    {
+        if (string.IsNullOrEmpty(inst) || !exitUtc.HasValue)
+            return;
+        if (!agg.MismatchOpenSince.TryGetValue(inst, out var enterUtc))
+            return;
+        var durationMs = (long)(exitUtc.Value - enterUtc).TotalMilliseconds;
+        if (durationMs > agg.MaxResolvedMismatchDurationMs)
+            agg.MaxResolvedMismatchDurationMs = durationMs;
+        agg.MismatchOpenSince.Remove(inst);
+    }
+
     private static void BumpMismatchDepth(KeyEventAggregate agg, string inst, int delta)
     {
         if (string.IsNullOrEmpty(inst)) return;
@@ -429,6 +467,7 @@ public sealed class RunSummaryKeyCounts
 {
     public int mismatch_block_enter { get; set; }
     public int mismatch_block_exit { get; set; }
+    public long mismatch_max_duration_ms { get; set; }
     public int flatten_confirmed { get; set; }
     public int recovery_started { get; set; }
     public int recovery_complete { get; set; }

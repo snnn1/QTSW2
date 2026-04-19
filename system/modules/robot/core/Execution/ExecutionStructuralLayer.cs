@@ -286,6 +286,17 @@ public static class ExecutionStructuralLayer
                 return true;
             }
 
+            // Stop-entry bracket setup can see an existing broker position before the stream exposure view has
+            // caught up. Keep recovery/parity/mismatch gates authoritative above, but do not fail the bracket
+            // solely on this lagging exposure registration snapshot.
+            if (IsOpeningEntryBracketSubmit(orderSubmitBlockedWhat))
+            {
+                const string entry = "no_active_exposures_bypass_opening_entry_bracket_with_broker_position";
+                snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail) ? entry : snapshot.Detail + ";" + entry;
+                snapshot.Reason = "";
+                return true;
+            }
+
             snapshot.Reason = StructuralBlocker.NoActiveExposuresWithBrokerPosition;
             snapshot.Detail = null;
             return false;
@@ -376,4 +387,7 @@ public static class ExecutionStructuralLayer
 
     private static bool IsDirectionalOrderSubmit(string blockedWhat) =>
         blockedWhat is "SUBMIT_ENTRY" or "SUBMIT_ENTRY_STOP";
+
+    private static bool IsOpeningEntryBracketSubmit(string? blockedWhat) =>
+        blockedWhat is "SUBMIT_ENTRY_STOP";
 }

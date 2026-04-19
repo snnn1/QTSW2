@@ -7,6 +7,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Security.Cryptography;
+using System.Text.Json;
 using System.Threading;
 
 namespace QTSW2.Robot.Core;
@@ -1771,11 +1772,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         FeatureFlags.CanonicalOwnershipLedgerEnabled = true;
         FeatureFlags.UnifiedExecutionAuthorityShadowEnabled = true;
-        FeatureFlags.UnifiedExecutionAuthorityEnabled = false;
-        FeatureFlags.ReconciliationRepairExecutorEnabled = false;
-        FeatureFlags.StructuralLayerUseLedgerOwnership = false;
+        FeatureFlags.UnifiedExecutionAuthorityEnabled = true;
+        FeatureFlags.ReconciliationRepairExecutorEnabled = true;
+        FeatureFlags.StructuralLayerUseLedgerOwnership = true;
 
-        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "PLAYBACK_AUDIT_SHADOW_FLAGS_APPLIED", state: "ENGINE",
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "PLAYBACK_AUDIT_ACTIVE_FLAGS_APPLIED", state: "ENGINE",
             new
             {
                 canonical_ownership_ledger_enabled = FeatureFlags.CanonicalOwnershipLedgerEnabled,
@@ -1788,7 +1789,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 previous_unified_execution_authority_enabled = ueaActiveWas,
                 previous_reconciliation_repair_executor_enabled = repairWas,
                 previous_structural_layer_use_ledger_ownership = structuralLedgerWas,
-                note = "Isolated playback audit mode: shadow artifact writers are enabled; activation/repair/read-path flags are forced off."
+                note = "Isolated playback audit mode: canonical ledger, UEA active decisioning, reconciliation repair execution, and structural ledger ownership are enabled."
             }));
     }
 
@@ -2286,6 +2287,15 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     {
                         foreach (var s in _streams.Values)
                             s.HandleReentryProtectionAccepted(now, reentryIntentId);
+                    },
+                    onReentrySubmitCompletedCallback: (reentryIntentId, now, success, error) =>
+                    {
+                        foreach (var s in _streams.Values)
+                            s.HandleReentrySubmitCompleted(reentryIntentId, now, success, error);
+                    },
+                    onSessionCloseFlattenConfirmedLateCallback: (originalIntentId, instrument, now) =>
+                    {
+                        OnSessionCloseFlattenConfirmedLate(originalIntentId, instrument, now);
                     },
                     blockInstrumentCallback: (instrument, now, reason) =>
                     {
@@ -2800,7 +2810,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
             var needSummarySnap = _executionMode != ExecutionMode.DRYRUN || _isolatedPlaybackPersistence;
             if (needSummarySnap)
+            {
                 summarySnap = _executionSummary.GetSnapshot();
+                summarySnap = HydrateExecutionSummaryFromKeyEventsIfEmpty(_persistenceBase, summarySnap);
+            }
 
             // Prepare execution summary if not DRYRUN (write to disk outside lock)
             if (_executionMode != ExecutionMode.DRYRUN && summarySnap != null)
@@ -2879,6 +2892,124 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             FeatureFlags.UnifiedExecutionAuthorityEnabled,
             FeatureFlags.ReconciliationRepairExecutorEnabled,
             FeatureFlags.StructuralLayerUseLedgerOwnership);
+    }
+
+    private static ExecutionSummarySnapshot HydrateExecutionSummaryFromKeyEventsIfEmpty(string persistenceBase, ExecutionSummarySnapshot snapshot)
+    {
+        if (snapshot.IntentsSeen > 0 || snapshot.OrdersSubmitted > 0 || snapshot.OrdersFilled > 0 ||
+            snapshot.OrdersRejected > 0 || snapshot.OrdersBlocked > 0)
+            return snapshot;
+
+        var keyEventsPath = Path.Combine(persistenceBase, RunRootArtifacts.KeyEventsFileName);
+        if (!File.Exists(keyEventsPath))
+            return snapshot;
+
+        var intents = new Dictionary<string, IntentSummary>(StringComparer.OrdinalIgnoreCase);
+        var blockedByReason = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var submitted = 0;
+        var rejected = 0;
+        var filled = 0;
+        var blocked = 0;
+
+        foreach (var raw in File.ReadLines(keyEventsPath))
+        {
+            if (string.IsNullOrWhiteSpace(raw))
+                continue;
+
+            try
+            {
+                using var doc = JsonDocument.Parse(raw);
+                var root = doc.RootElement;
+                var ev = TryGetJsonString(root, "event") ?? "";
+                if (ev.Length == 0)
+                    continue;
+
+                var data = root.TryGetProperty("data", out var dataEl) && dataEl.ValueKind == JsonValueKind.Object
+                    ? dataEl
+                    : default;
+                var intentId = TryGetJsonString(data, "intent_id") ?? "";
+                var stream = TryGetJsonString(root, "stream") ?? TryGetJsonString(data, "stream") ?? "";
+                var instrument = TryGetJsonString(root, "instrument") ?? TryGetJsonString(data, "instrument") ?? "";
+                var tradingDate = TryGetJsonString(data, "trading_date") ?? "";
+
+                if (!string.IsNullOrWhiteSpace(intentId) && !intents.ContainsKey(intentId))
+                {
+                    intents[intentId] = new IntentSummary
+                    {
+                        IntentId = intentId,
+                        TradingDate = tradingDate,
+                        Stream = stream,
+                        Instrument = instrument
+                    };
+                }
+
+                if (string.Equals(ev, "ENTRY_FILLED", StringComparison.OrdinalIgnoreCase))
+                {
+                    filled++;
+                    submitted++;
+                    if (!string.IsNullOrWhiteSpace(intentId) && intents.TryGetValue(intentId, out var intent))
+                    {
+                        intent.Executed = true;
+                        intent.OrdersFilled++;
+                        intent.OrdersSubmitted++;
+                        intent.OrderTypes.Add("ENTRY");
+                    }
+                }
+                else if (string.Equals(ev, "PROTECTIVE_SUBMITTED", StringComparison.OrdinalIgnoreCase))
+                {
+                    submitted++;
+                }
+                else if (string.Equals(ev, "ENTRY_REJECTED", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(ev, "ORDER_REJECTED", StringComparison.OrdinalIgnoreCase))
+                {
+                    rejected++;
+                    var reason = TryGetJsonString(root, "reason") ?? TryGetJsonString(data, "reason") ?? "rejected";
+                    if (!string.IsNullOrWhiteSpace(intentId) && intents.TryGetValue(intentId, out var intent))
+                    {
+                        intent.OrdersRejected++;
+                        intent.RejectionReasons.Add(reason);
+                    }
+                }
+                else if (string.Equals(ev, "EXECUTION_BLOCKED", StringComparison.OrdinalIgnoreCase))
+                {
+                    blocked++;
+                    var reason = TryGetJsonString(root, "reason") ?? TryGetJsonString(data, "reason") ?? "blocked";
+                    if (!blockedByReason.TryGetValue(reason, out var count)) count = 0;
+                    blockedByReason[reason] = count + 1;
+                    if (!string.IsNullOrWhiteSpace(intentId) && intents.TryGetValue(intentId, out var intent))
+                    {
+                        intent.Blocked = true;
+                        intent.BlockReason = reason;
+                    }
+                }
+            }
+            catch
+            {
+                // A malformed forensic line should not block shutdown summary writes.
+            }
+        }
+
+        if (intents.Count == 0 && submitted == 0 && filled == 0 && rejected == 0 && blocked == 0)
+            return snapshot;
+
+        snapshot.IntentsSeen = intents.Count;
+        snapshot.IntentsExecuted = intents.Values.Count(i => i.Executed);
+        snapshot.OrdersSubmitted = submitted;
+        snapshot.OrdersFilled = filled;
+        snapshot.OrdersRejected = rejected;
+        snapshot.OrdersBlocked = blocked;
+        snapshot.BlockedByReason = blockedByReason;
+        snapshot.IntentDetails = intents.Values.ToList();
+        return snapshot;
+    }
+
+    private static string? TryGetJsonString(JsonElement element, string propertyName)
+    {
+        if (element.ValueKind != JsonValueKind.Object)
+            return null;
+        if (!element.TryGetProperty(propertyName, out var value))
+            return null;
+        return value.ValueKind == JsonValueKind.String ? value.GetString() : value.ToString();
     }
 
     /// <summary>Tick with explicit Historical flag. Use this when caller knows State (e.g. strategy).</summary>
@@ -6558,7 +6689,110 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     public void OnForcedFlattenFailed(string instrument, string reason, DateTimeOffset utcNow)
     {
         if (string.IsNullOrWhiteSpace(instrument)) return;
+        if (string.Equals(reason, "FORCED_FLATTEN_BROKER_TIMEOUT", StringComparison.Ordinal) &&
+            HasInterruptedSessionCloseStreamForInstrument(instrument.Trim()))
+        {
+            var inst = instrument.Trim();
+            _frozenInstruments.Add(inst);
+            _riskLatchManager?.Persist(inst, reason);
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "",
+                eventType: "FORCED_FLATTEN_TIMEOUT_REENTRY_DEFERRED", state: "ENGINE",
+                new
+                {
+                    instrument = inst,
+                    reason,
+                    note = "Forced-flatten submit was accepted but broker-flat confirmation was slow; keeping interrupted stream active and risk-latched for broker-flat-gated reentry."
+                }));
+            return;
+        }
         StandDownStreamsForInstrument(instrument.Trim(), utcNow, reason);
+    }
+
+    public void OnSessionCloseFlattenConfirmedLate(string originalIntentId, string instrument, DateTimeOffset utcNow)
+    {
+        var iid = originalIntentId?.Trim() ?? "";
+        var inst = instrument?.Trim() ?? "";
+        if (string.IsNullOrWhiteSpace(iid) || string.IsNullOrWhiteSpace(inst))
+            return;
+
+        lock (_engineLock)
+        {
+            var matchedAny = false;
+            var tradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? TradingDateString;
+
+            foreach (var stream in _streams.Values)
+            {
+                if (!stream.IsActiveInterruptedBySessionClose)
+                    continue;
+                if (!string.Equals(stream.OriginalIntentId?.Trim(), iid, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var streamInst = stream.Instrument?.Trim() ?? "";
+                var streamExec = stream.ExecutionInstrument?.Trim() ?? "";
+                var matchesInstrument =
+                    string.Equals(streamInst, inst, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(streamExec, inst, StringComparison.OrdinalIgnoreCase) ||
+                    (!string.IsNullOrWhiteSpace(streamInst) && ExecutionInstrumentResolver.IsSameInstrument(streamInst, inst)) ||
+                    (!string.IsNullOrWhiteSpace(streamExec) && ExecutionInstrumentResolver.IsSameInstrument(streamExec, inst));
+                if (!matchesInstrument)
+                    continue;
+
+                matchedAny = true;
+                stream.HandleLateSessionCloseFlattenConfirmed(utcNow);
+
+                var clearedKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var key in new[] { inst, streamExec, streamInst })
+                {
+                    if (string.IsNullOrWhiteSpace(key) || !clearedKeys.Add(key))
+                        continue;
+                    _frozenInstruments.Remove(key);
+                    _riskLatchManager?.Clear(key);
+                }
+
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr,
+                    eventType: "INSTRUMENT_UNFROZEN_LATE_SESSION_FLATTEN", state: "ENGINE",
+                    new
+                    {
+                        instrument = inst,
+                        stream = stream.Stream,
+                        original_intent_id = iid,
+                        execution_instrument = streamExec,
+                        canonical_instrument = streamInst,
+                        note = "Session-close flatten timeout latch cleared after late fill proved broker-flat and original intent closed."
+                    }));
+            }
+
+            if (!matchedAny)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr,
+                    eventType: "SESSION_CLOSE_FLATTEN_LATE_CONFIRMED_NO_STREAM", state: "ENGINE",
+                    new
+                    {
+                        instrument = inst,
+                        original_intent_id = iid,
+                        note = "Late session-close flatten was broker-flat, but no active interrupted stream matched it."
+                    }));
+            }
+        }
+    }
+
+    private bool HasInterruptedSessionCloseStreamForInstrument(string instrument)
+    {
+        lock (_engineLock)
+        {
+            foreach (var stream in _streams.Values)
+            {
+                var streamInst = stream.Instrument ?? "";
+                var streamExec = stream.ExecutionInstrument ?? "";
+                if (!string.Equals(streamInst, instrument, StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(streamExec, instrument, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (stream.ExecutionInterruptedByClose)
+                    return true;
+            }
+        }
+
+        return false;
     }
 
     public void OnConnectionStatusUpdate(ConnectionStatus status, string connectionName)

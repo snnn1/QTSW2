@@ -515,6 +515,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     /// <summary>Callback when reentry protective bracket is accepted (both stop and target Working). Engine invokes HandleReentryProtectionAccepted on matching stream.</summary>
     private Action<string, DateTimeOffset>? _onReentryProtectionAcceptedCallback;
 
+    /// <summary>Callback when the strategy thread accepts/rejects the market reentry submit.</summary>
+    private Action<string, DateTimeOffset, bool, string?>? _onReentrySubmitCompletedCallback;
+
     /// <summary>Callback to check if entry orders for a stream should be cancelled when position is flat (invalid lifecycle).
     /// Returns (ShouldCancel, Reason) - true when stream is no longer eligible (EXPIRED, COMMITTED, forced_flatten, etc.).</summary>
     private Func<string, string, (bool ShouldCancel, string? Reason)>? _shouldCancelEntryOrdersForStreamCallback;
@@ -942,7 +945,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         Func<string, bool>? journalIntegrityRepairActiveForInstrumentCallback = null,
         Func<bool>? isGlobalKillSwitchActive = null,
         Func<string, bool>? isMismatchExecutionBlocked = null,
-        Func<string, string?, bool>? isInstrumentFrozenOrEpaBlocked = null)
+        Func<string, string?, bool>? isInstrumentFrozenOrEpaBlocked = null,
+        Action<string, DateTimeOffset, bool, string?>? onReentrySubmitCompletedCallback = null)
     {
         _standDownStreamCallback = standDownStreamCallback;
         _getNotificationServiceCallback = getNotificationServiceCallback;
@@ -951,6 +955,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         _onSupervisoryCriticalCallback = onSupervisoryCriticalCallback;
         _onReentryFillCallback = onReentryFillCallback;
         _onReentryProtectionAcceptedCallback = onReentryProtectionAcceptedCallback;
+        _onReentrySubmitCompletedCallback = onReentrySubmitCompletedCallback;
         _shouldCancelEntryOrdersForStreamCallback = shouldCancelEntryOrdersForStreamCallback;
         _hasSlotJournalWithEntryStopsForInstrumentCallback = hasSlotJournalWithEntryStopsForInstrumentCallback;
         _getActiveTradingDateString = getActiveTradingDateString;

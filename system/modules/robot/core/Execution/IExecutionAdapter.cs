@@ -202,6 +202,12 @@ public interface IExecutionAdapter
     IReadOnlyCollection<string> GetActiveIntentIdsForProtectiveAudit(string instrument) => Array.Empty<string>();
 
     /// <summary>
+    /// Open filled intent IDs for this instrument, including intents whose BE stop was already modified.
+    /// This is ownership/exposure context, not a "needs BE" filter.
+    /// </summary>
+    IReadOnlyCollection<string> GetOpenIntentIdsForInstrument(string instrument) => Array.Empty<string>();
+
+    /// <summary>
     /// Broker shows open position but journal open filled sum is zero: attempt tagged recovery journal upsert when
     /// robot ownership evidence is strong (tags, OrderMap, adoption candidates). Not used for empty decoded intent (untracked path).
     /// </summary>
@@ -270,6 +276,9 @@ public class PositionSnapshot
 
     /// <summary>Optional contract label for audit logs (e.g. NT Instrument.FullName). Bucketing uses <see cref="Instrument"/> only.</summary>
     public string? ContractLabel { get; set; }
+
+    /// <summary>Broker-side market position label when available (e.g. NT MarketPosition).</summary>
+    public string? MarketPosition { get; set; }
 }
 
 /// <summary>

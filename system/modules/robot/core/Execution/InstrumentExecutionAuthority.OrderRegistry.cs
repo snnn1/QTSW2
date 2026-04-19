@@ -174,6 +174,20 @@ public sealed partial class InstrumentExecutionAuthority
             return;
         if (!_orderRegistry.UpdateLifecycle(brokerOrderId, newState, utcNow))
         {
+            if (IsBenignTerminalLifecycleReplay(prev, newState))
+            {
+                Log?.Write(RobotEvents.ExecutionBase(utcNow, entry.IntentId ?? "", entry.Instrument, "ORDER_LIFECYCLE_TERMINAL_REPLAY_IGNORED", new
+                {
+                    broker_order_id = brokerOrderId,
+                    intent_id = entry.IntentId,
+                    previous_state = prev.ToString(),
+                    attempted_state = newState.ToString(),
+                    note = "Ignored stale broker lifecycle update after order reached a terminal state",
+                    iea_instance_id = InstanceId
+                }));
+                return;
+            }
+
             _orderRegistry.IncrementIntegrityFailure();
             Log?.Write(RobotEvents.ExecutionBase(utcNow, entry.IntentId ?? "", entry.Instrument, "ORDER_LIFECYCLE_TRANSITION_INVALID", new
             {
@@ -197,6 +211,13 @@ public sealed partial class InstrumentExecutionAuthority
             iea_instance_id = InstanceId
         }));
         NotifyReleaseSuppressionActivity();
+    }
+
+    private static bool IsBenignTerminalLifecycleReplay(OrderLifecycleState previous, OrderLifecycleState attempted)
+    {
+        var previousTerminal = previous is OrderLifecycleState.FILLED or OrderLifecycleState.CANCELED or OrderLifecycleState.REJECTED;
+        var attemptedLiveReplay = attempted is OrderLifecycleState.SUBMITTED or OrderLifecycleState.WORKING or OrderLifecycleState.PART_FILLED;
+        return previousTerminal && attemptedLiveReplay;
     }
 
     /// <summary>Add alias for an existing registry entry (e.g. when adopting).</summary>

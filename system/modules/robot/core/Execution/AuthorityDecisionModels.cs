@@ -10,6 +10,7 @@ namespace QTSW2.Robot.Core.Execution;
 public enum SubmitIntent
 {
     RiskIncreasing,
+    OpeningEntry,
     RiskCoverage,
     RiskReducing,
     Emergency

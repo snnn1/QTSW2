@@ -17,6 +17,9 @@ public static class IntentLifecycleTests
         if (!ValidTransition(IntentLifecycleState.CREATED, IntentLifecycleTransition.SUBMIT_ENTRY, IntentLifecycleState.ENTRY_SUBMITTED))
             return (false, "CREATED -> SUBMIT_ENTRY should yield ENTRY_SUBMITTED");
 
+        if (!ValidTransition(IntentLifecycleState.CREATED, IntentLifecycleTransition.ENTRY_ACCEPTED, IntentLifecycleState.ENTRY_WORKING))
+            return (false, "CREATED -> ENTRY_ACCEPTED should tolerate ack-before-submit and yield ENTRY_WORKING");
+
         if (!ValidTransition(IntentLifecycleState.ENTRY_SUBMITTED, IntentLifecycleTransition.ENTRY_ACCEPTED, IntentLifecycleState.ENTRY_WORKING))
             return (false, "ENTRY_SUBMITTED -> ENTRY_ACCEPTED should yield ENTRY_WORKING");
 
@@ -43,6 +46,12 @@ public static class IntentLifecycleTests
 
         if (!ValidTransition(IntentLifecycleState.EXIT_PENDING, IntentLifecycleTransition.INTENT_COMPLETED, IntentLifecycleState.TERMINAL))
             return (false, "EXIT_PENDING -> INTENT_COMPLETED should yield TERMINAL");
+
+        if (!ValidTransition(IntentLifecycleState.ENTRY_FILLED, IntentLifecycleTransition.INTENT_COMPLETED, IntentLifecycleState.TERMINAL))
+            return (false, "ENTRY_FILLED -> INTENT_COMPLETED should allow terminal completion after flatten/protective race");
+
+        if (!ValidTransition(IntentLifecycleState.ENTRY_PARTIALLY_FILLED, IntentLifecycleTransition.INTENT_COMPLETED, IntentLifecycleState.TERMINAL))
+            return (false, "ENTRY_PARTIALLY_FILLED -> INTENT_COMPLETED should allow terminal completion after flatten/recovery");
 
         if (!ValidTransition(IntentLifecycleState.ENTRY_WORKING, IntentLifecycleTransition.EXIT_STARTED, IntentLifecycleState.EXIT_PENDING))
             return (false, "ENTRY_WORKING -> EXIT_STARTED should yield EXIT_PENDING");
@@ -113,6 +122,10 @@ public static class IntentLifecycleTests
             return (false, "ENTRY_WORKING + ENTRY_ACCEPTED replay should be idempotent");
         if (!IntentLifecycleValidator.IsIdempotentIntentReplay(IntentLifecycleState.ENTRY_SUBMITTED, IntentLifecycleTransition.SUBMIT_ENTRY))
             return (false, "ENTRY_SUBMITTED + SUBMIT_ENTRY replay should be idempotent (IEA + adapter boundary)");
+        if (!IntentLifecycleValidator.IsIdempotentIntentReplay(IntentLifecycleState.ENTRY_WORKING, IntentLifecycleTransition.SUBMIT_ENTRY))
+            return (false, "ENTRY_WORKING + SUBMIT_ENTRY replay should be idempotent after ack-before-submit");
+        if (!IntentLifecycleValidator.IsIdempotentIntentReplay(IntentLifecycleState.ENTRY_PARTIALLY_FILLED, IntentLifecycleTransition.PROTECTIVES_PLACED))
+            return (false, "Partial-fill protective placement should not be logged as invalid before final fill");
         if (IntentLifecycleValidator.IsIdempotentIntentReplay(IntentLifecycleState.CREATED, IntentLifecycleTransition.ENTRY_FILLED))
             return (false, "CREATED + ENTRY_FILLED should not be treated as idempotent replay");
 

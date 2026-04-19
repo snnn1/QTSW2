@@ -497,6 +497,11 @@ public sealed class StreamStateMachine
             SlotStatus = SlotStatus.ACTIVE,
             SlotInstanceKey = null, // Will be set below if new journal
             ExecutionInterruptedByClose = false,
+            ReentrySubmitPending = false,
+            ReentrySubmitPendingAtUtc = null,
+            ReentrySubmitLastFailureUtc = null,
+            ReentrySubmitFailureCount = 0,
+            LastReentrySubmitError = null,
             ReentrySubmitted = false,
             ReentryFilled = false,
             ProtectionSubmitted = false,
@@ -521,6 +526,11 @@ public sealed class StreamStateMachine
             _journal.ForcedFlattenTimestamp = existing.ForcedFlattenTimestamp;
             _journal.OriginalIntentId = existing.OriginalIntentId;
             _journal.ReentryIntentId = existing.ReentryIntentId;
+            _journal.ReentrySubmitPending = existing.ReentrySubmitPending;
+            _journal.ReentrySubmitPendingAtUtc = existing.ReentrySubmitPendingAtUtc;
+            _journal.ReentrySubmitLastFailureUtc = existing.ReentrySubmitLastFailureUtc;
+            _journal.ReentrySubmitFailureCount = existing.ReentrySubmitFailureCount;
+            _journal.LastReentrySubmitError = existing.LastReentrySubmitError;
             _journal.ReentrySubmitted = existing.ReentrySubmitted;
             _journal.ReentryFilled = existing.ReentryFilled;
             _journal.ProtectionSubmitted = existing.ProtectionSubmitted;
@@ -1057,10 +1067,20 @@ public sealed class StreamStateMachine
 
         TryProcessDeferredBracketTradeAuthority(utcNow);
         
-        // SLOT PERSISTENCE: Check for market open re-entry (time-based, not bar-based)
-        if (_journal.SlotStatus == SlotStatus.ACTIVE && _journal.ExecutionInterruptedByClose && !_journal.ReentrySubmitted)
+        // SLOT PERSISTENCE: Forced-flatten reentry owns the slot until it either
+        // re-enters safely, fails terminally, or expires at the next slot.
+        if (_journal.SlotStatus == SlotStatus.ACTIVE && _journal.ExecutionInterruptedByClose)
         {
-            CheckMarketOpenReentry(utcNow);
+            if (!_journal.ReentrySubmitted)
+            {
+                CheckMarketOpenReentry(utcNow);
+            }
+
+            if (_journal.Committed || State == StreamState.DONE)
+                return;
+
+            if (_journal.ExecutionInterruptedByClose)
+                return;
         }
 
 
@@ -7264,12 +7284,12 @@ public sealed class StreamStateMachine
         _engine?.LogEngineEvent(utcNow, "FORCED_FLATTEN_FAILED", payload);
     }
 
-    private void LogSessionReentryBlocked(DateTimeOffset utcNow, string reasonCode, string detail)
+    private void LogSessionReentryBlocked(DateTimeOffset utcNow, string reasonCode, string detail, Dictionary<string, object?>? extra = null)
     {
         var dedupeKey = $"{TradingDate}|{Stream}|{reasonCode}";
         if (!_sessionReentryBlockedLogKeys.Add(dedupeKey))
             return;
-        _engine?.LogEngineEvent(utcNow, "SESSION_REENTRY_BLOCKED", new Dictionary<string, object?>
+        var payload = new Dictionary<string, object?>
         {
             ["trading_date"] = TradingDate,
             ["session_class"] = Session,
@@ -7277,7 +7297,13 @@ public sealed class StreamStateMachine
             ["stream"] = Stream,
             ["reason"] = reasonCode,
             ["detail"] = detail
-        });
+        };
+        if (extra != null)
+        {
+            foreach (var kv in extra)
+                payload[kv.Key] = kv.Value;
+        }
+        _engine?.LogEngineEvent(utcNow, "SESSION_REENTRY_BLOCKED", payload);
     }
 
     /// <summary>
@@ -7446,7 +7472,7 @@ public sealed class StreamStateMachine
         var brokerFlat = TryWaitBrokerFlatForExecutionInstrument(ExecutionInstrument, wallPollDeadlineUtc, utcNow, out var remainingQty);
         if (!brokerFlat)
         {
-            LogHealth("CRITICAL", "FORCED_FLATTEN_FAILED",
+            LogHealth("WARN", "FORCED_FLATTEN_CONFIRM_PENDING",
                 $"Broker flat not confirmed within {SESSION_FORCED_FLATTEN_BROKER_WAIT_SECONDS}s (remaining qty={remainingQty})",
                 new { original_intent_id = _journal.OriginalIntentId, instrument = ExecutionInstrument, remaining_qty = remainingQty });
             _engine?.LogEngineEvent(utcNow, "FORCED_FLATTEN_BROKER_TIMEOUT", new Dictionary<string, object?>
@@ -7658,6 +7684,27 @@ public sealed class StreamStateMachine
         {
             return; // Conditions not met for re-entry
         }
+
+        if (_journal.ReentrySubmitPending)
+        {
+            var pendingAgeSeconds = _journal.ReentrySubmitPendingAtUtc.HasValue
+                ? (utcNow - _journal.ReentrySubmitPendingAtUtc.Value).TotalSeconds
+                : 0.0;
+            if (pendingAgeSeconds < 120.0)
+                return;
+
+            _journal.ReentrySubmitPending = false;
+            _journal.ReentrySubmitPendingAtUtc = null;
+            _journals.Save(_journal);
+            LogSessionReentryBlocked(utcNow, "SUBMIT_PENDING_STALE_RETRY",
+                "Prior reentry submit remained pending beyond timeout; clearing pending state and retrying");
+        }
+
+        if (_journal.ReentrySubmitLastFailureUtc.HasValue &&
+            (utcNow - _journal.ReentrySubmitLastFailureUtc.Value).TotalSeconds < 30.0)
+        {
+            return;
+        }
         
         // Time gate: utcNow >= ReentryAllowedUtc (from SessionCloseResolver or spec fallback).
         // No reentry when HasSession=false (holiday).
@@ -7709,6 +7756,37 @@ public sealed class StreamStateMachine
                     "IE execution adapter queue unhealthy or poison — reentry not allowed");
                 return;
             }
+        }
+
+        try
+        {
+            var snap = _executionAdapter.GetAccountSnapshot(utcNow);
+            var exposure = BrokerPositionResolver.ResolveFromSnapshots(snap.Positions ?? new List<PositionSnapshot>(), execInst);
+            if (exposure.ReconciliationAbsQuantityTotal != 0)
+            {
+                LogSessionReentryBlocked(utcNow, "BROKER_NOT_FLAT",
+                    "Broker exposure is not flat at market-open reentry preflight",
+                    new Dictionary<string, object?>
+                    {
+                        ["instrument"] = execInst,
+                        ["canonical_key"] = exposure.CanonicalKey,
+                        ["broker_abs_quantity"] = exposure.ReconciliationAbsQuantityTotal,
+                        ["broker_legs"] = BrokerPositionResolver.ToDiagnosticRows(exposure)
+                    });
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            LogSessionReentryBlocked(utcNow, "BROKER_FLAT_PREFLIGHT_ERROR",
+                "Unable to verify broker flat before market-open reentry",
+                new Dictionary<string, object?>
+                {
+                    ["instrument"] = execInst,
+                    ["error"] = ex.Message,
+                    ["exception_type"] = ex.GetType().Name
+                });
+            return;
         }
         
         // Load bracket levels from ExecutionJournalEntry via OriginalIntentId (canonical source)
@@ -7819,10 +7897,6 @@ public sealed class StreamStateMachine
             ["reason"] = "MARKET_OPEN_GATES_PASSED"
         });
         
-        // Mark re-entry as submitted (idempotency)
-        _journal.ReentrySubmitted = true;
-        _journals.Save(_journal);
-
         // Enqueue SubmitMarketReentryCommand through IEA for actual order placement
         var cmd = new SubmitMarketReentryCommand
         {
@@ -7840,6 +7914,11 @@ public sealed class StreamStateMachine
             Reason = "MARKET_REENTRY",
             CallerContext = "CheckMarketOpenReentry"
         };
+
+        _journal.ReentrySubmitPending = true;
+        _journal.ReentrySubmitPendingAtUtc = utcNow;
+        _journals.Save(_journal);
+
         _executionAdapter.EnqueueExecutionCommand(cmd);
 
         _engine?.LogEngineEvent(utcNow, "SESSION_REENTRY_EXECUTED", new Dictionary<string, object?>
@@ -7855,7 +7934,7 @@ public sealed class StreamStateMachine
         });
         
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-            "REENTRY_SUBMITTED", State.ToString(),
+            "REENTRY_SUBMIT_ENQUEUED", State.ToString(),
             new
             {
                 reentry_intent_id = _journal.ReentryIntentId,
@@ -7866,8 +7945,106 @@ public sealed class StreamStateMachine
                 target_price = originalEntry.TargetPrice,
                 entry_price = originalEntry.EntryPrice,
                 command_id = cmd.CommandId,
-                note = "Re-entry MARKET order enqueued via IEA"
+                note = "Re-entry MARKET order enqueued via IEA; awaiting broker submit completion"
             }));
+    }
+
+    /// <summary>
+    /// Handle strategy-thread completion of re-entry market order submission.
+    /// </summary>
+    public void HandleReentrySubmitCompleted(string reentryIntentId, DateTimeOffset utcNow, bool success, string? error)
+    {
+        if (_journal.ReentryIntentId != reentryIntentId)
+            return;
+
+        _journal.ReentrySubmitPending = false;
+        _journal.ReentrySubmitPendingAtUtc = null;
+
+        if (success)
+        {
+            _journal.ReentrySubmitted = true;
+            _journal.ReentrySubmitFailureCount = 0;
+            _journal.ReentrySubmitLastFailureUtc = null;
+            _journal.LastReentrySubmitError = null;
+            _journals.Save(_journal);
+
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "REENTRY_SUBMITTED", State.ToString(),
+                new
+                {
+                    reentry_intent_id = reentryIntentId,
+                    original_intent_id = _journal.OriginalIntentId,
+                    note = "Re-entry MARKET order accepted by execution adapter"
+                }));
+            return;
+        }
+
+        _journal.ReentrySubmitted = false;
+        _journal.ReentrySubmitFailureCount++;
+        _journal.ReentrySubmitLastFailureUtc = utcNow;
+        _journal.LastReentrySubmitError = error ?? "";
+        _journals.Save(_journal);
+
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "REENTRY_SUBMIT_FAILED", State.ToString(),
+            new
+            {
+                reentry_intent_id = reentryIntentId,
+                original_intent_id = _journal.OriginalIntentId,
+                failure_count = _journal.ReentrySubmitFailureCount,
+                error = error ?? "",
+                transient_retry = IsTransientReentrySubmitFailure(error)
+            }));
+
+        if (IsTransientReentrySubmitFailure(error))
+        {
+            LogSessionReentryBlocked(utcNow, "REENTRY_SUBMIT_TRANSIENT_UNSAFE_STATE",
+                "Re-entry submit blocked by transient execution safety state; slot will remain active and retry",
+                new Dictionary<string, object?>
+                {
+                    ["reentry_intent_id"] = reentryIntentId,
+                    ["error"] = error ?? "",
+                    ["failure_count"] = _journal.ReentrySubmitFailureCount
+                });
+
+            if (_journal.ReentrySubmitFailureCount >= 60)
+            {
+                _ = Commit(utcNow, "REENTRY_FAILED_TRANSIENT_SAFETY_TIMEOUT", "REENTRY_FAILED");
+                LogHealth("CRITICAL", "REENTRY_FAILED", "Re-entry market submit stayed blocked by transient safety state for too long; slot stood down",
+                    new { reentry_intent_id = reentryIntentId, error = error ?? "", failure_count = _journal.ReentrySubmitFailureCount });
+            }
+            return;
+        }
+
+        if (_journal.ReentrySubmitFailureCount >= 3)
+        {
+            _ = Commit(utcNow, "REENTRY_FAILED_SUBMIT_REJECTED", "REENTRY_FAILED");
+            LogHealth("CRITICAL", "REENTRY_FAILED", "Re-entry market submit failed repeatedly; slot stood down",
+                new { reentry_intent_id = reentryIntentId, error = error ?? "" });
+        }
+    }
+
+    private static bool IsTransientReentrySubmitFailure(string? error)
+    {
+        if (string.IsNullOrWhiteSpace(error))
+            return false;
+
+        var normalized = error.Trim();
+        if (normalized.StartsWith("EXECUTION_BLOCKED_UNSAFE_STATE:", StringComparison.Ordinal))
+            return true;
+        if (normalized.StartsWith("EXECUTION_BLOCKED_EPA:MISMATCH_EXECUTION_BLOCK", StringComparison.Ordinal))
+            return true;
+        if (normalized.StartsWith("UEA_DENIED:", StringComparison.Ordinal) &&
+            (normalized.IndexOf("MISMATCH", StringComparison.OrdinalIgnoreCase) >= 0 ||
+             normalized.IndexOf("RECOVERY", StringComparison.OrdinalIgnoreCase) >= 0 ||
+             normalized.IndexOf("UNSAFE", StringComparison.OrdinalIgnoreCase) >= 0))
+        {
+            return true;
+        }
+
+        return normalized.IndexOf("quant_recovery_required", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               normalized.IndexOf("repair_active", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               normalized.IndexOf("state_consistency", StringComparison.OrdinalIgnoreCase) >= 0;
     }
     
     /// <summary>
@@ -7920,9 +8097,6 @@ public sealed class StreamStateMachine
         var quantity = originalEntry.EntryFilledQuantityTotal;
         if (quantity <= 0) quantity = 1;
         
-        _journal.ProtectionSubmitted = true;
-        _journals.Save(_journal);
-        
         // Submit protective bracket via execution adapter
         if (_executionAdapter != null)
         {
@@ -7938,6 +8112,40 @@ public sealed class StreamStateMachine
                     stop_price = stopPrice,
                     target_price = targetPrice
                 }));
+
+            if (stopResult.Success && targetResult.Success)
+            {
+                _journal.ProtectionSubmitted = true;
+                _journals.Save(_journal);
+            }
+            else
+            {
+                _journal.ProtectionSubmitted = false;
+                _journals.Save(_journal);
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "REENTRY_PROTECTION_SUBMIT_FAILED", State.ToString(),
+                    new
+                    {
+                        reentry_intent_id = reentryIntentId,
+                        stop_success = stopResult.Success,
+                        stop_error = stopResult.ErrorMessage,
+                        target_success = targetResult.Success,
+                        target_error = targetResult.ErrorMessage,
+                        instrument = ExecutionInstrument ?? Instrument ?? ""
+                    }));
+                var flattenQueued = _executionAdapter.TryEnqueueEmergencyFlattenProtective(ExecutionInstrument ?? Instrument ?? "", utcNow);
+                _ = Commit(utcNow, "REENTRY_PROTECTION_FAILED_SUBMIT_REJECTED", "REENTRY_PROTECTION_FAILED");
+                LogHealth("CRITICAL", "REENTRY_PROTECTION_FAILED", "Re-entry filled but protective submit failed; emergency flatten requested",
+                    new { reentry_intent_id = reentryIntentId, flatten_queued = flattenQueued });
+                return;
+            }
+        }
+        else
+        {
+            _ = Commit(utcNow, "REENTRY_PROTECTION_FAILED_NO_ADAPTER", "REENTRY_PROTECTION_FAILED");
+            LogHealth("CRITICAL", "REENTRY_PROTECTION_FAILED", "Re-entry filled but no execution adapter was available for protectives",
+                new { reentry_intent_id = reentryIntentId });
+            return;
         }
         
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
@@ -8580,4 +8788,3 @@ public sealed class StreamStateMachine
         }
     }
 }
-

@@ -10,6 +10,7 @@ public static class IntentLifecycleValidator
     private static readonly Dictionary<(IntentLifecycleState, IntentLifecycleTransition), IntentLifecycleState> ValidTransitions = new()
     {
         { (IntentLifecycleState.CREATED, IntentLifecycleTransition.SUBMIT_ENTRY), IntentLifecycleState.ENTRY_SUBMITTED },
+        { (IntentLifecycleState.CREATED, IntentLifecycleTransition.ENTRY_ACCEPTED), IntentLifecycleState.ENTRY_WORKING },
         { (IntentLifecycleState.ENTRY_SUBMITTED, IntentLifecycleTransition.ENTRY_ACCEPTED), IntentLifecycleState.ENTRY_WORKING },
         { (IntentLifecycleState.ENTRY_SUBMITTED, IntentLifecycleTransition.ENTRY_PARTIALLY_FILLED), IntentLifecycleState.ENTRY_PARTIALLY_FILLED },
         { (IntentLifecycleState.ENTRY_SUBMITTED, IntentLifecycleTransition.ENTRY_FILLED), IntentLifecycleState.ENTRY_FILLED },
@@ -25,6 +26,8 @@ public static class IntentLifecycleValidator
         { (IntentLifecycleState.ENTRY_SUBMITTED, IntentLifecycleTransition.EXIT_STARTED), IntentLifecycleState.EXIT_PENDING },
         { (IntentLifecycleState.PROTECTIVES_ACTIVE, IntentLifecycleTransition.INTENT_COMPLETED), IntentLifecycleState.TERMINAL },
         { (IntentLifecycleState.EXIT_PENDING, IntentLifecycleTransition.INTENT_COMPLETED), IntentLifecycleState.TERMINAL },
+        { (IntentLifecycleState.ENTRY_FILLED, IntentLifecycleTransition.INTENT_COMPLETED), IntentLifecycleState.TERMINAL },
+        { (IntentLifecycleState.ENTRY_PARTIALLY_FILLED, IntentLifecycleTransition.INTENT_COMPLETED), IntentLifecycleState.TERMINAL },
     };
 
     /// <summary>Check if a transition is valid. Returns (true, newState) or (false, currentState).</summary>
@@ -74,8 +77,10 @@ public static class IntentLifecycleValidator
         {
             // IEA SubmitEntryIntentCommand may apply SUBMIT_ENTRY before adapter boundary; stream path applies at submit.
             (IntentLifecycleState.ENTRY_SUBMITTED, IntentLifecycleTransition.SUBMIT_ENTRY) => true,
+            (IntentLifecycleState.ENTRY_WORKING, IntentLifecycleTransition.SUBMIT_ENTRY) => true,
             (IntentLifecycleState.ENTRY_FILLED, IntentLifecycleTransition.ENTRY_FILLED) => true,
             (IntentLifecycleState.ENTRY_PARTIALLY_FILLED, IntentLifecycleTransition.ENTRY_PARTIALLY_FILLED) => true,
+            (IntentLifecycleState.ENTRY_PARTIALLY_FILLED, IntentLifecycleTransition.PROTECTIVES_PLACED) => true,
             (IntentLifecycleState.ENTRY_WORKING, IntentLifecycleTransition.ENTRY_ACCEPTED) => true,
             (IntentLifecycleState.PROTECTIVES_ACTIVE, IntentLifecycleTransition.PROTECTIVES_PLACED) => true,
             (IntentLifecycleState.EXIT_PENDING, IntentLifecycleTransition.EXIT_STARTED) => true,

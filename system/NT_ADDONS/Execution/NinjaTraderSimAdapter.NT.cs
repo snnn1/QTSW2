@@ -412,10 +412,14 @@ public sealed partial class NinjaTraderSimAdapter
                     !string.Equals(master, canonical, StringComparison.OrdinalIgnoreCase))
                     continue;
                 var label = position.Instrument?.FullName ?? master;
+                var brokerMarketPosition = position.MarketPosition.ToString();
+                var signedQuantity = BrokerPositionResolver.ApplyMarketPositionSign(position.Quantity, brokerMarketPosition);
+                if (signedQuantity == 0) continue;
                 legs.Add(new BrokerPositionLeg
                 {
-                    SignedQuantity = position.Quantity,
+                    SignedQuantity = signedQuantity,
                     ContractLabel = label,
+                    BrokerMarketPosition = brokerMarketPosition,
                     NativeInstrument = position.Instrument
                 });
             }
@@ -481,6 +485,26 @@ public sealed partial class NinjaTraderSimAdapter
         var ntInstrument = (nativeInstrumentForBrokerOrder ?? (object?)_ntInstrument) as Instrument;
         if (account == null || ntInstrument == null)
             return OrderSubmissionResult.FailureResult("NT context not set", utcNow);
+
+        var (validDirection, directionError) = FlattenInvariantValidator.ValidateFlattenReducesExposure(
+            snapshot.AccountQuantityAtDecision,
+            side,
+            quantity);
+        if (!validDirection)
+        {
+            _log.Write(RobotEvents.ExecutionBase(utcNow, "", instrument, "FLATTEN_DIRECTION_INVALID", new
+            {
+                instrument,
+                account_quantity = snapshot.AccountQuantityAtDecision,
+                account_direction = snapshot.AccountDirectionAtDecision,
+                broker_market_position = snapshot.BrokerMarketPositionAtDecision,
+                chosen_side = side,
+                chosen_quantity = quantity,
+                error = directionError,
+                latch_request_id = snapshot.LatchRequestId
+            }));
+            return OrderSubmissionResult.FailureResult(directionError ?? "FLATTEN_DIRECTION_INVALID", utcNow);
+        }
 
         var orderAction = side.Equals("SELL", StringComparison.OrdinalIgnoreCase) ? OrderAction.Sell : OrderAction.BuyToCover;
         try
@@ -715,7 +739,8 @@ public sealed partial class NinjaTraderSimAdapter
                 DecisionUtc = utcNow,
                 FlattenLegIndex = li,
                 CanonicalExposureAbsTotalAtDecision = exposure.ReconciliationAbsQuantityTotal,
-                LegContractLabel = leg.ContractLabel
+                LegContractLabel = leg.ContractLabel,
+                BrokerMarketPositionAtDecision = leg.BrokerMarketPosition
             };
             lastSubmit = ((IIEAOrderExecutor)this).SubmitFlattenOrder(instrument, chosenSide, absQty, snapshot, utcNow, leg.NativeInstrument);
             if (!lastSubmit.Success)
@@ -1556,6 +1581,7 @@ public sealed partial class NinjaTraderSimAdapter
         {
             _log.Write(RobotEvents.ExecutionBase(utcNow, cmd.ReentryIntentId ?? "", execInst, "SUBMIT_MARKET_REENTRY_SKIPPED",
                 new { reason = "Missing required fields", reentryIntentId = cmd.ReentryIntentId, execInst, direction, quantity }));
+            _onReentrySubmitCompletedCallback?.Invoke(cmd.ReentryIntentId ?? "", utcNow, false, "Missing required fields");
             return;
         }
 
@@ -1592,6 +1618,7 @@ public sealed partial class NinjaTraderSimAdapter
         var result = SubmitEntryOrder(canonicalIntentId, execInst, direction, null, quantity, "MARKET", null, utcNow);
         _log.Write(RobotEvents.ExecutionBase(utcNow, canonicalIntentId, execInst, "SUBMIT_MARKET_REENTRY_COMPLETED",
             new { success = result.Success, error = result.ErrorMessage }));
+        _onReentrySubmitCompletedCallback?.Invoke(canonicalIntentId, utcNow, result.Success, result.ErrorMessage);
     }
 
     private void RegisterPendingFlattenVerification(string instrumentKey, string correlationId, DateTimeOffset utcNow)
@@ -5098,6 +5125,24 @@ public sealed partial class NinjaTraderSimAdapter
             var sessionClass = DeriveSessionClass(stream);
 
             _executionJournal.RecordExitFill(intentId, tradingDate, stream, fillPrice, allocQty, "FLATTEN", utcNow);
+            if (FeatureFlags.CanonicalOwnershipLedgerEnabled && _ownershipLedger != null)
+            {
+                var result = _ownershipLedger.RecordMappedExitFill(
+                    GetLedgerAccountName(), instrument.Trim(), intentId, allocQty, utcNow, executionSeq);
+                if (!result.Success)
+                {
+                    LogCriticalWithIeaContext(utcNow, intentId, instrument, "OWNERSHIP_FLATTEN_EXIT_CLOSE_FAILED",
+                        new
+                        {
+                            intent_id = intentId,
+                            instrument = instrument,
+                            account = GetLedgerAccountName(),
+                            fill_quantity = allocQty,
+                            error = result.ErrorReason ?? "",
+                            note = "Broker flatten fill closed legacy journal exposure but ownership ledger close failed"
+                        });
+                }
+            }
             _iea?.TryTransitionIntentLifecycle(intentId, IntentLifecycleTransition.INTENT_COMPLETED, null, utcNow);
             _coordinator?.OnExitFill(intentId, allocQty, utcNow);
 
@@ -6714,12 +6759,14 @@ public sealed partial class NinjaTraderSimAdapter
             {
                 if (position.Quantity != 0)
                 {
+                    var brokerMarketPosition = position.MarketPosition.ToString();
                     positions.Add(new PositionSnapshot
                     {
                         Instrument = position.Instrument.MasterInstrument.Name,
-                        Quantity = position.Quantity,
+                        Quantity = BrokerPositionResolver.ApplyMarketPositionSign(position.Quantity, brokerMarketPosition),
                         AveragePrice = (decimal)position.AveragePrice,
-                        ContractLabel = position.Instrument.FullName
+                        ContractLabel = position.Instrument.FullName,
+                        MarketPosition = brokerMarketPosition
                     });
                 }
             }
@@ -6774,27 +6821,18 @@ public sealed partial class NinjaTraderSimAdapter
         var workingOrders = GetWorkingProtectiveOrdersForIntent(intentId);
         if (workingOrders.Count > 0)
         {
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "TERMINAL_INTENT_HAS_WORKING_ORDERS", "ENGINE",
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "TERMINAL_INTENT_PROTECTIVE_CLEANUP_PENDING", "ENGINE",
                 new
                 {
-                    error = "Completed intent still has working protective orders - invariant violated",
                     intent_id = intentId,
                     stream = stream,
                     completion_reason = completionReason,
                     working_order_ids = workingOrders.Select(o => o.OrderId).ToList(),
                     working_order_types = workingOrders.Select(o => GetOrderTag(o)).ToList(),
                     count = workingOrders.Count,
-                    action = "CRITICAL_ANOMALY",
-                    note = "Terminal intent must have no working protective orders. Route to reconciliation."
+                    action = "CANCEL_PENDING",
+                    note = "Terminal intent cancel submitted; protective order state can remain accepted/working until NT emits cancel updates."
                 }));
-            var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
-            if (notificationService != null)
-            {
-                notificationService.EnqueueNotification($"TERMINAL_INTENT_HAS_WORKING_ORDERS:{intentId}",
-                    "CRITICAL: Terminal Intent Has Working Orders",
-                    $"Intent {intentId} completed ({completionReason}) but {workingOrders.Count} protective order(s) still Working. Order IDs: {string.Join(", ", workingOrders.Select(o => o.OrderId))}.",
-                    priority: 2);
-            }
             CancelProtectiveOrdersForIntent(intentId, utcNow);
         }
         else
@@ -7267,7 +7305,8 @@ public sealed partial class NinjaTraderSimAdapter
                         DecisionUtc = utcNow,
                         FlattenLegIndex = li,
                         CanonicalExposureAbsTotalAtDecision = absForPolicy,
-                        LegContractLabel = leg.ContractLabel
+                        LegContractLabel = leg.ContractLabel,
+                        BrokerMarketPositionAtDecision = leg.BrokerMarketPosition
                     };
                     submitResult = (this as IIEAOrderExecutor).SubmitFlattenOrder(instrument, chosenSide, absQty, snapshot, utcNow, leg.NativeInstrument);
                     if (!submitResult.Success)

@@ -3433,11 +3433,14 @@ public sealed partial class NinjaTraderSimAdapter
             {
                 if (position.Quantity != 0)
                 {
+                    var brokerMarketPosition = position.MarketPosition.ToString();
                     positions.Add(new PositionSnapshot
                     {
                         Instrument = position.Instrument.MasterInstrument.Name,
-                        Quantity = position.Quantity,
-                        AveragePrice = (decimal)position.AveragePrice
+                        Quantity = BrokerPositionResolver.ApplyMarketPositionSign(position.Quantity, brokerMarketPosition),
+                        AveragePrice = (decimal)position.AveragePrice,
+                        ContractLabel = position.Instrument.FullName,
+                        MarketPosition = brokerMarketPosition
                     });
                 }
             }
@@ -3494,27 +3497,18 @@ public sealed partial class NinjaTraderSimAdapter
         var workingOrders = GetWorkingProtectiveOrdersForIntent(intentId);
         if (workingOrders.Count > 0)
         {
-            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "TERMINAL_INTENT_HAS_WORKING_ORDERS", "ENGINE",
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "TERMINAL_INTENT_PROTECTIVE_CLEANUP_PENDING", "ENGINE",
                 new
                 {
-                    error = "Completed intent still has working protective orders - invariant violated",
                     intent_id = intentId,
                     stream = stream,
                     completion_reason = completionReason,
                     working_order_ids = workingOrders.Select(o => o.OrderId).ToList(),
                     working_order_types = workingOrders.Select(o => GetOrderTag(o)).ToList(),
                     count = workingOrders.Count,
-                    action = "CRITICAL_ANOMALY",
-                    note = "Terminal intent must have no working protective orders. Route to reconciliation."
+                    action = "CANCEL_PENDING",
+                    note = "Terminal intent cancel submitted; protective order state can remain accepted/working until NT emits cancel updates."
                 }));
-            var notificationService = _getNotificationServiceCallback?.Invoke() as QTSW2.Robot.Core.Notifications.NotificationService;
-            if (notificationService != null)
-            {
-                notificationService.EnqueueNotification($"TERMINAL_INTENT_HAS_WORKING_ORDERS:{intentId}",
-                    "CRITICAL: Terminal Intent Has Working Orders",
-                    $"Intent {intentId} completed ({completionReason}) but {workingOrders.Count} protective order(s) still Working. Order IDs: {string.Join(", ", workingOrders.Select(o => o.OrderId))}.",
-                    priority: 2);
-            }
             // Attempt cancel again (defense in depth)
             CancelProtectiveOrdersForIntent(intentId, utcNow);
         }
@@ -3593,7 +3587,18 @@ public sealed partial class NinjaTraderSimAdapter
             if (ordersToCancel.Count > 0)
             {
                 // Real NT API: Cancel orders
-                account.Cancel(ordersToCancel.ToArray());
+                var ordersArr = ordersToCancel.ToArray();
+                if (!EnsureStrategyThreadOrEnqueue("CancelProtectiveOrdersForIntent", intentId, null, $"CANCEL_PROTECTIVE:{intentId}", () => account.Cancel(ordersArr)))
+                {
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, "", "PROTECTIVE_CANCEL_ENQUEUED", new
+                    {
+                        intent_id = intentId,
+                        cancel_count = ordersArr.Length,
+                        order_ids = ordersArr.Select(o => o.OrderId).ToList(),
+                        note = "Protective cancel queued onto strategy thread."
+                    }));
+                    return;
+                }
                 
                 _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, "", "PROTECTIVE_ORDERS_CANCELLED_FOR_RECREATE", new
                 {

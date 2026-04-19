@@ -7686,7 +7686,7 @@ public sealed class StreamStateMachine
 
             if (!brokerFlat)
             {
-                LogHealth("CRITICAL", "FORCED_FLATTEN_FAILED",
+                LogHealth("WARN", "FORCED_FLATTEN_CONFIRM_PENDING",
                     $"Broker flat not confirmed within {SESSION_FORCED_FLATTEN_BROKER_WAIT_SECONDS + (retryQueued ? SESSION_FORCED_FLATTEN_RETRY_WAIT_SECONDS : 0)}s (remaining qty={remainingQty})",
                     new { original_intent_id = _journal.OriginalIntentId, instrument = ExecutionInstrument, remaining_qty = remainingQty, retry_queued = retryQueued });
                 _engine?.OnForcedFlattenFailed(ExecutionInstrument, "FORCED_FLATTEN_BROKER_TIMEOUT", utcNow);

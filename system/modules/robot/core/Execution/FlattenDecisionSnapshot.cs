@@ -28,6 +28,9 @@ public sealed class FlattenDecisionSnapshot
     /// <summary>Contract label for this leg (e.g. NT FullName).</summary>
     public string? LegContractLabel { get; set; }
 
+    /// <summary>Broker-side market position label used to derive signed quantity when available.</summary>
+    public string? BrokerMarketPositionAtDecision { get; set; }
+
     /// <summary>Convert to anonymous object for structured logging (JSONL).</summary>
     public object ToLogPayload()
     {
@@ -45,7 +48,8 @@ public sealed class FlattenDecisionSnapshot
             decision_utc = DecisionUtc.ToString("o"),
             flatten_leg_index = FlattenLegIndex,
             canonical_exposure_abs_total_at_decision = CanonicalExposureAbsTotalAtDecision,
-            leg_contract_label = LegContractLabel
+            leg_contract_label = LegContractLabel,
+            broker_market_position_at_decision = BrokerMarketPositionAtDecision
         };
     }
 }
