@@ -55,12 +55,13 @@ Write-Host ""
 # Step 4 (optional): Clear NinjaTrader cache so it recompiles (only when -ClearNinjaTraderCache)
 if ($ClearNinjaTraderCache) {
     Write-Host "[4/4] Clearing NinjaTrader cache (NinjaTrader must be closed)..." -ForegroundColor Cyan
-    $ntCustom = $null
+    $ntCustomDirs = @()
     foreach ($base in @(
         (Join-Path $env:USERPROFILE "OneDrive\Documents\NinjaTrader 8\bin\Custom"),
         (Join-Path $env:USERPROFILE "Documents\NinjaTrader 8\bin\Custom")
-    )) { if (Test-Path $base) { $ntCustom = $base; break } }
-    if ($ntCustom) {
+    )) { if (Test-Path $base) { $ntCustomDirs += $base } }
+    foreach ($ntCustom in $ntCustomDirs) {
+        Write-Host "  Custom folder: $ntCustom"
         $custom = Join-Path $ntCustom "NinjaTrader.Custom.dll"
         $vendor = Join-Path $ntCustom "NinjaTrader.Vendor.dll"
         foreach ($f in @($custom, $vendor)) {

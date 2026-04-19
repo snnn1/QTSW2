@@ -272,6 +272,9 @@ public class PositionSnapshot
 
     /// <summary>Optional contract label for audit logs (e.g. NT Instrument.FullName). Bucketing uses <see cref="Instrument"/> only.</summary>
     public string? ContractLabel { get; set; }
+
+    /// <summary>Broker-side market position label when available (e.g. NT MarketPosition).</summary>
+    public string? MarketPosition { get; set; }
 }
 
 /// <summary>

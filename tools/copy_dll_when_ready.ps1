@@ -13,18 +13,17 @@ for ($i = 0; $i -lt 6; $i++) {
 }
 $sourceDir = Join-Path $projectRoot "system\RobotCore_For_NinjaTrader\bin\Release\net48"
 
-# Resolve NinjaTrader Custom path (Documents or OneDrive\Documents)
-$ntCustom = $null
+# Resolve NinjaTrader Custom path(s) (Documents and/or OneDrive\Documents)
+$ntCustomDirs = @()
 foreach ($base in @(
     (Join-Path $env:USERPROFILE "OneDrive\Documents\NinjaTrader 8\bin\Custom"),
     (Join-Path $env:USERPROFILE "Documents\NinjaTrader 8\bin\Custom")
 )) {
     if (Test-Path $base) {
-        $ntCustom = $base
-        break
+        $ntCustomDirs += $base
     }
 }
-if (-not $ntCustom) {
+if ($ntCustomDirs.Count -eq 0) {
     Write-Host "[ERROR] NinjaTrader Custom folder not found. Tried OneDrive\Documents and Documents."
     pause
     exit 1
@@ -52,7 +51,10 @@ Write-Host "  Copying Robot.Core + dependencies to NinjaTrader"
 Write-Host "============================================================"
 Write-Host ""
 Write-Host "Source: $sourceDir"
-Write-Host "Destination: $ntCustom"
+Write-Host "Destinations:"
+foreach ($ntCustom in $ntCustomDirs) {
+    Write-Host "  $ntCustom"
+}
 Write-Host ""
 
 if (-not (Test-Path $sourceDir)) {
@@ -78,12 +80,15 @@ $copied = $false
 while ($attempt -lt $maxAttempts -and -not $copied) {
     $attempt++
     try {
-        foreach ($f in $filesToCopy) {
-            $src = Join-Path $sourceDir $f.Name
-            $dst = Join-Path $ntCustom $f.Name
-            if (Test-Path $src) {
-                Copy-Item $src $dst -Force -ErrorAction Stop
-                Write-Host "[OK] $($f.Name)"
+        foreach ($ntCustom in $ntCustomDirs) {
+            Write-Host "Destination: $ntCustom"
+            foreach ($f in $filesToCopy) {
+                $src = Join-Path $sourceDir $f.Name
+                $dst = Join-Path $ntCustom $f.Name
+                if (Test-Path $src) {
+                    Copy-Item $src $dst -Force -ErrorAction Stop
+                    Write-Host "[OK] $($f.Name)"
+                }
             }
         }
         $copied = $true

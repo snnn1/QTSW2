@@ -128,6 +128,19 @@ namespace NinjaTrader.NinjaScript.Strategies
         private readonly Dictionary<string, DateTimeOffset> _lastBeGateBlockedUtcByReason = new Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase);
         private const int BE_GATE_BLOCKED_RATE_LIMIT_SECONDS = 60;
         private const int BE_GATE_BLOCKED_NOISY_RATE_LIMIT_SECONDS = 300; // WRONG_MARKETDATA_TYPE, THROTTLED_SCAN — proof only, not every tick
+
+        private static IReadOnlyCollection<string>? TryGetOpenIntentIdsForInstrument(NinjaTraderSimAdapter adapter, string executionInstrument)
+        {
+            try
+            {
+                var method = typeof(NinjaTraderSimAdapter).GetMethod("GetOpenIntentIdsForInstrument", new[] { typeof(string) });
+                return method?.Invoke(adapter, new object[] { executionInstrument }) as IReadOnlyCollection<string>;
+            }
+            catch
+            {
+                return null;
+            }
+        }
         private const int BE_INACTIVE_WHILE_EXPOSED_THRESHOLD_SECONDS = 12;
         private const int BE_ACCOUNT_EXPOSURE_WITHOUT_INTENT_RATE_LIMIT_SECONDS = 300; // 5 minutes
         private const double BE_TICK_STALE_WARNING_SECONDS = 5;
@@ -2316,11 +2329,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _lastBePathActiveLogUtc[instrumentName] = now;
                 var activeIntents = _adapter != null ? _adapter.GetActiveIntentsForBEMonitoring(executionInstrument) : null;
                 var activeCount = activeIntents?.Count ?? -1;
+                var openIntentIds = _adapter != null ? TryGetOpenIntentIdsForInstrument(_adapter, executionInstrument) : null;
+                var openIntentCount = openIntentIds?.Count ?? -1;
                 _engine.LogEngineEvent(now, "BE_INTENT_RESOLUTION_INPUT", new Dictionary<string, object>
                 {
                     { "chart_instrument", instrumentName },
                     { "execution_instrument", executionInstrument },
                     { "resolved_active_intent_count", activeCount },
+                    { "open_intent_count", openIntentCount },
                     { "tick_price", tickPrice }
                 });
                 _engine.LogEngineEvent(now, "BE_PATH_ACTIVE", new Dictionary<string, object>
@@ -2329,12 +2345,26 @@ namespace NinjaTrader.NinjaScript.Strategies
                     { "tick_price", tickPrice },
                     { "in_position", true },
                     { "active_intent_count", activeCount },
+                    { "open_intent_count", openIntentCount },
                     { "note", "BE check path active (OnMarketData). active_intent_count>0 means intents await BE trigger." }
                 });
                 // HARDENING: If we have exposure but 0 intents for BE, the filter excluded them (e.g., execution instrument mismatch)
                 if (activeCount == 0 && hasExposure)
                 {
-                    if (QuantExecutionControlStore.IsPostFillAlignmentWindowActive(executionInstrument, now))
+                    if (openIntentCount > 0)
+                    {
+                        _engine.LogEngineEvent(now, "BE_FILTER_EXCLUDED_PROTECTED_EXPOSURE", new Dictionary<string, object>
+                        {
+                            { "chart_instrument", instrumentName },
+                            { "execution_instrument", executionInstrument },
+                            { "resolved_active_intent_count", 0 },
+                            { "open_intent_count", openIntentCount },
+                            { "open_intent_ids", openIntentIds != null ? string.Join(",", openIntentIds) : "" },
+                            { "tick_price", tickPrice },
+                            { "note", "Exposure has open robot intent(s), but none need BE monitoring." }
+                        });
+                    }
+                    else if (QuantExecutionControlStore.IsPostFillAlignmentWindowActive(executionInstrument, now))
                     {
                         _engine.LogEngineEvent(now, "OWNERSHIP_PENDING_CONVERGENCE", new Dictionary<string, object>
                         {

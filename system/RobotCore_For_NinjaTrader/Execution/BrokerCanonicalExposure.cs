@@ -43,11 +43,14 @@ public sealed class BrokerCanonicalExposure
 /// <summary>One broker position row within a canonical master-instrument bucket.</summary>
 public sealed class BrokerPositionLeg
 {
-    /// <summary>Signed quantity (NT position quantity).</summary>
+    /// <summary>Signed quantity (positive long, negative short).</summary>
     public int SignedQuantity { get; init; }
 
     /// <summary>Contract-level label for logs (e.g. NT FullName).</summary>
     public string? ContractLabel { get; init; }
+
+    /// <summary>Broker-side market position label when available (e.g. NT MarketPosition).</summary>
+    public string? BrokerMarketPosition { get; init; }
 
     /// <summary>NT Instrument instance for order creation; null in replay / tests.</summary>
     public object? NativeInstrument { get; init; }

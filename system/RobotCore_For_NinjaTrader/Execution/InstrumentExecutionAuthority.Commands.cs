@@ -256,10 +256,8 @@ public sealed partial class InstrumentExecutionAuthority
         var ntCmd = new NtSubmitMarketReentryCommand(correlationId, cmd);
         Executor.EnqueueNtAction(ntCmd);
 
-        TryTransitionIntentLifecycle(reentryIntentId, IntentLifecycleTransition.SUBMIT_ENTRY, cmd.CommandId, cmd.TimestampUtc);
-
         Log?.Write(RobotEvents.ExecutionBase(cmd.TimestampUtc, reentryIntentId, instrument, "EXECUTION_COMMAND_COMPLETED",
-            new { commandId = cmd.CommandId, commandType = nameof(SubmitMarketReentryCommand) }));
+            new { commandId = cmd.CommandId, commandType = nameof(SubmitMarketReentryCommand), lifecycle_transition_deferred = true }));
         _eventWriter?.Emit(new CanonicalExecutionEvent
         {
             TimestampUtc = cmd.TimestampUtc.ToString("o"),

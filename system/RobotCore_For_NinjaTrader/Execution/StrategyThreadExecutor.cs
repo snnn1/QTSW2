@@ -153,6 +153,8 @@ public sealed class NtFlattenInstrumentCommand : INtAction
     public string? RecoveryPolicySealCode { get; }
     public string? RecoveryPolicySealAttributionScope { get; }
     public IReadOnlyList<string>? ExplicitCancelBrokerOrderIds { get; }
+    /// <summary>When true, drain before normal FIFO work. Used for session-close and emergency flatten.</summary>
+    public bool PreferUrgentDrain { get; }
 
     /// <summary>True when this command is a post-flatten verify retry (coordination + debounce).</summary>
     public bool IsVerifyRetryFlatten { get; }
@@ -171,7 +173,8 @@ public sealed class NtFlattenInstrumentCommand : INtAction
         string? recoveryPolicySealCode = null,
         string? recoveryPolicySealAttributionScope = null,
         IReadOnlyList<string>? explicitCancelBrokerOrderIds = null,
-        bool isVerifyRetryFlatten = false)
+        bool isVerifyRetryFlatten = false,
+        bool preferUrgentDrain = false)
     {
         CorrelationId = correlationId;
         IntentId = intentId;
@@ -188,6 +191,7 @@ public sealed class NtFlattenInstrumentCommand : INtAction
         RecoveryPolicySealAttributionScope = recoveryPolicySealAttributionScope;
         ExplicitCancelBrokerOrderIds = explicitCancelBrokerOrderIds;
         IsVerifyRetryFlatten = isVerifyRetryFlatten;
+        PreferUrgentDrain = preferUrgentDrain;
     }
 
     public void Execute(INtActionExecutor executor) => executor.ExecuteFlattenInstrument(this);
@@ -307,7 +311,8 @@ public sealed class StrategyThreadExecutor
             _pendingCorrelationIds.Add(action.CorrelationId);
         }
 
-        var urgent = action is NtCancelOrdersCommand c && c.PreferUrgentDrain;
+        var urgent = (action is NtCancelOrdersCommand c && c.PreferUrgentDrain) ||
+                     (action is NtFlattenInstrumentCommand f && f.PreferUrgentDrain);
         if (urgent)
             _urgentQueue.Enqueue(action);
         else

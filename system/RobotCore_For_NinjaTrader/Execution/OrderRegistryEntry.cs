@@ -88,4 +88,19 @@ public sealed class OrderRegistryEntry
 
     /// <summary>Resolution path when looked up: DirectId, Alias, Adopted, Unresolved.</summary>
     public string? LastResolutionPath { get; set; }
+
+    /// <summary>
+    /// Original trade intent that this flatten order is intended to close. Kept separate from
+    /// IntentId so flatten orders do not overwrite entry/protective intent aliases.
+    /// </summary>
+    public string? FlattenOriginalIntentId { get; set; }
+
+    /// <summary>Flatten latch/request id used when the order was submitted.</summary>
+    public string? FlattenRequestId { get; set; }
+
+    /// <summary>Flatten reason at submit time.</summary>
+    public string? FlattenReason { get; set; }
+
+    /// <summary>Per-contract flatten leg index when one flatten request submits multiple close orders.</summary>
+    public int? FlattenLegIndex { get; set; }
 }

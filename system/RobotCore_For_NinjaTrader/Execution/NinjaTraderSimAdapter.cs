@@ -55,6 +55,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     /// <summary>Permanent dedup: first-seen (instrument + execution_id + fill_qty) per process; allows distinct partials (different ids or qty).</summary>
     private readonly ConcurrentDictionary<string, byte> _permanentExecutionProcessed = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, long> _permanentExecutionDedupSkipCount = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, byte> _lateSessionCloseFlattenConfirmed = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, OrderCallbackDedupEntry> _orderCallbackDedup50ms = new(StringComparer.OrdinalIgnoreCase);
 
     private sealed class OrderCallbackDedupEntry
@@ -558,6 +559,12 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     /// <summary>Callback when reentry protective bracket is accepted (both stop and target Working). Engine invokes HandleReentryProtectionAccepted on matching stream.</summary>
     private Action<string, DateTimeOffset>? _onReentryProtectionAcceptedCallback;
 
+    /// <summary>Callback when the strategy thread accepts/rejects the market reentry submit.</summary>
+    private Action<string, DateTimeOffset, bool, string?>? _onReentrySubmitCompletedCallback;
+
+    /// <summary>Callback when a timed-out session-close flatten is later proven closed and broker-flat.</summary>
+    private Action<string, string, DateTimeOffset>? _onSessionCloseFlattenConfirmedLateCallback;
+
     /// <summary>Callback to check if entry orders for a stream should be cancelled when position is flat (invalid lifecycle).
     /// Returns (ShouldCancel, Reason) - true when stream is no longer eligible (EXPIRED, COMMITTED, forced_flatten, etc.).</summary>
     private Func<string, string, (bool ShouldCancel, string? Reason)>? _shouldCancelEntryOrdersForStreamCallback;
@@ -985,7 +992,9 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         Func<string, bool>? journalIntegrityRepairActiveForInstrumentCallback = null,
         Func<bool>? isGlobalKillSwitchActive = null,
         Func<string, bool>? isMismatchExecutionBlocked = null,
-        Func<string, string?, bool>? isInstrumentFrozenOrEpaBlocked = null)
+        Func<string, string?, bool>? isInstrumentFrozenOrEpaBlocked = null,
+        Action<string, DateTimeOffset, bool, string?>? onReentrySubmitCompletedCallback = null,
+        Action<string, string, DateTimeOffset>? onSessionCloseFlattenConfirmedLateCallback = null)
     {
         _standDownStreamCallback = standDownStreamCallback;
         _getNotificationServiceCallback = getNotificationServiceCallback;
@@ -994,6 +1003,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         _onSupervisoryCriticalCallback = onSupervisoryCriticalCallback;
         _onReentryFillCallback = onReentryFillCallback;
         _onReentryProtectionAcceptedCallback = onReentryProtectionAcceptedCallback;
+        _onReentrySubmitCompletedCallback = onReentrySubmitCompletedCallback;
+        _onSessionCloseFlattenConfirmedLateCallback = onSessionCloseFlattenConfirmedLateCallback;
         _shouldCancelEntryOrdersForStreamCallback = shouldCancelEntryOrdersForStreamCallback;
         _hasSlotJournalWithEntryStopsForInstrumentCallback = hasSlotJournalWithEntryStopsForInstrumentCallback;
         _getActiveTradingDateString = getActiveTradingDateString;
@@ -1573,9 +1584,10 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         if (_ntActionQueue == null || !(this is INtActionExecutor)) return null;
         var cidCancel = $"SESSION_CLOSE_CANCEL:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
         var cidFlatten = $"SESSION_CLOSE_FLATTEN:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
-        _ntActionQueue.EnqueueNtAction(new NtCancelOrdersCommand(cidCancel, intentId, instrument, false, "FORCED_FLATTEN_CANCEL", utcNow), out _);
+        _ntActionQueue.EnqueueNtAction(new NtCancelOrdersCommand(cidCancel, intentId, instrument, false,
+            "FORCED_FLATTEN_CANCEL", utcNow, preferUrgentDrain: true), out _);
         EnqueueNtActionInternal(new NtFlattenInstrumentCommand(cidFlatten, intentId, instrument, "SESSION_FORCED_FLATTEN", utcNow,
-            DestructiveActionSource.MANUAL, DestructiveTriggerReason.MANUAL));
+            DestructiveActionSource.MANUAL, DestructiveTriggerReason.MANUAL, preferUrgentDrain: true));
         return FlattenResult.FailureResult("SESSION_CLOSE_FLATTEN_ENQUEUED", utcNow);
     }
 
@@ -1591,7 +1603,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             "IEA_BLOCK_EMERGENCY",
             utcNow,
             DestructiveActionSource.EMERGENCY,
-            DestructiveTriggerReason.IEA_ENQUEUE_FAILURE);
+            DestructiveTriggerReason.IEA_ENQUEUE_FAILURE,
+            preferUrgentDrain: true);
         EnqueueNtActionInternal(cmd);
     }
 
@@ -3809,19 +3822,57 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     }
 
     /// <summary>
-    /// Releasable / protective-relevant intent union: BE monitoring actives plus adoption candidates (same instrument scope).
+    /// Releasable / protective-relevant intent union: open filled intents plus adoption candidates (same instrument scope).
     /// </summary>
     public IReadOnlyCollection<string> GetActiveIntentIdsForProtectiveAudit(string instrument)
     {
         var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         if (!string.IsNullOrEmpty(instrument))
         {
-            foreach (var x in GetActiveIntentsForBEMonitoring(instrument))
-                set.Add(x.intentId);
+            foreach (var id in GetOpenIntentIdsForInstrument(instrument))
+                set.Add(id);
             foreach (var id in GetAdoptionCandidateIntentIds(instrument))
                 set.Add(id);
         }
         return set.Count == 0 ? Array.Empty<string>() : set.ToList();
+    }
+
+    public IReadOnlyCollection<string> GetOpenIntentIdsForInstrument(string instrument)
+    {
+        var openIntentIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(instrument))
+            return openIntentIds;
+
+        foreach (var kvp in IntentMap)
+        {
+            var intentId = kvp.Key;
+            var intent = kvp.Value;
+            if (!ExecutionInstrumentResolver.IsSameInstrument(intent.ExecutionInstrument, instrument))
+                continue;
+
+            var tradingDate = intent.TradingDate ?? "";
+            var stream = intent.Stream ?? "";
+            ExecutionJournalEntry? journalEntry;
+            try
+            {
+                journalEntry = _executionJournal.GetEntry(intentId, tradingDate, stream);
+            }
+            catch
+            {
+                continue;
+            }
+
+            if (journalEntry == null || !journalEntry.EntryFilled || journalEntry.EntryFilledQuantityTotal <= 0)
+                continue;
+            if (journalEntry.TradeCompleted)
+                continue;
+            if (journalEntry.ExitFilledQuantityTotal >= journalEntry.EntryFilledQuantityTotal)
+                continue;
+
+            openIntentIds.Add(intentId);
+        }
+
+        return openIntentIds.Count == 0 ? Array.Empty<string>() : openIntentIds.ToList();
     }
 
     /// <inheritdoc cref="IExecutionAdapter.TryRepairTaggedBrokerWithoutJournal"/>

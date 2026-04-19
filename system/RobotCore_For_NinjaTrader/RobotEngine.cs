@@ -2287,6 +2287,15 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         foreach (var s in _streams.Values)
                             s.HandleReentryProtectionAccepted(now, reentryIntentId);
                     },
+                    onReentrySubmitCompletedCallback: (reentryIntentId, now, success, error) =>
+                    {
+                        foreach (var s in _streams.Values)
+                            s.HandleReentrySubmitCompleted(reentryIntentId, now, success, error);
+                    },
+                    onSessionCloseFlattenConfirmedLateCallback: (originalIntentId, instrument, now) =>
+                    {
+                        OnSessionCloseFlattenConfirmedLate(originalIntentId, instrument, now);
+                    },
                     blockInstrumentCallback: (instrument, now, reason) =>
                     {
                         _executionAdapter?.RequestSupervisoryActionForInstrument(instrument, SupervisoryTriggerReason.IEA_ENQUEUE_FAILURE, SupervisorySeverity.HIGH, new { reason }, now);
@@ -6558,7 +6567,110 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     public void OnForcedFlattenFailed(string instrument, string reason, DateTimeOffset utcNow)
     {
         if (string.IsNullOrWhiteSpace(instrument)) return;
+        if (string.Equals(reason, "FORCED_FLATTEN_BROKER_TIMEOUT", StringComparison.Ordinal) &&
+            HasInterruptedSessionCloseStreamForInstrument(instrument.Trim()))
+        {
+            var inst = instrument.Trim();
+            _frozenInstruments.Add(inst);
+            _riskLatchManager?.Persist(inst, reason);
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "",
+                eventType: "FORCED_FLATTEN_TIMEOUT_REENTRY_DEFERRED", state: "ENGINE",
+                new
+                {
+                    instrument = inst,
+                    reason,
+                    note = "Forced-flatten submit was accepted but broker-flat confirmation was slow; keeping interrupted stream active and risk-latched for broker-flat-gated reentry."
+                }));
+            return;
+        }
         StandDownStreamsForInstrument(instrument.Trim(), utcNow, reason);
+    }
+
+    public void OnSessionCloseFlattenConfirmedLate(string originalIntentId, string instrument, DateTimeOffset utcNow)
+    {
+        var iid = originalIntentId?.Trim() ?? "";
+        var inst = instrument?.Trim() ?? "";
+        if (string.IsNullOrWhiteSpace(iid) || string.IsNullOrWhiteSpace(inst))
+            return;
+
+        lock (_engineLock)
+        {
+            var matchedAny = false;
+            var tradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? TradingDateString;
+
+            foreach (var stream in _streams.Values)
+            {
+                if (!stream.IsActiveInterruptedBySessionClose)
+                    continue;
+                if (!string.Equals(stream.OriginalIntentId?.Trim(), iid, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                var streamInst = stream.Instrument?.Trim() ?? "";
+                var streamExec = stream.ExecutionInstrument?.Trim() ?? "";
+                var matchesInstrument =
+                    string.Equals(streamInst, inst, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(streamExec, inst, StringComparison.OrdinalIgnoreCase) ||
+                    (!string.IsNullOrWhiteSpace(streamInst) && ExecutionInstrumentResolver.IsSameInstrument(streamInst, inst)) ||
+                    (!string.IsNullOrWhiteSpace(streamExec) && ExecutionInstrumentResolver.IsSameInstrument(streamExec, inst));
+                if (!matchesInstrument)
+                    continue;
+
+                matchedAny = true;
+                stream.HandleLateSessionCloseFlattenConfirmed(utcNow);
+
+                var clearedKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var key in new[] { inst, streamExec, streamInst })
+                {
+                    if (string.IsNullOrWhiteSpace(key) || !clearedKeys.Add(key))
+                        continue;
+                    _frozenInstruments.Remove(key);
+                    _riskLatchManager?.Clear(key);
+                }
+
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr,
+                    eventType: "INSTRUMENT_UNFROZEN_LATE_SESSION_FLATTEN", state: "ENGINE",
+                    new
+                    {
+                        instrument = inst,
+                        stream = stream.Stream,
+                        original_intent_id = iid,
+                        execution_instrument = streamExec,
+                        canonical_instrument = streamInst,
+                        note = "Session-close flatten timeout latch cleared after late fill proved broker-flat and original intent closed."
+                    }));
+            }
+
+            if (!matchedAny)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr,
+                    eventType: "SESSION_CLOSE_FLATTEN_LATE_CONFIRMED_NO_STREAM", state: "ENGINE",
+                    new
+                    {
+                        instrument = inst,
+                        original_intent_id = iid,
+                        note = "Late session-close flatten was broker-flat, but no active interrupted stream matched it."
+                    }));
+            }
+        }
+    }
+
+    private bool HasInterruptedSessionCloseStreamForInstrument(string instrument)
+    {
+        lock (_engineLock)
+        {
+            foreach (var stream in _streams.Values)
+            {
+                var streamInst = stream.Instrument ?? "";
+                var streamExec = stream.ExecutionInstrument ?? "";
+                if (!string.Equals(streamInst, instrument, StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(streamExec, instrument, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (stream.ExecutionInterruptedByClose)
+                    return true;
+            }
+        }
+
+        return false;
     }
 
     public void OnConnectionStatusUpdate(ConnectionStatus status, string connectionName)

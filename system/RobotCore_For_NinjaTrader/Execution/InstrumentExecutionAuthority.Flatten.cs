@@ -241,7 +241,8 @@ public sealed partial class InstrumentExecutionAuthority
                     DecisionUtc = utcNow,
                     FlattenLegIndex = li,
                     CanonicalExposureAbsTotalAtDecision = absForPolicy,
-                    LegContractLabel = leg.ContractLabel
+                    LegContractLabel = leg.ContractLabel,
+                    BrokerMarketPositionAtDecision = leg.BrokerMarketPosition
                 };
 
                 lastSubmit = Executor.SubmitFlattenOrder(instrumentKey, chosenSide, absQty, snapshot, utcNow, leg.NativeInstrument);
@@ -259,7 +260,16 @@ public sealed partial class InstrumentExecutionAuthority
                 }
 
                 if (!string.IsNullOrEmpty(lastSubmit.BrokerOrderId))
-                    RegisterFlattenOrder(lastSubmit.BrokerOrderId, instrumentKey, OrderOwnershipStatus.OWNED, "RequestFlatten", utcNow);
+                    RegisterFlattenOrder(
+                        lastSubmit.BrokerOrderId,
+                        instrumentKey,
+                        OrderOwnershipStatus.OWNED,
+                        "RequestFlatten",
+                        utcNow,
+                        originalIntentId: callerContext,
+                        flattenRequestId: snapshot.LatchRequestId,
+                        flattenReason: reason,
+                        flattenLegIndex: li);
                 Log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "FLATTEN_ORDER_SUBMITTED", state: "ENGINE", new
                 {
                     execution_instrument_key = ExecutionInstrumentKey,
@@ -330,7 +340,8 @@ public sealed partial class InstrumentExecutionAuthority
             {
                 instrument = instrumentKey,
                 order_id = orderId,
-                request_id = entry.RequestId
+                request_id = entry.RequestId,
+                original_intent_id = TryResolveByBrokerOrderId(orderId ?? "", out var regEntry) ? regEntry?.FlattenOriginalIntentId : null
             }));
         }
     }

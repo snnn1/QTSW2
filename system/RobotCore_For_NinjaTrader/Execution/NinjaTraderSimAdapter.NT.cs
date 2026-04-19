@@ -77,6 +77,11 @@ public sealed partial class NinjaTraderSimAdapter
         !string.IsNullOrEmpty(encodedTag) &&
         encodedTag.StartsWith($"{RobotOrderIds.Prefix}FLATTEN:", StringComparison.OrdinalIgnoreCase);
 
+    private bool IsRobotOwnedOrderUpdateRace(string? encodedTag, string? intentId) =>
+        (!string.IsNullOrWhiteSpace(intentId) && IntentMap.ContainsKey(intentId.Trim())) ||
+        (!string.IsNullOrWhiteSpace(encodedTag) &&
+         encodedTag.StartsWith(RobotOrderIds.Prefix, StringComparison.OrdinalIgnoreCase));
+
     private static bool IsRobotOwnedFlattenOrder(string? encodedTag, OrderInfo? orderFromMap) =>
         IsRobotOwnedFlattenByTag(encodedTag) ||
         (orderFromMap != null && string.Equals(orderFromMap.OrderType, "FLATTEN", StringComparison.OrdinalIgnoreCase));
@@ -445,10 +450,14 @@ public sealed partial class NinjaTraderSimAdapter
                     !string.Equals(master, canonical, StringComparison.OrdinalIgnoreCase))
                     continue;
                 var label = position.Instrument?.FullName ?? master;
+                var brokerMarketPosition = position.MarketPosition.ToString();
+                var signedQuantity = BrokerPositionResolver.ApplyMarketPositionSign(position.Quantity, brokerMarketPosition);
+                if (signedQuantity == 0) continue;
                 legs.Add(new BrokerPositionLeg
                 {
-                    SignedQuantity = position.Quantity,
+                    SignedQuantity = signedQuantity,
                     ContractLabel = label,
+                    BrokerMarketPosition = brokerMarketPosition,
                     NativeInstrument = position.Instrument
                 });
             }
@@ -514,6 +523,26 @@ public sealed partial class NinjaTraderSimAdapter
         var ntInstrument = (nativeInstrumentForBrokerOrder ?? (object?)_ntInstrument) as Instrument;
         if (account == null || ntInstrument == null)
             return OrderSubmissionResult.FailureResult("NT context not set", utcNow);
+
+        var (validDirection, directionError) = FlattenInvariantValidator.ValidateFlattenReducesExposure(
+            snapshot.AccountQuantityAtDecision,
+            side,
+            quantity);
+        if (!validDirection)
+        {
+            _log.Write(RobotEvents.ExecutionBase(utcNow, "", instrument, "FLATTEN_DIRECTION_INVALID", new
+            {
+                instrument,
+                account_quantity = snapshot.AccountQuantityAtDecision,
+                account_direction = snapshot.AccountDirectionAtDecision,
+                broker_market_position = snapshot.BrokerMarketPositionAtDecision,
+                chosen_side = side,
+                chosen_quantity = quantity,
+                error = directionError,
+                latch_request_id = snapshot.LatchRequestId
+            }));
+            return OrderSubmissionResult.FailureResult(directionError ?? "FLATTEN_DIRECTION_INVALID", utcNow);
+        }
 
         var orderAction = side.Equals("SELL", StringComparison.OrdinalIgnoreCase) ? OrderAction.Sell : OrderAction.BuyToCover;
         try
@@ -757,7 +786,8 @@ public sealed partial class NinjaTraderSimAdapter
                 DecisionUtc = utcNow,
                 FlattenLegIndex = li,
                 CanonicalExposureAbsTotalAtDecision = exposure.ReconciliationAbsQuantityTotal,
-                LegContractLabel = leg.ContractLabel
+                LegContractLabel = leg.ContractLabel,
+                BrokerMarketPositionAtDecision = leg.BrokerMarketPosition
             };
             lastSubmit = ((IIEAOrderExecutor)this).SubmitFlattenOrder(instrument, chosenSide, absQty, snapshot, utcNow, leg.NativeInstrument);
             if (!lastSubmit.Success)
@@ -1604,6 +1634,7 @@ public sealed partial class NinjaTraderSimAdapter
         {
             _log.Write(RobotEvents.ExecutionBase(utcNow, cmd.ReentryIntentId ?? "", execInst, "SUBMIT_MARKET_REENTRY_SKIPPED",
                 new { reason = "Missing required fields", reentryIntentId = cmd.ReentryIntentId, execInst, direction, quantity }));
+            _onReentrySubmitCompletedCallback?.Invoke(cmd.ReentryIntentId ?? "", utcNow, false, "Missing required fields");
             return;
         }
 
@@ -1640,6 +1671,7 @@ public sealed partial class NinjaTraderSimAdapter
         var result = SubmitEntryOrder(canonicalIntentId, execInst, direction, null, quantity, "MARKET", null, utcNow);
         _log.Write(RobotEvents.ExecutionBase(utcNow, canonicalIntentId, execInst, "SUBMIT_MARKET_REENTRY_COMPLETED",
             new { success = result.Success, error = result.ErrorMessage }));
+        _onReentrySubmitCompletedCallback?.Invoke(canonicalIntentId, utcNow, result.Success, result.ErrorMessage);
     }
 
     private void RegisterPendingFlattenVerification(string instrumentKey, string correlationId, DateTimeOffset utcNow)
@@ -1649,6 +1681,95 @@ public sealed partial class NinjaTraderSimAdapter
         var coordInst = GetFlattenCoordinationInstanceId();
         FlattenCoordinationTracker.Shared.TryPeekEpisodeForOwner(coordAcct, instrumentKey, coordInst, out var eid, out _, out _);
         _pendingFlattenVerifications[instrumentKey] = (utcNow, deadline, correlationId, eid);
+    }
+
+    private List<(string InstrumentKey, string CorrelationId, string? EpisodeId)> RetirePendingFlattenVerificationsForLateSessionClose(
+        string exposureInstrument,
+        string originalIntentId,
+        BrokerCanonicalExposure exposure,
+        DateTimeOffset utcNow)
+    {
+        var retired = new List<(string InstrumentKey, string CorrelationId, string? EpisodeId)>();
+        if (string.IsNullOrWhiteSpace(exposureInstrument))
+            return retired;
+
+        var coordAcct = GetCoordinationAccountName();
+        var coordInst = GetFlattenCoordinationInstanceId();
+        var hostChart = (_ntInstrument as Instrument)?.FullName;
+
+        foreach (var kvp in _pendingFlattenVerifications.ToArray())
+        {
+            var instrumentKey = kvp.Key;
+            if (!ExecutionInstrumentResolver.IsSameInstrument(instrumentKey, exposureInstrument) &&
+                !string.Equals(BrokerPositionResolver.NormalizeCanonicalKey(instrumentKey),
+                    BrokerPositionResolver.NormalizeCanonicalKey(exposureInstrument), StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (!_pendingFlattenVerifications.TryRemove(instrumentKey, out var pending))
+                continue;
+
+            FlattenCoordinationTracker.Shared.ProcessVerifyWindow(coordAcct, instrumentKey, coordInst, 0, utcNow, out _, out var episodeAfter, out _);
+            var episodeId = string.IsNullOrEmpty(episodeAfter) ? pending.EpisodeId : episodeAfter;
+            retired.Add((instrumentKey, pending.CorrelationId, episodeId));
+
+            _log.Write(RobotEvents.ExecutionBase(utcNow, originalIntentId, instrumentKey, "FLATTEN_VERIFY_RETIRED_LATE_SESSION_CLOSE_CONFIRMED",
+                new
+                {
+                    correlation_id = pending.CorrelationId,
+                    original_intent_id = originalIntentId,
+                    logical_instrument = instrumentKey,
+                    execution_instrument_key = exposureInstrument,
+                    canonical_broker_key = exposure.CanonicalKey,
+                    reconciliation_abs_remaining = exposure.ReconciliationAbsQuantityTotal,
+                    broker_position_rows = BrokerPositionResolver.ToDiagnosticRows(exposure),
+                    account = coordAcct,
+                    owner_instance_id = coordInst,
+                    current_instance_id = coordInst,
+                    episode_id = episodeId,
+                    host_chart_instrument = hostChart,
+                    note = "Late session-close flatten has broker-flat proof; retiring stale verifier before market-open reentry can be mistaken as old exposure."
+                }));
+
+            TryAppendLateSessionCloseFlattenConfirmedKeyEvent(utcNow, instrumentKey, pending.CorrelationId, episodeId, originalIntentId);
+            _flattenCompletionDecisionLog.Append(new FlattenCompletionDecisionRecord
+            {
+                Utc = utcNow,
+                Instrument = instrumentKey,
+                CanonicalBrokerKey = exposure.CanonicalKey,
+                ReconciliationAbsRemaining = 0,
+                Proof = FlattenCompletionDecisionRecord.ProofCanonicalAbsZero,
+                CorrelationId = pending.CorrelationId,
+                EpisodeId = episodeId,
+                Source = "LATE_SESSION_CLOSE_CONFIRM"
+            });
+        }
+
+        return retired;
+    }
+
+    private void TryAppendLateSessionCloseFlattenConfirmedKeyEvent(
+        DateTimeOffset utcNow,
+        string instrumentKey,
+        string correlationId,
+        string? episodeId,
+        string originalIntentId)
+    {
+        if (_keyEventWriter == null || string.IsNullOrWhiteSpace(instrumentKey) || string.IsNullOrWhiteSpace(correlationId))
+            return;
+
+        if (!_keyEventWriter.TryShouldEmitFlattenPhase("FLATTEN_CONFIRMED", instrumentKey, correlationId))
+            return;
+
+        _keyEventWriter.AppendKeyEvent(utcNow, "FLATTEN_CONFIRMED", instrumentKey, null,
+            "LATE_SESSION_CLOSE_CONFIRM",
+            new Dictionary<string, object?>
+            {
+                ["correlation_id"] = correlationId,
+                ["episode_id"] = episodeId,
+                ["original_intent_id"] = originalIntentId
+            });
     }
 
     partial void OnVerifyPendingFlattens()
@@ -3096,6 +3217,22 @@ public sealed partial class NinjaTraderSimAdapter
                 return;
 
             var instrument = order.Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
+            if (IsRobotOwnedOrderUpdateRace(encodedTag, intentId))
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ROBOT_ORDER_UPDATE_REGISTRY_RACE",
+                    new
+                    {
+                        broker_order_id = order.OrderId,
+                        intent_id = intentId,
+                        tag = encodedTag,
+                        tag_source = tagSource,
+                        parsed_leg = parsed.Leg,
+                        order_state = orderState.ToString(),
+                        note = "Robot-tagged order update arrived before OrderMap/IEA registry hydration completed; suppressing manual/external recovery."
+                    }));
+                return;
+            }
+
             // Phase 2: Order update for order not in registry or OrderMap - manual/external order policy
             if (_useInstrumentExecutionAuthority && _iea != null && !_iea.TryResolveByBrokerOrderId(order.OrderId, out _))
             {
@@ -3950,7 +4087,8 @@ public sealed partial class NinjaTraderSimAdapter
                 execution_id = execIdRec,
                 reason = "registry_miss_but_tag_matched"
             }));
-            ProcessBrokerFlattenFill(record.Execution, instrument, record.FillPrice, record.FillQuantity, utcNow, order.OrderId, order);
+            ProcessBrokerFlattenFill(record.Execution, instrument, record.FillPrice, record.FillQuantity, utcNow, order.OrderId, order,
+                TryResolveFlattenRegistryEntry(order.OrderId));
             CheckAllInstrumentsForFlatPositions(utcNow);
             return;
         }
@@ -4103,7 +4241,8 @@ public sealed partial class NinjaTraderSimAdapter
                 execution_id = execIdRec,
                 reason = "registry_miss_but_tag_matched"
             }));
-            ProcessBrokerFlattenFill(execution, instrumentFlatten, fillPrice, fillQuantity, utcNow, order.OrderId, order);
+            ProcessBrokerFlattenFill(execution, instrumentFlatten, fillPrice, fillQuantity, utcNow, order.OrderId, order,
+                TryResolveFlattenRegistryEntry(order.OrderId));
             CheckAllInstrumentsForFlatPositions(utcNow);
             return;
         }
@@ -4119,7 +4258,8 @@ public sealed partial class NinjaTraderSimAdapter
 
             if (TryRecognizeSelfInitiatedFlattenCloseFill(instrument, utcNow))
             {
-                ProcessBrokerFlattenFill(execution, instrument, fillPrice, fillQuantity, utcNow, order.OrderId, order);
+                ProcessBrokerFlattenFill(execution, instrument, fillPrice, fillQuantity, utcNow, order.OrderId, order,
+                    TryResolveFlattenRegistryEntry(order.OrderId));
                 CheckAllInstrumentsForFlatPositions(utcNow);
                 return;
             }
@@ -4236,7 +4376,10 @@ public sealed partial class NinjaTraderSimAdapter
                 intent_id = intentId,
                 resolution_path = resolutionPath,
                 order_role = regEntry.OrderRole.ToString(),
-                ownership_status = regEntry.OwnershipStatus.ToString()
+                ownership_status = regEntry.OwnershipStatus.ToString(),
+                flatten_original_intent_id = regEntry.FlattenOriginalIntentId,
+                flatten_request_id = regEntry.FlattenRequestId,
+                flatten_reason = regEntry.FlattenReason
             }));
             var fillQtyResolved = 0;
             try
@@ -4549,7 +4692,8 @@ public sealed partial class NinjaTraderSimAdapter
         if (IsRobotOwnedFlattenOrder(encodedTag, orderInfo) && order != null)
         {
             var flattenInst = order.Instrument?.MasterInstrument?.Name ?? orderInfo.Instrument?.Trim() ?? "UNKNOWN";
-            ProcessBrokerFlattenFill(execution, flattenInst, fillPrice, fillQuantity, utcNow, order.OrderId, order);
+            ProcessBrokerFlattenFill(execution, flattenInst, fillPrice, fillQuantity, utcNow, order.OrderId, order,
+                TryResolveFlattenRegistryEntry(order.OrderId));
             return;
         }
 
@@ -5179,7 +5323,7 @@ public sealed partial class NinjaTraderSimAdapter
     /// Emits EXECUTION_FILLED per intent, RecordExitFill, OnExitFill.
     /// If no intents can be mapped, emits EXECUTION_FILL_UNMAPPED (CRITICAL).
     /// </summary>
-    private void ProcessBrokerFlattenFill(object execution, string instrument, decimal fillPrice, int fillQuantity, DateTimeOffset utcNow, object orderId, Order order)
+    private void ProcessBrokerFlattenFill(object execution, string instrument, decimal fillPrice, int fillQuantity, DateTimeOffset utcNow, object orderId, Order order, OrderRegistryEntry? flattenRegistryEntry = null)
     {
         var accountName = _iea?.AccountName ?? ExecutionUpdateRouter.GetAccountNameFromOrder(order);
         var execInstKey = _iea?.ExecutionInstrumentKey ?? ExecutionUpdateRouter.GetExecutionInstrumentKeyFromOrder(order.Instrument);
@@ -5190,66 +5334,138 @@ public sealed partial class NinjaTraderSimAdapter
         try { dynamic d = execution; brokerExecId = d.ExecutionId as string; } catch { }
         var fillGroupId = ComputeFillGroupId(brokerExecId, orderIdInternal, brokerOrderId, utcNow.ToString("o"), fillPrice, fillQuantity);
 
-        // Try instrument and execInstKey - exposure.Instrument may be MES while order reports ES
-        var exposures = _coordinator?.GetActiveExposuresForInstrument(instrument) ?? new List<IntentExposure>();
-        if (exposures.Count == 0 && !string.IsNullOrEmpty(execInstKey))
-            exposures = _coordinator?.GetActiveExposuresForInstrument(execInstKey) ?? new List<IntentExposure>();
-        var matchingExposures = exposures.Where(e => ExecutionInstrumentResolver.IsSameInstrument(e.Instrument, instrument)).ToList();
+        List<(string IntentId, int Qty, string TradingDate, string Stream, ExecutionJournalEntry? Entry)> allocated;
+        var allocatedFromFlattenRegistry = false;
+        var allocatedFromOpenJournal = false;
 
-        if (matchingExposures.Count == 0)
+        if (TryAllocateFlattenFillFromRegistryLink(flattenRegistryEntry, instrument, execInstKey, fillQuantity, out allocated))
         {
-            EmitUnmappedFill(instrument, "NO_ACTIVE_EXPOSURES", fillPrice, fillQuantity, utcNow, orderId, order);
-            LogCriticalWithIeaContext(utcNow, "", instrument, "EXECUTION_FILL_UNMAPPED",
+            allocatedFromFlattenRegistry = true;
+            _log.Write(RobotEvents.ExecutionBase(utcNow, flattenRegistryEntry?.FlattenOriginalIntentId ?? "FLATTEN", instrument, "FLATTEN_FILL_ALLOCATED_FROM_REGISTRY_LINK",
                 new
                 {
-                    error = "Broker flatten fill cannot be mapped to any intent",
                     broker_order_id = brokerOrderId,
-                    instrument = instrument,
-                    account = accountName,
+                    instrument,
                     execution_instrument_key = execInstKey,
-                    fill_price = fillPrice,
                     fill_quantity = fillQuantity,
-                    timestamp_utc = utcNow.ToString("o"),
-                    note = "No active exposures for instrument - PnL gap"
-                });
-            return;
+                    allocation_count = allocated.Count,
+                    original_intent_id = flattenRegistryEntry?.FlattenOriginalIntentId,
+                    flatten_request_id = flattenRegistryEntry?.FlattenRequestId,
+                    flatten_reason = flattenRegistryEntry?.FlattenReason,
+                    flatten_leg_index = flattenRegistryEntry?.FlattenLegIndex,
+                    note = "Robot-owned flatten fill mapped from the flatten order registry link to its original intent."
+                }));
         }
-
-        var totalRemaining = matchingExposures.Sum(e => e.RemainingExposure);
-        if (totalRemaining <= 0)
+        else
         {
-            EmitUnmappedFill(instrument, "ZERO_REMAINING_EXPOSURE", fillPrice, fillQuantity, utcNow, orderId, order);
-            LogCriticalWithIeaContext(utcNow, "", instrument, "EXECUTION_FILL_UNMAPPED",
-                new
+            // Try instrument and execInstKey - exposure.Instrument may be MES while order reports ES
+            var exposures = _coordinator?.GetActiveExposuresForInstrument(instrument) ?? new List<IntentExposure>();
+            if (exposures.Count == 0 && !string.IsNullOrEmpty(execInstKey))
+                exposures = _coordinator?.GetActiveExposuresForInstrument(execInstKey) ?? new List<IntentExposure>();
+            var matchingExposures = exposures.Where(e => ExecutionInstrumentResolver.IsSameInstrument(e.Instrument, instrument)).ToList();
+
+            if (matchingExposures.Count == 0)
+            {
+                allocated = AllocateFlattenFillToOpenJournalEntries(instrument, execInstKey, fillQuantity);
+                allocatedFromOpenJournal = allocated.Count > 0;
+                if (!allocatedFromOpenJournal)
                 {
-                    error = "Broker flatten fill but exposures have zero remaining",
-                    broker_order_id = brokerOrderId,
-                    instrument = instrument,
-                    account = accountName,
-                    execution_instrument_key = execInstKey,
-                    fill_price = fillPrice,
-                    fill_quantity = fillQuantity,
-                    note = "Coordinator state inconsistent"
-                });
-            return;
+                    EmitUnmappedFill(instrument, "NO_ACTIVE_EXPOSURES", fillPrice, fillQuantity, utcNow, orderId, order);
+                    LogCriticalWithIeaContext(utcNow, "", instrument, "EXECUTION_FILL_UNMAPPED",
+                        new
+                        {
+                            error = "Broker flatten fill cannot be mapped to any intent",
+                            broker_order_id = brokerOrderId,
+                            instrument = instrument,
+                            account = accountName,
+                            execution_instrument_key = execInstKey,
+                            fill_price = fillPrice,
+                            fill_quantity = fillQuantity,
+                            timestamp_utc = utcNow.ToString("o"),
+                            note = "No registry link, active exposures, or open journal rows for instrument - PnL gap"
+                        });
+                    return;
+                }
+
+                _log.Write(RobotEvents.ExecutionBase(utcNow, "FLATTEN", instrument, "FLATTEN_FILL_ALLOCATED_FROM_OPEN_JOURNAL",
+                    new
+                    {
+                        broker_order_id = brokerOrderId,
+                        instrument,
+                        execution_instrument_key = execInstKey,
+                        fill_quantity = fillQuantity,
+                        allocation_count = allocated.Count,
+                        note = "Coordinator exposure was unavailable; open execution journal rows were used to map the robot-owned flatten fill."
+                    }));
+            }
+            else
+            {
+                var totalRemaining = matchingExposures.Sum(e => e.RemainingExposure);
+                if (totalRemaining <= 0)
+                {
+                    allocated = AllocateFlattenFillToOpenJournalEntries(instrument, execInstKey, fillQuantity);
+                    allocatedFromOpenJournal = allocated.Count > 0;
+                    if (!allocatedFromOpenJournal)
+                    {
+                        EmitUnmappedFill(instrument, "ZERO_REMAINING_EXPOSURE", fillPrice, fillQuantity, utcNow, orderId, order);
+                        LogCriticalWithIeaContext(utcNow, "", instrument, "EXECUTION_FILL_UNMAPPED",
+                            new
+                            {
+                                error = "Broker flatten fill but exposures have zero remaining",
+                                broker_order_id = brokerOrderId,
+                                instrument = instrument,
+                                account = accountName,
+                                execution_instrument_key = execInstKey,
+                                fill_price = fillPrice,
+                                fill_quantity = fillQuantity,
+                                note = "Coordinator state inconsistent and no registry/open journal fallback was available"
+                            });
+                        return;
+                    }
+
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, "FLATTEN", instrument, "FLATTEN_FILL_ALLOCATED_FROM_OPEN_JOURNAL",
+                        new
+                        {
+                            broker_order_id = brokerOrderId,
+                            instrument,
+                            execution_instrument_key = execInstKey,
+                            fill_quantity = fillQuantity,
+                            allocation_count = allocated.Count,
+                            note = "Coordinator exposure had zero remaining; open execution journal rows were used to map the robot-owned flatten fill."
+                        }));
+                }
+                else
+                {
+                    allocated = fillQuantity >= totalRemaining
+                        ? matchingExposures.Select(e => (e.IntentId, e.RemainingExposure, "", "", (ExecutionJournalEntry?)null)).ToList()
+                        : AllocateFlattenFillToExposures(matchingExposures, fillQuantity)
+                            .Select(e => (e.IntentId, e.Qty, "", "", (ExecutionJournalEntry?)null)).ToList();
+                }
+            }
         }
 
-        var allocated = fillQuantity >= totalRemaining
-            ? matchingExposures.Select(e => (e.IntentId, e.RemainingExposure)).ToList()
-            : AllocateFlattenFillToExposures(matchingExposures, fillQuantity);
-
-        foreach (var (intentId, allocQty) in allocated)
+        foreach (var (intentId, allocQty, journalTradingDate, journalStream, journalEntry) in allocated)
         {
             if (allocQty <= 0) continue;
             if (!IntentMap.TryGetValue(intentId, out var intent))
             {
-                EmitUnmappedFill(instrument, "INTENT_NOT_FOUND", fillPrice, allocQty, utcNow, orderId, order);
-                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "EXECUTION_FILL_UNMAPPED",
-                    new { broker_order_id = brokerOrderId, intent_id = intentId, alloc_qty = allocQty, error = "Intent not in IntentMap" }));
-                continue;
+                if (journalEntry != null)
+                {
+                    intent = CreateIntentFromJournalEntry(journalTradingDate, journalStream, intentId, journalEntry);
+                    if (intent != null)
+                        RegisterIntent(intent);
+                }
+
+                if (intent == null)
+                {
+                    EmitUnmappedFill(instrument, "INTENT_NOT_FOUND", fillPrice, allocQty, utcNow, orderId, order);
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "EXECUTION_FILL_UNMAPPED",
+                        new { broker_order_id = brokerOrderId, intent_id = intentId, alloc_qty = allocQty, error = "Intent not in IntentMap" }));
+                    continue;
+                }
             }
 
-            var tradingDate = intent.TradingDate ?? "";
+            var tradingDate = intent.TradingDate ?? journalTradingDate ?? "";
             if (string.IsNullOrWhiteSpace(tradingDate))
             {
                 EmitUnmappedFill(instrument, "TRADING_DATE_NULL", fillPrice, allocQty, utcNow, orderId, order);
@@ -5258,12 +5474,30 @@ public sealed partial class NinjaTraderSimAdapter
                 continue;
             }
 
-            var stream = intent.Stream ?? "";
+            var stream = intent.Stream ?? journalStream ?? "";
             var direction = intent.Direction ?? "";
             var side = direction.Equals("Long", StringComparison.OrdinalIgnoreCase) ? "SELL" : "BUY";
             var sessionClass = DeriveSessionClass(stream);
 
             _executionJournal.RecordExitFill(intentId, tradingDate, stream, fillPrice, allocQty, "FLATTEN", utcNow);
+            if (FeatureFlags.CanonicalOwnershipLedgerEnabled && _ownershipLedger != null)
+            {
+                var result = _ownershipLedger.RecordMappedExitFill(
+                    GetLedgerAccountName(), instrument.Trim(), intentId, allocQty, utcNow, executionSeq);
+                if (!result.Success)
+                {
+                    LogCriticalWithIeaContext(utcNow, intentId, instrument, "OWNERSHIP_FLATTEN_EXIT_CLOSE_FAILED",
+                        new
+                        {
+                            intent_id = intentId,
+                            instrument = instrument,
+                            account = GetLedgerAccountName(),
+                            fill_quantity = allocQty,
+                            error = result.ErrorReason ?? "",
+                            note = "Broker flatten fill closed legacy journal exposure but ownership ledger close failed"
+                        });
+                }
+            }
             _iea?.TryTransitionIntentLifecycle(intentId, IntentLifecycleTransition.INTENT_COMPLETED, null, utcNow);
             _coordinator?.OnExitFill(intentId, allocQty, utcNow);
 
@@ -5290,9 +5524,236 @@ public sealed partial class NinjaTraderSimAdapter
                     stream_key = stream,
                     session_class = sessionClass,
                     source = "robot",
-                    mapped = true
+                    mapped = true,
+                    mapped_from_flatten_registry = allocatedFromFlattenRegistry,
+                    mapped_from_open_journal = allocatedFromOpenJournal
+                }));
+
+            TryNotifyLateSessionCloseFlattenComplete(
+                flattenRegistryEntry,
+                intentId,
+                instrument,
+                execInstKey,
+                tradingDate,
+                stream,
+                utcNow,
+                accountName,
+                brokerOrderId);
+        }
+    }
+
+    private void TryNotifyLateSessionCloseFlattenComplete(
+        OrderRegistryEntry? flattenRegistryEntry,
+        string intentId,
+        string instrument,
+        string? executionInstrumentKey,
+        string tradingDate,
+        string stream,
+        DateTimeOffset utcNow,
+        string accountName,
+        string brokerOrderId)
+    {
+        if (flattenRegistryEntry == null)
+            return;
+
+        if (!string.Equals(flattenRegistryEntry.FlattenReason?.Trim(), "SESSION_FORCED_FLATTEN", StringComparison.OrdinalIgnoreCase))
+            return;
+
+        var originalIntentId = flattenRegistryEntry.FlattenOriginalIntentId?.Trim() ?? "";
+        if (string.IsNullOrWhiteSpace(originalIntentId) ||
+            !string.Equals(originalIntentId, intentId, StringComparison.OrdinalIgnoreCase) ||
+            string.IsNullOrWhiteSpace(tradingDate) ||
+            string.IsNullOrWhiteSpace(stream))
+        {
+            return;
+        }
+
+        var entry = _executionJournal.GetEntry(originalIntentId, tradingDate, stream);
+        var remainingOpenQty = entry != null ? ExecutionJournal.GetEntryRemainingOpenQuantity(entry) : int.MaxValue;
+        if (remainingOpenQty > 0)
+            return;
+
+        var exposureInstrument = !string.IsNullOrWhiteSpace(executionInstrumentKey)
+            ? executionInstrumentKey.Trim()
+            : instrument.Trim();
+
+        BrokerCanonicalExposure exposure;
+        try
+        {
+            exposure = ((IIEAOrderExecutor)this).GetBrokerCanonicalExposure(exposureInstrument);
+        }
+        catch (Exception ex)
+        {
+            _log.Write(RobotEvents.ExecutionBase(utcNow, originalIntentId, instrument, "SESSION_CLOSE_FLATTEN_LATE_BROKER_FLAT_CHECK_FAILED",
+                new
+                {
+                    broker_order_id = brokerOrderId,
+                    instrument,
+                    execution_instrument_key = exposureInstrument,
+                    account = accountName,
+                    error = ex.Message,
+                    exception_type = ex.GetType().Name
+                }));
+            return;
+        }
+
+        if (!FlattenCompletionAuthority.IsOfficialFlattenComplete(exposure))
+            return;
+
+        var dedupeKey = $"{originalIntentId}|{exposureInstrument}|{flattenRegistryEntry.FlattenRequestId ?? ""}";
+        if (!_lateSessionCloseFlattenConfirmed.TryAdd(dedupeKey, 0))
+            return;
+
+        var retiredVerifiers = RetirePendingFlattenVerificationsForLateSessionClose(exposureInstrument, originalIntentId, exposure, utcNow);
+        var fallbackCorrelationId = flattenRegistryEntry.FlattenRequestId?.Trim();
+        if (!string.IsNullOrWhiteSpace(fallbackCorrelationId))
+            TryAppendLateSessionCloseFlattenConfirmedKeyEvent(utcNow, exposureInstrument, fallbackCorrelationId, null, originalIntentId);
+
+        _log.Write(RobotEvents.ExecutionBase(utcNow, originalIntentId, instrument, "SESSION_CLOSE_FLATTEN_LATE_BROKER_FLAT_CONFIRMED",
+            new
+            {
+                broker_order_id = brokerOrderId,
+                instrument,
+                execution_instrument_key = exposureInstrument,
+                account = accountName,
+                trading_date = tradingDate,
+                stream,
+                original_intent_id = originalIntentId,
+                flatten_request_id = flattenRegistryEntry.FlattenRequestId,
+                flatten_reason = flattenRegistryEntry.FlattenReason,
+                journal_remaining_open_qty = remainingOpenQty,
+                broker_reconciliation_abs_total = exposure.ReconciliationAbsQuantityTotal,
+                broker_legs = BrokerPositionResolver.ToDiagnosticRows(exposure),
+                retired_pending_flatten_verifiers = retiredVerifiers.Select(x => new { instrument = x.InstrumentKey, correlation_id = x.CorrelationId, episode_id = x.EpisodeId }).ToArray(),
+                note = "Timed-out session-close flatten later completed; broker-flat proof will clear the reentry latch."
+            }));
+
+        try
+        {
+            _onSessionCloseFlattenConfirmedLateCallback?.Invoke(originalIntentId, exposureInstrument, utcNow);
+        }
+        catch (Exception ex)
+        {
+            _log.Write(RobotEvents.ExecutionBase(utcNow, originalIntentId, instrument, "SESSION_CLOSE_FLATTEN_LATE_CALLBACK_FAILED",
+                new
+                {
+                    broker_order_id = brokerOrderId,
+                    instrument,
+                    execution_instrument_key = exposureInstrument,
+                    account = accountName,
+                    error = ex.Message,
+                    exception_type = ex.GetType().Name
                 }));
         }
+    }
+
+    private OrderRegistryEntry? TryResolveFlattenRegistryEntry(object? orderId)
+    {
+        var brokerOrderId = orderId?.ToString() ?? "";
+        if (!_useInstrumentExecutionAuthority || _iea == null || string.IsNullOrEmpty(brokerOrderId))
+            return null;
+
+        if (!_iea.TryResolveByBrokerOrderId(brokerOrderId, out var entry) || entry == null)
+            return null;
+
+        return entry.OrderRole == OrderRole.FLATTEN || entry.OrderRole == OrderRole.RECOVERY_FLATTEN
+            ? entry
+            : null;
+    }
+
+    private bool TryAllocateFlattenFillFromRegistryLink(
+        OrderRegistryEntry? flattenRegistryEntry,
+        string instrument,
+        string? executionInstrumentKey,
+        int fillQuantity,
+        out List<(string IntentId, int Qty, string TradingDate, string Stream, ExecutionJournalEntry? Entry)> allocated)
+    {
+        allocated = new List<(string IntentId, int Qty, string TradingDate, string Stream, ExecutionJournalEntry? Entry)>();
+        if (flattenRegistryEntry == null || fillQuantity <= 0)
+            return false;
+
+        var originalIntentId = flattenRegistryEntry.FlattenOriginalIntentId?.Trim() ?? "";
+        if (string.IsNullOrEmpty(originalIntentId) ||
+            originalIntentId.Equals("NT_FLATTEN", StringComparison.OrdinalIgnoreCase) ||
+            originalIntentId.Equals("EMERGENCY_BLOCK", StringComparison.OrdinalIgnoreCase) ||
+            originalIntentId.Equals("UNKNOWN_UNTrackED_FILL", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var registryInstrument = flattenRegistryEntry.Instrument?.Trim() ?? "";
+        var executionInstrument = !string.IsNullOrWhiteSpace(executionInstrumentKey)
+            ? executionInstrumentKey.Trim()
+            : (!string.IsNullOrWhiteSpace(registryInstrument) ? registryInstrument : instrument.Trim());
+        var canonical = DeriveCanonicalFromExecutionInstrument(executionInstrument);
+
+        var located = _executionJournal.TryGetAdoptionCandidateEntry(originalIntentId, executionInstrument, canonical)
+            ?? _executionJournal.TryGetAdoptionCandidateEntry(originalIntentId, instrument, canonical)
+            ?? (!string.IsNullOrWhiteSpace(registryInstrument)
+                ? _executionJournal.TryGetAdoptionCandidateEntry(originalIntentId, registryInstrument, canonical)
+                : null);
+
+        if (!located.HasValue)
+            return false;
+
+        var remaining = ExecutionJournal.GetEntryRemainingOpenQuantity(located.Value.Entry);
+        if (remaining <= 0)
+            return false;
+
+        var qty = Math.Min(fillQuantity, remaining);
+        if (qty <= 0)
+            return false;
+
+        allocated.Add((originalIntentId, qty, located.Value.TradingDate, located.Value.Stream, located.Value.Entry));
+        return true;
+    }
+
+    private List<(string IntentId, int Qty, string TradingDate, string Stream, ExecutionJournalEntry? Entry)> AllocateFlattenFillToOpenJournalEntries(
+        string instrument,
+        string? executionInstrumentKey,
+        int fillQuantity)
+    {
+        var result = new List<(string IntentId, int Qty, string TradingDate, string Stream, ExecutionJournalEntry? Entry)>();
+        if (fillQuantity <= 0) return result;
+
+        var openByInstrument = _executionJournal.GetOpenJournalEntriesByInstrument();
+        var candidates = new List<(string TradingDate, string Stream, string IntentId, ExecutionJournalEntry Entry, int Remaining)>();
+        foreach (var kvp in openByInstrument)
+        {
+            var journalInstrument = kvp.Key?.Trim() ?? "";
+            if (string.IsNullOrEmpty(journalInstrument))
+                continue;
+            if (!ExecutionInstrumentResolver.IsSameInstrument(journalInstrument, instrument) &&
+                !ExecutionInstrumentResolver.IsSameInstrument(journalInstrument, executionInstrumentKey))
+                continue;
+
+            foreach (var row in kvp.Value)
+            {
+                var remaining = ExecutionJournal.GetEntryRemainingOpenQuantity(row.Entry);
+                if (remaining <= 0)
+                    continue;
+                candidates.Add((row.TradingDate, row.Stream, row.IntentId, row.Entry, remaining));
+            }
+        }
+
+        var remainingFill = fillQuantity;
+        foreach (var candidate in candidates
+                     .OrderBy(c => c.TradingDate, StringComparer.Ordinal)
+                     .ThenBy(c => c.Stream, StringComparer.Ordinal)
+                     .ThenBy(c => c.IntentId, StringComparer.Ordinal))
+        {
+            if (remainingFill <= 0)
+                break;
+
+            var qty = Math.Min(remainingFill, candidate.Remaining);
+            if (qty <= 0)
+                continue;
+
+            result.Add((candidate.IntentId, qty, candidate.TradingDate, candidate.Stream, candidate.Entry));
+            remainingFill -= qty;
+        }
+
+        return result;
     }
 
     private static List<(string IntentId, int Qty)> AllocateFlattenFillToExposures(List<IntentExposure> exposures, int fillQuantity)
@@ -6880,12 +7341,14 @@ public sealed partial class NinjaTraderSimAdapter
             {
                 if (position.Quantity != 0)
                 {
+                    var brokerMarketPosition = position.MarketPosition.ToString();
                     positions.Add(new PositionSnapshot
                     {
                         Instrument = position.Instrument.MasterInstrument.Name,
-                        Quantity = position.Quantity,
+                        Quantity = BrokerPositionResolver.ApplyMarketPositionSign(position.Quantity, brokerMarketPosition),
                         AveragePrice = (decimal)position.AveragePrice,
-                        ContractLabel = position.Instrument.FullName
+                        ContractLabel = position.Instrument.FullName,
+                        MarketPosition = brokerMarketPosition
                     });
                 }
             }
@@ -7433,7 +7896,8 @@ public sealed partial class NinjaTraderSimAdapter
                         DecisionUtc = utcNow,
                         FlattenLegIndex = li,
                         CanonicalExposureAbsTotalAtDecision = absForPolicy,
-                        LegContractLabel = leg.ContractLabel
+                        LegContractLabel = leg.ContractLabel,
+                        BrokerMarketPositionAtDecision = leg.BrokerMarketPosition
                     };
                     submitResult = (this as IIEAOrderExecutor).SubmitFlattenOrder(instrument, chosenSide, absQty, snapshot, utcNow, leg.NativeInstrument);
                     if (!submitResult.Success)

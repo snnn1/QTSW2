@@ -223,7 +223,7 @@ public static class SessionCloseResolver
                 if (string.CompareOrdinal(tradingDayStr, targetTradingDay) > 0)
                 {
                     // First segment of next day = next session begin (market reopen for reentry)
-                    var beginOffset = new DateTimeOffset(begin, tz.GetUtcOffset(begin));
+                    var beginOffset = ToSessionOffset(begin, tz);
                     nextSessionBeginUtc = beginOffset.ToUniversalTime();
                     break;
                 }
@@ -231,8 +231,8 @@ public static class SessionCloseResolver
                 if (tradingDayStr == targetTradingDay)
                 {
                     sawTargetDay = true;
-                    var beginOffset = new DateTimeOffset(begin, tz.GetUtcOffset(begin));
-                    var endOffset = new DateTimeOffset(end, tz.GetUtcOffset(end));
+                    var beginOffset = ToSessionOffset(begin, tz);
+                    var endOffset = ToSessionOffset(end, tz);
                     segments.Add((beginOffset.ToUniversalTime(), endOffset.ToUniversalTime()));
                 }
 
@@ -307,6 +307,16 @@ public static class SessionCloseResolver
         }
 
         return result;
+    }
+
+    private static DateTimeOffset ToSessionOffset(DateTime sessionTime, TimeZoneInfo exchangeTimeZone)
+    {
+        if (sessionTime.Kind == DateTimeKind.Utc)
+            return new DateTimeOffset(sessionTime);
+        if (sessionTime.Kind == DateTimeKind.Local)
+            return new DateTimeOffset(sessionTime).ToUniversalTime();
+
+        return new DateTimeOffset(sessionTime, exchangeTimeZone.GetUtcOffset(sessionTime));
     }
 
     /// <summary>
