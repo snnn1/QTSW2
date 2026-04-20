@@ -129,6 +129,9 @@ public sealed class HealthMonitor
     private static readonly Dictionary<long, bool> _sharedConnectionLostLoggedByIncident = new(); // Key: incident ID (ticks)
     private static readonly Dictionary<long, bool> _sharedConnectionLostNotifiedByIncident = new(); // Key: incident ID (ticks)
     private static readonly Dictionary<long, int> _sharedConnectionLostInstanceCountByIncident = new(); // Key: incident ID (ticks)
+    private static readonly object _sharedTimetablePollLock = new object();
+    private static long? _sharedTimetablePollStallLoggedForLastPollTicks;
+    private static long? _sharedTimetablePollRecoveryLoggedForPollTicks;
     // NinjaTrader disables strategy after "lost price connection more than 4 times in 5 minutes"
     private static readonly List<DateTimeOffset> _connectionLossTimestamps = new();
     private static DateTimeOffset _lastPriceConnectionLossRepeatedLogUtc = DateTimeOffset.MinValue;
@@ -573,8 +576,21 @@ public sealed class HealthMonitor
         if (_timetablePollStallActive)
         {
             _timetablePollStallActive = false;
-            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "TIMETABLE_POLL_STALL_RECOVERED", state: "ENGINE",
-                new { last_poll_utc = pollUtc.ToString("o") }));
+            var shouldLogRecovery = false;
+            lock (_sharedTimetablePollLock)
+            {
+                if (_sharedTimetablePollRecoveryLoggedForPollTicks != pollUtc.UtcTicks)
+                {
+                    _sharedTimetablePollRecoveryLoggedForPollTicks = pollUtc.UtcTicks;
+                    shouldLogRecovery = true;
+                }
+            }
+
+            if (shouldLogRecovery)
+            {
+                _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "TIMETABLE_POLL_STALL_RECOVERED", state: "ENGINE",
+                    new { last_poll_utc = pollUtc.ToString("o") }));
+            }
         }
     }
     
@@ -663,16 +679,28 @@ public sealed class HealthMonitor
             if (!_timetablePollStallActive)
             {
                 _timetablePollStallActive = true;
-                
-                // LOG ONLY - no notification (non-execution-critical)
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "TIMETABLE_POLL_STALL_DETECTED", state: "ENGINE",
-                    new
+                var shouldLogDetected = false;
+                lock (_sharedTimetablePollLock)
+                {
+                    if (_sharedTimetablePollStallLoggedForLastPollTicks != _lastTimetablePollUtc.UtcTicks)
                     {
-                        last_poll_utc = _lastTimetablePollUtc.ToString("o"),
-                        elapsed_seconds = elapsed,
-                        threshold_seconds = TIMETABLE_POLL_STALL_SECONDS,
-                        note = "Notification suppressed - non-execution-critical (log only)"
-                    }));
+                        _sharedTimetablePollStallLoggedForLastPollTicks = _lastTimetablePollUtc.UtcTicks;
+                        shouldLogDetected = true;
+                    }
+                }
+
+                if (shouldLogDetected)
+                {
+                    // LOG ONLY - no notification (non-execution-critical)
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "TIMETABLE_POLL_STALL_DETECTED", state: "ENGINE",
+                        new
+                        {
+                            last_poll_utc = _lastTimetablePollUtc.ToString("o"),
+                            elapsed_seconds = elapsed,
+                            threshold_seconds = TIMETABLE_POLL_STALL_SECONDS,
+                            note = "Notification suppressed - non-execution-critical (log only; shared-process dedupe enabled)"
+                        }));
+                }
                 
                 // NOTIFICATION DISABLED: Timetable poll stall is non-execution-critical
                 // SendNotification("TIMETABLE_POLL_STALL", title, message, priority: 1);
