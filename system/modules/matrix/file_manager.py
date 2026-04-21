@@ -11,9 +11,10 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, Any
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -26,20 +27,44 @@ logger = logging.getLogger(__name__)
 # Authoritative in-process matrix for timetable publish (dashboard / same Python process).
 # Updated on every save_master_matrix; manual/API publish must use this — not load_existing_matrix.
 _CURRENT_MASTER_MATRIX_DF: Optional[pd.DataFrame] = None
+_CURRENT_MASTER_MATRIX_META: Dict[str, Any] = {}
 
 
-def set_current_master_matrix_df(df: Optional[pd.DataFrame]) -> None:
+def set_current_master_matrix_df(
+    df: Optional[pd.DataFrame],
+    *,
+    source_path: Optional[str] = None,
+    file_mtime: Optional[float] = None,
+    snapshot_id: Optional[str] = None,
+    source_kind: str = "in_memory",
+) -> None:
     """Replace the process-wide matrix snapshot used for live timetable publishing."""
     global _CURRENT_MASTER_MATRIX_DF
+    global _CURRENT_MASTER_MATRIX_META
     if df is None:
         _CURRENT_MASTER_MATRIX_DF = None
+        _CURRENT_MASTER_MATRIX_META = {}
         return
     _CURRENT_MASTER_MATRIX_DF = df.copy()
+    source_name = Path(source_path).name if source_path else (snapshot_id or "in_memory")
+    _CURRENT_MASTER_MATRIX_META = {
+        "source_kind": str(source_kind or "in_memory"),
+        "source_path": str(source_path) if source_path else None,
+        "source_name": source_name,
+        "file_mtime": float(file_mtime) if file_mtime is not None else None,
+        "snapshot_id": str(snapshot_id or f"in_memory_{uuid.uuid4().hex[:12]}"),
+        "row_count": int(len(df)),
+    }
 
 
 def get_current_master_matrix_df() -> Optional[pd.DataFrame]:
     """Latest matrix written by save_master_matrix in this process, or None if never saved."""
     return _CURRENT_MASTER_MATRIX_DF
+
+
+def get_current_master_matrix_meta() -> Dict[str, Any]:
+    """Metadata for the latest in-process matrix snapshot used by dashboard/timetable flows."""
+    return dict(_CURRENT_MASTER_MATRIX_META)
 
 
 # Regex to extract row count from filename: master_matrix_YYYYMMDD_HHMMSS_Nn.parquet
@@ -256,7 +281,14 @@ def save_master_matrix(
         duration_ms=duration_ms,
     )
 
-    set_current_master_matrix_df(df)
+    final_mtime = parquet_file.stat().st_mtime if parquet_file.exists() else None
+    set_current_master_matrix_df(
+        df,
+        source_path=str(parquet_file),
+        file_mtime=final_mtime,
+        snapshot_id=parquet_file.name,
+        source_kind="disk",
+    )
 
     # Persist execution timetable from matrix in background (non-blocking).
     # Keeps timetable_current.json aligned with disk matrix when builds only call save_master_matrix.
@@ -496,6 +528,5 @@ def get_best_matrix_file(output_dir: str) -> Optional[Path]:
         except Exception:
             pass
     return best_path
-
 
 

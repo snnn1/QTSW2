@@ -1,0 +1,8 @@
+﻿{
+    "TaskName":  "Pipeline Runner",
+    "TaskPath":  "\\",
+    "State":  3,
+    "Execute":  "C:\\Users\\jakej\\AppData\\Local\\Programs\\Python\\Python313\\python.exe",
+    "Arguments":  "-m tools.automation.run_pipeline_standalone",
+    "WorkingDirectory":  "C:\\Users\\jakej\\QTSW2"
+}

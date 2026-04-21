@@ -2567,6 +2567,65 @@ public sealed class ExecutionJournal
         return closed;
     }
 
+    /// <summary>
+    /// When broker-flat proof arrives after a timed-out session-close flatten, close any still-open interrupted
+    /// journal rows for the same execution/canonical instrument set so sibling streams can reenter together.
+    /// </summary>
+    public int ReconcileInterruptedSessionCloseBrokerFlat(
+        string executionInstrumentPrimary,
+        string? canonicalInstrument,
+        IReadOnlyCollection<string> interruptedIntentIds,
+        DateTimeOffset utcNow,
+        string? triggerSource = null)
+    {
+        var executionKey = executionInstrumentPrimary?.Trim() ?? "";
+        if (string.IsNullOrWhiteSpace(executionKey) || interruptedIntentIds == null || interruptedIntentIds.Count == 0)
+            return 0;
+
+        var interruptedSet = interruptedIntentIds as HashSet<string> ??
+                             new HashSet<string>(interruptedIntentIds, StringComparer.OrdinalIgnoreCase);
+        if (interruptedSet.Count == 0)
+            return 0;
+
+        var openByInstrument = GetOpenJournalEntriesByInstrument();
+        var processed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var closed = 0;
+
+        foreach (var kv in openByInstrument)
+        {
+            if (!OpenJournalInstrumentKeyMatches(kv.Key, executionKey, canonicalInstrument))
+                continue;
+
+            foreach (var (tradingDate, stream, intentId, entry) in kv.Value)
+            {
+                if (!interruptedSet.Contains(intentId))
+                    continue;
+
+                var rowKey = $"{tradingDate}_{stream}_{intentId}";
+                if (!processed.Add(rowKey))
+                    continue;
+
+                var openQty = GetEntryRemainingOpenQuantity(entry);
+                if (openQty <= 0)
+                    continue;
+
+                if (RecordReconciliationComplete(
+                        tradingDate,
+                        stream,
+                        intentId,
+                        utcNow,
+                        brokerPositionQtyAbsAtDecision: 0,
+                        journalOpenQtyBeforeClose: openQty,
+                        triggerSource: triggerSource ?? "LateSessionCloseFlattenBrokerFlat"))
+                {
+                    closed++;
+                }
+            }
+        }
+
+        return closed;
+    }
+
     private bool TryCloseStaleAdoptionJournalEntry(string tradingDate, string stream, string intentId, DateTimeOffset utcNow)
     {
         if (string.IsNullOrWhiteSpace(tradingDate) || string.IsNullOrWhiteSpace(stream) || string.IsNullOrWhiteSpace(intentId))

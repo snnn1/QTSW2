@@ -78,7 +78,10 @@ import pandas as pd
 import json
 
 # Base paths (must be defined before logging setup)
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
+# merger.py lives at system/modules/merger/merger.py, so repo root is parents[3].
+# Using the repo root keeps merger aligned with the rest of the pipeline, which
+# reads and writes under QTSW2/data and QTSW2/logs rather than QTSW2/system/...
+BASE_DIR = Path(__file__).resolve().parents[3]
 LOGS_DIR = BASE_DIR / 'logs'
 
 # Ensure logs directory exists before setting up logging

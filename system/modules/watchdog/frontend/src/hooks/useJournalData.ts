@@ -21,7 +21,8 @@ import type {
 export function useExecutionJournal(
   tradingDate: string,
   stream?: string,
-  intentId?: string
+  intentId?: string,
+  runRoot?: string | null
 ) {
   const [entries, setEntries] = useState<ExecutionJournalEntry[]>([])
   const [loading, setLoading] = useState(false)
@@ -34,7 +35,7 @@ export function useExecutionJournal(
     }
     
     setLoading(true)
-    fetchExecutionJournal(tradingDate, stream, intentId).then(({ data, error: apiError }) => {
+    fetchExecutionJournal(tradingDate, stream, intentId, runRoot).then(({ data, error: apiError }) => {
       if (apiError) {
         setError(apiError)
         setEntries([])
@@ -44,7 +45,7 @@ export function useExecutionJournal(
       }
       setLoading(false)
     })
-  }, [tradingDate, stream, intentId])
+  }, [tradingDate, stream, intentId, runRoot])
   
   return { entries, loading, error }
 }
@@ -52,7 +53,7 @@ export function useExecutionJournal(
 /**
  * Hook for fetching stream journal
  */
-export function useStreamJournal(tradingDate: string) {
+export function useStreamJournal(tradingDate: string, runRoot?: string | null) {
   const [streams, setStreams] = useState<StreamJournal[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -64,7 +65,7 @@ export function useStreamJournal(tradingDate: string) {
     }
     
     setLoading(true)
-    fetchStreamJournal(tradingDate).then(({ data, error: apiError }) => {
+    fetchStreamJournal(tradingDate, runRoot).then(({ data, error: apiError }) => {
       if (apiError) {
         setError(apiError)
         setStreams([])
@@ -74,7 +75,7 @@ export function useStreamJournal(tradingDate: string) {
       }
       setLoading(false)
     })
-  }, [tradingDate])
+  }, [tradingDate, runRoot])
   
   return { streams, loading, error }
 }
@@ -82,7 +83,7 @@ export function useStreamJournal(tradingDate: string) {
 /**
  * Hook for fetching execution summary
  */
-export function useExecutionSummary(tradingDate: string) {
+export function useExecutionSummary(tradingDate: string, runRoot?: string | null) {
   const [summary, setSummary] = useState<ExecutionSummary | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -94,7 +95,7 @@ export function useExecutionSummary(tradingDate: string) {
     }
     
     setLoading(true)
-    fetchExecutionSummary(tradingDate).then(({ data, error: apiError }) => {
+    fetchExecutionSummary(tradingDate, runRoot).then(({ data, error: apiError }) => {
       if (apiError) {
         setError(apiError)
         setSummary(null)
@@ -104,7 +105,7 @@ export function useExecutionSummary(tradingDate: string) {
       }
       setLoading(false)
     })
-  }, [tradingDate])
+  }, [tradingDate, runRoot])
   
   return { summary, loading, error }
 }
@@ -112,7 +113,7 @@ export function useExecutionSummary(tradingDate: string) {
 /**
  * Hook for fetching unified daily journal
  */
-export function useDailyJournal(tradingDate: string) {
+export function useDailyJournal(tradingDate: string, runRoot?: string | null) {
   const [journal, setJournal] = useState<DailyJournal | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -124,7 +125,7 @@ export function useDailyJournal(tradingDate: string) {
     }
 
     setLoading(true)
-    fetchDailyJournal(tradingDate).then(({ data, error: apiError }) => {
+    fetchDailyJournal(tradingDate, runRoot).then(({ data, error: apiError }) => {
       if (apiError) {
         setError(apiError)
         setJournal(null)
@@ -134,7 +135,7 @@ export function useDailyJournal(tradingDate: string) {
       }
       setLoading(false)
     })
-  }, [tradingDate])
+  }, [tradingDate, runRoot])
 
   return { journal, loading, error }
 }

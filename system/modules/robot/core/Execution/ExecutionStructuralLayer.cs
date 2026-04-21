@@ -51,6 +51,80 @@ public static class ExecutionStructuralLayer
         || (FeatureFlags.QuantExecutionControlStoreEnabled
             && QuantExecutionControlStore.OffersBookkeepingLagProtection(inst, utc));
 
+    private static bool TryBypassQuantRecoveryRequiredForMarketReentry(
+        string? orderSubmitBlockedWhat,
+        QuantExecutionControlSnapshot qSnap,
+        out string detail)
+    {
+        detail = "";
+        if (!string.Equals(orderSubmitBlockedWhat, "SUBMIT_MARKET_REENTRY", StringComparison.Ordinal))
+            return false;
+        if (qSnap.Phase != QuantExecutionInstrumentPhase.RecoveryRequired)
+            return false;
+        if (!string.Equals(qSnap.RecoveryRequiredReason, "recovery_stabilization_window_expired_broker_gross_mismatch", StringComparison.Ordinal))
+            return false;
+
+        detail = "market_reentry_quant_recovery_gross_mismatch_bypass";
+        return true;
+    }
+
+    private static bool IsJournalAuthorityFallbackSubmit(string? orderSubmitBlockedWhat) =>
+        orderSubmitBlockedWhat is "SUBMIT_MARKET_REENTRY" or "SUBMIT_PROTECTIVE_STOP" or "SUBMIT_TARGET";
+
+    private static bool TryFallbackToJournalAuthorityForSubmit(
+        string? orderSubmitBlockedWhat,
+        DerivedPositionAuthority derivedFromLedger,
+        int brokerPositionQty,
+        int journalRealOpenQty,
+        int journalRecoveredOpenQty,
+        out DerivedPositionAuthority fallbackAuthority,
+        out string detail)
+    {
+        detail = "";
+        fallbackAuthority = derivedFromLedger;
+        if (!IsJournalAuthorityFallbackSubmit(orderSubmitBlockedWhat))
+            return false;
+        if (derivedFromLedger != DerivedPositionAuthority.UNKNOWN)
+            return false;
+
+        var journalAuthority = PositionAuthorityDerivation.DerivePositionAuthority(
+            brokerPositionQty, journalRealOpenQty, journalRecoveredOpenQty);
+        if (journalAuthority != DerivedPositionAuthority.REAL)
+            return false;
+
+        fallbackAuthority = journalAuthority;
+        detail = orderSubmitBlockedWhat switch
+        {
+            "SUBMIT_MARKET_REENTRY" => "market_reentry_authority_fallback_journal_real",
+            "SUBMIT_PROTECTIVE_STOP" or "SUBMIT_TARGET" => "risk_coverage_authority_fallback_journal_real",
+            _ => ""
+        };
+        return true;
+    }
+
+    private static bool TryBypassParityNotOkForProtectedSubmit(
+        string? orderSubmitBlockedWhat,
+        JournalParityResult parity,
+        DerivedPositionAuthority derived,
+        out string detail)
+    {
+        detail = "";
+        if (orderSubmitBlockedWhat is not "SUBMIT_MARKET_REENTRY" and not "SUBMIT_PROTECTIVE_STOP" and not "SUBMIT_TARGET")
+            return false;
+        if (parity.Status != JournalParityStatus.POSITION_MISMATCH)
+            return false;
+        if (derived != DerivedPositionAuthority.REAL)
+            return false;
+
+        detail = orderSubmitBlockedWhat switch
+        {
+            "SUBMIT_MARKET_REENTRY" => "market_reentry_parity_position_mismatch_bypass_real_authority",
+            "SUBMIT_PROTECTIVE_STOP" or "SUBMIT_TARGET" => "risk_coverage_parity_position_mismatch_bypass_real_authority",
+            _ => ""
+        };
+        return true;
+    }
+
     private static void ApplyFacts(
         ExecutionSafetySnapshot snap,
         JournalParityResult parity,
@@ -128,7 +202,8 @@ public static class ExecutionStructuralLayer
 
         if (FeatureFlags.QuantExecutionControlStoreEnabled && !flattenAuthorityBypass)
         {
-            var qPhase = QuantExecutionControlStore.GetSnapshot(inst).Phase;
+            var qSnap = QuantExecutionControlStore.GetSnapshot(inst);
+            var qPhase = qSnap.Phase;
             if (qPhase == QuantExecutionInstrumentPhase.UnmappedExecution)
             {
                 snapshot.Reason = StructuralBlocker.QuantUnmappedExecution;
@@ -148,9 +223,18 @@ public static class ExecutionStructuralLayer
                 var blockDirectional = string.IsNullOrEmpty(orderSubmitBlockedWhat) || IsDirectionalOrderSubmit(orderSubmitBlockedWhat);
                 if (blockDirectional)
                 {
-                    snapshot.Reason = StructuralBlocker.QuantRecoveryRequired;
-                    snapshot.Detail = "tier1_quant_phase_recovery_required";
-                    return false;
+                    if (TryBypassQuantRecoveryRequiredForMarketReentry(orderSubmitBlockedWhat, qSnap, out var quantBypassDetail))
+                    {
+                        snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
+                            ? quantBypassDetail
+                            : snapshot.Detail + ";" + quantBypassDetail;
+                    }
+                    else
+                    {
+                        snapshot.Reason = StructuralBlocker.QuantRecoveryRequired;
+                        snapshot.Detail = "tier1_quant_phase_recovery_required";
+                        return false;
+                    }
                 }
             }
         }
@@ -168,6 +252,8 @@ public static class ExecutionStructuralLayer
 
         // Phase 8: when ledger ownership is available and the flag is on, derive authority from ledger
         DerivedPositionAuthority derived;
+        var (journalRealOpen, journalRecoveredOpen, _) =
+            req.Journal.GetPositionAuthorityOpenQuantitiesForInstrument(inst, canonical);
         int realOpen, recoveredOpen;
         if (FeatureFlags.StructuralLayerUseLedgerOwnership && req.LedgerOwnershipSnapshot != null)
         {
@@ -176,10 +262,27 @@ public static class ExecutionStructuralLayer
             recoveredOpen = 0;
             derived = PositionAuthorityDerivation.DerivePositionAuthority(
                 parity.BrokerPositionQty, realOpen, recoveredOpen);
+            if (TryFallbackToJournalAuthorityForSubmit(
+                    orderSubmitBlockedWhat,
+                    derived,
+                    parity.BrokerPositionQty,
+                    journalRealOpen,
+                    journalRecoveredOpen,
+                    out var fallbackAuthority,
+                    out var authorityFallbackDetail))
+            {
+                derived = fallbackAuthority;
+                realOpen = journalRealOpen;
+                recoveredOpen = journalRecoveredOpen;
+                snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
+                    ? authorityFallbackDetail
+                    : snapshot.Detail + ";" + authorityFallbackDetail;
+            }
         }
         else
         {
-            (realOpen, recoveredOpen, _) = req.Journal.GetPositionAuthorityOpenQuantitiesForInstrument(inst, canonical);
+            realOpen = journalRealOpen;
+            recoveredOpen = journalRecoveredOpen;
             derived = PositionAuthorityDerivation.DerivePositionAuthority(
                 parity.BrokerPositionQty, realOpen, recoveredOpen);
         }
@@ -229,6 +332,12 @@ public static class ExecutionStructuralLayer
                     ? parityLagDetail
                     : snapshot.Detail + ";" + parityLagDetail;
             }
+            else if (TryBypassParityNotOkForProtectedSubmit(orderSubmitBlockedWhat, parity, derived, out var parityProtectedDetail))
+            {
+                snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
+                    ? parityProtectedDetail
+                    : snapshot.Detail + ";" + parityProtectedDetail;
+            }
             else if (FeatureFlags.StructuralLayerPhase3DemoteParityNotOkSubmitDeny)
             {
                 var tag = "phase3_parity_not_ok_demoted_to_diagnostic:parity=" + parity.Status;
@@ -277,6 +386,17 @@ public static class ExecutionStructuralLayer
         if (noActiveExposures && parity.BrokerPositionQty != 0)
         {
             snapshot.NoActiveExposuresWithBrokerPosition = true;
+            // Coordinated market-open reentry can race coordinator exposure registration after the first sibling
+            // has already reopened the broker position. Keep earlier parity/authority/quant gates authoritative,
+            // but do not fail the second sibling solely because the coordinator view has not caught up yet.
+            if (string.Equals(orderSubmitBlockedWhat, "SUBMIT_MARKET_REENTRY", StringComparison.Ordinal))
+            {
+                const string reentry = "no_active_exposures_bypass_market_reentry_with_broker_position";
+                snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail) ? reentry : snapshot.Detail + ";" + reentry;
+                snapshot.Reason = "";
+                return true;
+            }
+
             // First protective stop after a mapped fill may race exposure registration; do not hard-deny on this alone.
             if (string.Equals(orderSubmitBlockedWhat, "SUBMIT_PROTECTIVE_STOP", StringComparison.Ordinal))
             {

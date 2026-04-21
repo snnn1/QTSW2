@@ -2011,6 +2011,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     isGlobalKillSwitchActive: () => _killSwitch?.IsEnabled() == true,
                     isMismatchExecutionBlocked: inst =>
                         _mismatchCoordinator != null && _mismatchCoordinator.IsInstrumentBlockedByMismatch(inst),
+                    isMismatchExecutionBlockedForSubmit: (inst, submitPath) =>
+                        _mismatchCoordinator != null && _mismatchCoordinator.IsSubmitBlockedByMismatch(inst, submitPath),
                     isInstrumentFrozenOrEpaBlocked: IsInstrumentEpaAdapterSubmitBlocked);
                 
                 // Wire coordinator to adapter
@@ -2321,6 +2323,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     if (healthMonitorConfig.enabled)
                     {
                         _healthMonitor = new HealthMonitor(_persistenceBase, healthMonitorConfig, _log);
+                        _healthMonitor.SetPlaybackTelemetryMode(_isolatedPlaybackPersistence);
                         _healthMonitor.SetActiveStreamsCallback(() => HasActiveStreams());
                         _healthMonitor.SetMarketOpenCallback(() => _time != null && TimeService.IsCmeMarketOpen(_time.ConvertUtcToChicago(DateTimeOffset.UtcNow)));
                     }
@@ -3882,7 +3885,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         {
             timeService = _time;
             marketCloseTime = string.IsNullOrWhiteSpace(_spec?.entry_cutoff?.market_close_time) ? EMERGENCY_MARKET_CLOSE_DEFAULT : _spec.entry_cutoff.market_close_time;
-            marketReopenTime = string.IsNullOrWhiteSpace(_spec?.entry_cutoff?.market_reopen_time) ? "17:00" : _spec.entry_cutoff.market_reopen_time;
+            marketReopenTime = SessionTimingPolicy.ResolveMarketReopenTime(_spec);
             barsInstrument = _executionInstrument ?? "N/A";
         }
         if (timeService == null)
@@ -3892,15 +3895,16 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         {
             var closeChicago = timeService.ConstructChicagoTime(td, marketCloseTime);
             var closeUtc = timeService.ConvertChicagoToUtc(closeChicago);
+            var flattenTriggerUtc = SessionTimingPolicy.ResolveForcedFlattenTriggerUtc(td, closeUtc, timeService, _spec, out var effectiveLeadSeconds);
             var reopenChicago = timeService.ConstructChicagoTime(td, marketReopenTime);
             var reopenUtc = timeService.ConvertChicagoToUtc(reopenChicago);
             return new SessionCloseResult
             {
                 HasSession = true,
                 FailureReason = null,
-                BufferSeconds = SESSION_CLOSE_FALLBACK_BUFFER_SECONDS,
+                BufferSeconds = effectiveLeadSeconds,
                 ResolvedSessionCloseUtc = closeUtc,
-                FlattenTriggerUtc = closeUtc.AddSeconds(-SESSION_CLOSE_FALLBACK_BUFFER_SECONDS),
+                FlattenTriggerUtc = flattenTriggerUtc,
                 NextSessionBeginUtc = reopenUtc,
                 BarsInstrument = barsInstrument
             };
@@ -3939,7 +3943,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         // Fallback: compute from spec market_reopen_time (same calendar day as market close)
         if (_spec != null && _time != null && DateOnly.TryParse(tradingDay, out var td))
         {
-            var reopenStr = string.IsNullOrWhiteSpace(_spec.entry_cutoff?.market_reopen_time) ? "17:00" : _spec.entry_cutoff.market_reopen_time;
+            var reopenStr = SessionTimingPolicy.ResolveMarketReopenTime(_spec);
             var reopenChicago = _time.ConstructChicagoTime(td, reopenStr);
             var reopenUtc = _time.ConvertChicagoToUtc(reopenChicago);
             return (reopenUtc, true);
@@ -4096,8 +4100,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }));
     }
 
-    private const int SESSION_CLOSE_FALLBACK_BUFFER_SECONDS = 300;
-
     /// <summary>
     /// CME equity index default close. Used when spec is null (emergency fail-closed).
     /// Spec market_close_time is America/Chicago local time (DST-aware via TimeService).
@@ -4135,10 +4137,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         var calendarGroup = CalendarGroupResolver.Resolve(_executionInstrument, _masterInstrumentName);
         var dayStr = day.ToString("yyyy-MM-dd");
         var barsInstrument = _executionInstrument ?? "N/A";
+        var forcedFlattenBufferSeconds = SessionTimingPolicy.ResolveForcedFlattenBufferSeconds(_spec);
 
         foreach (var sessionClass in new[] { "S1", "S2" })
         {
-            if (!_sessionPolicyService.TryBuildSessionClose(day, calendarGroup, _time, _spec, SESSION_CLOSE_FALLBACK_BUFFER_SECONDS, barsInstrument, out var mat))
+            if (!_sessionPolicyService.TryBuildSessionClose(day, calendarGroup, _time, _spec, forcedFlattenBufferSeconds, barsInstrument, out var mat))
                 continue;
 
             lock (_engineLock)
@@ -4174,7 +4177,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// ResolveAndSetSessionCloseIfNeeded never ran.
     ///
     /// TIMEZONE CONTRACT (non-negotiable):
-    /// - spec.entry_cutoff.market_close_time is America/Chicago local time (DST-aware).
+    /// - spec.entry_cutoff.market_close_time is the fallback session-close authority in America/Chicago local time.
+    /// - spec.forced_flatten.buffer_seconds defines the lead time before session close.
     /// - TimeService.ConstructChicagoTime uses GetUtcOffset(localDateTime) for correct DST.
     /// - ConvertChicagoToUtc produces UTC for comparison with utcNow.
     /// - Never treat Chicago local as UTC.
@@ -4203,7 +4207,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         if (!DateOnly.TryParse(tradingDay, out var tradingDate))
             return null;
 
-        // Path 1: Spec available — use spec.entry_cutoff.market_close_time (America/Chicago local)
+        // Path 1: Spec available — use spec.entry_cutoff.market_close_time as fallback session-close authority
         if (_spec != null && _time != null)
         {
             var marketCloseTime = _spec.entry_cutoff?.market_close_time;
@@ -4265,8 +4269,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // America/Chicago local → UTC (deterministic, DST-aware)
             var sessionEndChicago = _time!.ConstructChicagoTime(tradingDate, hhmm);
             var sessionEndUtc = _time.ConvertChicagoToUtc(sessionEndChicago);
-            var flattenTriggerUtc = sessionEndUtc.AddSeconds(-SESSION_CLOSE_FALLBACK_BUFFER_SECONDS);
-            var reopenStr = string.IsNullOrWhiteSpace(_spec?.entry_cutoff?.market_reopen_time) ? "17:00" : _spec!.entry_cutoff!.market_reopen_time;
+            var flattenTriggerUtc = SessionTimingPolicy.ResolveForcedFlattenTriggerUtc(tradingDate, sessionEndUtc, _time, _spec, out var effectiveLeadSeconds);
+            var reopenStr = SessionTimingPolicy.ResolveMarketReopenTime(_spec);
             var reopenChicago = _time.ConstructChicagoTime(tradingDate, reopenStr);
             var nextSessionBeginUtc = _time.ConvertChicagoToUtc(reopenChicago);
             var fallback = new SessionCloseResult
@@ -4275,7 +4279,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 FlattenTriggerUtc = flattenTriggerUtc,
                 ResolvedSessionCloseUtc = sessionEndUtc,
                 NextSessionBeginUtc = nextSessionBeginUtc,
-                BufferSeconds = SESSION_CLOSE_FALLBACK_BUFFER_SECONDS,
+                BufferSeconds = effectiveLeadSeconds,
                 BarsInstrument = _executionInstrument ?? "N/A"
             };
             var key = (tradingDay, sessionClass);
@@ -8785,7 +8789,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 return ReconciliationForcedConvergenceResult.Succeeded(softFp);
             }
 
-            return ReconciliationForcedConvergenceResult.Failed(readiness.Summary ?? "not_release_ready");
+            return ReconciliationForcedConvergenceResult.Failed(
+                readiness.Summary ?? "not_release_ready",
+                ForcedConvergenceRiskLatchPolicy.ShouldPersistDurableRiskLatch(readiness));
         }
 
         var fp = BuildForcedConvergenceFingerprint(inst, snap, utcNow);
@@ -8865,6 +8871,23 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private void OnForcedBrokerConvergenceFailure(string instrument, ReconciliationForcedConvergenceContext ctx,
         ReconciliationForcedConvergenceResult result)
     {
+        if (!result.RequiresDurableRiskLatch)
+        {
+            var utcNow = DateTimeOffset.UtcNow;
+            LogEvent(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_FORCED_CONVERGENCE_SOFT_DEFERRED", "ENGINE",
+                new
+                {
+                    instrument = instrument.Trim(),
+                    limit_reason = ctx.LimitReason,
+                    failure_reason = result.FailureReason ?? "unknown",
+                    attempts = ctx.Attempts,
+                    no_progress_count = ctx.NoProgressCount,
+                    durable_risk_latch_persisted = false,
+                    note = "Forced convergence remained fail-closed in the mismatch gate, but did not persist a restart-durable risk latch because the failure class is recoverable or evidence was insufficient for durable escalation."
+                }));
+            return;
+        }
+
         var reason = $"FORCED_CONVERGENCE_FAILED:{result.FailureReason ?? "unknown"}";
         StandDownStreamsForInstrument(instrument.Trim(), DateTimeOffset.UtcNow, reason);
     }

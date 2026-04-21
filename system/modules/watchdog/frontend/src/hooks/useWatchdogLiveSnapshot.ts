@@ -2,7 +2,7 @@
  * Single tick: /status + /stream-states + /slot-lifecycle so the live page sees one consistent refresh.
  * Backend also returns snapshot_utc on status and stream-states (separate HTTP calls ≈ ms apart).
  */
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { fetchWatchdogStatus, fetchStreamStates, fetchSlotLifecycle, type SlotLifecycleSlot } from '../services/watchdogApi'
 import { usePollingInterval } from './usePollingInterval'
 import type {
@@ -15,13 +15,14 @@ import type {
 
 const POLL_MS = 5000
 
-export function useWatchdogLiveSnapshot() {
+export function useWatchdogLiveSnapshot(runRoot?: string | null) {
   const [status, setStatus] = useState<WatchdogStatus | null>(null)
   const [streams, setStreams] = useState<StreamState[]>([])
   const [timetableUnavailable, setTimetableUnavailable] = useState(false)
   const [outOfTimetableActiveStreams, setOutOfTimetableActiveStreams] = useState<OutOfTimetableActiveStream[]>([])
   const [executionExpectationGaps, setExecutionExpectationGaps] = useState<ExecutionExpectationGap[]>([])
   const [flattenLookupMetrics, setFlattenLookupMetrics] = useState<FlattenLookupMetrics | null>(null)
+  const [streamStateReferenceUtc, setStreamStateReferenceUtc] = useState<string | null>(null)
   const [slotLifecycle, setSlotLifecycle] = useState<SlotLifecycleSlot[]>([])
   const [statusError, setStatusError] = useState<string | null>(null)
   const [streamsError, setStreamsError] = useState<string | null>(null)
@@ -35,9 +36,9 @@ export function useWatchdogLiveSnapshot() {
     }
 
     const [st, ss, sl] = await Promise.all([
-      fetchWatchdogStatus(),
-      fetchStreamStates(),
-      fetchSlotLifecycle(),
+      fetchWatchdogStatus(runRoot),
+      fetchStreamStates(runRoot),
+      fetchSlotLifecycle(runRoot),
     ])
 
     if (st.data) {
@@ -52,6 +53,7 @@ export function useWatchdogLiveSnapshot() {
       setOutOfTimetableActiveStreams(ss.data.out_of_timetable_active_streams ?? [])
       setExecutionExpectationGaps(ss.data.execution_expectation_gaps ?? [])
       setFlattenLookupMetrics(ss.data.flatten_lookup_metrics ?? null)
+      setStreamStateReferenceUtc(ss.data.state_reference_utc ?? ss.data.snapshot_utc ?? null)
       setTimetableUnavailable(Boolean(ss.data.timetable_unavailable || ss.data.enabled_streams_unknown))
       setStreamsError(null)
     } else {
@@ -59,6 +61,7 @@ export function useWatchdogLiveSnapshot() {
       setOutOfTimetableActiveStreams([])
       setExecutionExpectationGaps([])
       setFlattenLookupMetrics(null)
+      setStreamStateReferenceUtc(null)
     }
 
     if (sl.data) {
@@ -70,9 +73,25 @@ export function useWatchdogLiveSnapshot() {
 
     hasLoadedRef.current = true
     setLoading(false)
-  }, [])
+  }, [runRoot])
 
   const { lastSuccessfulPollTimestamp } = usePollingInterval(poll, POLL_MS)
+
+  useEffect(() => {
+    setStatus(null)
+    setStreams([])
+    setTimetableUnavailable(false)
+    setOutOfTimetableActiveStreams([])
+    setExecutionExpectationGaps([])
+    setFlattenLookupMetrics(null)
+    setStreamStateReferenceUtc(null)
+    setSlotLifecycle([])
+    setStatusError(null)
+    setStreamsError(null)
+    setSlotLifecycleError(null)
+    setLoading(true)
+    hasLoadedRef.current = false
+  }, [runRoot])
 
   return {
     status,
@@ -80,6 +99,7 @@ export function useWatchdogLiveSnapshot() {
     outOfTimetableActiveStreams,
     executionExpectationGaps,
     flattenLookupMetrics,
+    streamStateReferenceUtc,
     timetableUnavailable,
     slotLifecycle,
     statusError,

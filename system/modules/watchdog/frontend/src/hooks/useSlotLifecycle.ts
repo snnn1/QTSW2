@@ -5,14 +5,14 @@ import { useState, useEffect } from 'react'
 import { fetchSlotLifecycle, type SlotLifecycleSlot } from '../services/watchdogApi'
 import { usePollingInterval } from './usePollingInterval'
 
-export function useSlotLifecycle() {
+export function useSlotLifecycle(runRoot?: string | null) {
   const [slots, setSlots] = useState<SlotLifecycleSlot[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
   const poll = async () => {
     try {
-      const { data, error: apiError } = await fetchSlotLifecycle()
+      const { data, error: apiError } = await fetchSlotLifecycle(runRoot)
       if (apiError) {
         setError(apiError)
         setLoading(false)
@@ -33,6 +33,12 @@ export function useSlotLifecycle() {
   useEffect(() => {
     poll()
   }, [])
+
+  useEffect(() => {
+    setSlots([])
+    setError(null)
+    setLoading(true)
+  }, [runRoot])
 
   return {
     slots,

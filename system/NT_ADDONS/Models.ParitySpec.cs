@@ -16,6 +16,8 @@ public sealed class ParitySpec
 
     public EntryCutoff entry_cutoff { get; set; } = new();
 
+    public ForcedFlattenPolicy forced_flatten { get; set; } = new();
+
     public BreakoutSpec breakout { get; set; } = new();
 
     public TimetableValidation timetable_validation { get; set; } = new();
@@ -54,6 +56,7 @@ public sealed class ParitySpec
             throw new InvalidOperationException("sessions must include S1 and S2.");
 
         entry_cutoff.ValidateOrThrow();
+        forced_flatten.ValidateOrThrow();
         breakout.ValidateOrThrow();
         timetable_validation.ValidateOrThrow();
 
@@ -90,6 +93,37 @@ public sealed class EntryCutoff
             throw new InvalidOperationException($"entry_cutoff.type must be MARKET_CLOSE (got '{type}').");
         if (string.IsNullOrWhiteSpace(market_close_time))
             throw new InvalidOperationException("entry_cutoff.market_close_time missing.");
+    }
+}
+
+public sealed class ForcedFlattenPolicy
+{
+    /// <summary>
+    /// Optional explicit flatten trigger time in Chicago local time (HH:mm).
+    /// When set, this takes precedence over buffer_seconds.
+    /// </summary>
+    public string local_time { get; set; } = "";
+
+    /// <summary>
+    /// Lead time before session close to trigger forced flatten.
+    /// Optional; defaults to 300 seconds when omitted.
+    /// </summary>
+    public int buffer_seconds { get; set; } = 300;
+
+    /// <summary>
+    /// Optional market reopen time (Chicago) for post-flatten reentry.
+    /// When omitted, runtime falls back to entry_cutoff.market_reopen_time, then 17:00.
+    /// </summary>
+    public string market_reopen_time { get; set; } = "";
+
+    public string? rule { get; set; }
+
+    public void ValidateOrThrow()
+    {
+        if (!string.IsNullOrWhiteSpace(local_time) && !TimeSpan.TryParse(local_time.Trim(), out _))
+            throw new InvalidOperationException($"forced_flatten.local_time must be a valid HH:mm time (got '{local_time}').");
+        if (buffer_seconds <= 0)
+            throw new InvalidOperationException($"forced_flatten.buffer_seconds must be positive (got {buffer_seconds}).");
     }
 }
 

@@ -27,15 +27,11 @@ from modules.watchdog.aggregator.session_flatten_state import SessionFlattenStat
 from .state_manager import WatchdogStateManager, CursorManager, _is_trading_date_within_max_age
 from .timetable_poller import TimetablePoller, compute_timetable_trading_date
 from .market_calendar import get_market_state
+from .run_context import WatchdogRunContext, resolve_active_run_context
 from .config import (
     ORDER_STUCK_DETECTED_COOLDOWN_SECONDS,
     ALERT_STARTUP_GRACE_SECONDS,
     CONFIRMED_ORPHAN_HEARTBEAT_LOST_SECONDS,
-    EXECUTION_JOURNALS_DIR,
-    EXECUTION_SUMMARIES_DIR,
-    FRONTEND_FEED_FILE,
-    ROBOT_JOURNAL_DIR,
-    LOG_GROWTH_MONITOR_FILE,
     LOG_GROWTH_STALL_THRESHOLD_SECONDS,
     PROCESS_MONITOR_GRACE_SECONDS,
     PROCESS_MONITOR_INTERVAL_SECONDS,
@@ -96,6 +92,39 @@ def _latest_prior_watchdog_info_for_stream(
         return None
     _, latest_info = max(prior_candidates, key=lambda x: x[0])
     return latest_info
+
+
+def _derive_stream_state_reference_utc(
+    streams: List[Dict[str, Any]],
+    current_trading_date: Optional[str],
+) -> Optional[str]:
+    """Historical/playback runs use the latest session timestamp, not wall clock."""
+    if not current_trading_date:
+        return None
+
+    wall_trading_date = compute_timetable_trading_date(datetime.now(CHICAGO_TZ))
+    if current_trading_date == wall_trading_date:
+        return None
+
+    candidates: List[datetime] = []
+    for stream in streams:
+        if str(stream.get("trading_date") or "").strip() != current_trading_date:
+            continue
+        for key in ("state_entry_time_utc", "range_locked_time_utc"):
+            raw = stream.get(key)
+            if not raw:
+                continue
+            try:
+                parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            except Exception:
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            candidates.append(parsed.astimezone(timezone.utc))
+
+    if not candidates:
+        return None
+    return max(candidates).isoformat()
 
 
 def _attach_position_authority_to_stream_row(state_manager: WatchdogStateManager, row: Dict[str, Any]) -> None:
@@ -268,6 +297,18 @@ def _session_from_stream_id(stream_id: str) -> str:
     if len(s) >= 2 and s[-1] == "2":
         return "S2"
     return "S1"
+
+
+def _journal_trading_date_from_name(path: Path) -> Optional[str]:
+    stem = path.stem
+    trading_date = stem.split("_", 1)[0].strip() if stem else ""
+    if len(trading_date) != 10:
+        return None
+    try:
+        datetime.strptime(trading_date, "%Y-%m-%d")
+    except ValueError:
+        return None
+    return trading_date
 
 
 def _get_execution_instrument_for_canonical(canonical_instrument: str) -> Optional[str]:
@@ -523,8 +564,8 @@ class WatchdogAggregator:
         self._ingestion_degraded: bool = False
         self._ingestion_degraded_entered_at: Optional[datetime] = None
 
-        # INGESTION: /events cache - (events, cached_at_utc) to avoid linear disk scaling
-        self._events_cache: Optional[Tuple[List[Dict], datetime]] = None
+        # INGESTION: /events cache - keyed by feed file to avoid cross-run leakage.
+        self._events_cache: Optional[Tuple[Path, List[Dict], datetime]] = None
 
         # Opt-in CPU/load diagnostics (WATCHDOG_CPU_DIAG=1)
         self._last_cpu_diag_utc: Optional[datetime] = None
@@ -570,6 +611,217 @@ class WatchdogAggregator:
 
         # Timetable drift: edge-triggered alert / log transitions
         self._prev_timetable_drift: Optional[bool] = None
+        self._run_context: WatchdogRunContext = resolve_active_run_context()
+
+    def _refresh_run_context(self) -> WatchdogRunContext:
+        if getattr(self, "_snapshot_mode", False):
+            return self._run_context
+        context = resolve_active_run_context()
+        previous = getattr(self, "_run_context", None)
+        if previous is None or previous.persistence_base != context.persistence_base:
+            if previous is None:
+                logger.info(
+                    "WATCHDOG_RUN_CONTEXT_ACTIVE: persistence_base=%s run_id=%s",
+                    context.persistence_base,
+                    context.run_id,
+                )
+            else:
+                logger.info(
+                    "WATCHDOG_RUN_CONTEXT_CHANGED: old_persistence_base=%s new_persistence_base=%s old_run_id=%s new_run_id=%s",
+                    previous.persistence_base,
+                    context.persistence_base,
+                    previous.run_id,
+                    context.run_id,
+                )
+        self._run_context = context
+        return context
+
+    def _frontend_feed_file(self) -> Path:
+        return self._refresh_run_context().frontend_feed_file
+
+    def _execution_journals_dir(self) -> Path:
+        return self._refresh_run_context().execution_journals_dir
+
+    def _slot_journals_dir(self) -> Path:
+        return self._refresh_run_context().slot_journals_dir
+
+    def _execution_summaries_dir(self) -> Path:
+        return self._refresh_run_context().execution_summaries_dir
+
+    def _feed_file_for_context(self, context: Optional[WatchdogRunContext] = None) -> Path:
+        return context.frontend_feed_file if context is not None else self._frontend_feed_file()
+
+    def _context_is_active(self, context: Optional[WatchdogRunContext]) -> bool:
+        if context is None:
+            return True
+        return self._refresh_run_context().persistence_base == context.persistence_base
+
+    def _derive_snapshot_trading_date(
+        self,
+        context: WatchdogRunContext,
+        feed_events: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        candidates: List[str] = []
+        for event in reversed(feed_events):
+            trading_date = (
+                event.get("trading_date")
+                or (event.get("data") or {}).get("trading_date")
+                or ""
+            )
+            if isinstance(trading_date, str) and trading_date.strip():
+                candidates.append(trading_date.strip()[:10])
+        for journal_dir in (context.slot_journals_dir, context.execution_journals_dir):
+            if not journal_dir.exists():
+                continue
+            for journal_file in journal_dir.glob("*.json"):
+                trading_date = _journal_trading_date_from_name(journal_file)
+                if trading_date:
+                    candidates.append(trading_date)
+        summary_file = context.persistence_base / "summary.json"
+        if summary_file.exists():
+            try:
+                summary = json.loads(summary_file.read_text(encoding="utf-8"))
+                trading_date = str(summary.get("trading_date") or "").strip()
+                if trading_date:
+                    candidates.append(trading_date[:10])
+            except Exception:
+                pass
+        return max(candidates) if candidates else None
+
+    def _build_snapshot_timetable_metadata(
+        self,
+        state_manager: WatchdogStateManager,
+        trading_date: str,
+        base_metadata: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Tuple[Set[str], Dict[str, Dict[str, Any]], List[str]]:
+        stream_ids: Set[str] = set()
+        metadata: Dict[str, Dict[str, Any]] = {}
+        ordered: List[str] = []
+
+        for (td, stream_id), info in state_manager.get_stream_states().items():
+            if td != trading_date or not stream_id:
+                continue
+            stream_ids.add(stream_id)
+            if stream_id not in ordered:
+                ordered.append(stream_id)
+            seeded = dict((base_metadata or {}).get(stream_id, {}))
+            instrument = (
+                getattr(info, "instrument", None)
+                or seeded.get("instrument")
+                or _canonical_from_stream_id(stream_id)
+            )
+            session = (
+                getattr(info, "session", None)
+                or seeded.get("session")
+                or _session_from_stream_id(stream_id)
+            )
+            slot_time = getattr(info, "slot_time_chicago", None) or seeded.get("slot_time")
+            metadata[stream_id] = {
+                **seeded,
+                "instrument": instrument,
+                "session": session,
+                "slot_time": slot_time,
+                "enabled": True,
+            }
+
+        for intent in state_manager.get_intent_exposures().values():
+            if getattr(intent, "trading_date", None) != trading_date:
+                continue
+            stream_id = getattr(intent, "stream_id", None)
+            if not stream_id:
+                continue
+            stream_ids.add(stream_id)
+            if stream_id not in ordered:
+                ordered.append(stream_id)
+            seeded = dict((base_metadata or {}).get(stream_id, {}))
+            metadata.setdefault(
+                stream_id,
+                {
+                    **seeded,
+                    "instrument": seeded.get("instrument") or _canonical_from_stream_id(stream_id),
+                    "session": seeded.get("session") or _session_from_stream_id(stream_id),
+                    "slot_time": seeded.get("slot_time"),
+                    "enabled": True,
+                },
+            )
+
+        return stream_ids, metadata, ordered or sorted(stream_ids)
+
+    def _build_run_scoped_snapshot(self, context: WatchdogRunContext) -> "WatchdogAggregator":
+        snapshot = WatchdogAggregator()
+        snapshot._snapshot_mode = True
+        snapshot._run_context = context
+        snapshot._notification_service = None
+        snapshot._process_monitor = None
+        snapshot._watchdog_started_utc = None
+        snapshot._event_processor = EventProcessor(
+            snapshot._state_manager,
+            snapshot._session_flatten_tracker,
+            record_incidents=False,
+        )
+
+        utc_now = datetime.now(timezone.utc)
+        (
+            polled_trading_date,
+            polled_enabled_streams,
+            polled_timetable_hash,
+            polled_metadata,
+            polled_source,
+            polled_ordered,
+            polled_identity_hash,
+        ) = self._timetable_poller.poll()
+        snapshot._state_manager.update_timetable_streams(
+            polled_enabled_streams,
+            polled_trading_date,
+            polled_timetable_hash,
+            utc_now,
+            enabled_streams_metadata=polled_metadata,
+            timetable_file_source=polled_source,
+            enabled_streams_unknown=polled_enabled_streams is None,
+            enabled_streams_ordered=polled_ordered,
+            timetable_identity_hash=polled_identity_hash,
+        )
+
+        feed_events = snapshot._read_events_tail(max(TAIL_LINE_COUNT, 5000))
+        for event in feed_events:
+            snapshot._event_processor.process_event(event)
+
+        trading_date = self._derive_snapshot_trading_date(context, feed_events)
+        snapshot._state_manager.hydrate_intent_exposures_from_journals(context.execution_journals_dir)
+        if trading_date and trading_date != snapshot._state_manager.get_trading_date():
+            snapshot._state_manager.update_timetable_state(
+                snapshot._state_manager.get_enabled_streams() is not None,
+                trading_date,
+            )
+        snapshot._state_manager.hydrate_stream_states_from_slot_journals(context.slot_journals_dir)
+
+        effective_trading_date = (
+            trading_date
+            or snapshot._state_manager.get_trading_date()
+            or compute_timetable_trading_date(datetime.now(CHICAGO_TZ))
+        )
+        stream_ids, metadata, ordered = self._build_snapshot_timetable_metadata(
+            snapshot._state_manager,
+            effective_trading_date,
+            polled_metadata,
+        )
+        if stream_ids:
+            snapshot._state_manager.update_timetable_streams(
+                stream_ids,
+                effective_trading_date,
+                None,
+                utc_now,
+                enabled_streams_metadata=metadata,
+                timetable_file_source="run_context_snapshot",
+                enabled_streams_unknown=False,
+                enabled_streams_ordered=ordered,
+                timetable_identity_hash=None,
+            )
+        snapshot._state_manager.hydrate_range_data_from_ranges_file(
+            trading_date=effective_trading_date,
+            ranges_file=context.ranges_file(effective_trading_date),
+        )
+        return snapshot
 
     def _get_startup_timetable_session_and_replay(self) -> Tuple[Optional[str], bool]:
         """
@@ -638,8 +890,9 @@ class WatchdogAggregator:
         # INGESTION: Single tail read for all startup init (connection, tick, bars, identity)
         logger.info("Initializing watchdog state from recent events on startup")
         startup_snapshot: List[Dict] = []
-        if FRONTEND_FEED_FILE.exists():
-            lines, _, _ = _read_last_lines_with_metrics(FRONTEND_FEED_FILE, TAIL_LINE_COUNT)
+        feed_file = self._frontend_feed_file()
+        if feed_file.exists():
+            lines, _, _ = _read_last_lines_with_metrics(feed_file, TAIL_LINE_COUNT)
             for line_str in lines:
                 line = line_str.strip() if isinstance(line_str, str) else str(line_str)
                 if not line:
@@ -668,7 +921,7 @@ class WatchdogAggregator:
             self._rebuild_connection_status_from_snapshot(startup_snapshot)
 
         logger.info("Hydrating intent exposures from execution journals")
-        self._state_manager.hydrate_intent_exposures_from_journals(EXECUTION_JOURNALS_DIR)
+        self._state_manager.hydrate_intent_exposures_from_journals(self._execution_journals_dir())
 
         # Init engine tick from snapshot
         # Reject ticks that predate startup (_last_invalidate_utc) - tail has old events only.
@@ -848,7 +1101,10 @@ class WatchdogAggregator:
             from .pnl.ledger_builder import LedgerBuilder
             from .pnl.pnl_calculator import compute_intent_realized_pnl, aggregate_stream_pnl
             
-            ledger_builder = LedgerBuilder()
+            ledger_builder = LedgerBuilder(
+                execution_journals_dir=self._execution_journals_dir(),
+                robot_logs_dir=self._refresh_run_context().robot_logs_dir,
+            )
             
             # Build ledger rows
             ledger_rows = ledger_builder.build_ledger_rows(trading_date, stream)
@@ -927,6 +1183,16 @@ class WatchdogAggregator:
                     "streams": []
                 }
 
+    def get_stream_pnl_for_context(
+        self,
+        trading_date: str,
+        stream: Optional[str] = None,
+        context: Optional[WatchdogRunContext] = None,
+    ) -> Dict:
+        if context is None or self._context_is_active(context):
+            return self.get_stream_pnl(trading_date, stream)
+        return self._build_run_scoped_snapshot(context).get_stream_pnl(trading_date, stream)
+
     def get_daily_journal(self, trading_date: str) -> Dict[str, Any]:
         """
         Unified daily journal: streams with trades, total PnL, and summary.
@@ -936,7 +1202,10 @@ class WatchdogAggregator:
             from .pnl.ledger_builder import LedgerBuilder
             from .pnl.pnl_calculator import compute_intent_realized_pnl, aggregate_stream_pnl
 
-            ledger_builder = LedgerBuilder()
+            ledger_builder = LedgerBuilder(
+                execution_journals_dir=self._execution_journals_dir(),
+                robot_logs_dir=self._refresh_run_context().robot_logs_dir,
+            )
             # skip_invalid_intents=True: show partial journal when some intents have invariant
             # violations (e.g. exit_qty > entry_qty from overfill/corruption) so user sees other streams
             ledger_rows = ledger_builder.build_ledger_rows(trading_date, skip_invalid_intents=True)
@@ -952,8 +1221,9 @@ class WatchdogAggregator:
 
             # Load slot journals for stream metadata (PascalCase)
             slot_journals: Dict[str, Dict] = {}
-            if ROBOT_JOURNAL_DIR.exists():
-                for jf in ROBOT_JOURNAL_DIR.glob(f"{trading_date}_*.json"):
+            slot_journals_dir = self._slot_journals_dir()
+            if slot_journals_dir.exists():
+                for jf in slot_journals_dir.glob(f"{trading_date}_*.json"):
                     try:
                         with open(jf, "r") as f:
                             sj = json.load(f)
@@ -1057,7 +1327,7 @@ class WatchdogAggregator:
 
             # Load execution summary if exists
             summary = None
-            summary_file = EXECUTION_SUMMARIES_DIR / f"{trading_date}.json"
+            summary_file = self._execution_summaries_dir() / f"{trading_date}.json"
             if summary_file.exists():
                 try:
                     with open(summary_file, "r") as f:
@@ -1079,6 +1349,15 @@ class WatchdogAggregator:
                 "streams": [],
                 "summary": None,
             }
+
+    def get_daily_journal_for_context(
+        self,
+        trading_date: str,
+        context: Optional[WatchdogRunContext] = None,
+    ) -> Dict[str, Any]:
+        if context is None or self._context_is_active(context):
+            return self.get_daily_journal(trading_date)
+        return self._build_run_scoped_snapshot(context).get_daily_journal(trading_date)
 
     def _maybe_emit_cpu_diag(
         self,
@@ -1105,8 +1384,9 @@ class WatchdogAggregator:
 
         feed_size_mb = None
         try:
-            if FRONTEND_FEED_FILE.exists():
-                feed_size_mb = round(FRONTEND_FEED_FILE.stat().st_size / (1024 * 1024), 2)
+            feed_file = self._frontend_feed_file()
+            if feed_file.exists():
+                feed_size_mb = round(feed_file.stat().st_size / (1024 * 1024), 2)
         except OSError:
             pass
 
@@ -1158,7 +1438,7 @@ class WatchdogAggregator:
                 # Run in thread pool to avoid blocking event loop (file is large: ~1GB)
                 ms_feed = 0.0
                 feed_ran = False
-                if FRONTEND_FEED_FILE.exists():
+                if self._frontend_feed_file().exists():
                     t_feed = time.perf_counter()
                     await loop.run_in_executor(executor, self._process_feed_events_sync)
                     ms_feed = (time.perf_counter() - t_feed) * 1000
@@ -1374,7 +1654,7 @@ class WatchdogAggregator:
                             f"TRADING_DAY_ROLLOVER: {previous_trading_date} -> {trading_date}, "
                             f"cleaned up {streams_before - streams_after} stale stream(s)"
                         )
-                        self._state_manager.hydrate_intent_exposures_from_journals(EXECUTION_JOURNALS_DIR)
+                        self._state_manager.hydrate_intent_exposures_from_journals(self._execution_journals_dir())
 
                     if timetable_hash and timetable_hash != self._state_manager.get_timetable_hash():
                         pass
@@ -1673,9 +1953,10 @@ class WatchdogAggregator:
                     )
 
         # LOG_FILE_STALLED: feed file size unchanged for 60s (logging deadlock, file handle lost, NT not flushing)
-        if LOG_GROWTH_MONITOR_FILE.exists():
+        log_growth_monitor_file = self._frontend_feed_file()
+        if log_growth_monitor_file.exists():
             try:
-                size_now = LOG_GROWTH_MONITOR_FILE.stat().st_size
+                size_now = log_growth_monitor_file.stat().st_size
                 if self._log_file_size_last is not None and size_now == self._log_file_size_last:
                     if self._log_file_stall_started_utc is None:
                         self._log_file_stall_started_utc = now_utc
@@ -1684,7 +1965,7 @@ class WatchdogAggregator:
                             alert_type="LOG_FILE_STALLED",
                             severity="high",
                             context={
-                                "file": str(LOG_GROWTH_MONITOR_FILE),
+                                "file": str(log_growth_monitor_file),
                                 "size_bytes": size_now,
                                 "stall_seconds": int((now_utc - self._log_file_stall_started_utc).total_seconds()),
                             },
@@ -1786,8 +2067,9 @@ class WatchdogAggregator:
             cursor = self._cursor_manager.load_cursor()
 
             # --- SINGLE TAIL READ PER CYCLE ---
+            feed_file = self._frontend_feed_file()
             lines, tail_read_bytes, tail_read_duration_ms = _read_last_lines_with_metrics(
-                FRONTEND_FEED_FILE, TAIL_LINE_COUNT
+                feed_file, TAIL_LINE_COUNT
             )
 
             # Parse lines into events (single pass)
@@ -2004,11 +2286,12 @@ class WatchdogAggregator:
         import json
         
         bar_events = []
-        if not FRONTEND_FEED_FILE.exists():
+        feed_file = self._frontend_feed_file()
+        if not feed_file.exists():
             return bar_events
         
         try:
-            lines = _read_last_lines(FRONTEND_FEED_FILE, 5000)
+            lines = _read_last_lines(feed_file, 5000)
             for line in reversed(lines):
                 if len(bar_events) >= max_events:
                     break
@@ -2031,13 +2314,14 @@ class WatchdogAggregator:
         """
         import json
         
-        if not FRONTEND_FEED_FILE.exists():
+        feed_file = self._frontend_feed_file()
+        if not feed_file.exists():
             return []
         
         ticks = []
         try:
             # Read file in reverse to find most recent ticks
-            with open(FRONTEND_FEED_FILE, 'rb') as f:
+            with open(feed_file, 'rb') as f:
                 # Seek to end
                 f.seek(0, 2)  # 2 = SEEK_END
                 file_size = f.tell()
@@ -2121,12 +2405,13 @@ class WatchdogAggregator:
         
         events = []
         
-        if not FRONTEND_FEED_FILE.exists():
+        feed_file = self._frontend_feed_file()
+        if not feed_file.exists():
             return events
         
         try:
             MAX_LINES_TO_READ = 5000
-            lines = _read_last_lines(FRONTEND_FEED_FILE, MAX_LINES_TO_READ)
+            lines = _read_last_lines(feed_file, MAX_LINES_TO_READ)
             
             parse_errors = 0
             for line_str in lines:
@@ -2165,7 +2450,8 @@ class WatchdogAggregator:
         import json
         from collections import defaultdict
         
-        if not FRONTEND_FEED_FILE.exists():
+        feed_file = self._frontend_feed_file()
+        if not feed_file.exists():
             logger.warning("Feed file does not exist, cannot rebuild stream states")
             return
         
@@ -2175,7 +2461,7 @@ class WatchdogAggregator:
             latest_states: Dict[tuple, tuple] = {}
             
             # Tail-only read: avoid loading entire file
-            recent_lines = _read_last_lines(FRONTEND_FEED_FILE, 5000)
+            recent_lines = _read_last_lines(feed_file, 5000)
             for line in recent_lines:
                 line = line.strip() if isinstance(line, str) else str(line)
                 if not line:
@@ -2223,7 +2509,8 @@ class WatchdogAggregator:
         import json
         from datetime import datetime, timezone
         
-        if not FRONTEND_FEED_FILE.exists():
+        feed_file = self._frontend_feed_file()
+        if not feed_file.exists():
             logger.warning("Feed file does not exist, cannot rebuild connection status")
             return
         
@@ -2234,7 +2521,7 @@ class WatchdogAggregator:
             latest_timestamp = None
             
             # Tail-only read: avoid loading entire file
-            recent_lines = _read_last_lines(FRONTEND_FEED_FILE, 5000)
+            recent_lines = _read_last_lines(feed_file, 5000)
             for line in recent_lines:
                 line = line.strip() if isinstance(line, str) else str(line)
                 if not line:
@@ -2401,7 +2688,12 @@ class WatchdogAggregator:
             filtered.append(ev)
         return filtered
 
-    def get_events_since(self, run_id: str, since_seq: int) -> List[Dict]:
+    def get_events_since(
+        self,
+        run_id: str,
+        since_seq: int,
+        context: Optional[WatchdogRunContext] = None,
+    ) -> List[Dict]:
         """
         Get most recent events for Live Events feed.
         
@@ -2416,17 +2708,18 @@ class WatchdogAggregator:
         to reduce verbosity - same philosophy as WebSocket important_events buffer.
         """
         now = datetime.now(timezone.utc)
+        feed_file = self._feed_file_for_context(context)
         if self._events_cache:
-            cached_events, cached_at = self._events_cache
+            cached_feed_file, cached_events, cached_at = self._events_cache
             age = (now - cached_at).total_seconds()
-            if age < EVENTS_CACHE_TTL_SECONDS:
+            if cached_feed_file == feed_file and age < EVENTS_CACHE_TTL_SECONDS:
                 all_events = cached_events
             else:
-                all_events = self._read_events_tail(1000)
-                self._events_cache = (all_events, now)
+                all_events = self._read_events_tail(1000, context=context)
+                self._events_cache = (feed_file, all_events, now)
         else:
-            all_events = self._read_events_tail(1000)
-            self._events_cache = (all_events, now)
+            all_events = self._read_events_tail(1000, context=context)
+            self._events_cache = (feed_file, all_events, now)
 
         # Filter out noisy event types for Live Event Feed
         filtered = self._filter_events_for_live_feed(all_events)
@@ -2437,7 +2730,7 @@ class WatchdogAggregator:
 
         # Merge ring buffer (derived anomalies) so REST clients see ORDER_STUCK_DETECTED,
         # EXECUTION_LATENCY_SPIKE_DETECTED, RECOVERY_LOOP_DETECTED
-        ring_events = self._ring_buffer_events_for_rest()
+        ring_events = self._ring_buffer_events_for_rest() if self._context_is_active(context) else []
         merged = filtered + ring_events
         merged.sort(key=lambda e: e.get("timestamp_utc", "") or e.get("ts_utc", "") or e.get("timestamp_chicago", ""))
         return merged[-300:] if len(merged) > 300 else merged
@@ -2463,13 +2756,14 @@ class WatchdogAggregator:
             })
         return out
 
-    def _read_events_tail(self, n: int) -> List[Dict]:
+    def _read_events_tail(self, n: int, context: Optional[WatchdogRunContext] = None) -> List[Dict]:
         """Read last N lines from feed and parse to events. No cache."""
         events = []
-        if not FRONTEND_FEED_FILE.exists():
+        feed_file = self._feed_file_for_context(context)
+        if not feed_file.exists():
             return events
         try:
-            lines = _read_last_lines(FRONTEND_FEED_FILE, n)
+            lines = _read_last_lines(feed_file, n)
             for line_str in lines:
                 if not line_str.strip():
                     continue
@@ -2484,6 +2778,15 @@ class WatchdogAggregator:
     def get_events_for_slot_lifecycle(self, n: int = 500) -> List[Dict]:
         """Get recent events for slot lifecycle aggregation. No run_id filter."""
         return self._read_events_tail(n)
+
+    def get_events_for_slot_lifecycle_for_context(
+        self,
+        n: int = 500,
+        context: Optional[WatchdogRunContext] = None,
+    ) -> List[Dict]:
+        if context is None or self._context_is_active(context):
+            return self.get_events_for_slot_lifecycle(n)
+        return self._build_run_scoped_snapshot(context).get_events_for_slot_lifecycle(n)
 
     def get_operator_snapshot(self, n_events: int = 500) -> Dict[str, Dict[str, Any]]:
         """
@@ -2565,6 +2868,14 @@ class WatchdogAggregator:
             logger.debug("get_session_flatten_state baseline ensure skipped: %s", e)
         return tracker.list_rows_sorted(datetime.now(timezone.utc))
 
+    def get_session_flatten_state_for_context(
+        self,
+        context: Optional[WatchdogRunContext] = None,
+    ) -> List[Dict[str, Any]]:
+        if context is None or self._context_is_active(context):
+            return self.get_session_flatten_state()
+        return self._build_run_scoped_snapshot(context).get_session_flatten_state()
+
     def _session_flatten_ledger_singleton(self):
         """Shared ledger when NotificationService is unavailable (audit file still updated)."""
         led = getattr(self, "_session_flatten_fallback_ledger", None)
@@ -2631,29 +2942,30 @@ class WatchdogAggregator:
 
             # Process check: when NinjaTrader is not running, override engine_alive and connection
             # to prevent false ENGINE ALIVE / BROKER CONNECTED from stale feed ticks
-            try:
-                from .process_monitor import check_ninjatrader_running
-                from .config import PROCESS_MONITOR_PROCESS_NAME
-                ninja_running, _ = check_ninjatrader_running(PROCESS_MONITOR_PROCESS_NAME)
-                if not ninja_running:
-                    status["engine_alive"] = False
-                    status["engine_activity_state"] = "STALLED"
-                    status["engine_activity_classification"] = "STALLED"
-                    status["engine_tick_stall_detected"] = True
-                    status["execution_safe"] = False
-                    status["timetable_drift"] = False
-                    status["robot_timetable_hash"] = None
-                    status["robot_timetable_observed_chicago"] = None
-                    # Invalidate heartbeat so we don't show ENGINE ALIVE at login (stale heartbeat)
-                    self._state_manager.invalidate_engine_liveness()
-                    # Don't show Connected when process is down (stale ticks may have set it)
-                    if status.get("connection_status") == "Connected":
-                        status["connection_status"] = "Unknown"
-                    # Don't show DATA FLOWING when engine/NinjaTrader is off (stale bar/tick data in tail)
-                    status["feed_health_classification"] = "DATA_STALLED"
-                    status["data_status"] = "STALLED"
-            except Exception as e:
-                logger.debug(f"Process check during status: {e}")
+            if not getattr(self, "_snapshot_mode", False):
+                try:
+                    from .process_monitor import check_ninjatrader_running
+                    from .config import PROCESS_MONITOR_PROCESS_NAME
+                    ninja_running, _ = check_ninjatrader_running(PROCESS_MONITOR_PROCESS_NAME)
+                    if not ninja_running:
+                        status["engine_alive"] = False
+                        status["engine_activity_state"] = "STALLED"
+                        status["engine_activity_classification"] = "STALLED"
+                        status["engine_tick_stall_detected"] = True
+                        status["execution_safe"] = False
+                        status["timetable_drift"] = False
+                        status["robot_timetable_hash"] = None
+                        status["robot_timetable_observed_chicago"] = None
+                        # Invalidate heartbeat so we don't show ENGINE ALIVE at login (stale heartbeat)
+                        self._state_manager.invalidate_engine_liveness()
+                        # Don't show Connected when process is down (stale ticks may have set it)
+                        if status.get("connection_status") == "Connected":
+                            status["connection_status"] = "Unknown"
+                        # Don't show DATA FLOWING when engine/NinjaTrader is off (stale bar/tick data in tail)
+                        status["feed_health_classification"] = "DATA_STALLED"
+                        status["data_status"] = "STALLED"
+                except Exception as e:
+                    logger.debug(f"Process check during status: {e}")
             # Add fill_health from cached metrics (Phase 3: populated by _fill_metrics_loop, no blocking)
             try:
                 trading_date = self._state_manager.get_trading_date()
@@ -2737,7 +3049,8 @@ class WatchdogAggregator:
             else:
                 status["active_alerts"] = []
             # Persist critical status snapshots for post-incident analysis
-            _maybe_persist_status_snapshot(status)
+            if not getattr(self, "_snapshot_mode", False):
+                _maybe_persist_status_snapshot(status)
             status["snapshot_utc"] = datetime.now(timezone.utc).isoformat()
             # Align with /stream-states: UI and execution_severity can rely on /status alone
             _esu = self._state_manager.get_enabled_streams_unknown()
@@ -2779,6 +3092,14 @@ class WatchdogAggregator:
                 "enabled_streams_unknown": True,
                 "timetable_unavailable": True,
             }
+
+    def get_watchdog_status_for_context(
+        self,
+        context: Optional[WatchdogRunContext] = None,
+    ) -> Dict:
+        if context is None or self._context_is_active(context):
+            return self.get_watchdog_status()
+        return self._build_run_scoped_snapshot(context).get_watchdog_status()
     
     def get_ingestion_stats(self) -> Dict:
         """Get latest ingestion telemetry (tail read duration, loop duration, etc.)."""
@@ -2814,6 +3135,14 @@ class WatchdogAggregator:
                 "session_slot_time_valid": False,
                 "trading_date_set": False
             }
+
+    def get_risk_gate_status_for_context(
+        self,
+        context: Optional[WatchdogRunContext] = None,
+    ) -> Dict:
+        if context is None or self._context_is_active(context):
+            return self.get_risk_gate_status()
+        return self._build_run_scoped_snapshot(context).get_risk_gate_status()
     
     def get_unprotected_positions(self) -> Dict:
         """Get current unprotected positions."""
@@ -2829,15 +3158,27 @@ class WatchdogAggregator:
                 "timestamp_chicago": datetime.now(CHICAGO_TZ).isoformat(),
                 "unprotected_positions": []
             }
+
+    def get_unprotected_positions_for_context(
+        self,
+        context: Optional[WatchdogRunContext] = None,
+    ) -> Dict:
+        if context is None or self._context_is_active(context):
+            return self.get_unprotected_positions()
+        return self._build_run_scoped_snapshot(context).get_unprotected_positions()
     
-    def get_current_run_id(self) -> Optional[str]:
+    def get_current_run_id(self, context: Optional[WatchdogRunContext] = None) -> Optional[str]:
         """
         Get current engine run_id - the run_id from the most recent event in the feed.
         Previously returned run_id with highest event_seq (wrong: event_seq is per-run,
         so an old long-running session could win over a newer one, causing Live Events
         to show 30+ min stale data).
         """
-        run_id = self._get_run_id_from_most_recent_feed_event()
+        run_id = self._get_run_id_from_most_recent_feed_event(context)
+        if run_id:
+            return run_id
+        if context is not None:
+            return context.run_id
         if not run_id:
             run_id = self._event_feed.get_current_run_id()
         if not run_id:
@@ -2846,17 +3187,21 @@ class WatchdogAggregator:
                 run_id = max(cursor.items(), key=lambda x: x[1])[0] if cursor else None
         return run_id
 
-    def _get_run_id_from_most_recent_feed_event(self) -> Optional[str]:
+    def _get_run_id_from_most_recent_feed_event(
+        self,
+        context: Optional[WatchdogRunContext] = None,
+    ) -> Optional[str]:
         """
         Get run_id from the event with the most recent timestamp in the feed tail.
         Uses last 100 lines (not just last line) to avoid flip-flopping when multiple
         NinjaTrader instances write interleaved events - the last line can alternate
         between run_ids; picking by timestamp stabilizes the feed.
         """
-        if not FRONTEND_FEED_FILE.exists():
+        feed_file = self._feed_file_for_context(context)
+        if not feed_file.exists():
             return None
         try:
-            lines = _read_last_lines(FRONTEND_FEED_FILE, 100)
+            lines = _read_last_lines(feed_file, 100)
             best_run_id = None
             best_ts = ""
             for line_str in lines:
@@ -2909,9 +3254,17 @@ class WatchdogAggregator:
             now_utc = datetime.now(timezone.utc)
             if self._last_slot_journal_hydrate_utc is None or \
                     (now_utc - self._last_slot_journal_hydrate_utc).total_seconds() >= 30:
-                self._state_manager.hydrate_intent_exposures_from_journals(EXECUTION_JOURNALS_DIR)
-                self._state_manager.hydrate_stream_states_from_slot_journals()
-                self._state_manager.hydrate_range_data_from_ranges_file()
+                context = self._refresh_run_context()
+                current_td_for_ranges = self._state_manager.get_trading_date()
+                if not current_td_for_ranges:
+                    chicago_now = datetime.now(CHICAGO_TZ)
+                    current_td_for_ranges = compute_timetable_trading_date(chicago_now)
+                self._state_manager.hydrate_intent_exposures_from_journals(context.execution_journals_dir)
+                self._state_manager.hydrate_stream_states_from_slot_journals(context.slot_journals_dir)
+                self._state_manager.hydrate_range_data_from_ranges_file(
+                    trading_date=current_td_for_ranges,
+                    ranges_file=context.ranges_file(current_td_for_ranges),
+                )
                 self._last_slot_journal_hydrate_utc = now_utc
 
             # CRITICAL: Use getter, never access private fields directly
@@ -3165,9 +3518,12 @@ class WatchdogAggregator:
         except Exception as e:
             logger.error(f"Error getting stream states: {e}", exc_info=True)
         
+        state_reference_utc = _derive_stream_state_reference_utc(streams, current_trading_date)
+
         return {
             "snapshot_utc": datetime.now(timezone.utc).isoformat(),
             "timestamp_chicago": datetime.now(CHICAGO_TZ).isoformat(),
+            "state_reference_utc": state_reference_utc,
             "streams": streams,
             "out_of_timetable_active_streams": out_of_timetable_active_streams,
             "execution_expectation_gaps": execution_expectation_gaps,
@@ -3177,6 +3533,14 @@ class WatchdogAggregator:
             "enabled_streams_unknown": self._state_manager.get_enabled_streams_unknown(),
             "timetable_source": self._state_manager.get_timetable_source(),
         }
+
+    def get_stream_states_for_context(
+        self,
+        context: Optional[WatchdogRunContext] = None,
+    ) -> Dict:
+        if context is None or self._context_is_active(context):
+            return self.get_stream_states()
+        return self._build_run_scoped_snapshot(context).get_stream_states()
     
     def _add_derived_event_to_buffer(self, event_type: str, data: Dict) -> None:
         """Phase 9: Add watchdog-derived event to ring buffer (e.g. RECOVERY_LOOP_DETECTED)."""
@@ -3426,7 +3790,7 @@ class WatchdogAggregator:
         # Merge journal truth: hydrate from journals (throttled to every 60s)
         now = datetime.now(timezone.utc)
         if self._last_hydrate_utc is None or (now - self._last_hydrate_utc).total_seconds() >= 60:
-            self._state_manager.hydrate_intent_exposures_from_journals(EXECUTION_JOURNALS_DIR)
+            self._state_manager.hydrate_intent_exposures_from_journals(self._execution_journals_dir())
             self._last_hydrate_utc = now
         intents = []
         try:
@@ -3458,3 +3822,11 @@ class WatchdogAggregator:
             "timestamp_chicago": datetime.now(CHICAGO_TZ).isoformat(),
             "intents": intents
         }
+
+    def get_active_intents_for_context(
+        self,
+        context: Optional[WatchdogRunContext] = None,
+    ) -> Dict:
+        if context is None or self._context_is_active(context):
+            return self.get_active_intents()
+        return self._build_run_scoped_snapshot(context).get_active_intents()

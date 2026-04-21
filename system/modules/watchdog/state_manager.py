@@ -38,6 +38,7 @@ from .config import (
     CONNECTION_STABLE_WINDOW_SECONDS,
 )
 from .market_session import is_market_open
+from .timetable_poller import compute_timetable_trading_date
 
 logger = logging.getLogger(__name__)
 
@@ -1126,7 +1127,11 @@ class WatchdogStateManager:
             logger.info(f"hydrate_stream_states_from_slot_journals: hydrated {hydrated} stream(s)")
         return hydrated
 
-    def hydrate_range_data_from_ranges_file(self, trading_date: Optional[str] = None) -> int:
+    def hydrate_range_data_from_ranges_file(
+        self,
+        trading_date: Optional[str] = None,
+        ranges_file: Optional[Path] = None,
+    ) -> int:
         """
         Populate range_high, range_low, freeze_close for RANGE_LOCKED streams from ranges_{date}.jsonl
         when event-derived range data is missing. Slot journal hydration gives state but not ranges.
@@ -1136,7 +1141,7 @@ class WatchdogStateManager:
         if not current_td:
             from .timetable_poller import compute_timetable_trading_date
             current_td = compute_timetable_trading_date(datetime.now(CHICAGO_TZ))
-        ranges_file = ROBOT_LOGS_DIR / f"ranges_{current_td}.jsonl"
+        ranges_file = ranges_file or (ROBOT_LOGS_DIR / f"ranges_{current_td}.jsonl")
         if not ranges_file.exists():
             return 0
         updated = 0
@@ -1736,14 +1741,28 @@ class WatchdogStateManager:
         
         return engine_alive
     
-    def compute_stuck_streams(self) -> List[Dict]:
+    def _historical_stream_reference_utc(self, trading_date: Optional[str]) -> Optional[datetime]:
+        """Best-effort session clock for historical/playback runs."""
+        if not trading_date:
+            return None
+
+        candidates = [
+            info.state_entry_time_utc
+            for (td, _stream), info in self._stream_states.items()
+            if td == trading_date and getattr(info, "state_entry_time_utc", None) is not None
+        ]
+        if not candidates:
+            return None
+        return max(candidates)
+
+    def compute_stuck_streams(self, reference_utc: Optional[datetime] = None) -> List[Dict]:
         """Compute stuck streams derived field."""
         stuck_streams = []
-        now = datetime.now(timezone.utc)
+        now = reference_utc or datetime.now(timezone.utc)
         
         # Check market status for market-aware stuck detection
         try:
-            chicago_now = datetime.now(CHICAGO_TZ)
+            chicago_now = now.astimezone(CHICAGO_TZ)
             market_open = is_market_open(chicago_now)
         except Exception as e:
             logger.warning(f"Error checking market status: {e}, defaulting to market_open=True")
@@ -2218,10 +2237,15 @@ class WatchdogStateManager:
     
     def compute_watchdog_status(self) -> Dict:
         """Compute watchdog status derived field."""
-        engine_alive = self.compute_engine_alive()
-        stuck_streams = self.compute_stuck_streams()
-        
         now = datetime.now(timezone.utc)
+        engine_alive = self.compute_engine_alive()
+        current_trading_date = self.get_trading_date()
+        wall_trading_date = compute_timetable_trading_date(now.astimezone(CHICAGO_TZ))
+        historical_reference_utc = None
+        if current_trading_date and current_trading_date != wall_trading_date:
+            historical_reference_utc = self._historical_stream_reference_utc(current_trading_date)
+        stuck_streams = self.compute_stuck_streams(reference_utc=historical_reference_utc or now)
+
         timetable_drift = self.compute_timetable_drift()
         current_identity = self._timetable_identity_hash if self._timetable_identity_hash is not None else self._timetable_hash
 

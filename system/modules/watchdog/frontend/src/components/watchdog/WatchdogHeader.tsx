@@ -1,7 +1,7 @@
 /**
  * WatchdogHeader component - Global sticky header
  */
-import { useMemo, ReactNode } from 'react'
+import { ReactNode, useMemo } from 'react'
 import { CopyableText } from '../ui/CopyableText'
 import { formatChicagoTime } from '../../utils/timeUtils.ts'
 import type { OverallExecutionDerived } from '../../utils/executionSeverity'
@@ -9,7 +9,8 @@ import { overallExecutionOperatorMessage } from '../../utils/executionSeverity'
 
 interface WatchdogHeaderProps {
   runId: string | null
-  /** Engine activity only — not execution severity (see overallExecution). */
+  viewMode?: 'live' | 'run'
+  /** Engine activity only - not execution severity (see overallExecution). */
   engineStatus: 'ALIVE' | 'STALLED' | 'RECOVERY_IN_PROGRESS' | 'IDLE_MARKET_CLOSED'
   marketOpen: boolean | null
   connectionStatus: string | null
@@ -35,8 +36,12 @@ interface WatchdogHeaderProps {
   }
 }
 
+const badgeClass =
+  'inline-flex items-center rounded-full px-3 py-1.5 text-xs font-semibold leading-none whitespace-nowrap'
+
 export function WatchdogHeader({
   runId,
+  viewMode = 'live',
   engineStatus,
   marketOpen,
   connectionStatus,
@@ -59,126 +64,117 @@ export function WatchdogHeader({
     return elapsed > 10000 ? 'STALE' : 'OK'
   }, [lastSuccessfulPollTimestamp])
 
+  const shortHash = (value: string | null | undefined) => {
+    if (!value) return '-'
+    return value.length > 12 ? `${value.slice(0, 8)}...` : value
+  }
+
   const getEngineStatusBadge = () => {
     switch (engineStatus) {
       case 'ALIVE':
         return (
-          <span className="px-3 py-1.5 bg-green-600 text-white rounded-full font-semibold text-sm whitespace-nowrap">
-            ENGINE ALIVE
+          <span className={`${badgeClass} bg-green-600 text-white`} title="Engine alive">
+            Engine Alive
           </span>
         )
       case 'IDLE_MARKET_CLOSED': {
         const idleMessage =
           marketOpen === false
-            ? 'ENGINE IDLE (MARKET CLOSED)'
+            ? 'Engine idle (market closed)'
             : barsExpectedCount === 0
-              ? 'ENGINE IDLE (WAITING FOR RANGE WINDOWS)'
-              : 'ENGINE IDLE'
+              ? 'Engine idle (waiting for range windows)'
+              : 'Engine idle'
         return (
-          <span
-            className="px-3 py-1.5 bg-gray-500 text-white rounded-full font-semibold text-sm whitespace-nowrap"
-            title={idleMessage}
-          >
-            ENGINE IDLE
+          <span className={`${badgeClass} bg-gray-500 text-white`} title={idleMessage}>
+            Engine Idle
           </span>
         )
       }
       case 'STALLED': {
         const stallMessage =
           worstLastBarAgeSeconds !== null && worstLastBarAgeSeconds !== undefined
-            ? `ENGINE STALLED (No bars for ${Math.round(worstLastBarAgeSeconds / 60)} min)`
+            ? `Engine stalled (no bars for ${Math.round(worstLastBarAgeSeconds / 60)} min)`
             : barsExpectedCount !== undefined && barsExpectedCount > 0
-              ? `ENGINE STALLED (${barsExpectedCount} instrument(s) expecting bars)`
-              : 'ENGINE STALLED'
+              ? `Engine stalled (${barsExpectedCount} instrument(s) expecting bars)`
+              : 'Engine stalled'
         return (
-          <span
-            className="px-3 py-1.5 bg-red-600 text-white rounded-full font-semibold text-sm whitespace-nowrap"
-            title={stallMessage}
-          >
-            ENGINE STALLED
+          <span className={`${badgeClass} bg-red-600 text-white`} title={stallMessage}>
+            Engine Stalled
           </span>
         )
       }
       case 'RECOVERY_IN_PROGRESS':
         return (
-          <span className="px-3 py-1.5 bg-amber-500 text-black rounded-full font-semibold text-sm whitespace-nowrap">
-            RECOVERY IN PROGRESS
+          <span className={`${badgeClass} bg-amber-500 text-black`} title="Recovery in progress">
+            Recovery
           </span>
         )
       default:
-        return (
-          <span className="px-3 py-1.5 bg-gray-600 text-white rounded-full font-semibold text-sm whitespace-nowrap">
-            UNKNOWN
-          </span>
-        )
+        return <span className={`${badgeClass} bg-gray-600 text-white`}>Unknown</span>
     }
-  }
-
-  const shortHash = (h: string | null | undefined) => {
-    if (h == null || h === '') return '—'
-    return h.length > 12 ? `${h.slice(0, 8)}…` : h
   }
 
   const getExecutionSeverityBadge = () => {
-    const msg = overallExecutionOperatorMessage(overallExecution)
-    const sev = overallExecution.overall_execution_severity
-    /** ENGAGED is WARNING + not blocked — same tradability as SAFE; gate line lives under SYSTEM STATUS. */
+    const message = overallExecutionOperatorMessage(overallExecution)
+    const severity = overallExecution.overall_execution_severity
     const tradableNotBlockedWarning =
-      sev === 'WARNING' && overallExecution.execution_blocked === false
-    if (sev === 'SAFE' || tradableNotBlockedWarning) {
+      severity === 'WARNING' && overallExecution.execution_blocked === false
+
+    if (severity === 'SAFE' || tradableNotBlockedWarning) {
       const title =
         tradableNotBlockedWarning &&
         overallExecution.overall_execution_reason === 'RECONCILIATION_GATE_ENGAGED'
-          ? 'Overlay tradable. Reconciliation gate ENGAGED — see SYSTEM STATUS diagnostic (non-blocking). ' +
-            (msg || '')
-          : msg
+          ? `Overlay tradable. Reconciliation gate engaged - see system status diagnostic. ${message || ''}`
+          : message
       return (
         <span
           data-testid="execution-severity-badge"
-          className="px-3 py-1.5 bg-emerald-700 text-white rounded-full font-semibold text-sm whitespace-nowrap"
+          className={`${badgeClass} bg-emerald-700 text-white`}
           title={title}
         >
-          OVERLAY TRADABLE
+          Overlay OK
         </span>
       )
     }
-    if (sev === 'WARNING') {
+
+    if (severity === 'WARNING') {
       return (
         <span
           data-testid="execution-severity-badge"
-          className="px-3 py-1.5 bg-amber-500 text-black rounded-full font-semibold text-sm whitespace-nowrap"
-          title={msg}
+          className={`${badgeClass} bg-amber-500 text-black`}
+          title={message}
         >
-          OVERLAY BLOCKED
+          Overlay Blocked
         </span>
       )
     }
-    if (sev === 'CRITICAL') {
+
+    if (severity === 'CRITICAL') {
       const isDrift = overallExecution.overall_execution_reason === 'TIMETABLE_DRIFT'
       const hashSuffix =
         isDrift && executionHashDetail
-          ? ` Robot: ${shortHash(executionHashDetail.robot)} · Publisher: ${shortHash(executionHashDetail.publisher)}` +
-            (executionHashDetail.content
-              ? ` · Content hash: ${shortHash(executionHashDetail.content)}`
-              : '')
+          ? ` Robot: ${shortHash(executionHashDetail.robot)} | Publisher: ${shortHash(executionHashDetail.publisher)}${
+              executionHashDetail.content ? ` | Content: ${shortHash(executionHashDetail.content)}` : ''
+            }`
           : ''
       return (
         <span
           data-testid="execution-severity-badge"
-          className="px-3 py-1.5 bg-red-700 text-white rounded-full font-semibold text-sm whitespace-nowrap"
-          title={msg + hashSuffix}
+          className={`${badgeClass} bg-red-700 text-white`}
+          title={`${message}${hashSuffix}`}
         >
-          {isDrift ? 'EXECUTION CRITICAL (Timetable Drift)' : 'EXECUTION CRITICAL'}
+          {isDrift ? 'Execution Drift' : 'Execution Critical'}
         </span>
       )
     }
+
     return (
       <span
         data-testid="execution-severity-badge"
-        className="px-3 py-1.5 bg-gray-600 text-white rounded-full font-semibold text-sm whitespace-nowrap"
-        title={msg}
+        className={`${badgeClass} bg-gray-600 text-white`}
+        title={message}
       >
-        EXECUTION UNKNOWN
+        Execution Unknown
       </span>
     )
   }
@@ -186,45 +182,35 @@ export function WatchdogHeader({
   const getBrokerStatusBadge = () => {
     if (derivedConnectionState === 'LOST') {
       return (
-        <span className="px-3 py-1.5 bg-red-600 text-white rounded-full font-semibold text-sm whitespace-nowrap">
-          BROKER DISCONNECTED
+        <span className={`${badgeClass} bg-red-600 text-white`} title="Broker disconnected">
+          Broker Lost
         </span>
       )
     }
     if (derivedConnectionState === 'RECOVERING') {
       return (
-        <span
-          className="px-3 py-1.5 bg-amber-500 text-black rounded-full font-semibold text-sm whitespace-nowrap"
-          title="Recovering - not safe yet"
-        >
-          BROKER RECOVERING
+        <span className={`${badgeClass} bg-amber-500 text-black`} title="Broker recovering">
+          Broker Recovering
         </span>
       )
     }
-    if (derivedConnectionState === 'STABLE') {
+    if (derivedConnectionState === 'STABLE' || connectionStatus === 'Connected') {
       return (
-        <span className="px-3 py-1.5 bg-green-600 text-white rounded-full font-semibold text-sm whitespace-nowrap">
-          BROKER CONNECTED
+        <span className={`${badgeClass} bg-green-600 text-white`} title="Broker connected">
+          Broker Connected
         </span>
       )
     }
     if (connectionStatus === null) {
       return (
-        <span className="px-3 py-1.5 bg-gray-600 text-white rounded-full font-semibold text-sm whitespace-nowrap">
-          BROKER UNKNOWN
-        </span>
-      )
-    }
-    if (connectionStatus === 'Connected') {
-      return (
-        <span className="px-3 py-1.5 bg-green-600 text-white rounded-full font-semibold text-sm whitespace-nowrap">
-          BROKER CONNECTED
+        <span className={`${badgeClass} bg-gray-600 text-white`} title="Broker status unknown">
+          Broker Unknown
         </span>
       )
     }
     return (
-      <span className="px-3 py-1.5 bg-red-600 text-white rounded-full font-semibold text-sm whitespace-nowrap">
-        BROKER DISCONNECTED
+      <span className={`${badgeClass} bg-red-600 text-white`} title="Broker disconnected">
+        Broker Lost
       </span>
     )
   }
@@ -233,32 +219,28 @@ export function WatchdogHeader({
     switch (dataFlowStatus) {
       case 'FLOWING':
         return (
-          <span className="px-3 py-1.5 bg-green-600 text-white rounded-full font-semibold text-sm whitespace-nowrap">
-            DATA FLOWING
+          <span className={`${badgeClass} bg-green-600 text-white`} title="Data flowing">
+            Data Flowing
           </span>
         )
       case 'STALLED':
-        return (
-          <span className="px-3 py-1.5 bg-red-600 text-white rounded-full font-semibold text-sm whitespace-nowrap">
-            DATA STALLED
-          </span>
-        )
+        return <span className={`${badgeClass} bg-red-600 text-white`}>Data Stalled</span>
       case 'MARKET_CLOSED':
         return (
-          <span className="px-3 py-1.5 bg-gray-500 text-white rounded-full font-semibold text-sm whitespace-nowrap">
-            MARKET CLOSED
+          <span className={`${badgeClass} bg-gray-500 text-white`} title="Market closed">
+            Data Closed
           </span>
         )
       case 'ACCEPTABLE_SILENCE':
         return (
-          <span className="px-3 py-1.5 bg-gray-500 text-white rounded-full font-semibold text-sm whitespace-nowrap">
-            DATA SILENT (OK)
+          <span className={`${badgeClass} bg-gray-500 text-white`} title="Acceptable silence">
+            Data Silent
           </span>
         )
       default:
         return (
-          <span className="px-3 py-1.5 bg-gray-600 text-white rounded-full font-semibold text-sm whitespace-nowrap">
-            DATA UNKNOWN
+          <span className={`${badgeClass} bg-gray-600 text-white`} title="Data status unknown">
+            Data Unknown
           </span>
         )
     }
@@ -267,82 +249,114 @@ export function WatchdogHeader({
   const getMarketStatusBadge = () => {
     if (marketOpen === null) {
       return (
-        <span className="px-3 py-1.5 bg-gray-600 text-white rounded-full font-semibold text-sm whitespace-nowrap">
-          MARKET UNKNOWN
+        <span className={`${badgeClass} bg-gray-600 text-white`} title="Market status unknown">
+          Market Unknown
         </span>
       )
     }
     if (marketOpen) {
-      return (
-        <span className="px-3 py-1.5 bg-green-600 text-white rounded-full font-semibold text-sm whitespace-nowrap">
-          MARKET OPEN
-        </span>
-      )
+      return <span className={`${badgeClass} bg-green-600 text-white`}>Market Open</span>
     }
-    return (
-      <span className="px-3 py-1.5 bg-gray-500 text-white rounded-full font-semibold text-sm whitespace-nowrap">
-        MARKET CLOSED
-      </span>
-    )
+    return <span className={`${badgeClass} bg-gray-500 text-white`}>Market Closed</span>
   }
 
   const getIdentityBadge = () => {
     if (identityInvariantsPass === null) {
       return (
         <span
-          className="px-3 py-1.5 bg-gray-600 text-white rounded-full font-semibold text-sm whitespace-nowrap"
+          className={`${badgeClass} bg-gray-600 text-white`}
           title="Identity status not yet checked"
         >
-          IDENTITY UNKNOWN
+          Identity Unknown
         </span>
       )
     }
     if (identityInvariantsPass) {
       return (
         <span
-          className="px-3 py-1.5 bg-green-600 text-white rounded-full font-semibold text-sm whitespace-nowrap"
+          className={`${badgeClass} bg-green-600 text-white`}
           title="All identity invariants passed"
         >
-          IDENTITY OK
+          Identity OK
         </span>
       )
     }
+
     const violationsText =
       identityViolations.length > 0 ? identityViolations.join('; ') : 'Unknown violation'
     return (
       <span
-        className="px-3 py-1.5 bg-red-600 text-white rounded-full font-semibold text-sm whitespace-nowrap cursor-help"
+        className={`${badgeClass} cursor-help bg-red-600 text-white`}
         title={`Identity violations: ${violationsText}`}
       >
-        IDENTITY VIOLATION
+        Identity Fail
+      </span>
+    )
+  }
+
+  const getViewModeBadge = () => {
+    if (viewMode === 'run') {
+      return (
+        <span
+          className={`${badgeClass} bg-sky-700 text-white`}
+          title="Dashboard is scoped to the selected run"
+        >
+          Run View
+        </span>
+      )
+    }
+    return (
+      <span
+        className={`${badgeClass} bg-gray-700 text-gray-100`}
+        title="Dashboard is following the live watchdog state"
+      >
+        Live View
       </span>
     )
   }
 
   return (
-    <header className="fixed top-6 left-0 right-0 h-10 bg-gray-900 border-b border-gray-700 z-40 flex items-center px-3">
-      <div className="flex items-center gap-4 flex-1">
-        <h1 className="text-base font-bold">QTSW2 Execution Watchdog</h1>
-        {runId && <CopyableText text={runId} />}
-      </div>
-
-      <div className="flex-1 flex justify-center items-center gap-2">
-        {getEngineStatusBadge()}
-        {getExecutionSeverityBadge()}
-        {getBrokerStatusBadge()}
-        {getDataFlowBadge()}
-        {getMarketStatusBadge()}
-        {getIdentityBadge()}
-      </div>
-
-      <div className="flex items-center gap-4 flex-1 justify-end">
-        <div className={`text-sm ${dataFreshness === 'OK' ? 'text-green-500' : 'text-red-500'}`}>
-          Data Freshness: {dataFreshness}
+    <header className="fixed left-0 right-0 top-11 z-40 border-b border-slate-700/70 bg-slate-950/85 backdrop-blur-md">
+      <div className="watchdog-content flex min-h-[56px] items-center gap-3 px-2 py-2">
+        <div className="flex min-w-0 max-w-[26%] flex-[0.75] items-center gap-2">
+          <div className="hidden min-w-0 shrink xl:block">
+            <h1 className="truncate text-sm font-semibold tracking-[0.02em] text-slate-100">
+              QTSW2 Watchdog
+            </h1>
+          </div>
+          {getViewModeBadge()}
+          {runId && (
+            <CopyableText
+              text={runId}
+              className="min-w-0 shrink"
+              textClassName="block max-w-[8rem] truncate rounded-md bg-slate-800/70 px-2 py-1 text-xs text-slate-200 xl:max-w-[10rem]"
+              buttonClassName="shrink-0 bg-slate-700/80 hover:bg-slate-600/90"
+            />
+          )}
         </div>
-        <div className="text-sm font-mono">{clockSlot ?? chicagoTime}</div>
-        {lastEngineTick && (
-          <div className="text-xs text-gray-400">Last Tick: {formatChicagoTime(lastEngineTick)}</div>
-        )}
+
+        <div className="flex min-w-0 flex-1 flex-nowrap items-center justify-center gap-2 overflow-hidden">
+          {getEngineStatusBadge()}
+          {getExecutionSeverityBadge()}
+          {getBrokerStatusBadge()}
+          {getDataFlowBadge()}
+          {getMarketStatusBadge()}
+          {getIdentityBadge()}
+        </div>
+
+        <div className="flex shrink-0 items-center justify-end gap-2 whitespace-nowrap">
+          <div className={`text-xs ${dataFreshness === 'OK' ? 'text-emerald-400' : 'text-rose-400'}`}>
+            {dataFreshness}
+          </div>
+          <div className="rounded-full border border-slate-700/70 bg-slate-900/80 px-2.5 py-1 text-xs font-mono text-slate-100">
+            {clockSlot ?? chicagoTime}
+          </div>
+          {lastEngineTick && (
+            <div className="hidden text-xs text-slate-400 xl:block">
+              Last Tick: {formatChicagoTime(lastEngineTick)}
+            </div>
+          )}
+        </div>
       </div>
     </header>
   )

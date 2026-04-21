@@ -89,6 +89,12 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
         Console.WriteLine(pass ? "PASS: Terminal intent hardening tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
+    else if (testName.Equals("FORCED_FLATTEN_POLICY", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = ForcedFlattenPolicyTests.RunForcedFlattenPolicyTests();
+        Console.WriteLine(pass ? "PASS: Forced flatten policy tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
     else if (testName.Equals("IEA_FLATTEN", StringComparison.OrdinalIgnoreCase))
     {
         var (pass, err) = IeaFlattenAuthorityTests.RunIeaFlattenTests();
@@ -956,4 +962,3 @@ for (var t = simStart; t <= simEnd; t = t.AddMinutes(1))
     engine.Stop();
     Console.WriteLine("Done. Inspect logs/robot/robot_skeleton.jsonl and logs/robot/journal/ for output.");
 }
-

@@ -28,13 +28,7 @@ from modules.watchdog.metrics_history import (
     aggregate_incidents_by_month,
     get_metrics_history,
 )
-from modules.watchdog.config import (
-    FRONTEND_FEED_FILE,
-    EXECUTION_JOURNALS_DIR,
-    EXECUTION_SUMMARIES_DIR,
-    ROBOT_JOURNAL_DIR,
-    FRONTEND_FEED_FILE,
-)
+from modules.watchdog.run_context import WatchdogRunContext, build_run_context, resolve_active_run_context
 from modules.watchdog.websocket_tracker import get_tracker
 from modules.watchdog.market_calendar import get_market_state
 from modules.watchdog.run_artifacts import (
@@ -62,6 +56,15 @@ def get_aggregator() -> WatchdogAggregator:
         logger.error(error_msg)
         raise HTTPException(status_code=503, detail=error_msg)
     return aggregator_instance
+
+
+def _resolve_request_run_context(run_root: Optional[str] = None) -> WatchdogRunContext:
+    if run_root and run_root.strip():
+        root = validate_peek_run_root(run_root.strip())
+        if root is None:
+            raise HTTPException(status_code=400, detail="Invalid run_root")
+        return build_run_context(root)
+    return resolve_active_run_context()
 
 
 @router.get("/market-state")
@@ -140,13 +143,18 @@ async def get_recent_runs(limit: int = Query(5, ge=1, le=20)):
 
 
 @router.get("/session-flatten-state")
-async def get_session_flatten_state():
+async def get_session_flatten_state(
+    run_root: Optional[str] = Query(
+        None,
+        description="Optional peek: absolute run directory (must be under runs/ or data/playback/).",
+    ),
+):
     """
     Aggregated session close + forced-flatten lifecycle (engine events only).
     """
     try:
         aggregator = get_aggregator()
-        return aggregator.get_session_flatten_state()
+        return aggregator.get_session_flatten_state_for_context(_resolve_request_run_context(run_root))
     except HTTPException:
         raise
     except Exception as e:
@@ -155,11 +163,16 @@ async def get_session_flatten_state():
 
 
 @router.get("/status")
-async def get_watchdog_status():
+async def get_watchdog_status(
+    run_root: Optional[str] = Query(
+        None,
+        description="Optional peek: absolute run directory (must be under runs/ or data/playback/).",
+    ),
+):
     """Get current WatchdogStatus (pre-computed by backend)."""
     try:
         aggregator = get_aggregator()
-        status = aggregator.get_watchdog_status()
+        status = aggregator.get_watchdog_status_for_context(_resolve_request_run_context(run_root))
         return status
     except HTTPException:
         raise
@@ -207,24 +220,27 @@ async def get_alerts(
 @router.get("/events")
 async def get_events(
     run_id: Optional[str] = Query(None, description="Current engine run_id (optional, will use current if not provided)"),
-    since_seq: int = Query(0, description="Last processed event_seq")
+    since_seq: int = Query(0, description="Last processed event_seq"),
+    run_root: Optional[str] = Query(
+        None,
+        description="Optional peek: absolute run directory (must be under runs/ or data/playback/).",
+    ),
 ):
     """Get events since last cursor position (incremental tailing)."""
     try:
         aggregator = get_aggregator()
-        
-        # Always get run_id from BOTTOM of feed (most recent event)
-        # Never use client's run_id - it may be stale, causing us to filter out newest events
-        current_run_id = aggregator.get_current_run_id()
+        context = _resolve_request_run_context(run_root)
+        requested_run_id = run_id.strip() if isinstance(run_id, str) and run_id.strip() else None
+        current_run_id = requested_run_id or aggregator.get_current_run_id(context)
         if not current_run_id:
             return {
                 "run_id": None,
                 "events": [],
-                "next_seq": 0
+                "next_seq": 0,
+                "persistence_root": str(context.persistence_base),
             }
-        
-        # Always query by current_run_id - events at bottom of file are from current run
-        events = aggregator.get_events_since(current_run_id, since_seq)
+
+        events = aggregator.get_events_since(current_run_id, since_seq, context)
         
         # Debug: Check if ENGINE_TICK_CALLSITE events are in the response
         tick_callsite_events = [e for e in events if e.get("event_type") == "ENGINE_TICK_CALLSITE"]
@@ -246,7 +262,8 @@ async def get_events(
         return {
             "run_id": current_run_id,
             "events": events_with_id,
-            "next_seq": next_seq
+            "next_seq": next_seq,
+            "persistence_root": str(context.persistence_base),
         }
     except HTTPException:
         raise
@@ -267,44 +284,64 @@ async def get_ingestion_stats():
 
 
 @router.get("/risk-gates")
-async def get_risk_gates():
+async def get_risk_gates(
+    run_root: Optional[str] = Query(
+        None,
+        description="Optional peek: absolute run directory (must be under runs/ or data/playback/).",
+    ),
+):
     """Get current RiskGateStatus (pre-computed by backend)."""
     try:
         aggregator = get_aggregator()
-        return aggregator.get_risk_gate_status()
+        return aggregator.get_risk_gate_status_for_context(_resolve_request_run_context(run_root))
     except Exception as e:
         logger.error(f"Error getting risk gates: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error getting risk gates: {str(e)}")
 
 
 @router.get("/unprotected-positions")
-async def get_unprotected_positions():
+async def get_unprotected_positions(
+    run_root: Optional[str] = Query(
+        None,
+        description="Optional peek: absolute run directory (must be under runs/ or data/playback/).",
+    ),
+):
     """Get current unprotected positions (pre-computed by backend)."""
     try:
         aggregator = get_aggregator()
-        return aggregator.get_unprotected_positions()
+        return aggregator.get_unprotected_positions_for_context(_resolve_request_run_context(run_root))
     except Exception as e:
         logger.error(f"Error getting unprotected positions: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error getting unprotected positions: {str(e)}")
 
 
 @router.get("/stream-states")
-async def get_stream_states():
+async def get_stream_states(
+    run_root: Optional[str] = Query(
+        None,
+        description="Optional peek: absolute run directory (must be under runs/ or data/playback/).",
+    ),
+):
     """Get current stream states."""
     try:
         aggregator = get_aggregator()
-        return aggregator.get_stream_states()
+        return aggregator.get_stream_states_for_context(_resolve_request_run_context(run_root))
     except Exception as e:
         logger.error(f"Error getting stream states: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error getting stream states: {str(e)}")
 
 
 @router.get("/active-intents")
-async def get_active_intents():
+async def get_active_intents(
+    run_root: Optional[str] = Query(
+        None,
+        description="Optional peek: absolute run directory (must be under runs/ or data/playback/).",
+    ),
+):
     """Get current active intents."""
     try:
         aggregator = get_aggregator()
-        return aggregator.get_active_intents()
+        return aggregator.get_active_intents_for_context(_resolve_request_run_context(run_root))
     except Exception as e:
         logger.error(f"Error getting active intents: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error getting active intents: {str(e)}")
@@ -312,19 +349,24 @@ async def get_active_intents():
 
 @router.get("/open-journals")
 async def get_open_journals(
-    include_previous_days: int = Query(0, ge=0, description="Include journals from previous N days (0 = all)")
+    include_previous_days: int = Query(0, ge=0, description="Include journals from previous N days (0 = all)"),
+    run_root: Optional[str] = Query(
+        None,
+        description="Optional peek: absolute run directory (must be under runs/ or data/playback/).",
+    ),
 ):
     """
     Get all open execution journals (EntryFilled && !TradeCompleted).
     Operational visibility for carry-over positions from previous days.
     """
     entries = []
-    if not EXECUTION_JOURNALS_DIR.exists():
+    journals_dir = _resolve_request_run_context(run_root).execution_journals_dir
+    if not journals_dir.exists():
         return {"entries": entries, "count": 0}
     cutoff_date = None
     if include_previous_days > 0:
         cutoff_date = (datetime.now(timezone.utc) - timedelta(days=include_previous_days)).date()
-    for journal_file in EXECUTION_JOURNALS_DIR.glob("*.json"):
+    for journal_file in journals_dir.glob("*.json"):
         try:
             with open(journal_file, 'r') as f:
                 entry = json.load(f)
@@ -402,14 +444,21 @@ async def get_active_incidents_endpoint():
 
 
 @router.get("/slot-lifecycle")
-async def get_slot_lifecycle():
+async def get_slot_lifecycle(
+    run_root: Optional[str] = Query(
+        None,
+        description="Optional peek: absolute run directory (must be under runs/ or data/playback/).",
+    ),
+):
     """
     Get slot lifecycle state (forced flatten, reentry, slot expiry) per stream.
     Computed in-memory from event feed. No persistence.
     """
     try:
         aggregator = get_aggregator()
-        events = aggregator.get_events_for_slot_lifecycle(500)
+        events = aggregator.get_events_for_slot_lifecycle_for_context(
+            500, _resolve_request_run_context(run_root)
+        )
         slots = build_slot_lifecycle(events)
         return slots
     except HTTPException:
@@ -544,17 +593,22 @@ async def get_ws_health():
 async def get_execution_journal(
     trading_date: str = Query(..., description="Trading date (YYYY-MM-DD)"),
     stream: Optional[str] = Query(None, description="Filter by stream"),
-    intent_id: Optional[str] = Query(None, description="Filter by intent_id")
+    intent_id: Optional[str] = Query(None, description="Filter by intent_id"),
+    run_root: Optional[str] = Query(
+        None,
+        description="Optional peek: absolute run directory (must be under runs/ or data/playback/).",
+    ),
 ):
     """Get ExecutionJournalEntry for historical review."""
     entries = []
-    
-    if not EXECUTION_JOURNALS_DIR.exists():
+
+    journals_dir = _resolve_request_run_context(run_root).execution_journals_dir
+    if not journals_dir.exists():
         return {"entries": []}
-    
+
     if intent_id:
         # Single intent file
-        journal_file = EXECUTION_JOURNALS_DIR / f"{trading_date}_{stream}_{intent_id}.json"
+        journal_file = journals_dir / f"{trading_date}_{stream}_{intent_id}.json"
         if journal_file.exists():
             try:
                 with open(journal_file, 'r') as f:
@@ -567,7 +621,7 @@ async def get_execution_journal(
     else:
         # All intents for trading_date (and optionally stream)
         pattern = f"{trading_date}_*.json" if not stream else f"{trading_date}_{stream}_*.json"
-        for journal_file in EXECUTION_JOURNALS_DIR.glob(pattern):
+        for journal_file in journals_dir.glob(pattern):
             try:
                 with open(journal_file, 'r') as f:
                     entry = json.load(f)
@@ -582,18 +636,23 @@ async def get_execution_journal(
 
 @router.get("/journal/streams")
 async def get_stream_journal(
-    trading_date: str = Query(..., description="Trading date (YYYY-MM-DD)")
+    trading_date: str = Query(..., description="Trading date (YYYY-MM-DD)"),
+    run_root: Optional[str] = Query(
+        None,
+        description="Optional peek: absolute run directory (must be under runs/ or data/playback/).",
+    ),
 ):
     """Get StreamState for all streams on trading date."""
     streams = []
-    
-    if not ROBOT_JOURNAL_DIR.exists():
+
+    journals_dir = _resolve_request_run_context(run_root).slot_journals_dir
+    if not journals_dir.exists():
         return {
             "trading_date": trading_date,
             "streams": []
         }
-    
-    for journal_file in ROBOT_JOURNAL_DIR.glob(f"{trading_date}_*.json"):
+
+    for journal_file in journals_dir.glob(f"{trading_date}_*.json"):
         try:
             with open(journal_file, 'r') as f:
                 journal = json.load(f)
@@ -626,7 +685,11 @@ async def get_stream_journal(
 
 @router.get("/journal/daily")
 async def get_daily_journal(
-    trading_date: str = Query(..., description="Trading date (YYYY-MM-DD)")
+    trading_date: str = Query(..., description="Trading date (YYYY-MM-DD)"),
+    run_root: Optional[str] = Query(
+        None,
+        description="Optional peek: absolute run directory (must be under runs/ or data/playback/).",
+    ),
 ):
     """
     Unified daily journal: streams, trades, total PnL, and summary.
@@ -634,7 +697,10 @@ async def get_daily_journal(
     """
     try:
         aggregator = get_aggregator()
-        return aggregator.get_daily_journal(trading_date)
+        return aggregator.get_daily_journal_for_context(
+            trading_date,
+            _resolve_request_run_context(run_root),
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -644,10 +710,14 @@ async def get_daily_journal(
 
 @router.get("/journal/summary")
 async def get_execution_summary(
-    trading_date: str = Query(..., description="Trading date (YYYY-MM-DD)")
+    trading_date: str = Query(..., description="Trading date (YYYY-MM-DD)"),
+    run_root: Optional[str] = Query(
+        None,
+        description="Optional peek: absolute run directory (must be under runs/ or data/playback/).",
+    ),
 ):
     """Get ExecutionSummary for trading date."""
-    summary_file = EXECUTION_SUMMARIES_DIR / f"{trading_date}.json"
+    summary_file = _resolve_request_run_context(run_root).execution_summaries_dir / f"{trading_date}.json"
     
     if not summary_file.exists():
         raise HTTPException(status_code=404, detail=f"Summary not found for {trading_date}")
@@ -673,12 +743,13 @@ async def reprocess_identity():
     try:
         import json
         from datetime import datetime, timezone
-        
-        if not FRONTEND_FEED_FILE.exists():
+
+        feed_file = resolve_active_run_context().frontend_feed_file
+        if not feed_file.exists():
             return {"success": False, "error": "Frontend feed file not found"}
-        
+
         # Read recent events (tail-only, no full file load)
-        recent_lines = _read_last_lines(FRONTEND_FEED_FILE, 5000)
+        recent_lines = _read_last_lines(feed_file, 5000)
         
         latest_identity_event = None
         latest_timestamp = None
@@ -752,7 +823,11 @@ async def get_fill_metrics(
 @router.get("/stream-pnl")
 async def get_stream_pnl(
     trading_date: str = Query(..., description="Trading date (YYYY-MM-DD)"),
-    stream: Optional[str] = Query(None, description="Filter by stream")
+    stream: Optional[str] = Query(None, description="Filter by stream"),
+    run_root: Optional[str] = Query(
+        None,
+        description="Optional peek: absolute run directory (must be under runs/ or data/playback/).",
+    ),
 ):
     """
     Get realized P&L for stream(s).
@@ -761,7 +836,11 @@ async def get_stream_pnl(
     Frontend fetches P&L separately and joins by stream id.
     """
     aggregator = get_aggregator()
-    return aggregator.get_stream_pnl(trading_date, stream)
+    return aggregator.get_stream_pnl_for_context(
+        trading_date,
+        stream,
+        _resolve_request_run_context(run_root),
+    )
 
 
 def _convert_utc_to_chicago(utc_timestamp_str: str) -> Optional[str]:

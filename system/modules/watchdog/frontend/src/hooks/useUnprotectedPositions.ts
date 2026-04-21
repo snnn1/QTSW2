@@ -7,7 +7,7 @@ import { fetchUnprotectedPositions } from '../services/watchdogApi'
 import { usePollingInterval } from './usePollingInterval'
 import type { UnprotectedPosition } from '../types/watchdog'
 
-export function useUnprotectedPositions() {
+export function useUnprotectedPositions(runRoot?: string | null) {
   const [positions, setPositions] = useState<UnprotectedPosition[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -19,7 +19,7 @@ export function useUnprotectedPositions() {
     if (!hasLoadedRef.current) {
       setLoading(true)
     }
-    const { data, error: apiError } = await fetchUnprotectedPositions()
+    const { data, error: apiError } = await fetchUnprotectedPositions(runRoot)
     if (apiError) {
       setError(apiError)
       hasLoadedRef.current = true // Mark as loaded even on error
@@ -49,9 +49,21 @@ export function useUnprotectedPositions() {
   useEffect(() => {
     poll()
   }, [])
+
+  useEffect(() => {
+    setPositions([])
+    setError(null)
+    setLoading(true)
+    hasLoadedRef.current = false
+    hasScrolledRef.current = false
+  }, [runRoot])
   
   // Auto-scroll to panel if unprotected positions exist
   useEffect(() => {
+    if (runRoot) {
+      hasScrolledRef.current = false
+      return
+    }
     if (positions.length > 0 && !hasScrolledRef.current) {
       const panel = document.getElementById('active-intent-panel')
       if (panel) {
@@ -61,7 +73,7 @@ export function useUnprotectedPositions() {
     } else if (positions.length === 0) {
       hasScrolledRef.current = false
     }
-  }, [positions])
+  }, [positions, runRoot])
   
   return {
     positions,

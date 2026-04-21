@@ -10,7 +10,7 @@ Write-Host ""
 $taskName = "Pipeline Runner"
 $workingDir = "C:\Users\jakej\QTSW2"
 # Use standalone runner that doesn't require backend
-$arguments = "-m automation.run_pipeline_standalone"
+$arguments = "-m tools.automation.run_pipeline_standalone"
 $description = "Runs data pipeline at :00, :15, :30, :45 of every hour and at system startup"
 
 # Try to find Python - first check if 'python' is in PATH, then try common locations

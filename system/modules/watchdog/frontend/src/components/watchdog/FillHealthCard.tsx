@@ -1,8 +1,5 @@
 /**
  * FillHealthCard - Execution logging hygiene metrics
- *
- * Shows fill_coverage_rate, unmapped_rate, null_trading_date_rate from new canonical fill logging.
- * Targets: coverage=100%, unmapped=0, null_td=0.
  */
 import type { FillHealthInfo } from '../../types/watchdog'
 
@@ -13,8 +10,13 @@ interface FillHealthCardProps {
 export function FillHealthCard({ fillHealth }: FillHealthCardProps) {
   if (!fillHealth) {
     return (
-      <div className="bg-gray-800 rounded-lg p-4">
-        <div className="text-sm text-gray-400 mb-1">Fill Health</div>
+      <div className="watchdog-panel">
+        <div className="watchdog-panel-header">
+          <div>
+            <div className="watchdog-panel-kicker">Execution Logging</div>
+            <div className="watchdog-panel-title">Fill Health</div>
+          </div>
+        </div>
         <div className="text-xs text-gray-500">No fill data for today</div>
       </div>
     )
@@ -26,41 +28,46 @@ export function FillHealthCard({ fillHealth }: FillHealthCardProps) {
   const nullTdPct = (fillHealth.null_trading_date_rate * 100).toFixed(1)
 
   return (
-    <div className={`rounded-lg p-4 ${ok ? 'bg-gray-800' : 'bg-amber-900/30 border border-amber-600/50'}`}>
-      <div className="flex items-center justify-between mb-2">
-        <div className="text-sm text-gray-400">Fill Health</div>
+    <div className={`watchdog-panel ${ok ? '' : 'border-amber-600/50 bg-amber-900/20'}`}>
+      <div className="watchdog-panel-header">
+        <div>
+          <div className="watchdog-panel-kicker">Execution Logging</div>
+          <div className="watchdog-panel-title">Fill Health</div>
+        </div>
         <span
-          className={`px-2 py-0.5 rounded text-xs font-medium ${
-            ok ? 'bg-green-600/80 text-white' : 'bg-amber-600 text-black'
+          className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+            ok ? 'bg-green-600/80 text-white' : 'bg-amber-500 text-black'
           }`}
         >
-          {ok ? 'OK' : 'WARN'}
+          {ok ? 'OK' : 'Warn'}
         </span>
       </div>
-      <div className="space-y-1 text-sm">
+      <div className="space-y-2 text-sm">
         <div className="flex justify-between">
-          <span className="text-gray-500">Coverage</span>
+          <span className="text-gray-400">Coverage</span>
           <span className={fillHealth.fill_coverage_rate >= 1 ? 'text-green-400' : 'text-amber-400'}>
             {coveragePct}%
           </span>
         </div>
         <div className="flex justify-between">
-          <span className="text-gray-500">Unmapped</span>
+          <span className="text-gray-400">Unmapped</span>
           <span className={fillHealth.unmapped_rate <= 0 ? 'text-green-400' : 'text-amber-400'}>
             {fillHealth.unmapped_fills} ({unmappedPct}%)
           </span>
         </div>
         <div className="flex justify-between">
-          <span className="text-gray-500">Null trading_date</span>
-          <span className={fillHealth.null_trading_date_rate <= 0 ? 'text-green-400' : 'text-amber-400'}>
+          <span className="text-gray-400">Null trading date</span>
+          <span
+            className={fillHealth.null_trading_date_rate <= 0 ? 'text-green-400' : 'text-amber-400'}
+          >
             {fillHealth.null_trading_date_fills} ({nullTdPct}%)
           </span>
         </div>
         {(fillHealth.broker_flatten_fill_count ?? 0) > 0 ||
-         (fillHealth.execution_update_unknown_order_critical_count ?? 0) > 0 ||
-         (fillHealth.execution_fill_blocked_count ?? 0) > 0 ||
-         (fillHealth.execution_fill_unmapped_count ?? 0) > 0 ? (
-          <div className="text-xs text-amber-400 mt-2 pt-2 border-t border-gray-700 space-y-0.5">
+        (fillHealth.execution_update_unknown_order_critical_count ?? 0) > 0 ||
+        (fillHealth.execution_fill_blocked_count ?? 0) > 0 ||
+        (fillHealth.execution_fill_unmapped_count ?? 0) > 0 ? (
+          <div className="mt-3 space-y-1 border-t border-gray-700/70 pt-3 text-xs text-amber-300">
             {(fillHealth.broker_flatten_fill_count ?? 0) > 0 && (
               <div>Broker flatten: {fillHealth.broker_flatten_fill_count}</div>
             )}
@@ -75,7 +82,7 @@ export function FillHealthCard({ fillHealth }: FillHealthCardProps) {
             )}
           </div>
         ) : null}
-        <div className="text-xs text-gray-500 mt-2 pt-2 border-t border-gray-700">
+        <div className="mt-3 border-t border-gray-700/70 pt-3 text-xs text-gray-500">
           {fillHealth.total_fills} total fills ({fillHealth.trading_date})
         </div>
       </div>

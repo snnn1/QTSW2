@@ -239,9 +239,15 @@ def canonicalize_stream(stream_id: str, execution_instrument: str) -> str:
 class EventProcessor:
     """Processes events and updates state manager."""
     
-    def __init__(self, state_manager: WatchdogStateManager, session_flatten_tracker=None):
+    def __init__(
+        self,
+        state_manager: WatchdogStateManager,
+        session_flatten_tracker=None,
+        record_incidents: bool = True,
+    ):
         self._state_manager = state_manager
         self._session_flatten_tracker = session_flatten_tracker
+        self._record_incidents = record_incidents
         self._last_processed_seq: Dict[str, int] = {}  # run_id -> event_seq
     
     def _parse_timestamp(self, timestamp_str: str) -> Optional[datetime]:
@@ -278,10 +284,11 @@ class EventProcessor:
             event["timestamp_utc"] = str(raw_ts).strip()
 
         # Incident recorder: purely observational, never throws (sees normalized keys)
-        try:
-            incident_recorder_process_event(event)
-        except Exception:
-            pass
+        if self._record_incidents:
+            try:
+                incident_recorder_process_event(event)
+            except Exception:
+                pass
 
         event_type = event.get("event_type") or ""
         run_id = event.get("run_id", "")

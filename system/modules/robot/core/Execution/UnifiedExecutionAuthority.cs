@@ -45,6 +45,7 @@ public sealed class UnifiedExecutionAuthority
         if (!ExecutionPermissionAuthority.TryAdapterOrderSubmitPreflight(
                 request.GlobalKillSwitchActive,
                 request.MismatchExecutionBlocked,
+                request.MismatchExecutionBlockedForSubmit,
                 request.InstrumentFrozenOrEpaBlocked,
                 instrument,
                 request.SubmitPath,
@@ -59,7 +60,9 @@ public sealed class UnifiedExecutionAuthority
         // Gate 2: Explicit Mismatch Block (first-class authority input)
         // Gate1 checks mismatch via EPA preflight, but this gate is the explicit mismatch authority
         // for non-coverage submits. When Gate1+Gate2 merge in Phase 2, this becomes the single check.
-        if (request.MismatchExecutionBlocked?.Invoke(instrument) == true
+        var mismatchBlocked = request.MismatchExecutionBlockedForSubmit?.Invoke(instrument, request.SubmitPath) ??
+                              (request.MismatchExecutionBlocked?.Invoke(instrument) == true);
+        if (mismatchBlocked
             && request.SubmitIntent != SubmitIntent.RiskCoverage)
         {
             trail.Add(new GateEvaluation { GateName = "Gate2_MismatchBlock", Passed = false, DenyReason = "MISMATCH_EXECUTION_BLOCKED" });

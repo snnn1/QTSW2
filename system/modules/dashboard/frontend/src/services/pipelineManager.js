@@ -195,10 +195,10 @@ export async function startApp(app) {
 
 export async function checkBackendConnection() {
   try {
-    // Use direct backend URL in development (port 8001) instead of relying on Vite proxy
-    // This fixes connection failures when proxy is unstable
+    // Use direct backend URL in development instead of relying on Vite proxy.
+    // Repo launch scripts and Vite proxy targets use backend :8000.
     const isDev = window.location.hostname === 'localhost' && window.location.port === '5173'
-    const healthUrl = isDev ? 'http://localhost:8001/health' : HEALTH_URL
+    const healthUrl = isDev ? 'http://localhost:8000/health' : HEALTH_URL
     const res = await fetchWithTimeout(healthUrl, {}, API_TIMEOUT_SHORT)
     if (!res.ok) {
       console.warn(`[Health Check] Backend returned status ${res.status}`)

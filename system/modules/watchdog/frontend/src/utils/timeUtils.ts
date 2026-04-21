@@ -99,10 +99,12 @@ export function parseChicagoTime(): string {
 /**
  * Compute time in state (seconds elapsed)
  */
-export function computeTimeInState(entryTimeUtc: string): number {
+export function computeTimeInState(entryTimeUtc: string, referenceTimeUtc?: string | null): number {
   const entry = new Date(entryTimeUtc)
-  const now = new Date()
-  return Math.floor((now.getTime() - entry.getTime()) / 1000)
+  if (isNaN(entry.getTime())) return 0
+  const reference = referenceTimeUtc ? new Date(referenceTimeUtc) : new Date()
+  const effectiveReference = isNaN(reference.getTime()) ? new Date() : reference
+  return Math.max(0, Math.floor((effectiveReference.getTime() - entry.getTime()) / 1000))
 }
 
 /**

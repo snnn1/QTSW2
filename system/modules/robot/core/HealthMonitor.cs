@@ -65,6 +65,7 @@ public sealed class HealthMonitor
     // PHASE 3: Engine heartbeat and timetable poll tracking
     private DateTimeOffset _lastEngineTickUtc = DateTimeOffset.MinValue;
     private DateTimeOffset _lastTimetablePollUtc = DateTimeOffset.MinValue;
+    private DateTimeOffset _engineStartUtc = DateTimeOffset.MinValue;
     
     // PHASE 4: Session-aware monitoring state
     private readonly Dictionary<string, bool> _instrumentHasReceivedData = new(StringComparer.OrdinalIgnoreCase);
@@ -77,7 +78,9 @@ public sealed class HealthMonitor
     private const int DATA_LOSS_LOG_RATE_LIMIT_MINUTES = 15; // Log at most once per 15 minutes per instrument
     private ConnectionIncident? _currentIncident = null; // Single source of truth for connection tracking
     private bool _engineTickStallActive = false;
+    private int _engineTickStallConsecutiveCount = 0;
     private bool _timetablePollStallActive = false;
+    private bool _playbackTelemetryMode = false;
     
     // Session awareness: callback to check if any streams are in active trading state
     private Func<bool>? _hasActiveStreamsCallback;
@@ -116,6 +119,8 @@ public sealed class HealthMonitor
     
     // PHASE 3: Stall detection thresholds
     private const int ENGINE_TICK_STALL_SECONDS = 120; // Engine tick should occur at least every 120 seconds (increased for noise reduction)
+    private const int ENGINE_TICK_STALL_HYSTERESIS_COUNT = 2;
+    private const int ENGINE_START_GRACE_PERIOD_SECONDS = 180;
     private const int TIMETABLE_POLL_STALL_SECONDS = 60; // Timetable poll should occur at least every 60 seconds
     
     private const int CONNECTION_LOST_SUSTAINED_SECONDS = 60; // Must be disconnected for 60+ seconds before notifying
@@ -172,6 +177,7 @@ public sealed class HealthMonitor
     public void SetRunId(string runId)
     {
         _runId = runId;
+        _engineStartUtc = DateTimeOffset.UtcNow;
     }
     
     /// <summary>
@@ -221,6 +227,11 @@ public sealed class HealthMonitor
     public void SetMarketOpenCallback(Func<bool>? callback)
     {
         _isMarketOpenCallback = callback;
+    }
+
+    public void SetPlaybackTelemetryMode(bool enabled)
+    {
+        _playbackTelemetryMode = enabled;
     }
 
     /// <summary>
@@ -640,25 +651,45 @@ public sealed class HealthMonitor
             return;
 
         var elapsed = (utcNow - _lastEngineTickUtc).TotalSeconds;
-        
-        if (elapsed >= ENGINE_TICK_STALL_SECONDS)
+        if (elapsed < ENGINE_TICK_STALL_SECONDS)
         {
-            if (!_engineTickStallActive)
+            _engineTickStallConsecutiveCount = 0;
+            return;
+        }
+
+        _engineTickStallConsecutiveCount++;
+        if (_engineTickStallConsecutiveCount < ENGINE_TICK_STALL_HYSTERESIS_COUNT)
+            return;
+
+        if (!_engineTickStallActive)
+        {
+            _engineTickStallActive = true;
+            var inStartupGrace = _engineStartUtc != DateTimeOffset.MinValue &&
+                (utcNow - _engineStartUtc).TotalSeconds < ENGINE_START_GRACE_PERIOD_SECONDS;
+            var eventType = inStartupGrace
+                ? "ENGINE_TICK_STALL_STARTUP"
+                : _playbackTelemetryMode
+                    ? "ENGINE_TICK_STALL_PLAYBACK"
+                    : "ENGINE_TICK_STALL_RUNTIME";
+            var causeHint = inStartupGrace ? "hydration_or_bars_loading" : _playbackTelemetryMode ? "isolated_playback_wallclock_gap" : null;
+
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: eventType, state: "ENGINE",
+                new
+                {
+                    last_tick_utc = _lastEngineTickUtc.ToString("o"),
+                    elapsed_seconds = elapsed,
+                    threshold_seconds = ENGINE_TICK_STALL_SECONDS,
+                    consecutive_count = _engineTickStallConsecutiveCount,
+                    cause_hint = causeHint,
+                    in_startup_grace = inStartupGrace,
+                    playback_mode = _playbackTelemetryMode
+                }));
+
+            if (!inStartupGrace && !_playbackTelemetryMode)
             {
-                _engineTickStallActive = true;
-                
                 var title = "Engine Tick Stall Detected";
                 var message = $"Engine Tick() has not been called for {elapsed:F0}s. Last tick: {_lastEngineTickUtc:o} UTC. Threshold: {ENGINE_TICK_STALL_SECONDS}s";
-                
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ENGINE_TICK_STALL_DETECTED", state: "ENGINE",
-                    new
-                    {
-                        last_tick_utc = _lastEngineTickUtc.ToString("o"),
-                        elapsed_seconds = elapsed,
-                        threshold_seconds = ENGINE_TICK_STALL_SECONDS
-                    }));
-                
-                SendNotification("ENGINE_TICK_STALL", title, message, priority: 2, skipPerKeyRateLimit: true); // Emergency priority, respects per-event-type limiter
+                SendNotification("ENGINE_TICK_STALL", title, message, priority: 2, skipPerKeyRateLimit: true);
             }
         }
     }

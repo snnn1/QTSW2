@@ -292,9 +292,18 @@ public static class StateConsistencyReleaseEvaluator
         if (r.BlockerInvariantViolation)
             r.IsExplainable = false;
 
-        r.ReleaseReady = r.IsExplainable && !hasStructuralBlocker && !r.BlockerInvariantViolation;
+        var releaseReady = r.IsExplainable && !hasStructuralBlocker && !r.BlockerInvariantViolation;
+        if (!releaseReady && IsBrokerFlatSoftTransitionOnlyRelease(i, r, resolved))
+        {
+            releaseReady = true;
+            r.Contradictions.Add("info_soft_transition_broker_flat_release");
+        }
+
+        r.ReleaseReady = releaseReady;
         r.Summary = r.ReleaseReady
-            ? "release_ready"
+            ? (r.Contradictions.Contains("info_soft_transition_broker_flat_release")
+                ? "release_ready_soft_transition_broker_flat"
+                : "release_ready")
             : string.Join(";", r.Contradictions);
 
         r.SnapshotSufficient = true;
@@ -316,6 +325,108 @@ public static class StateConsistencyReleaseEvaluator
             Summary = reason,
             Contradictions = new List<string> { reason }
         };
+    }
+
+    private static bool IsBrokerFlatSoftTransitionOnlyRelease(
+        StateConsistencyReleaseEvaluationInput input,
+        StateConsistencyReleaseReadinessResult readiness,
+        IReadOnlyList<(ReconciliationBlocker Blocker, ReconciliationDecision Decision)> resolved)
+    {
+        if (resolved.Count == 0 || readiness.BlockerInvariantViolation)
+            return false;
+
+        if (input.BrokerPositionQty != 0 || input.BrokerWorkingCount != 0)
+            return false;
+
+        if (input.UseInstrumentExecutionAuthority && input.IeaOwnedPlusAdoptedWorking > 0)
+            return false;
+
+        if (!readiness.BrokerPositionExplainable || !readiness.BrokerWorkingExplainable ||
+            !readiness.LocalStateCoherent || readiness.UnexplainedBrokerPositionQty != 0 ||
+            readiness.UnexplainedBrokerWorkingCount != 0)
+            return false;
+
+        foreach (var x in resolved)
+        {
+            switch (x.Decision)
+            {
+                case ReconciliationDecision.IGNORE:
+                    continue;
+                case ReconciliationDecision.ADOPT:
+                case ReconciliationDecision.RETRY:
+                    if (!IsSoftTransitionBlocker(x.Blocker.ReasonCode))
+                        return false;
+                    continue;
+                case ReconciliationDecision.ALTERNATE_LANE:
+                    if (x.Blocker.IsTerminal == true || !IsSoftTransitionBlocker(x.Blocker.ReasonCode))
+                        return false;
+                    continue;
+                default:
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool IsSoftTransitionBlocker(ReconciliationBlockerReasonCode reasonCode) =>
+        reasonCode is ReconciliationBlockerReasonCode.BrokerVisibleAdoptableExposure
+            or ReconciliationBlockerReasonCode.TagMismatchExposure
+            or ReconciliationBlockerReasonCode.JournalOnlyBrokerFlat
+            or ReconciliationBlockerReasonCode.AlreadyOwnedElsewhere
+            or ReconciliationBlockerReasonCode.StaleSnapshot;
+}
+
+/// <summary>Policy for whether forced-convergence failure should also persist a restart-durable risk latch.</summary>
+public static class ForcedConvergenceRiskLatchPolicy
+{
+    public static bool ShouldPersistDurableRiskLatch(StateConsistencyReleaseReadinessResult? readiness)
+    {
+        if (readiness == null || readiness.ReleaseReady || !readiness.SnapshotSufficient)
+            return false;
+
+        if (readiness.LegacyClassifierGap)
+            return false;
+
+        if (readiness.BlockerInvariantViolation)
+            return true;
+
+        var resolved = readiness.ResolvedBlockers;
+        if (resolved != null && resolved.Count > 0)
+        {
+            foreach (var x in resolved)
+            {
+                if (x.Decision == ReconciliationDecision.ESCALATE)
+                    return true;
+
+                if (x.Decision == ReconciliationDecision.ALTERNATE_LANE && x.Blocker.IsTerminal == true)
+                    return true;
+            }
+
+            var onlyRecoverableBlockers = resolved.All(x =>
+                x.Decision is ReconciliationDecision.IGNORE
+                    or ReconciliationDecision.ADOPT
+                    or ReconciliationDecision.RETRY ||
+                (x.Decision == ReconciliationDecision.ALTERNATE_LANE && x.Blocker.IsTerminal != true));
+            if (onlyRecoverableBlockers)
+                return false;
+        }
+
+        var hasUnexplainedPositionWithoutBridge = readiness.UnexplainedBrokerPositionQty > 0 &&
+                                                 readiness.DiagnosticBrokerWorkingCount == 0 &&
+                                                 readiness.DiagnosticIeaOwnedPlusAdoptedWorking == 0 &&
+                                                 !readiness.PendingAdoptionExists;
+        if (hasUnexplainedPositionWithoutBridge)
+            return true;
+
+        var hasUnexplainedWorkingWithoutResolutionLane = readiness.UnexplainedBrokerWorkingCount > 0 &&
+                                                         !readiness.PendingAdoptionExists &&
+                                                         (resolved == null || resolved.Count == 0 ||
+                                                          resolved.All(x => x.Decision == ReconciliationDecision.IGNORE));
+        if (hasUnexplainedWorkingWithoutResolutionLane)
+            return true;
+
+        return false;
     }
 }
 

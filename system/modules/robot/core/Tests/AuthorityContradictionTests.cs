@@ -15,6 +15,8 @@ public static class AuthorityContradictionTests
     {
         var e = Case_MismatchBlockVsBrokerFlattenTruth();
         if (e != null) return (false, e);
+        e = Case_SubmitPathAwareMismatchBypass();
+        if (e != null) return (false, e);
         e = Case_RecoveryVsStructuralExecution();
         if (e != null) return (false, e);
         e = Case_BrokerVsJournalSingleParityClassification();
@@ -28,7 +30,7 @@ public static class AuthorityContradictionTests
     /// </summary>
     private static string? Case_MismatchBlockVsBrokerFlattenTruth()
     {
-        if (ExecutionPermissionAuthority.TryAdapterOrderSubmitPreflight(() => false, _ => true, (_, _) => false, "MES", "SUBMIT_ENTRY_STOP", out var deny) ||
+        if (ExecutionPermissionAuthority.TryAdapterOrderSubmitPreflight(() => false, _ => true, null, (_, _) => false, "MES", "SUBMIT_ENTRY_STOP", out var deny) ||
             deny != "MISMATCH_EXECUTION_BLOCK")
             return "expected EPA deny MISMATCH_EXECUTION_BLOCK when mismatch callback true";
 
@@ -42,6 +44,37 @@ public static class AuthorityContradictionTests
         // Official flatten-complete (G4) is broker-model zero; non-zero => not complete — single normative story.
         if (exposure.ReconciliationAbsQuantityTotal == 0)
             return "expected non-zero reconciliation abs for open broker position";
+        return null;
+    }
+
+    private static string? Case_SubmitPathAwareMismatchBypass()
+    {
+        bool GateByPath(string _, string? submitPath) =>
+            !string.Equals(submitPath, "SUBMIT_ENTRY_STOP", StringComparison.Ordinal);
+
+        if (!ExecutionPermissionAuthority.TryAdapterOrderSubmitPreflight(
+                () => false,
+                _ => true,
+                GateByPath,
+                (_, _) => false,
+                "MES",
+                "SUBMIT_ENTRY_STOP",
+                out var allowDeny))
+            return "expected submit-path mismatch bypass to allow SUBMIT_ENTRY_STOP";
+        if (!string.IsNullOrEmpty(allowDeny))
+            return "expected no deny reason on SUBMIT_ENTRY_STOP bypass";
+
+        if (ExecutionPermissionAuthority.TryAdapterOrderSubmitPreflight(
+                () => false,
+                _ => false,
+                GateByPath,
+                (_, _) => false,
+                "MES",
+                "SUBMIT_ENTRY",
+                out var deny) ||
+            deny != "MISMATCH_EXECUTION_BLOCK")
+            return "expected submit-path mismatch deny for SUBMIT_ENTRY";
+
         return null;
     }
 

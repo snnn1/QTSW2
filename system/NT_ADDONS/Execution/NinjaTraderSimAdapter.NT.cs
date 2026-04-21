@@ -1615,7 +1615,7 @@ public sealed partial class NinjaTraderSimAdapter
         RegisterIntent(reentryIntent);
         RegisterIntentPolicy(canonicalIntentId, quantity, quantity, instrument, execInst, "EXECUTION_COMMAND");
 
-        var result = SubmitEntryOrder(canonicalIntentId, execInst, direction, null, quantity, "MARKET", null, utcNow);
+        var result = SubmitMarketReentryOrder(canonicalIntentId, execInst, direction, quantity, utcNow);
         _log.Write(RobotEvents.ExecutionBase(utcNow, canonicalIntentId, execInst, "SUBMIT_MARKET_REENTRY_COMPLETED",
             new { success = result.Success, error = result.ErrorMessage }));
         _onReentrySubmitCompletedCallback?.Invoke(canonicalIntentId, utcNow, result.Success, result.ErrorMessage);

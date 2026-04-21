@@ -7,7 +7,12 @@ import { fetchStreamPnl, type StreamPnl } from '../services/watchdogApi'
 
 const PNL_POLL_INTERVAL_MS = 60000 // 60 seconds when market open
 
-export function useStreamPnl(tradingDate: string, stream?: string, marketOpen?: boolean | null) {
+export function useStreamPnl(
+  tradingDate: string,
+  stream?: string,
+  marketOpen?: boolean | null,
+  runRoot?: string | null
+) {
   const [pnl, setPnl] = useState<Record<string, StreamPnl>>({})
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -23,7 +28,7 @@ export function useStreamPnl(tradingDate: string, stream?: string, marketOpen?: 
       }
       setError(null)
       
-      const { data, error: apiError } = await fetchStreamPnl(tradingDate, stream)
+      const { data, error: apiError } = await fetchStreamPnl(tradingDate, stream, runRoot)
       
       if (cancelled) return
       
@@ -77,13 +82,13 @@ export function useStreamPnl(tradingDate: string, stream?: string, marketOpen?: 
     return () => {
       cancelled = true
     }
-  }, [tradingDate, stream])
+  }, [tradingDate, stream, runRoot])
 
   // Poll for PnL refresh when market is open
   useEffect(() => {
     if (!tradingDate || marketOpen !== true) return
     const interval = setInterval(() => {
-      fetchStreamPnl(tradingDate, stream).then(({ data, error: apiError }) => {
+      fetchStreamPnl(tradingDate, stream, runRoot).then(({ data, error: apiError }) => {
         if (apiError || !data) return
         if (stream) {
           const streamPnl: StreamPnl = {
@@ -111,7 +116,7 @@ export function useStreamPnl(tradingDate: string, stream?: string, marketOpen?: 
       })
     }, PNL_POLL_INTERVAL_MS)
     return () => clearInterval(interval)
-  }, [tradingDate, stream, marketOpen])
+  }, [tradingDate, stream, marketOpen, runRoot])
   
   return { pnl, loading, error }
 }

@@ -41,6 +41,79 @@ def _matrix_data_error_response(status_code: int, message: str) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"error": message})
 
 
+def _validate_api_trade_date_contract(df, context: str) -> None:
+    """Matrix API follows the same strict trade_date contract as timetable generation."""
+    from modules.matrix.data_loader import _validate_trade_date_dtype, _validate_trade_date_presence
+
+    if df is None or df.empty:
+        return
+    _validate_trade_date_presence(df, context)
+    _validate_trade_date_dtype(df, context)
+
+
+def _resolve_matrix_source(file_path: Optional[str] = None):
+    """
+    Resolve matrix data from the requested file, else prefer the in-memory authoritative snapshot.
+
+    Returns:
+        Tuple[pd.DataFrame, Dict[str, Any]]
+        metadata keys: file_name, matrix_file_id, file_mtime, matrix_source
+    """
+    import pandas as pd
+    from modules.matrix.file_manager import (
+        get_best_matrix_file,
+        get_current_master_matrix_df,
+        get_current_master_matrix_meta,
+        read_parquet_matrix_file,
+    )
+
+    root_matrix_dir = QTSW2_ROOT / "data" / "master_matrix"
+    if not root_matrix_dir.exists():
+        raise FileNotFoundError(f"Master matrix directory not found: {root_matrix_dir}")
+
+    if file_path:
+        resolved_path = Path(file_path)
+        if not resolved_path.is_absolute():
+            resolved_path = root_matrix_dir / resolved_path
+        if not resolved_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+        df = read_parquet_matrix_file(resolved_path)
+        return df, {
+            "file_name": resolved_path.name,
+            "matrix_file_id": resolved_path.name,
+            "file_mtime": resolved_path.stat().st_mtime,
+            "matrix_source": "disk",
+        }
+
+    in_memory_df = get_current_master_matrix_df()
+    in_memory_meta = get_current_master_matrix_meta()
+    if in_memory_df is not None:
+        file_name = (
+            in_memory_meta.get("source_name")
+            or (Path(in_memory_meta["source_path"]).name if in_memory_meta.get("source_path") else None)
+            or "in_memory"
+        )
+        return in_memory_df.copy(), {
+            "file_name": file_name,
+            "matrix_file_id": in_memory_meta.get("snapshot_id") or file_name,
+            "file_mtime": in_memory_meta.get("file_mtime"),
+            "matrix_source": in_memory_meta.get("source_kind") or "in_memory",
+        }
+
+    file_to_load = get_best_matrix_file(str(root_matrix_dir))
+    if file_to_load is None:
+        raise FileNotFoundError(
+            f"No master matrix files found. Checked: {root_matrix_dir}. Build the matrix first."
+        )
+    df = read_parquet_matrix_file(file_to_load)
+    return df, {
+        "file_name": file_to_load.name,
+        "matrix_file_id": file_to_load.name,
+        "file_mtime": file_to_load.stat().st_mtime,
+        "matrix_source": "disk",
+    }
+
+
 def _invalidate_matrix_cache():
     """Clear matrix data cache and MatrixState (call after build/resequence)."""
     global _matrix_data_cache, _breakdown_cache, _stream_stats_cache, _api_cache_hits, _api_cache_misses

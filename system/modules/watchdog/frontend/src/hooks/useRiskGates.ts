@@ -7,7 +7,7 @@ import { fetchRiskGates } from '../services/watchdogApi'
 import { usePollingInterval } from './usePollingInterval'
 import type { RiskGateStatus } from '../types/watchdog'
 
-export function useRiskGates() {
+export function useRiskGates(runRoot?: string | null) {
   const [gates, setGates] = useState<RiskGateStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -18,7 +18,7 @@ export function useRiskGates() {
     if (!hasLoadedRef.current) {
       setLoading(true)
     }
-    const { data, error: apiError } = await fetchRiskGates()
+    const { data, error: apiError } = await fetchRiskGates(runRoot)
     if (apiError) {
       setError(apiError)
       hasLoadedRef.current = true // Mark as loaded even on error
@@ -46,6 +46,13 @@ export function useRiskGates() {
   useEffect(() => {
     poll()
   }, [])
+
+  useEffect(() => {
+    setGates(null)
+    setError(null)
+    setLoading(true)
+    hasLoadedRef.current = false
+  }, [runRoot])
   
   return {
     gates,

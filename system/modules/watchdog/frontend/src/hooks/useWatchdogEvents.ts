@@ -41,7 +41,7 @@ function wsEventToWatchdogEvent(ws: { seq?: number; event_id?: string; event_seq
   }
 }
 
-export function useWatchdogEvents() {
+export function useWatchdogEvents(runRoot?: string | null) {
   const [events, setEvents] = useState<WatchdogEvent[]>([])
   const [cursor, setCursor] = useState<Cursor>({ runId: null, lastEventSeq: 0 })
   const [loading, setLoading] = useState(true)
@@ -55,7 +55,7 @@ export function useWatchdogEvents() {
     if (!hasLoadedRef.current) {
       setLoading(true)
     }
-    const { data, error: apiError } = await fetchWatchdogEvents(cursor.runId, cursor.lastEventSeq)
+    const { data, error: apiError } = await fetchWatchdogEvents(cursor.runId, cursor.lastEventSeq, runRoot)
     
     if (apiError) {
       setError(apiError)
@@ -65,8 +65,6 @@ export function useWatchdogEvents() {
     }
     
     if (data) {
-      // Backend now returns mixed runs (most recent 500 by timestamp) - don't reset on run_id change
-      // Just merge new events; dedupe by run_id:event_seq handles mixed runs
       if (data.run_id && data.run_id !== cursor.runId) {
         setCursor(prev => ({ ...prev, runId: data.run_id }))
       }
@@ -125,13 +123,17 @@ export function useWatchdogEvents() {
     // Always mark as loaded to prevent infinite loading state
     hasLoadedRef.current = true
     setLoading(false)
-  }, [cursor.runId, cursor.lastEventSeq])
+  }, [cursor.runId, cursor.lastEventSeq, runRoot])
   
-  const pollIntervalMs = wsConnected ? REST_POLL_MS_WHEN_WS_CONNECTED : REST_POLL_MS_WHEN_WS_DISCONNECTED
+  const restOnlyMode = Boolean(runRoot)
+  const pollIntervalMs = restOnlyMode
+    ? REST_POLL_MS_WHEN_WS_DISCONNECTED
+    : (wsConnected ? REST_POLL_MS_WHEN_WS_CONNECTED : REST_POLL_MS_WHEN_WS_DISCONNECTED)
   const { lastSuccessfulPollTimestamp } = usePollingInterval(poll, pollIntervalMs)
 
   // WebSocket subscription: merge live events when WS connected
   useEffect(() => {
+    if (restOnlyMode) return
     if (!wsSubscribe) return
     const unsub = wsSubscribe((wsEvent: { type?: string; seq?: number; event_id?: string; event_seq?: number; ts_utc?: string; run_id?: string; stream_id?: string; data?: Record<string, unknown> }) => {
       if (wsEvent.type === 'heartbeat') return
@@ -154,12 +156,21 @@ export function useWatchdogEvents() {
       })
     })
     return unsub
-  }, [wsSubscribe])
+  }, [wsSubscribe, restOnlyMode])
 
   // Initial load
   useEffect(() => {
     poll()
   }, [])
+
+  useEffect(() => {
+    setEvents([])
+    setCursor({ runId: null, lastEventSeq: 0 })
+    setError(null)
+    setLoading(true)
+    processedEventsRef.current.clear()
+    hasLoadedRef.current = false
+  }, [runRoot])
   
   // Memoize sorted events - sort by timestamp (event_seq resets on watchdog restart,
   // so old events can have higher seq than new ones, causing stale display)

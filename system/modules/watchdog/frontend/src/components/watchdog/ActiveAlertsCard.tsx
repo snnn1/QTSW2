@@ -32,15 +32,19 @@ export function ActiveAlertsCard({ alerts }: ActiveAlertsCardProps) {
   }
 
   return (
-    <div id="active-alerts-panel" className="bg-gray-800 rounded-lg p-4 border border-amber-600/50">
-      <div className="text-sm font-semibold text-amber-400 mb-2">
-        Active Alerts ({alerts.length})
+    <div id="active-alerts-panel" className="watchdog-panel border-amber-600/50 bg-amber-950/20">
+      <div className="watchdog-panel-header">
+        <div>
+          <div className="watchdog-panel-kicker text-amber-500">Live Alerts</div>
+          <div className="watchdog-panel-title text-amber-200">Active Alerts</div>
+        </div>
+        <div className="watchdog-panel-meta text-amber-300">{alerts.length} open</div>
       </div>
       <div className="space-y-2">
         {alerts.map((a) => (
           <div
             key={a.alert_id}
-            className="text-sm bg-gray-900/50 rounded p-2 border border-gray-700"
+            className="rounded-xl border border-amber-700/30 bg-gray-950/45 p-3 text-sm"
           >
             <div className="font-medium text-amber-300">
               {ALERT_TYPE_LABELS[a.alert_type] ?? a.alert_type.replace(/_/g, ' ')}

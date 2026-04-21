@@ -80,6 +80,7 @@ public sealed class HealthMonitor
     private bool _engineTickStallActive = false;
     private int _engineTickStallConsecutiveCount = 0; // Hysteresis: require N consecutive evaluations before notifying
     private bool _timetablePollStallActive = false;
+    private bool _playbackTelemetryMode = false;
     
     // Session awareness: callback to check if any streams are in active trading state
     private Func<bool>? _hasActiveStreamsCallback;
@@ -212,6 +213,11 @@ public sealed class HealthMonitor
     {
         _runId = runId;
         _engineStartUtc = DateTimeOffset.UtcNow; // For startup grace period (suppress stall during hydration)
+    }
+
+    public void SetPlaybackTelemetryMode(bool enabled)
+    {
+        _playbackTelemetryMode = enabled;
     }
     
     /// <summary>
@@ -900,8 +906,12 @@ public sealed class HealthMonitor
         if (!_engineTickStallActive)
         {
             _engineTickStallActive = true;
-            var eventType = inStartupGrace ? "ENGINE_TICK_STALL_STARTUP" : "ENGINE_TICK_STALL_RUNTIME";
-            var causeHint = inStartupGrace ? "hydration_or_bars_loading" : null;
+            var eventType = inStartupGrace
+                ? "ENGINE_TICK_STALL_STARTUP"
+                : _playbackTelemetryMode
+                    ? "ENGINE_TICK_STALL_PLAYBACK"
+                    : "ENGINE_TICK_STALL_RUNTIME";
+            var causeHint = inStartupGrace ? "hydration_or_bars_loading" : _playbackTelemetryMode ? "isolated_playback_wallclock_gap" : null;
             
             _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: eventType, state: "ENGINE",
                 new
@@ -911,12 +921,13 @@ public sealed class HealthMonitor
                     threshold_seconds = ENGINE_TICK_STALL_SECONDS,
                     consecutive_count = _engineTickStallConsecutiveCount,
                     cause_hint = causeHint,
-                    in_startup_grace = inStartupGrace
+                    in_startup_grace = inStartupGrace,
+                    playback_mode = _playbackTelemetryMode
                 }));
             
-            // Only notify for runtime stall (critical); startup stall is info-only
+            // Only notify for live runtime stall; startup/playback stall is log-only.
             // Cooldown: max 1 push per 30 min per process to avoid spam
-            if (!inStartupGrace)
+            if (!inStartupGrace && !_playbackTelemetryMode)
             {
                 lock (_sharedEngineTickLock)
                 {

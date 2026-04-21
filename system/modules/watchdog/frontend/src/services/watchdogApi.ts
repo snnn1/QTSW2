@@ -86,9 +86,12 @@ export async function fetchSessionFlattenState(): Promise<ApiResponse<SessionFla
   }
 }
 
-export async function fetchWatchdogStatus(): Promise<ApiResponse<WatchdogStatus>> {
+export async function fetchWatchdogStatus(runRoot?: string | null): Promise<ApiResponse<WatchdogStatus>> {
   try {
-    const response = await fetchWithTimeout(`${API_BASE}/status`)
+    const qs = new URLSearchParams()
+    if (runRoot) qs.set('run_root', runRoot)
+    const url = qs.toString() ? `${API_BASE}/status?${qs.toString()}` : `${API_BASE}/status`
+    const response = await fetchWithTimeout(url)
     if (!response.ok) {
       // Try to get error detail from response
       let errorDetail = response.statusText
@@ -114,12 +117,17 @@ export async function fetchWatchdogStatus(): Promise<ApiResponse<WatchdogStatus>
  */
 export async function fetchWatchdogEvents(
   runId: string | null,
-  sinceSeq: number
+  sinceSeq: number,
+  runRoot?: string | null
 ): Promise<ApiResponse<{ run_id: string | null; events: WatchdogEvent[]; next_seq: number }>> {
   try {
+    const params = new URLSearchParams({ since_seq: String(sinceSeq) })
+    if (runRoot) params.set('run_root', runRoot)
+    if (runId) params.set('run_id', runId)
+
     if (!runId) {
-      // If no runId, try to get current run_id from backend
-      const response = await fetchWithTimeout(`${API_BASE}/events?since_seq=${sinceSeq}`)
+      // If no runId, let the backend resolve the current run for this run_root.
+      const response = await fetchWithTimeout(`${API_BASE}/events?${params.toString()}`)
       if (!response.ok) {
         let errorDetail = response.statusText
         try {
@@ -135,8 +143,8 @@ export async function fetchWatchdogEvents(
       const data = await response.json()
       return { data, error: null }
     }
-    
-    const response = await fetchWithTimeout(`${API_BASE}/events?run_id=${encodeURIComponent(runId)}&since_seq=${sinceSeq}`)
+
+    const response = await fetchWithTimeout(`${API_BASE}/events?${params.toString()}`)
     if (!response.ok) {
       let errorDetail = response.statusText
       try {
@@ -159,9 +167,12 @@ export async function fetchWatchdogEvents(
 /**
  * Fetch risk gate status
  */
-export async function fetchRiskGates(): Promise<ApiResponse<RiskGateStatus>> {
+export async function fetchRiskGates(runRoot?: string | null): Promise<ApiResponse<RiskGateStatus>> {
   try {
-    const response = await fetchWithTimeout(`${API_BASE}/risk-gates`)
+    const qs = new URLSearchParams()
+    if (runRoot) qs.set('run_root', runRoot)
+    const url = qs.toString() ? `${API_BASE}/risk-gates?${qs.toString()}` : `${API_BASE}/risk-gates`
+    const response = await fetchWithTimeout(url)
     if (!response.ok) {
       let errorDetail = response.statusText
       try {
@@ -184,9 +195,14 @@ export async function fetchRiskGates(): Promise<ApiResponse<RiskGateStatus>> {
 /**
  * Fetch unprotected positions
  */
-export async function fetchUnprotectedPositions(): Promise<ApiResponse<{ timestamp_chicago: string; unprotected_positions: UnprotectedPosition[] }>> {
+export async function fetchUnprotectedPositions(
+  runRoot?: string | null
+): Promise<ApiResponse<{ timestamp_chicago: string; unprotected_positions: UnprotectedPosition[] }>> {
   try {
-    const response = await fetchWithTimeout(`${API_BASE}/unprotected-positions`)
+    const qs = new URLSearchParams()
+    if (runRoot) qs.set('run_root', runRoot)
+    const url = qs.toString() ? `${API_BASE}/unprotected-positions?${qs.toString()}` : `${API_BASE}/unprotected-positions`
+    const response = await fetchWithTimeout(url)
     if (!response.ok) {
       let errorDetail = response.statusText
       try {
@@ -212,12 +228,14 @@ export async function fetchUnprotectedPositions(): Promise<ApiResponse<{ timesta
 export async function fetchExecutionJournal(
   tradingDate: string,
   stream?: string,
-  intentId?: string
+  intentId?: string,
+  runRoot?: string | null
 ): Promise<ApiResponse<{ entries: ExecutionJournalEntry[] }>> {
   try {
     const params = new URLSearchParams({ trading_date: tradingDate })
     if (stream) params.append('stream', stream)
     if (intentId) params.append('intent_id', intentId)
+    if (runRoot) params.append('run_root', runRoot)
     
     const response = await fetch(`${API_BASE}/journal/execution?${params.toString()}`)
     if (!response.ok) {
@@ -233,9 +251,14 @@ export async function fetchExecutionJournal(
 /**
  * Fetch stream journal
  */
-export async function fetchStreamJournal(tradingDate: string): Promise<ApiResponse<{ trading_date: string; streams: StreamJournal[] }>> {
+export async function fetchStreamJournal(
+  tradingDate: string,
+  runRoot?: string | null
+): Promise<ApiResponse<{ trading_date: string; streams: StreamJournal[] }>> {
   try {
-    const response = await fetch(`${API_BASE}/journal/streams?trading_date=${encodeURIComponent(tradingDate)}`)
+    const params = new URLSearchParams({ trading_date: tradingDate })
+    if (runRoot) params.append('run_root', runRoot)
+    const response = await fetch(`${API_BASE}/journal/streams?${params.toString()}`)
     if (!response.ok) {
       return { data: null, error: `HTTP ${response.status}: ${response.statusText}` }
     }
@@ -249,9 +272,14 @@ export async function fetchStreamJournal(tradingDate: string): Promise<ApiRespon
 /**
  * Fetch execution summary
  */
-export async function fetchExecutionSummary(tradingDate: string): Promise<ApiResponse<ExecutionSummary>> {
+export async function fetchExecutionSummary(
+  tradingDate: string,
+  runRoot?: string | null
+): Promise<ApiResponse<ExecutionSummary>> {
   try {
-    const response = await fetch(`${API_BASE}/journal/summary?trading_date=${encodeURIComponent(tradingDate)}`)
+    const params = new URLSearchParams({ trading_date: tradingDate })
+    if (runRoot) params.append('run_root', runRoot)
+    const response = await fetch(`${API_BASE}/journal/summary?${params.toString()}`)
     if (!response.ok) {
       return { data: null, error: `HTTP ${response.status}: ${response.statusText}` }
     }
@@ -265,9 +293,14 @@ export async function fetchExecutionSummary(tradingDate: string): Promise<ApiRes
 /**
  * Fetch unified daily journal (streams, trades, total PnL, summary)
  */
-export async function fetchDailyJournal(tradingDate: string): Promise<ApiResponse<DailyJournal>> {
+export async function fetchDailyJournal(
+  tradingDate: string,
+  runRoot?: string | null
+): Promise<ApiResponse<DailyJournal>> {
   try {
-    const response = await fetch(`${API_BASE}/journal/daily?trading_date=${encodeURIComponent(tradingDate)}`)
+    const params = new URLSearchParams({ trading_date: tradingDate })
+    if (runRoot) params.append('run_root', runRoot)
+    const response = await fetch(`${API_BASE}/journal/daily?${params.toString()}`)
     if (!response.ok) {
       return { data: null, error: `HTTP ${response.status}: ${response.statusText}` }
     }
@@ -281,9 +314,12 @@ export async function fetchDailyJournal(tradingDate: string): Promise<ApiRespons
 /**
  * Fetch current stream states
  */
-export async function fetchStreamStates(): Promise<ApiResponse<StreamStatesResponse>> {
+export async function fetchStreamStates(runRoot?: string | null): Promise<ApiResponse<StreamStatesResponse>> {
   try {
-    const response = await fetchWithTimeout(`${API_BASE}/stream-states`)
+    const qs = new URLSearchParams()
+    if (runRoot) qs.set('run_root', runRoot)
+    const url = qs.toString() ? `${API_BASE}/stream-states?${qs.toString()}` : `${API_BASE}/stream-states`
+    const response = await fetchWithTimeout(url)
     if (!response.ok) {
       let errorDetail = response.statusText
       try {
@@ -306,9 +342,12 @@ export async function fetchStreamStates(): Promise<ApiResponse<StreamStatesRespo
 /**
  * Fetch active intents
  */
-export async function fetchActiveIntents(): Promise<ApiResponse<{ timestamp_chicago: string; intents: IntentExposure[] }>> {
+export async function fetchActiveIntents(runRoot?: string | null): Promise<ApiResponse<{ timestamp_chicago: string; intents: IntentExposure[] }>> {
   try {
-    const response = await fetchWithTimeout(`${API_BASE}/active-intents`)
+    const qs = new URLSearchParams()
+    if (runRoot) qs.set('run_root', runRoot)
+    const url = qs.toString() ? `${API_BASE}/active-intents?${qs.toString()}` : `${API_BASE}/active-intents`
+    const response = await fetchWithTimeout(url)
     if (!response.ok) {
       let errorDetail = response.statusText
       try {
@@ -499,9 +538,12 @@ export interface SlotLifecycleSlot {
 /**
  * Fetch slot lifecycle (forced flatten, reentry, slot expiry per stream)
  */
-export async function fetchSlotLifecycle(): Promise<ApiResponse<SlotLifecycleSlot[]>> {
+export async function fetchSlotLifecycle(runRoot?: string | null): Promise<ApiResponse<SlotLifecycleSlot[]>> {
   try {
-    const response = await fetchWithTimeout(`${API_BASE}/slot-lifecycle`)
+    const qs = new URLSearchParams()
+    if (runRoot) qs.set('run_root', runRoot)
+    const url = qs.toString() ? `${API_BASE}/slot-lifecycle?${qs.toString()}` : `${API_BASE}/slot-lifecycle`
+    const response = await fetchWithTimeout(url)
     if (!response.ok) {
       let errorDetail = response.statusText
       try {
@@ -695,11 +737,13 @@ export async function fetchOperatorSnapshot(
  */
 export async function fetchStreamPnl(
   tradingDate: string,
-  stream?: string
+  stream?: string,
+  runRoot?: string | null
 ): Promise<ApiResponse<StreamPnlResponse>> {
   try {
     const params = new URLSearchParams({ trading_date: tradingDate })
     if (stream) params.append('stream', stream)
+    if (runRoot) params.append('run_root', runRoot)
     
     const response = await fetch(`${API_BASE}/stream-pnl?${params.toString()}`)
     if (!response.ok) {

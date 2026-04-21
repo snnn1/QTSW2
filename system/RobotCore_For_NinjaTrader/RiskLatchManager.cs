@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 
 namespace QTSW2.Robot.Core;
 
@@ -11,6 +12,8 @@ namespace QTSW2.Robot.Core;
 /// </summary>
 public sealed class RiskLatchManager
 {
+    public const string ObsoleteLegacyClassifierGapMarker = "release_blocker_legacy_count_without_classifier";
+
     private readonly string _root;
     private readonly string _account;
     private readonly string _latchDir;
@@ -40,6 +43,10 @@ public sealed class RiskLatchManager
         var safeInstrument = SanitizeForFilename(instrument);
         return Path.Combine(_latchDir, $"risk_latch_{safeAccount}_{safeInstrument}.json");
     }
+
+    public static bool IsObsoleteLegacyClassifierGapReason(string? reason) =>
+        !string.IsNullOrWhiteSpace(reason) &&
+        reason.IndexOf(ObsoleteLegacyClassifierGapMarker, StringComparison.OrdinalIgnoreCase) >= 0;
 
     /// <summary>Persist a risk latch for the given instrument. Call when blocking.</summary>
     public void Persist(string instrument, string reason)
@@ -80,10 +87,37 @@ public sealed class RiskLatchManager
         }
     }
 
+    public bool TryDeleteLatchFile(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return false;
+        try
+        {
+            if (!File.Exists(path))
+                return true;
+
+            var fullPath = Path.GetFullPath(path);
+            var latchRoot = Path.GetFullPath(_latchDir);
+            if (!fullPath.StartsWith(latchRoot, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            File.Delete(fullPath);
+            return true;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
     /// <summary>Read all persisted risk latches and return instrument keys. Call at startup before RiskGate.</summary>
     public IReadOnlyList<string> Hydrate()
     {
-        var result = new List<string>();
+        return HydrateEntries().Select(x => x.Instrument).ToList();
+    }
+
+    public IReadOnlyList<RiskLatchEntry> HydrateEntries()
+    {
+        var result = new List<RiskLatchEntry>();
         if (!Directory.Exists(_latchDir)) return result;
         try
         {
@@ -95,7 +129,16 @@ public sealed class RiskLatchManager
                     var json = File.ReadAllText(path);
                     var payload = JsonUtil.Deserialize<RiskLatchPayload>(json);
                     if (!string.IsNullOrWhiteSpace(payload?.Instrument))
-                        result.Add(payload.Instrument);
+                    {
+                        result.Add(new RiskLatchEntry
+                        {
+                            Account = payload.Account ?? "",
+                            Instrument = payload.Instrument,
+                            BlockedAtUtc = payload.BlockedAtUtc ?? "",
+                            Reason = payload.Reason ?? "",
+                            FilePath = path
+                        });
+                    }
                 }
                 catch
                 {
@@ -108,6 +151,15 @@ public sealed class RiskLatchManager
             // Best-effort
         }
         return result;
+    }
+
+    public sealed class RiskLatchEntry
+    {
+        public string Account { get; init; } = "";
+        public string Instrument { get; init; } = "";
+        public string BlockedAtUtc { get; init; } = "";
+        public string Reason { get; init; } = "";
+        public string FilePath { get; init; } = "";
     }
 
     private class RiskLatchPayload

@@ -1,7 +1,7 @@
 /**
  * WatchdogPage - Primary Live Watchdog page
  */
-import { useState, useMemo, useCallback } from 'react'
+import { useState, useMemo, useCallback, useEffect } from 'react'
 import { WatchdogHeader } from './components/watchdog/WatchdogHeader'
 import { CriticalAlertBanner } from './components/watchdog/CriticalAlertBanner'
 import { StreamStatusTable } from './components/watchdog/StreamStatusTable'
@@ -42,6 +42,7 @@ import { HardGatesStrip } from './components/watchdog/HardGatesStrip'
 import { QuantHealthStrip } from './components/watchdog/QuantHealthStrip'
 import { RunTimelinePanel } from './components/watchdog/RunTimelinePanel'
 import { useRunArtifacts } from './hooks/useRunArtifacts'
+import { isRunSummaryUnavailable } from './types/watchdog'
 import type { StreamState, WatchdogEvent } from './types/watchdog'
 import { deriveOverallExecutionStatus, executionSeverityAlert } from './utils/executionSeverity'
 
@@ -49,6 +50,8 @@ export function WatchdogPage() {
   const [selectedStream, setSelectedStream] = useState<StreamState | null>(null)
   const [selectedEvent, setSelectedEvent] = useState<WatchdogEvent | null>(null)
   const [peekRunRoot, setPeekRunRoot] = useState<string | null>(null)
+  const [autoFollowPlayback, setAutoFollowPlayback] = useState(true)
+  const fullRunMode = Boolean(peekRunRoot)
 
   const {
     summary: runSummary,
@@ -57,9 +60,48 @@ export function WatchdogPage() {
     keyEventsError: keyEventsError,
     recentRuns: recentRunsPayload,
     recentError: recentRunsError,
+    activeSummary,
+    activePersistenceRoot,
   } = useRunArtifacts(peekRunRoot)
 
-  const clearPeek = useCallback(() => setPeekRunRoot(null), [])
+  const isPlaybackRunRoot = useCallback((runRoot: string | null | undefined) => {
+    if (!runRoot) return false
+    const normalized = runRoot.replace(/\\/g, '/').toLowerCase()
+    return normalized.includes('/runs/') || normalized.includes('/data/playback/')
+  }, [])
+
+  const activePlaybackRunRoot = useMemo(() => {
+    return isPlaybackRunRoot(activePersistenceRoot) ? activePersistenceRoot : null
+  }, [activePersistenceRoot, isPlaybackRunRoot])
+
+  const activePlaybackRunId = useMemo(() => {
+    if (!activePlaybackRunRoot || !activeSummary || isRunSummaryUnavailable(activeSummary)) {
+      return null
+    }
+    return activeSummary.run_id ?? null
+  }, [activePlaybackRunRoot, activeSummary])
+
+  const clearPeek = useCallback(() => {
+    setAutoFollowPlayback(false)
+    setPeekRunRoot(null)
+  }, [])
+
+  const handleSelectRunRoot = useCallback((dir: string) => {
+    setAutoFollowPlayback(false)
+    setPeekRunRoot(dir)
+  }, [])
+
+  const enableAutoFollowPlayback = useCallback(() => {
+    if (!activePlaybackRunRoot) return
+    setAutoFollowPlayback(true)
+    setPeekRunRoot(activePlaybackRunRoot)
+  }, [activePlaybackRunRoot])
+
+  useEffect(() => {
+    if (!autoFollowPlayback || !activePlaybackRunRoot) return
+    if (peekRunRoot === activePlaybackRunRoot) return
+    setPeekRunRoot(activePlaybackRunRoot)
+  }, [autoFollowPlayback, activePlaybackRunRoot, peekRunRoot])
   
   // Fetch data — /status + /stream-states + /slot-lifecycle in one tick (useWatchdogLiveSnapshot)
   const {
@@ -69,17 +111,18 @@ export function WatchdogPage() {
     outOfTimetableActiveStreams,
     executionExpectationGaps,
     flattenLookupMetrics,
+    streamStateReferenceUtc,
     slotLifecycle,
     statusError,
     streamsError,
     slotLifecycleError,
     loading: liveSnapshotLoading,
     lastSuccessfulPollTimestamp: liveSnapshotPollTime,
-  } = useWatchdogLiveSnapshot()
-  const { events, cursor, loading: eventsLoading, error: eventsError, lastSuccessfulPollTimestamp: eventsPollTime } = useWatchdogEvents()
-  const { gates, loading: gatesLoading, error: gatesError, lastSuccessfulPollTimestamp: gatesPollTime } = useRiskGates()
-  const { positions: unprotectedPositions, loading: positionsLoading, error: positionsError, lastSuccessfulPollTimestamp: positionsPollTime } = useUnprotectedPositions()
-  const { intents: activeIntents, loading: intentsLoading, error: intentsError, lastSuccessfulPollTimestamp: intentsPollTime } = useActiveIntents()
+  } = useWatchdogLiveSnapshot(peekRunRoot)
+  const { events, cursor, loading: eventsLoading, error: eventsError, lastSuccessfulPollTimestamp: eventsPollTime } = useWatchdogEvents(peekRunRoot)
+  const { gates, loading: gatesLoading, error: gatesError, lastSuccessfulPollTimestamp: gatesPollTime } = useRiskGates(peekRunRoot)
+  const { positions: unprotectedPositions, loading: positionsLoading, error: positionsError, lastSuccessfulPollTimestamp: positionsPollTime } = useUnprotectedPositions(peekRunRoot)
+  const { intents: activeIntents, loading: intentsLoading, error: intentsError, lastSuccessfulPollTimestamp: intentsPollTime } = useActiveIntents(peekRunRoot)
   const { recentAlerts, loading: alertsHistoryLoading } = useWatchdogAlerts(24, 30)
   const { incidents, loading: incidentsLoading } = useIncidents(50)
   const { active: activeIncidents, loading: activeIncidentsLoading } = useActiveIncidents()
@@ -89,7 +132,12 @@ export function WatchdogPage() {
   
   // Get P&L data
   const currentTradingDate = status?.trading_date || streams[0]?.trading_date || new Date().toISOString().split('T')[0]
-  const { pnl } = useStreamPnl(currentTradingDate, undefined, status?.market_open ?? null)
+  const { pnl } = useStreamPnl(currentTradingDate, undefined, status?.market_open ?? null, peekRunRoot)
+
+  useEffect(() => {
+    setSelectedStream(null)
+    setSelectedEvent(null)
+  }, [peekRunRoot])
   
   // Calculate total P&L
   const totalPnl = useMemo(() => {
@@ -97,6 +145,18 @@ export function WatchdogPage() {
       return sum + (s.realized_pnl || 0)
     }, 0)
   }, [pnl])
+
+  const instrumentHealthDisplay = useMemo(() => {
+    if (!fullRunMode) {
+      return instrumentHealth
+    }
+    return Object.entries(status?.data_stall_detected || {}).map(([instrument, info]) => ({
+      instrument,
+      status: info.stall_detected ? 'DATA_STALLED' : 'OK',
+      last_bar_chicago: info.last_bar_chicago ?? null,
+      elapsed_seconds: info.elapsed_seconds ?? null,
+    }))
+  }, [fullRunMode, instrumentHealth, status?.data_stall_detected])
   
   const hasErrors =
     statusError ||
@@ -328,11 +388,12 @@ export function WatchdogPage() {
   }, [status, unprotectedPositions, timetableUnavailable, overallExecution])
   
   return (
-    <div className="min-h-screen bg-black text-white">
+    <div className="watchdog-page-shell text-white">
       <WatchdogHeader
         identityInvariantsPass={status?.last_identity_invariants_pass ?? null}
         identityViolations={status?.last_identity_violations ?? []}
         runId={cursor.runId}
+        viewMode={fullRunMode ? 'run' : 'live'}
         engineStatus={engineStatus}
         marketOpen={status?.market_open !== undefined ? status.market_open : null}
         connectionStatus={status?.connection_status ?? null}
@@ -359,8 +420,8 @@ export function WatchdogPage() {
       
       {/* Error Display */}
       {hasErrors && (
-        <div className="container mx-auto px-4 py-4 mt-16">
-          <div className="bg-red-900 border border-red-700 rounded-lg p-4">
+        <div className="watchdog-content mt-32 px-1 py-4">
+          <div className="watchdog-card rounded-2xl border-red-700/70 bg-red-950/55 p-4">
             <h2 className="text-lg font-semibold mb-2">API Errors</h2>
             <div className="space-y-1 text-sm">
               {statusError && <div>Status: {statusError}</div>}
@@ -380,30 +441,34 @@ export function WatchdogPage() {
       
       {/* Loading State */}
       {isLoading && !hasErrors && (
-        <div className="container mx-auto px-4 py-8 mt-16">
-          <div className="text-center text-gray-400">
+        <div className="watchdog-content mt-32 px-1 py-8">
+          <div className="watchdog-card rounded-2xl p-8 text-center text-gray-400">
             <div className="text-lg mb-2">Loading watchdog data...</div>
             <div className="text-sm">Connecting to backend...</div>
           </div>
         </div>
       )}
       
-      <div className="container mx-auto px-4 pt-4 pb-8 mt-16">
-        <div className="grid grid-cols-10 gap-4">
+      <div className="watchdog-content px-1 pb-10 pt-32">
+        <div className="grid grid-cols-1 gap-5 xl:grid-cols-10">
           {/* Left Column (70%) */}
-          <div className="col-span-7 space-y-4">
+          <div className="space-y-5 xl:col-span-7">
             <RunVerdictStrip
               summary={runSummary}
               clientError={runSummaryError}
               peekActive={Boolean(peekRunRoot)}
               onClearPeek={peekRunRoot ? clearPeek : undefined}
+              autoFollowPlayback={autoFollowPlayback}
+              activePlaybackRunId={activePlaybackRunId}
+              activePlaybackRunRoot={activePlaybackRunRoot}
+              onEnableAutoFollow={activePlaybackRunRoot ? enableAutoFollowPlayback : undefined}
             />
             <HardGatesStrip status={status} slotLifecycle={slotLifecycle} />
             <QuantHealthStrip
               recent={recentRunsPayload}
               error={recentRunsError}
               selectedRunRoot={peekRunRoot}
-              onSelectRunRoot={(dir) => setPeekRunRoot(dir)}
+              onSelectRunRoot={handleSelectRunRoot}
             />
             <RunTimelinePanel
               events={keyEventsPayload?.events ?? []}
@@ -420,6 +485,7 @@ export function WatchdogPage() {
               <StreamStatusTable
                 streams={streams}
                 onStreamClick={setSelectedStream}
+                referenceTimeUtc={streamStateReferenceUtc ?? status?.snapshot_utc ?? null}
                 marketOpen={status?.market_open ?? null}
                 outOfTimetableActiveStreams={outOfTimetableActiveStreams}
                 executionExpectationGaps={executionExpectationGaps}
@@ -434,19 +500,20 @@ export function WatchdogPage() {
           </div>
           
           {/* Right Column (30%) */}
-          <div className="col-span-3 space-y-4">
+          <div className="space-y-5 xl:col-span-3">
             <SystemAuthorityStatusBar
               byInstrument={status?.position_authority_by_instrument}
               overallExecution={overallExecution}
               reconciliationGateState={status?.reconciliation_gate_state}
             />
             {/* P&L Summary Card */}
-            <div className="bg-gray-800 rounded-lg p-4">
-              <div className="text-sm text-gray-400 mb-1">Total Realized P&L</div>
-              <div className={`text-2xl font-bold ${totalPnl >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+            <div className="watchdog-card rounded-2xl p-5">
+              <div className="mb-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-slate-500">P&L Snapshot</div>
+              <div className="text-sm text-gray-400 mb-2">Total Realized P&L</div>
+              <div className={`text-3xl font-semibold tracking-tight ${totalPnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
                 ${totalPnl.toFixed(2)}
               </div>
-              <div className="text-xs text-gray-500 mt-1">
+              <div className="mt-2 text-xs text-gray-500">
                 {Object.keys(pnl).length} stream(s)
               </div>
             </div>
@@ -471,23 +538,35 @@ export function WatchdogPage() {
             {/* Slot lifecycle - forced flatten, reentry, slot expiry */}
             <SlotLifecyclePanel slots={slotLifecycle} loading={liveSnapshotLoading} />
 
-            {/* Phase 1: Alert history (24h) */}
-            <AlertsHistoryCard recent={recentAlerts} loading={alertsHistoryLoading} />
+            {fullRunMode ? (
+              <div className="watchdog-card rounded-2xl p-4">
+                <div className="mb-2 text-sm font-semibold text-gray-200">Run-Scoped Mode</div>
+                <div className="text-xs leading-relaxed text-gray-400">
+                  Incident history, alert history, reliability trends, and other process-wide watchdog history
+                  are hidden while viewing a specific run so the page stays scoped to that run.
+                </div>
+              </div>
+            ) : (
+              <>
+                {/* Phase 1: Alert history (24h) */}
+                <AlertsHistoryCard recent={recentAlerts} loading={alertsHistoryLoading} />
 
-            {/* Active incidents (ongoing) */}
-            <ActiveIncidentsPanel active={activeIncidents} loading={activeIncidentsLoading} />
+                {/* Active incidents (ongoing) */}
+                <ActiveIncidentsPanel active={activeIncidents} loading={activeIncidentsLoading} />
 
-            {/* Phase 6: Incident timeline (historical) */}
-            <IncidentTimeline incidents={incidents} loading={incidentsLoading} />
+                {/* Phase 6: Incident timeline (historical) */}
+                <IncidentTimeline incidents={incidents} loading={incidentsLoading} />
 
-            {/* Phase 6: System reliability */}
-            <ReliabilityPanel metrics={metrics} loading={metricsLoading} />
+                {/* Phase 6: System reliability */}
+                <ReliabilityPanel metrics={metrics} loading={metricsLoading} />
+
+                {/* Phase 8: Reliability trends */}
+                <MetricsHistoryPanel byPeriod={metricsHistory} loading={metricsHistoryLoading} granularity="week" />
+              </>
+            )}
 
             {/* Phase 6: Instrument health */}
-            <InstrumentHealthPanel instruments={instrumentHealth} loading={instrumentHealthLoading} />
-
-            {/* Phase 8: Reliability trends */}
-            <MetricsHistoryPanel byPeriod={metricsHistory} loading={metricsHistoryLoading} granularity="week" />
+            <InstrumentHealthPanel instruments={instrumentHealthDisplay} loading={fullRunMode ? liveSnapshotLoading : instrumentHealthLoading} />
 
             {/* Execution Integrity - anomaly counts */}
             <ExecutionIntegrityPanel counts={status?.execution_integrity ?? null} />

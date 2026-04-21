@@ -4,16 +4,95 @@
 
 body {
   margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
-    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
-    sans-serif;
+  font-family: 'Segoe UI', 'Inter', 'Helvetica Neue', Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  background:
+    radial-gradient(circle at top, rgba(71, 85, 105, 0.18), transparent 32%),
+    linear-gradient(180deg, #111827 0%, #0b1220 38%, #050914 100%);
+  color: #e5e7eb;
 }
 
 code {
   font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
     monospace;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.watchdog-page-shell {
+  min-height: 100vh;
+  background:
+    linear-gradient(180deg, rgba(17, 24, 39, 0.72) 0%, rgba(2, 6, 23, 0.82) 100%);
+}
+
+.watchdog-content {
+  width: min(1600px, calc(100% - 2rem));
+  margin-inline: auto;
+}
+
+.watchdog-card {
+  border: 1px solid rgba(71, 85, 105, 0.6);
+  background: rgba(17, 24, 39, 0.82);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.22);
+  backdrop-filter: blur(10px);
+}
+
+.watchdog-panel {
+  border: 1px solid rgba(71, 85, 105, 0.62);
+  background: rgba(17, 24, 39, 0.82);
+  border-radius: 1rem;
+  padding: 1rem;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.18);
+}
+
+.watchdog-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.85rem;
+}
+
+.watchdog-panel-kicker {
+  font-size: 0.65rem;
+  line-height: 1;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: rgb(100 116 139);
+  margin-bottom: 0.35rem;
+  font-weight: 700;
+}
+
+.watchdog-panel-title {
+  font-size: 0.95rem;
+  line-height: 1.2;
+  font-weight: 600;
+  color: rgb(226 232 240);
+}
+
+.watchdog-panel-meta {
+  font-size: 0.72rem;
+  color: rgb(148 163 184);
+}
+
+.watchdog-panel-table {
+  width: 100%;
+  font-size: 0.875rem;
+}
+
+.watchdog-panel-table thead {
+  background: rgba(30, 41, 59, 0.72);
+}
+
+.watchdog-panel-table th {
+  font-size: 0.65rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgb(148 163 184);
+  font-weight: 700;
 }
 
 /* Watchdog UI Animations */

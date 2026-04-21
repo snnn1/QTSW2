@@ -46,6 +46,35 @@ public static class StateConsistencyGateTests
             Contradictions = new List<string> { why }
         };
 
+        StateConsistencyReleaseReadinessResult SoftTransitionFlat(string inst) => new()
+        {
+            Instrument = inst,
+            SnapshotSufficient = true,
+            ReleaseReady = false,
+            IsExplainable = true,
+            BrokerPositionExplainable = true,
+            BrokerWorkingExplainable = true,
+            LocalStateCoherent = true,
+            PendingAdoptionExists = true,
+            DiagnosticBrokerPositionQty = 0,
+            DiagnosticJournalOpenQty = 0,
+            DiagnosticBrokerWorkingCount = 0,
+            DiagnosticIeaOwnedPlusAdoptedWorking = 0,
+            DiagnosticPendingAdoptionCandidateCount = 1,
+            DiagnosticAdoptDecisionCount = 1,
+            Summary = "pending_adoption_adopt_decision;blocker_adopt:BrokerVisibleAdoptableExposure:test",
+            Contradictions = new List<string> { "pending_adoption_adopt_decision", "blocker_adopt:BrokerVisibleAdoptableExposure:test" },
+            ResolvedBlockers = new List<(ReconciliationBlocker Blocker, ReconciliationDecision Decision)>
+            {
+                (new ReconciliationBlocker
+                {
+                    ReasonCode = ReconciliationBlockerReasonCode.BrokerVisibleAdoptableExposure,
+                    IntentId = "soft-transition-test",
+                    IsTerminal = false
+                }, ReconciliationDecision.ADOPT)
+            }
+        };
+
         // 1) First mismatch engages immediately + DetectedBlocked
         var coord1 = new MismatchEscalationCoordinator(
             getSnapshot: () => snap,
@@ -587,6 +616,79 @@ public static class StateConsistencyGateTests
             return (false, "17: must remain blocked on persistent mismatch with unexplained working");
         if (st.GateLifecyclePhase == GateLifecyclePhase.None)
             return (false, "17: gate should not release while not release-ready");
+
+        // 18) Broker-flat release-ready state can release promptly without waiting for the full quiet window.
+        var coord18 = new MismatchEscalationCoordinator(
+            getSnapshot: () => snap,
+            getActiveInstruments: () => Array.Empty<string>(),
+            getMismatchObservations: (_, _) => Array.Empty<MismatchObservation>(),
+            isInstrumentBlocked: _ => false,
+            isFlattenInProgress: _ => false,
+            isRecoveryInProgress: _ => false,
+            log: null,
+            runInstrumentGateReconciliation: (_, _, _) =>
+                new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Success },
+            evaluateReleaseReadiness: (_, _, _, _) => Ready("ST6"),
+            stateConsistencyStableWindowMs: 500);
+        coord18.ProcessObservationForTest(new MismatchObservation
+        {
+            Instrument = "ST6",
+            MismatchType = MismatchType.BROKER_AHEAD,
+            Present = true,
+            ObservedUtc = t0,
+            NetBrokerQty = 0,
+            NetJournalQty = 0
+        });
+        coord18.AdvanceStateConsistencyGateForTest("ST6", snap, t0, new MismatchObservation
+        {
+            Instrument = "ST6",
+            MismatchType = MismatchType.BROKER_AHEAD,
+            Present = true,
+            ObservedUtc = t0,
+            NetBrokerQty = 0,
+            NetJournalQty = 0,
+            BrokerWorkingOrderCount = 0,
+            LocalWorkingOrderCount = 0
+        });
+        coord18.AdvanceStateConsistencyGateForTest("ST6", snap, t0.AddMilliseconds(10), new MismatchObservation
+        {
+            Instrument = "ST6",
+            MismatchType = MismatchType.BROKER_AHEAD,
+            Present = true,
+            ObservedUtc = t0.AddMilliseconds(10),
+            NetBrokerQty = 0,
+            NetJournalQty = 0,
+            BrokerWorkingOrderCount = 0,
+            LocalWorkingOrderCount = 0
+        });
+        st = coord18.GetStateForTest("ST6");
+        if (st == null || st.Blocked)
+            return (false, "18: broker-flat release-ready state should release promptly");
+
+        // 19) Soft-transition broker-flat cleanup can bypass mismatch authority for lock-time entry stops only.
+        var coord19 = new MismatchEscalationCoordinator(
+            getSnapshot: () => snap,
+            getActiveInstruments: () => Array.Empty<string>(),
+            getMismatchObservations: (_, _) => Array.Empty<MismatchObservation>(),
+            isInstrumentBlocked: _ => false,
+            isFlattenInProgress: _ => false,
+            isRecoveryInProgress: _ => false,
+            log: null,
+            runInstrumentGateReconciliation: (_, _, _) =>
+                new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Partial },
+            evaluateReleaseReadiness: (_, _, _, _) => SoftTransitionFlat("ST7"),
+            stateConsistencyStableWindowMs: 500);
+        coord19.ProcessObservationForTest(new MismatchObservation
+        {
+            Instrument = "ST7",
+            MismatchType = MismatchType.BROKER_AHEAD,
+            Present = true,
+            ObservedUtc = t0
+        });
+        if (!coord19.IsSubmitBlockedByMismatch("ST7", "SUBMIT_ENTRY"))
+            return (false, "19: generic opening entry should remain mismatch-blocked");
+        if (coord19.IsSubmitBlockedByMismatch("ST7", "SUBMIT_ENTRY_STOP"))
+            return (false, "19: soft-transition lock entry stop should bypass mismatch block");
 
         return (true, null);
         }

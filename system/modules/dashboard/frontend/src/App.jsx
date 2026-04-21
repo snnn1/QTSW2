@@ -80,21 +80,6 @@ function App() {
     }
   }, []) // Empty deps - only run once on mount
 
-  // Check if accessing from wrong port (production mode should be on 8001)
-  useEffect(() => {
-    const currentPort = window.location.port
-    if (currentPort === '8000' && window.location.hostname === 'localhost') {
-      console.error('[App] Wrong port detected! Backend is on port 8001, but page is on port 8000.')
-      console.error('[App] Please navigate to: http://localhost:8001')
-      // Show alert to user
-      alert('Wrong port detected!\n\nBackend is running on port 8001.\nPlease navigate to:\nhttp://localhost:8001\n\nClosing this page...')
-      // Redirect after a moment
-      setTimeout(() => {
-        window.location.href = 'http://localhost:8001'
-      }, 2000)
-    }
-  }, [])
-
   return (
     <ErrorBoundary>
       <div className="min-h-screen bg-black text-white">

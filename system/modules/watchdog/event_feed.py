@@ -18,14 +18,13 @@ import pytz
 from collections import Counter, defaultdict
 
 from .config import (
-    ROBOT_LOGS_DIR,
-    FRONTEND_FEED_FILE,
     LIVE_CRITICAL_EVENT_TYPES,
     ROBOT_LOG_READ_POSITIONS_FILE,
     WATCHDOG_CPU_DIAG_ENABLED,
     ORDER_RELATED_EVENT_TYPES,
     ENGINE_TICK_DIAGNOSTIC_EVENT_TYPES,
 )
+from .run_context import resolve_active_run_context
 from .slot_end_payload import promote_slot_end_summary_fields_from_payload
 
 logger = logging.getLogger(__name__)
@@ -431,32 +430,33 @@ class EventFeedGenerator:
         except Exception as e:
             logger.warning(f"Failed to save read positions: {e}")
     
-    def _find_robot_log_files(self) -> List[Path]:
+    def _find_robot_log_files(self, context=None) -> List[Path]:
         """Find all robot log files."""
-        if not ROBOT_LOGS_DIR.exists():
+        context = context or resolve_active_run_context()
+        if not context.robot_logs_dir.exists():
             return []
         
         log_files = []
         # Find robot_ENGINE.jsonl and robot_<instrument>.jsonl files
-        for log_file in ROBOT_LOGS_DIR.glob("robot_*.jsonl"):
+        for log_file in context.robot_logs_dir.glob("robot_*.jsonl"):
             log_files.append(log_file)
         
         return sorted(log_files)
     
-    def _rotate_feed_file_if_needed(self):
+    def _rotate_feed_file_if_needed(self, frontend_feed_file: Path):
         """Rotate frontend_feed.jsonl if it exceeds size limit.
         WATCHDOG_INGESTION_HARDENING: 80MB threshold (was 100MB) for better tail scan variance."""
         MAX_FILE_SIZE_MB = 80  # Rotate at 80 MB (was 100)
         MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
         
-        if not FRONTEND_FEED_FILE.exists():
+        if not frontend_feed_file.exists():
             return
         
         try:
-            file_size = FRONTEND_FEED_FILE.stat().st_size
+            file_size = frontend_feed_file.stat().st_size
             if file_size >= MAX_FILE_SIZE_BYTES:
                 # Create archive directory
-                archive_dir = FRONTEND_FEED_FILE.parent / "archive"
+                archive_dir = frontend_feed_file.parent / "archive"
                 archive_dir.mkdir(parents=True, exist_ok=True)
                 
                 # Generate archive filename with timestamp
@@ -464,7 +464,7 @@ class EventFeedGenerator:
                 archive_path = archive_dir / f"frontend_feed_{timestamp}.jsonl"
                 
                 # Move current file to archive
-                shutil.move(str(FRONTEND_FEED_FILE), str(archive_path))
+                shutil.move(str(frontend_feed_file), str(archive_path))
                 logger.info(f"Rotated frontend_feed.jsonl ({file_size / (1024*1024):.2f} MB) -> archive/{archive_path.name}")
                 
                 # Reset read positions since we're starting fresh
@@ -479,7 +479,8 @@ class EventFeedGenerator:
         Returns number of events processed.
         """
         cycle_t0 = time.perf_counter()
-        log_files = self._find_robot_log_files()
+        context = resolve_active_run_context()
+        log_files = self._find_robot_log_files(context)
         if not log_files:
             logger.debug("No robot log files found")
             self.last_cycle_metrics = {
@@ -491,10 +492,11 @@ class EventFeedGenerator:
             return 0
         
         # Ensure frontend feed file exists
-        FRONTEND_FEED_FILE.parent.mkdir(parents=True, exist_ok=True)
+        frontend_feed_file = context.frontend_feed_file
+        frontend_feed_file.parent.mkdir(parents=True, exist_ok=True)
         
         # Rotate if needed before processing
-        self._rotate_feed_file_if_needed()
+        self._rotate_feed_file_if_needed(frontend_feed_file)
         
         processed_count = 0
         
@@ -546,7 +548,7 @@ class EventFeedGenerator:
                     break
 
         tick_callsite_written = 0
-        with open(FRONTEND_FEED_FILE, 'a', encoding='utf-8') as f:
+        with open(frontend_feed_file, 'a', encoding='utf-8') as f:
             for event in all_events:
                 feed_event = self._process_event(event)
                 if feed_event:

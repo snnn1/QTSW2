@@ -257,6 +257,7 @@ export type FlattenLookupMetrics = Record<
 
 export interface StreamStatesResponse {
   snapshot_utc?: string;
+  state_reference_utc?: string;
   timestamp_chicago: string;
   streams: StreamState[];
   /** Present on current API; missing on older backends — treat as []. */

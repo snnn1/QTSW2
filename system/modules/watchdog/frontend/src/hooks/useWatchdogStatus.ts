@@ -7,7 +7,7 @@ import { fetchWatchdogStatus } from '../services/watchdogApi'
 import { usePollingInterval } from './usePollingInterval'
 import type { WatchdogStatus } from '../types/watchdog'
 
-export function useWatchdogStatus() {
+export function useWatchdogStatus(runRoot?: string | null) {
   const [status, setStatus] = useState<WatchdogStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -20,7 +20,7 @@ export function useWatchdogStatus() {
     }
     
     try {
-      const { data, error: apiError } = await fetchWatchdogStatus()
+      const { data, error: apiError } = await fetchWatchdogStatus(runRoot)
       
       if (apiError) {
         setError(apiError)
@@ -72,6 +72,13 @@ export function useWatchdogStatus() {
   useEffect(() => {
     poll()
   }, [])
+
+  useEffect(() => {
+    setStatus(null)
+    setError(null)
+    setLoading(true)
+    hasLoadedRef.current = false
+  }, [runRoot])
   
   return {
     status,

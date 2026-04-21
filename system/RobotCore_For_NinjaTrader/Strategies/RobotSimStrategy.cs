@@ -2063,7 +2063,24 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 foreach (var sessionClass in new[] { "S1", "S2" })
                 {
-                    var result = SessionCloseResolver.Resolve(Bars, spec, sessionClass, tradingDay, strategyInstanceId: _instanceId);
+                    var result = SessionCloseResolver.Resolve(
+                        Bars,
+                        spec,
+                        sessionClass,
+                        tradingDay,
+                        bufferSeconds: SessionTimingPolicy.ResolveForcedFlattenBufferSeconds(spec),
+                        strategyInstanceId: _instanceId);
+                    if (result.HasSession && result.ResolvedSessionCloseUtc.HasValue &&
+                        DateOnly.TryParse(tradingDay, out var tradingDate))
+                    {
+                        result.FlattenTriggerUtc = SessionTimingPolicy.ResolveForcedFlattenTriggerUtc(
+                            tradingDate,
+                            result.ResolvedSessionCloseUtc.Value,
+                            new TimeService(spec.timezone),
+                            spec,
+                            out var effectiveLeadSeconds);
+                        result.BufferSeconds = effectiveLeadSeconds;
+                    }
                     _engine.SetSessionCloseResolved(tradingDay, sessionClass, result);
                 }
                 _lastSessionCloseResolvedTradingDay = tradingDay;

@@ -230,6 +230,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
 
     /// <summary>G1: RiskGate gate −1a — EPA/engine mismatch execution block (mirrors <see cref="RiskGate"/> before frozen).</summary>
     private Func<string, bool>? _isMismatchExecutionBlocked;
+    private Func<string, string?, bool>? _isMismatchExecutionBlockedForSubmit;
 
     /// <summary>RiskGate gate −1b: execution lock + path-aware policy (instrument, submit_path) — excludes mismatch authority.</summary>
     private Func<string, string?, bool>? _isInstrumentFrozenOrEpaBlocked;
@@ -992,6 +993,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         Func<string, bool>? journalIntegrityRepairActiveForInstrumentCallback = null,
         Func<bool>? isGlobalKillSwitchActive = null,
         Func<string, bool>? isMismatchExecutionBlocked = null,
+        Func<string, string?, bool>? isMismatchExecutionBlockedForSubmit = null,
         Func<string, string?, bool>? isInstrumentFrozenOrEpaBlocked = null,
         Action<string, DateTimeOffset, bool, string?>? onReentrySubmitCompletedCallback = null,
         Action<string, string, DateTimeOffset>? onSessionCloseFlattenConfirmedLateCallback = null)
@@ -1011,6 +1013,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         _journalIntegrityRepairActiveForInstrumentCallback = journalIntegrityRepairActiveForInstrumentCallback;
         _isGlobalKillSwitchActive = isGlobalKillSwitchActive;
         _isMismatchExecutionBlocked = isMismatchExecutionBlocked;
+        _isMismatchExecutionBlockedForSubmit = isMismatchExecutionBlockedForSubmit;
         _isInstrumentFrozenOrEpaBlocked = isInstrumentFrozenOrEpaBlocked;
     }
 
@@ -2063,6 +2066,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         if (!ExecutionPermissionAuthority.TryAdapterOrderSubmitPreflight(
                 _isGlobalKillSwitchActive,
                 _isMismatchExecutionBlocked,
+                _isMismatchExecutionBlockedForSubmit,
                 _isInstrumentFrozenOrEpaBlocked,
                 instrument,
                 blockedWhat,
@@ -2147,6 +2151,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             UtcNow = utcNow,
             GlobalKillSwitchActive = _isGlobalKillSwitchActive,
             MismatchExecutionBlocked = _isMismatchExecutionBlocked,
+            MismatchExecutionBlockedForSubmit = _isMismatchExecutionBlockedForSubmit,
             InstrumentFrozenOrEpaBlocked = _isInstrumentFrozenOrEpaBlocked,
             BuildSafetyRequest = (inst, iid, t) => BuildExecutionSafetyEvaluationRequest(inst, iid, t),
             OwnershipLedger = _ownershipLedger,
@@ -2462,7 +2467,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     /// <summary>
     /// STEP 2: Implement Entry Order Submission (REAL NT API)
     /// </summary>
-    public OrderSubmissionResult SubmitEntryOrder(
+    private OrderSubmissionResult SubmitEntryOrderCore(
         string intentId,
         string instrument,
         string direction,
@@ -2470,7 +2475,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         int quantity,
         string? entryOrderType,
         string? ocoGroup,
-        DateTimeOffset utcNow)
+        DateTimeOffset utcNow,
+        string submitPath)
     {
         if (!TryIntentIdConsistencyGuard(intentId, instrument, "entry", utcNow, out var intentIdFail))
             return intentIdFail!;
@@ -2533,7 +2539,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 
-        if (!TryExecutionSafetyGateForOrderSubmit(intentId, instrument, "SUBMIT_ENTRY", utcNow, out var safetyFailEntry))
+        if (!TryExecutionSafetyGateForOrderSubmit(intentId, instrument, submitPath, utcNow, out var safetyFailEntry))
             return safetyFailEntry!;
 
         try
@@ -2564,6 +2570,27 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             return OrderSubmissionResult.FailureResult($"Entry order submission failed: {ex.Message}", utcNow);
         }
     }
+
+    public OrderSubmissionResult SubmitEntryOrder(
+        string intentId,
+        string instrument,
+        string direction,
+        decimal? entryPrice,
+        int quantity,
+        string? entryOrderType,
+        string? ocoGroup,
+        DateTimeOffset utcNow) =>
+        SubmitEntryOrderCore(intentId, instrument, direction, entryPrice, quantity, entryOrderType, ocoGroup, utcNow,
+            "SUBMIT_ENTRY");
+
+    public OrderSubmissionResult SubmitMarketReentryOrder(
+        string intentId,
+        string instrument,
+        string direction,
+        int quantity,
+        DateTimeOffset utcNow) =>
+        SubmitEntryOrderCore(intentId, instrument, direction, null, quantity, "MARKET", null, utcNow,
+            "SUBMIT_MARKET_REENTRY");
 
     /// <summary>
     /// STEP 2b: Submit stop-market entry order (breakout stop).

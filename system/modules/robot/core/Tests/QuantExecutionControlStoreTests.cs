@@ -16,6 +16,7 @@ public static class QuantExecutionControlStoreTests
         var prevStore = FeatureFlags.QuantExecutionControlStoreEnabled;
         var prevAlign = FeatureFlags.EnablePostFillAlignmentGate;
         var prevLag = FeatureFlags.StructuralLayerAllowSubmitDuringPendingAlignmentLag;
+        var prevLedger = FeatureFlags.StructuralLayerUseLedgerOwnership;
         try
         {
             FeatureFlags.QuantExecutionControlStoreEnabled = true;
@@ -40,6 +41,24 @@ public static class QuantExecutionControlStoreTests
             e = Case_RecoveryRequired_Structural_AllowsProtectiveBlocksEntry();
             if (e != null) return (false, e);
 
+            e = Case_RecoveryRequired_MarketReentry_GrossMismatchBypassesStructuralDeny();
+            if (e != null) return (false, e);
+
+            e = Case_MarketReentry_UsesJournalAuthorityWhenLedgerIsStale();
+            if (e != null) return (false, e);
+
+            e = Case_MarketReentry_PositionMismatchBypassesWhenAuthorityIsReal();
+            if (e != null) return (false, e);
+
+            e = Case_RiskCoverage_PositionMismatchBypassesWhenAuthorityIsReal();
+            if (e != null) return (false, e);
+
+            e = Case_MarketReentry_NoActiveExposureLagBypassesWhenBrokerAlreadyOpen();
+            if (e != null) return (false, e);
+
+            e = Case_RiskCoverage_UsesJournalAuthorityWhenLedgerIsStale();
+            if (e != null) return (false, e);
+
             e = Case_MappedFill_DoesNotMutateRecoveryRequiredUnmappedOrLocked();
             if (e != null) return (false, e);
 
@@ -57,6 +76,7 @@ public static class QuantExecutionControlStoreTests
             FeatureFlags.QuantExecutionControlStoreEnabled = prevStore;
             FeatureFlags.EnablePostFillAlignmentGate = prevAlign;
             FeatureFlags.StructuralLayerAllowSubmitDuringPendingAlignmentLag = prevLag;
+            FeatureFlags.StructuralLayerUseLedgerOwnership = prevLedger;
             JournalParityPendingLedger.Clear();
         }
     }
@@ -445,6 +465,418 @@ public static class QuantExecutionControlStoreTests
         finally
         {
             FeatureFlags.PostFillAlignmentWindowMs = prev;
+        }
+    }
+
+    private static string? Case_RecoveryRequired_MarketReentry_GrossMismatchBypassesStructuralDeny()
+    {
+        JournalParityPendingLedger.Clear();
+        QuantExecutionControlStore.Clear();
+        var t0 = DateTimeOffset.Parse("2099-07-03T12:00:00Z");
+        var prev = FeatureFlags.PostFillAlignmentWindowMs;
+        FeatureFlags.PostFillAlignmentWindowMs = 100;
+        try
+        {
+            var inst = "QM_REENTRY_RR";
+            JournalParityPendingLedger.TryRecordTrustedFill(inst, "rk", 1, "i", t0);
+            QuantExecutionControlStore.EvaluateEscalationAndApplyIfRequired(inst, t0.AddSeconds(1), 0, null);
+            var qSnap = QuantExecutionControlStore.GetSnapshot(inst);
+            if (qSnap.Phase != QuantExecutionInstrumentPhase.RecoveryRequired)
+                return "market reentry bypass: setup RecoveryRequired failed";
+            if (qSnap.RecoveryRequiredReason != "recovery_stabilization_window_expired_broker_gross_mismatch")
+                return "market reentry bypass: wrong recovery reason " + qSnap.RecoveryRequiredReason;
+
+            var root = Path.Combine(Path.GetTempPath(), "quant_rr_reentry_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            try
+            {
+                var log = new RobotLogger(root);
+                var journal = new ExecutionJournal(root, log);
+                var snap = new AccountSnapshot
+                {
+                    Positions = new List<PositionSnapshot> { new() { Instrument = inst, Quantity = 0 } },
+                    WorkingOrders = new List<WorkingOrderSnapshot>(),
+                    CapturedAtUtc = t0
+                };
+                var req = new ExecutionSafetyEvaluationRequest
+                {
+                    Instrument = inst,
+                    CanonicalInstrument = inst,
+                    UtcNow = t0,
+                    Journal = journal,
+                    AccountSnapshot = snap,
+                    UseInstrumentExecutionAuthority = false,
+                    IeaOwnedPlusAdoptedWorking = 0,
+                    RecoveryExecutionDisallowed = false,
+                    JournalIntegrityOrReconciliationRepairActive = false
+                };
+
+                if (!ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_MARKET_REENTRY", false, out var ok))
+                    return "market reentry bypass: expected allow, got " + ok.Reason;
+                if (ok.Detail == null || ok.Detail.IndexOf("market_reentry_quant_recovery_gross_mismatch_bypass", StringComparison.Ordinal) < 0)
+                    return "market reentry bypass: missing bypass detail, got " + ok.Detail;
+                return null;
+            }
+            finally
+            {
+                try
+                {
+                    if (Directory.Exists(root))
+                        Directory.Delete(root, true);
+                }
+                catch
+                {
+                    /* best effort */
+                }
+            }
+        }
+        finally
+        {
+            FeatureFlags.PostFillAlignmentWindowMs = prev;
+        }
+    }
+
+    private static string? Case_MarketReentry_UsesJournalAuthorityWhenLedgerIsStale()
+    {
+        JournalParityPendingLedger.Clear();
+        QuantExecutionControlStore.Clear();
+        var prevLedger = FeatureFlags.StructuralLayerUseLedgerOwnership;
+        FeatureFlags.StructuralLayerUseLedgerOwnership = true;
+        var t0 = DateTimeOffset.Parse("2099-07-04T12:00:00Z");
+        var root = Path.Combine(Path.GetTempPath(), "market_reentry_stale_ledger_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var log = new RobotLogger(root);
+            var journal = new ExecutionJournal(root, log);
+            var snap = new AccountSnapshot
+            {
+                Positions = new List<PositionSnapshot> { new() { Instrument = "QM_REENTRY_LEDGER", Quantity = 0 } },
+                WorkingOrders = new List<WorkingOrderSnapshot>(),
+                CapturedAtUtc = t0
+            };
+            var req = new ExecutionSafetyEvaluationRequest
+            {
+                Instrument = "QM_REENTRY_LEDGER",
+                CanonicalInstrument = "QM_REENTRY_LEDGER",
+                UtcNow = t0,
+                Journal = journal,
+                AccountSnapshot = snap,
+                UseInstrumentExecutionAuthority = false,
+                IeaOwnedPlusAdoptedWorking = 0,
+                RecoveryExecutionDisallowed = false,
+                JournalIntegrityOrReconciliationRepairActive = false,
+                LedgerOwnershipSnapshot = new InstrumentOwnershipSnapshot
+                {
+                    Account = "default",
+                    ExecutionInstrumentKey = "QM_REENTRY_LEDGER",
+                    OwnershipVersion = 1,
+                    LedgerSignedNetQty = -2,
+                    SnapshotUtc = t0
+                }
+            };
+
+            if (ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_ENTRY", false, out var denyEntry))
+                return "stale ledger reentry: expected SUBMIT_ENTRY deny under stale ledger authority";
+            if (denyEntry.Reason != ExecutionStructuralLayer.StructuralBlocker.AuthorityUnknown)
+                return "stale ledger reentry: wrong SUBMIT_ENTRY deny reason " + denyEntry.Reason;
+
+            if (!ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_MARKET_REENTRY", false, out var ok))
+                return "stale ledger reentry: expected reentry allow, got " + ok.Reason;
+            if (ok.Detail == null || ok.Detail.IndexOf("market_reentry_authority_fallback_journal_real", StringComparison.Ordinal) < 0)
+                return "stale ledger reentry: missing journal fallback detail, got " + ok.Detail;
+            return null;
+        }
+        finally
+        {
+            FeatureFlags.StructuralLayerUseLedgerOwnership = prevLedger;
+            try
+            {
+                if (Directory.Exists(root))
+                    Directory.Delete(root, true);
+            }
+            catch
+            {
+                /* best effort */
+            }
+        }
+    }
+
+    private static string? Case_MarketReentry_PositionMismatchBypassesWhenAuthorityIsReal()
+    {
+        JournalParityPendingLedger.Clear();
+        QuantExecutionControlStore.Clear();
+        var prevLedger = FeatureFlags.StructuralLayerUseLedgerOwnership;
+        FeatureFlags.StructuralLayerUseLedgerOwnership = true;
+        var t0 = DateTimeOffset.Parse("2099-07-05T12:00:00Z");
+        var root = Path.Combine(Path.GetTempPath(), "market_reentry_parity_real_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var log = new RobotLogger(root);
+            var journal = new ExecutionJournal(root, log);
+            var snap = new AccountSnapshot
+            {
+                Positions = new List<PositionSnapshot> { new() { Instrument = "QM_REENTRY_PARITY", Quantity = 2 } },
+                WorkingOrders = new List<WorkingOrderSnapshot>(),
+                CapturedAtUtc = t0
+            };
+            var req = new ExecutionSafetyEvaluationRequest
+            {
+                Instrument = "QM_REENTRY_PARITY",
+                CanonicalInstrument = "QM_REENTRY_PARITY",
+                UtcNow = t0,
+                Journal = journal,
+                AccountSnapshot = snap,
+                UseInstrumentExecutionAuthority = false,
+                IeaOwnedPlusAdoptedWorking = 0,
+                RecoveryExecutionDisallowed = false,
+                JournalIntegrityOrReconciliationRepairActive = false,
+                LedgerOwnershipSnapshot = new InstrumentOwnershipSnapshot
+                {
+                    Account = "default",
+                    ExecutionInstrumentKey = "QM_REENTRY_PARITY",
+                    OwnershipVersion = 1,
+                    LedgerSignedNetQty = -2,
+                    SnapshotUtc = t0
+                }
+            };
+
+            if (ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_ENTRY", false, out var denyEntry))
+                return "market reentry parity bypass: expected SUBMIT_ENTRY deny under parity mismatch";
+            if (denyEntry.Reason != ExecutionStructuralLayer.StructuralBlocker.ParityNotOk)
+                return "market reentry parity bypass: wrong SUBMIT_ENTRY deny reason " + denyEntry.Reason;
+
+            if (!ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_MARKET_REENTRY", false, out var ok))
+                return "market reentry parity bypass: expected allow, got " + ok.Reason;
+            if (ok.Detail == null || ok.Detail.IndexOf("market_reentry_parity_position_mismatch_bypass_real_authority", StringComparison.Ordinal) < 0)
+                return "market reentry parity bypass: missing parity bypass detail, got " + ok.Detail;
+            return null;
+        }
+        finally
+        {
+            FeatureFlags.StructuralLayerUseLedgerOwnership = prevLedger;
+            try
+            {
+                if (Directory.Exists(root))
+                    Directory.Delete(root, true);
+            }
+            catch
+            {
+                /* best effort */
+            }
+        }
+    }
+
+    private static string? Case_RiskCoverage_UsesJournalAuthorityWhenLedgerIsStale()
+    {
+        JournalParityPendingLedger.Clear();
+        QuantExecutionControlStore.Clear();
+        var prevLedger = FeatureFlags.StructuralLayerUseLedgerOwnership;
+        FeatureFlags.StructuralLayerUseLedgerOwnership = true;
+        var t0 = DateTimeOffset.Parse("2099-07-06T12:00:00Z");
+        var root = Path.Combine(Path.GetTempPath(), "risk_coverage_stale_ledger_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var log = new RobotLogger(root);
+            var journal = new ExecutionJournal(root, log);
+            const string inst = "QM_PROTECTIVE_LEDGER";
+            journal.RecordSubmission("intent-prot", "2099-07-06", "S1", inst, "ENTRY", "broker-entry", t0);
+            journal.RecordEntryFill("intent-prot", "2099-07-06", "S1", 100m, 2, t0, 1m, "Short", inst, inst);
+
+            var snap = new AccountSnapshot
+            {
+                Positions = new List<PositionSnapshot> { new() { Instrument = inst, Quantity = 2 } },
+                WorkingOrders = new List<WorkingOrderSnapshot>(),
+                CapturedAtUtc = t0
+            };
+            var req = new ExecutionSafetyEvaluationRequest
+            {
+                Instrument = inst,
+                CanonicalInstrument = inst,
+                UtcNow = t0,
+                Journal = journal,
+                AccountSnapshot = snap,
+                UseInstrumentExecutionAuthority = false,
+                IeaOwnedPlusAdoptedWorking = 0,
+                RecoveryExecutionDisallowed = false,
+                JournalIntegrityOrReconciliationRepairActive = false,
+                LedgerOwnershipSnapshot = new InstrumentOwnershipSnapshot
+                {
+                    Account = "default",
+                    ExecutionInstrumentKey = inst,
+                    OwnershipVersion = 1,
+                    LedgerSignedNetQty = 0,
+                    SnapshotUtc = t0
+                }
+            };
+
+            if (ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_ENTRY", false, out var denyEntry))
+                return "risk coverage stale ledger: expected SUBMIT_ENTRY deny under stale ledger authority";
+            if (denyEntry.Reason != ExecutionStructuralLayer.StructuralBlocker.AuthorityUnknown)
+                return "risk coverage stale ledger: wrong SUBMIT_ENTRY deny reason " + denyEntry.Reason;
+
+            if (!ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_PROTECTIVE_STOP", false, out var okProt))
+                return "risk coverage stale ledger: expected protective stop allow, got " + okProt.Reason;
+            if (okProt.Detail == null || okProt.Detail.IndexOf("risk_coverage_authority_fallback_journal_real", StringComparison.Ordinal) < 0)
+                return "risk coverage stale ledger: missing protective fallback detail, got " + okProt.Detail;
+
+            if (!ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_TARGET", false, out var okTgt))
+                return "risk coverage stale ledger: expected target allow, got " + okTgt.Reason;
+            if (okTgt.Detail == null || okTgt.Detail.IndexOf("risk_coverage_authority_fallback_journal_real", StringComparison.Ordinal) < 0)
+                return "risk coverage stale ledger: missing target fallback detail, got " + okTgt.Detail;
+
+            return null;
+        }
+        finally
+        {
+            FeatureFlags.StructuralLayerUseLedgerOwnership = prevLedger;
+            try
+            {
+                if (Directory.Exists(root))
+                    Directory.Delete(root, true);
+            }
+            catch
+            {
+                /* best effort */
+            }
+        }
+    }
+
+    private static string? Case_RiskCoverage_PositionMismatchBypassesWhenAuthorityIsReal()
+    {
+        JournalParityPendingLedger.Clear();
+        QuantExecutionControlStore.Clear();
+        var prevLedger = FeatureFlags.StructuralLayerUseLedgerOwnership;
+        FeatureFlags.StructuralLayerUseLedgerOwnership = true;
+        var t0 = DateTimeOffset.Parse("2099-07-06T12:30:00Z");
+        var root = Path.Combine(Path.GetTempPath(), "risk_coverage_parity_real_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var log = new RobotLogger(root);
+            var journal = new ExecutionJournal(root, log);
+            const string inst = "QM_PROTECTIVE_PARITY";
+            journal.RecordSubmission("intent-prot-parity", "2099-07-06", "S1", inst, "ENTRY", "broker-entry", t0);
+            journal.RecordEntryFill("intent-prot-parity", "2099-07-06", "S1", 100m, 2, t0, 1m, "Short", inst, inst);
+
+            var snap = new AccountSnapshot
+            {
+                Positions = new List<PositionSnapshot> { new() { Instrument = inst, Quantity = 4 } },
+                WorkingOrders = new List<WorkingOrderSnapshot>(),
+                CapturedAtUtc = t0
+            };
+            var req = new ExecutionSafetyEvaluationRequest
+            {
+                Instrument = inst,
+                CanonicalInstrument = inst,
+                UtcNow = t0,
+                Journal = journal,
+                AccountSnapshot = snap,
+                UseInstrumentExecutionAuthority = false,
+                IeaOwnedPlusAdoptedWorking = 0,
+                RecoveryExecutionDisallowed = false,
+                JournalIntegrityOrReconciliationRepairActive = false,
+                LedgerOwnershipSnapshot = new InstrumentOwnershipSnapshot
+                {
+                    Account = "default",
+                    ExecutionInstrumentKey = inst,
+                    OwnershipVersion = 1,
+                    LedgerSignedNetQty = -4,
+                    SnapshotUtc = t0
+                }
+            };
+
+            if (ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_ENTRY", false, out var denyEntry))
+                return "risk coverage parity bypass: expected SUBMIT_ENTRY deny under parity mismatch";
+            if (denyEntry.Reason != ExecutionStructuralLayer.StructuralBlocker.ParityNotOk)
+                return "risk coverage parity bypass: wrong SUBMIT_ENTRY deny reason " + denyEntry.Reason;
+
+            if (!ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_PROTECTIVE_STOP", false, out var okProt))
+                return "risk coverage parity bypass: expected protective stop allow, got " + okProt.Reason;
+            if (okProt.Detail == null || okProt.Detail.IndexOf("risk_coverage_parity_position_mismatch_bypass_real_authority", StringComparison.Ordinal) < 0)
+                return "risk coverage parity bypass: missing protective bypass detail, got " + okProt.Detail;
+
+            if (!ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_TARGET", false, out var okTgt))
+                return "risk coverage parity bypass: expected target allow, got " + okTgt.Reason;
+            if (okTgt.Detail == null || okTgt.Detail.IndexOf("risk_coverage_parity_position_mismatch_bypass_real_authority", StringComparison.Ordinal) < 0)
+                return "risk coverage parity bypass: missing target bypass detail, got " + okTgt.Detail;
+
+            return null;
+        }
+        finally
+        {
+            FeatureFlags.StructuralLayerUseLedgerOwnership = prevLedger;
+            try
+            {
+                if (Directory.Exists(root))
+                    Directory.Delete(root, true);
+            }
+            catch
+            {
+                /* best effort */
+            }
+        }
+    }
+
+    private static string? Case_MarketReentry_NoActiveExposureLagBypassesWhenBrokerAlreadyOpen()
+    {
+        JournalParityPendingLedger.Clear();
+        QuantExecutionControlStore.Clear();
+        var t0 = DateTimeOffset.Parse("2099-07-07T12:00:00Z");
+        var root = Path.Combine(Path.GetTempPath(), "market_reentry_no_exposure_lag_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var log = new RobotLogger(root);
+            var journal = new ExecutionJournal(root, log);
+            const string inst = "QM_REENTRY_EXPOSURE_LAG";
+            journal.RecordSubmission("intent-reentry", "2099-07-07", "S1", inst, "ENTRY", "broker-entry", t0);
+            journal.RecordEntryFill("intent-reentry", "2099-07-07", "S1", 100m, 2, t0, 1m, "Short", inst, inst);
+
+            var snap = new AccountSnapshot
+            {
+                Positions = new List<PositionSnapshot> { new() { Instrument = inst, Quantity = 2 } },
+                WorkingOrders = new List<WorkingOrderSnapshot>(),
+                CapturedAtUtc = t0
+            };
+            var req = new ExecutionSafetyEvaluationRequest
+            {
+                Instrument = inst,
+                CanonicalInstrument = inst,
+                UtcNow = t0,
+                Journal = journal,
+                AccountSnapshot = snap,
+                UseInstrumentExecutionAuthority = false,
+                IeaOwnedPlusAdoptedWorking = 0,
+                RecoveryExecutionDisallowed = false,
+                JournalIntegrityOrReconciliationRepairActive = false
+            };
+
+            if (ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_ENTRY", false, out var denyEntry))
+                return "market reentry no exposure lag: expected SUBMIT_ENTRY deny";
+            if (denyEntry.Reason != ExecutionStructuralLayer.StructuralBlocker.NoActiveExposuresWithBrokerPosition)
+                return "market reentry no exposure lag: wrong SUBMIT_ENTRY deny reason " + denyEntry.Reason;
+
+            if (!ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_MARKET_REENTRY", false, out var ok))
+                return "market reentry no exposure lag: expected allow, got " + ok.Reason;
+            if (ok.Detail == null || ok.Detail.IndexOf("no_active_exposures_bypass_market_reentry_with_broker_position", StringComparison.Ordinal) < 0)
+                return "market reentry no exposure lag: missing bypass detail, got " + ok.Detail;
+
+            return null;
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(root))
+                    Directory.Delete(root, true);
+            }
+            catch
+            {
+                /* best effort */
+            }
         }
     }
 }

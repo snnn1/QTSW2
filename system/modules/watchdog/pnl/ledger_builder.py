@@ -60,6 +60,14 @@ class LedgerInvariantViolation(Exception):
 
 class LedgerBuilder:
     """Builds per-intent ledger rows for P&L calculation."""
+
+    def __init__(
+        self,
+        execution_journals_dir: Optional[Path] = None,
+        robot_logs_dir: Optional[Path] = None,
+    ) -> None:
+        self._execution_journals_dir = execution_journals_dir or EXECUTION_JOURNALS_DIR
+        self._robot_logs_dir = robot_logs_dir or ROBOT_LOGS_DIR
     
     def build_ledger_rows(
         self,
@@ -113,14 +121,14 @@ class LedgerBuilder:
         """Load ExecutionJournalEntry files and normalize."""
         journals = {}
         
-        if not EXECUTION_JOURNALS_DIR.exists():
-            logger.warning(f"Execution journals directory does not exist: {EXECUTION_JOURNALS_DIR}")
+        if not self._execution_journals_dir.exists():
+            logger.warning(f"Execution journals directory does not exist: {self._execution_journals_dir}")
             return journals
         
         # Pattern: {trading_date}_{stream}_{intent_id}.json
         pattern = f"{trading_date}_*.json" if not stream else f"{trading_date}_{stream}_*.json"
         
-        for journal_file in EXECUTION_JOURNALS_DIR.glob(pattern):
+        for journal_file in self._execution_journals_dir.glob(pattern):
             try:
                 with open(journal_file, 'r') as f:
                     raw = json.load(f)
@@ -432,13 +440,13 @@ class LedgerBuilder:
         execution_fills = defaultdict(list)
         exit_fill_by_order_id: Dict[str, Dict] = {}  # For backfill: order_id -> normalized EXECUTION_EXIT_FILL
         
-        if not ROBOT_LOGS_DIR.exists():
-            logger.warning(f"Robot logs directory does not exist: {ROBOT_LOGS_DIR}")
+        if not self._robot_logs_dir.exists():
+            logger.warning(f"Robot logs directory does not exist: {self._robot_logs_dir}")
             return execution_fills
         
-        log_files = sorted(ROBOT_LOGS_DIR.glob("robot_*.jsonl"))
+        log_files = sorted(self._robot_logs_dir.glob("robot_*.jsonl"))
         if not log_files:
-            logger.warning(f"No robot_*.jsonl files found in {ROBOT_LOGS_DIR}")
+            logger.warning(f"No robot_*.jsonl files found in {self._robot_logs_dir}")
             return execution_fills
         
         try:

@@ -32,6 +32,12 @@
     "market_reopen_time": "17:00",
     "rule": "If breakout occurs after market_close_time, treat as NoTrade (no entry). Reentry after forced flatten at market_reopen_time."
   },
+  "forced_flatten": {
+    "local_time": "",
+    "buffer_seconds": 300,
+    "market_reopen_time": "17:00",
+    "rule": "Trigger forced flatten at local_time when provided; otherwise use buffer_seconds before the resolved session close. Separate from entry_cutoff."
+  },
   "breakout": {
     "initial_submission_freshness_minutes": 0,
     "offset_ticks": 1,

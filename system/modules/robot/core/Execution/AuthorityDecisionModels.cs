@@ -62,6 +62,7 @@ public sealed class AuthorityEvaluationRequest
 
     public Func<bool>? GlobalKillSwitchActive { get; init; }
     public Func<string, bool>? MismatchExecutionBlocked { get; init; }
+    public Func<string, string?, bool>? MismatchExecutionBlockedForSubmit { get; init; }
     public Func<string, string?, bool>? InstrumentFrozenOrEpaBlocked { get; init; }
     public Func<string, string?, DateTimeOffset, ExecutionSafetyEvaluationRequest>? BuildSafetyRequest { get; init; }
     public InstrumentOwnershipLedger? OwnershipLedger { get; init; }

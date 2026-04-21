@@ -28,11 +28,15 @@ def get_watchdog_project_root() -> Path:
         p = Path(env)
         if p.is_dir():
             return p.resolve()
-    # config.QTSW2_ROOT is parent of modules/ (often .../system); runs/ may live one level up
+    root = QTSW2_ROOT.resolve()
+    if (root / "runs").is_dir() or (root / "data").is_dir():
+        return root
+
+    # Backward-compat fallback for deployments where the actual engine root sits one level up.
     parent = QTSW2_ROOT.parent
     if (parent / "runs").is_dir() or (parent / "data").is_dir():
         return parent.resolve()
-    return QTSW2_ROOT.resolve()
+    return root
 
 
 def resolve_active_persistence_base() -> Optional[Path]:

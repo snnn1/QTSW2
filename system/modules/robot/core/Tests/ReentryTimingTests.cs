@@ -5,6 +5,7 @@
 
 using System;
 using System.IO;
+using System.Text.Json;
 using QTSW2.Robot.Core;
 
 namespace QTSW2.Robot.Core.Tests;
@@ -27,7 +28,12 @@ public static class ReentryTimingTests
             Directory.CreateDirectory(tempRoot);
             Directory.CreateDirectory(Path.Combine(tempRoot, "data", "timetable"));
             Directory.CreateDirectory(Path.Combine(tempRoot, "configs"));
-            File.Copy(configPath, Path.Combine(tempRoot, "configs", "analyzer_robot_parity.json"));
+            var tempConfigPath = Path.Combine(tempRoot, "configs", "analyzer_robot_parity.json");
+            File.Copy(configPath, tempConfigPath);
+            var tempSpec = ParitySpec.LoadFromFile(tempConfigPath);
+            tempSpec.forced_flatten.buffer_seconds = 420;
+            tempSpec.forced_flatten.market_reopen_time = "18:30";
+            File.WriteAllText(tempConfigPath, JsonSerializer.Serialize(tempSpec, new JsonSerializerOptions { WriteIndented = true }));
             var execPolicyPath = Path.Combine(root, "configs", "execution_policy.json");
             if (File.Exists(execPolicyPath))
                 File.Copy(execPolicyPath, Path.Combine(tempRoot, "configs", "execution_policy.json"));
@@ -48,10 +54,10 @@ public static class ReentryTimingTests
             if (holidayUtc.HasValue)
                 return (false, "Holiday should return reentryUtc=null");
 
-            // 2. Early close: NextSessionBeginUtc = 17:55 CT (hypothetical 13:00 close, 17:00 reopen - same as normal for CME)
-            var spec = ParitySpec.LoadFromFile(configPath);
+            // 2. Early close: NextSessionBeginUtc uses the explicit forced_flatten.market_reopen_time override.
+            var spec = ParitySpec.LoadFromFile(tempConfigPath);
             var time = new TimeService(spec.timezone);
-            var reopenChicago = time.ConstructChicagoTime(new DateOnly(2026, 3, 15), "17:00");
+            var reopenChicago = time.ConstructChicagoTime(new DateOnly(2026, 3, 15), SessionTimingPolicy.ResolveMarketReopenTime(spec));
             var nextSessionBeginUtc = time.ConvertChicagoToUtc(reopenChicago);
             engine.SetSessionCloseResolved(tradingDay, "S1", new SessionCloseResult
             {
@@ -86,17 +92,17 @@ public static class ReentryTimingTests
             if (!afterSession || !afterUtc.HasValue || afterUtc.Value != delayedOpenUtc)
                 return (false, $"Delayed open: after 14:30 should allow reentry at {delayedOpenUtc:o}");
 
-            // 4. Fallback: no cache, spec available -> returns (17:00 CT in UTC, true)
+            // 4. Fallback: no cache, spec available -> returns forced_flatten.market_reopen_time in UTC
             var fallbackDay = "2026-03-16";
             var (fallbackUtc, fallbackSession) = engine.GetReentryAllowedUtc(fallbackDay, "S1", utcNow);
             if (!fallbackSession)
                 return (false, "Fallback (no cache) should return hasSession=true");
             if (!fallbackUtc.HasValue)
-                return (false, "Fallback should compute reentryUtc from spec market_reopen_time");
-            var expectedReopen = time.ConstructChicagoTime(new DateOnly(2026, 3, 16), "17:00");
+                return (false, "Fallback should compute reentryUtc from forced_flatten.market_reopen_time");
+            var expectedReopen = time.ConstructChicagoTime(new DateOnly(2026, 3, 16), SessionTimingPolicy.ResolveMarketReopenTime(spec));
             var expectedReopenUtc = time.ConvertChicagoToUtc(expectedReopen);
             if (Math.Abs((fallbackUtc.Value - expectedReopenUtc).TotalSeconds) > 1)
-                return (false, $"Fallback reentryUtc should be 17:00 CT: expected {expectedReopenUtc:o}, got {fallbackUtc:o}");
+                return (false, $"Fallback reentryUtc should match forced_flatten.market_reopen_time: expected {expectedReopenUtc:o}, got {fallbackUtc:o}");
 
             return (true, null);
         }

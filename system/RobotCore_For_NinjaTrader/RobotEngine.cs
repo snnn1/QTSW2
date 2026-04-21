@@ -2221,11 +2221,35 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 throw new InvalidOperationException("KillSwitch must be initialized before RiskGate.");
             // Hydrate risk latches (persisted instrument blocks) so blocks survive restarts
             _riskLatchManager = new RiskLatchManager(_persistenceBase, _accountName ?? "UNKNOWN");
-            foreach (var inst in _riskLatchManager.Hydrate())
+            foreach (var latch in _riskLatchManager.HydrateEntries())
             {
-                _frozenInstruments.Add(inst);
+                if (RiskLatchManager.IsObsoleteLegacyClassifierGapReason(latch.Reason))
+                {
+                    var deleted = _riskLatchManager.TryDeleteLatchFile(latch.FilePath);
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: deleted ? "RISK_LATCH_DELETED_OBSOLETE" : "RISK_LATCH_SKIPPED_OBSOLETE", state: "ENGINE",
+                        new
+                        {
+                            instrument = latch.Instrument,
+                            reason = latch.Reason,
+                            blocked_at_utc = latch.BlockedAtUtc,
+                            file_name = Path.GetFileName(latch.FilePath),
+                            note = deleted
+                                ? "Obsolete legacy-classifier-gap latch removed during startup hydration."
+                                : "Obsolete legacy-classifier-gap latch ignored during startup hydration, but file deletion failed."
+                        }));
+                    continue;
+                }
+
+                _frozenInstruments.Add(latch.Instrument);
                 LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "RISK_LATCH_HYDRATED", state: "ENGINE",
-                    new { instrument = inst, note = "Persisted block re-applied on startup" }));
+                    new
+                    {
+                        instrument = latch.Instrument,
+                        reason = latch.Reason,
+                        blocked_at_utc = latch.BlockedAtUtc,
+                        file_name = Path.GetFileName(latch.FilePath),
+                        note = "Persisted block re-applied on startup"
+                    }));
             }
             _mismatchBlockDecisionLog = new MismatchExecutionBlockDecisionLog(_persistenceBase);
             _flattenCompletionDecisionLog = new FlattenCompletionDecisionLog(_persistenceBase);
@@ -2339,6 +2363,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     getActiveTradingDateString: () => TradingDateString,
                     isGlobalKillSwitchActive: () => IsGlobalKillSwitchActive(),
                     isMismatchExecutionBlocked: IsMismatchExecutionAuthorityBlocked,
+                    isMismatchExecutionBlockedForSubmit: (inst, submitPath) =>
+                        _mismatchCoordinator != null && _mismatchCoordinator.IsSubmitBlockedByMismatch(inst, submitPath),
                     isInstrumentFrozenOrEpaBlocked: IsInstrumentEpaAdapterSubmitBlocked);
                 
                 // Wire coordinator to adapter
@@ -2649,6 +2675,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     if (healthMonitorConfig.enabled)
                     {
                         _healthMonitor = new HealthMonitor(_persistenceBase, healthMonitorConfig, _log);
+                        _healthMonitor.SetPlaybackTelemetryMode(_isolatedPlaybackPersistence);
                         _healthMonitor.SetActiveStreamsCallback(() => HasActiveStreams());
                         _healthMonitor.SetMarketOpenCallback(() => _time != null && TimeService.IsCmeMarketOpen(_time.ConvertUtcToChicago(DateTimeOffset.UtcNow)));
                     }
@@ -4143,7 +4170,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         // Fallback: compute from spec market_reopen_time (same calendar day as market close)
         if (_spec != null && _time != null && DateOnly.TryParse(tradingDay, out var td))
         {
-            var reopenStr = string.IsNullOrWhiteSpace(_spec.entry_cutoff?.market_reopen_time) ? "17:00" : _spec.entry_cutoff.market_reopen_time;
+            var reopenStr = SessionTimingPolicy.ResolveMarketReopenTime(_spec);
             var reopenChicago = _time.ConstructChicagoTime(td, reopenStr);
             var reopenUtc = _time.ConvertChicagoToUtc(reopenChicago);
             return (reopenUtc, true);
@@ -4299,8 +4326,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }));
     }
 
-    private const int SESSION_CLOSE_FALLBACK_BUFFER_SECONDS = 300;
-
     /// <summary>
     /// CME equity index default close. Used when spec is null (emergency fail-closed).
     /// Spec market_close_time is America/Chicago local time (DST-aware via TimeService).
@@ -4393,8 +4418,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             // America/Chicago local → UTC (deterministic, DST-aware)
             var sessionEndChicago = _time!.ConstructChicagoTime(tradingDate, hhmm);
             var sessionEndUtc = _time.ConvertChicagoToUtc(sessionEndChicago);
-            var flattenTriggerUtc = sessionEndUtc.AddSeconds(-SESSION_CLOSE_FALLBACK_BUFFER_SECONDS);
-            var reopenStr = string.IsNullOrWhiteSpace(_spec?.entry_cutoff?.market_reopen_time) ? "17:00" : _spec!.entry_cutoff!.market_reopen_time;
+            var flattenTriggerUtc = SessionTimingPolicy.ResolveForcedFlattenTriggerUtc(tradingDate, sessionEndUtc, _time, _spec, out var effectiveLeadSeconds);
+            var reopenStr = SessionTimingPolicy.ResolveMarketReopenTime(_spec);
             var reopenChicago = _time.ConstructChicagoTime(tradingDate, reopenStr);
             var nextSessionBeginUtc = _time.ConvertChicagoToUtc(reopenChicago);
             var fallback = new SessionCloseResult
@@ -4403,7 +4428,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 FlattenTriggerUtc = flattenTriggerUtc,
                 ResolvedSessionCloseUtc = sessionEndUtc,
                 NextSessionBeginUtc = nextSessionBeginUtc,
-                BufferSeconds = SESSION_CLOSE_FALLBACK_BUFFER_SECONDS,
+                BufferSeconds = effectiveLeadSeconds,
                 BarsInstrument = _executionInstrument ?? "N/A"
             };
             var key = (tradingDay, sessionClass);
@@ -6717,14 +6742,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         lock (_engineLock)
         {
-            var matchedAny = false;
+            var matchedStreams = new List<StreamStateMachine>();
+            var interruptedIntentIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string? canonicalInstrument = null;
             var tradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? TradingDateString;
 
             foreach (var stream in _streams.Values)
             {
                 if (!stream.IsActiveInterruptedBySessionClose)
-                    continue;
-                if (!string.Equals(stream.OriginalIntentId?.Trim(), iid, StringComparison.OrdinalIgnoreCase))
                     continue;
 
                 var streamInst = stream.Instrument?.Trim() ?? "";
@@ -6737,10 +6762,31 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 if (!matchesInstrument)
                     continue;
 
-                matchedAny = true;
+                matchedStreams.Add(stream);
+                if (!string.IsNullOrWhiteSpace(stream.OriginalIntentId))
+                    interruptedIntentIds.Add(stream.OriginalIntentId.Trim());
+                if (string.IsNullOrWhiteSpace(canonicalInstrument) && !string.IsNullOrWhiteSpace(streamInst))
+                    canonicalInstrument = streamInst;
+            }
+
+            var reconciledInterruptedJournals = 0;
+            if (_executionJournal != null && interruptedIntentIds.Count > 0)
+            {
+                reconciledInterruptedJournals = _executionJournal.ReconcileInterruptedSessionCloseBrokerFlat(
+                    inst,
+                    canonicalInstrument,
+                    interruptedIntentIds,
+                    utcNow,
+                    "LateSessionCloseFlattenBrokerFlat");
+            }
+
+            foreach (var stream in matchedStreams)
+            {
                 stream.HandleLateSessionCloseFlattenConfirmed(utcNow);
 
                 var clearedKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var streamInst = stream.Instrument?.Trim() ?? "";
+                var streamExec = stream.ExecutionInstrument?.Trim() ?? "";
                 foreach (var key in new[] { inst, streamExec, streamInst })
                 {
                     if (string.IsNullOrWhiteSpace(key) || !clearedKeys.Add(key))
@@ -6756,13 +6802,16 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         instrument = inst,
                         stream = stream.Stream,
                         original_intent_id = iid,
+                        stream_original_intent_id = stream.OriginalIntentId?.Trim() ?? "",
                         execution_instrument = streamExec,
                         canonical_instrument = streamInst,
+                        interrupted_stream_count = matchedStreams.Count,
+                        reconciled_interrupted_journals = reconciledInterruptedJournals,
                         note = "Session-close flatten timeout latch cleared after late fill proved broker-flat and original intent closed."
                     }));
             }
 
-            if (!matchedAny)
+            if (matchedStreams.Count == 0)
             {
                 LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr,
                     eventType: "SESSION_CLOSE_FLATTEN_LATE_CONFIRMED_NO_STREAM", state: "ENGINE",
@@ -8781,7 +8830,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 return ReconciliationForcedConvergenceResult.Succeeded(softFp);
             }
 
-            return ReconciliationForcedConvergenceResult.Failed(readiness.Summary ?? "not_release_ready");
+            return ReconciliationForcedConvergenceResult.Failed(
+                readiness.Summary ?? "not_release_ready",
+                ForcedConvergenceRiskLatchPolicy.ShouldPersistDurableRiskLatch(readiness));
         }
 
         var fp = BuildForcedConvergenceFingerprint(inst, snap, utcNow);
@@ -8861,6 +8912,23 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private void OnForcedBrokerConvergenceFailure(string instrument, ReconciliationForcedConvergenceContext ctx,
         ReconciliationForcedConvergenceResult result)
     {
+        if (!result.RequiresDurableRiskLatch)
+        {
+            var utcNow = DateTimeOffset.UtcNow;
+            LogEvent(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_FORCED_CONVERGENCE_SOFT_DEFERRED", "ENGINE",
+                new
+                {
+                    instrument = instrument.Trim(),
+                    limit_reason = ctx.LimitReason,
+                    failure_reason = result.FailureReason ?? "unknown",
+                    attempts = ctx.Attempts,
+                    no_progress_count = ctx.NoProgressCount,
+                    durable_risk_latch_persisted = false,
+                    note = "Forced convergence remained fail-closed in the mismatch gate, but did not persist a restart-durable risk latch because the failure class is recoverable or evidence was insufficient for durable escalation."
+                }));
+            return;
+        }
+
         var reason = $"FORCED_CONVERGENCE_FAILED:{result.FailureReason ?? "unknown"}";
         StandDownStreamsForInstrument(instrument.Trim(), DateTimeOffset.UtcNow, reason);
     }

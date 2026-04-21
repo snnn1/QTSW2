@@ -13,7 +13,8 @@ SCHEDULE_CONFIG_FILE = QTSW2_ROOT / "configs" / "schedule.json"
 
 # Dashboard configuration constants
 # Port configuration
-DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "8001"))
+# Current repo launch scripts and frontend proxy targets use :8000.
+DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "8000"))
 
 # Timeout constants (milliseconds)
 API_TIMEOUT_SHORT = 2000   # 2 seconds - for fast-failing endpoints

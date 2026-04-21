@@ -2959,7 +2959,27 @@ function AppContent() {
         setTimetableApiStatus({ loading: true, error: null })
       }
       try {
-        const tt = await matrixApi.getCurrentTimetable()
+        let tt = null
+        if (
+          timetableMode === 'historical' &&
+          /^\d{4}-\d{2}-\d{2}$/.test(timetableGenerateDate.trim())
+        ) {
+          tt = await matrixApi.previewExecutionTimetable({
+            tradingDate: timetableGenerateDate.trim(),
+            mode: 'historical',
+            streamFilters,
+          })
+        } else if (timetableMode === 'historical') {
+          workerApplyExecutionTimetableFromApi(null)
+          setTimetableSourceMeta(null)
+          setTimetableApiStatus({
+            loading: false,
+            error: 'Historical mode requires a valid session date',
+          })
+          return
+        } else {
+          tt = await matrixApi.getCurrentTimetable()
+        }
         if (cancelled) return
         if (!tt || typeof tt !== 'object') {
           console.warn('[Timetable] API missing or invalid — no worker fallback')
@@ -2988,12 +3008,19 @@ function AppContent() {
       }
     }
     load({ showLoading: true })
-    const id = setInterval(() => load({ showLoading: false }), 60000)
+    const shouldPoll = timetableMode === 'live'
+    const id = shouldPoll ? setInterval(() => load({ showLoading: false }), 60000) : null
     return () => {
       cancelled = true
-      clearInterval(id)
+      if (id) clearInterval(id)
     }
-  }, [deferredActiveTab, workerApplyExecutionTimetableFromApi])
+  }, [
+    deferredActiveTab,
+    workerApplyExecutionTimetableFromApi,
+    timetableMode,
+    timetableGenerateDate,
+    streamFilters,
+  ])
 
   useEffect(() => {
     if (deferredActiveTab !== 'timetable') return

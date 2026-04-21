@@ -30,11 +30,33 @@ export interface RunVerdictStripProps {
   summary: import('../../types/watchdog').RunSummaryResult | null
   peekActive: boolean
   onClearPeek?: () => void
+  autoFollowPlayback?: boolean
+  activePlaybackRunId?: string | null
+  activePlaybackRunRoot?: string | null
+  onEnableAutoFollow?: () => void
   /** When the summary request failed entirely (no payload). */
   clientError?: string | null
 }
 
-export function RunVerdictStrip({ summary, peekActive, onClearPeek, clientError }: RunVerdictStripProps) {
+function activePlaybackLabel(runId?: string | null, runRoot?: string | null): string | null {
+  if (runId && runId.trim()) return runId.trim()
+  if (!runRoot) return null
+  const parts = runRoot.replace(/\\/g, '/').split('/').filter(Boolean)
+  return parts.length ? parts[parts.length - 1] : null
+}
+
+export function RunVerdictStrip({
+  summary,
+  peekActive,
+  onClearPeek,
+  autoFollowPlayback = false,
+  activePlaybackRunId,
+  activePlaybackRunRoot,
+  onEnableAutoFollow,
+  clientError,
+}: RunVerdictStripProps) {
+  const playbackLabel = activePlaybackLabel(activePlaybackRunId, activePlaybackRunRoot)
+
   if (clientError && !summary) {
     return (
       <div className="rounded-lg border border-red-900/60 bg-gray-900/80 p-4 text-sm text-red-300">
@@ -72,7 +94,7 @@ export function RunVerdictStrip({ summary, peekActive, onClearPeek, clientError 
     <div className={`rounded-lg border bg-gray-900/90 p-4 ${accent}`}>
       {peekActive && onClearPeek && (
         <div className="mb-3 flex items-center justify-between border-b border-gray-700/60 pb-2">
-          <span className="text-xs text-amber-200/90">Viewing a selected run (not necessarily current)</span>
+          <span className="text-xs text-amber-200/90">Run-scoped dashboard mode is active</span>
           <button
             type="button"
             className="text-xs text-sky-400 hover:text-sky-300"
@@ -80,6 +102,24 @@ export function RunVerdictStrip({ summary, peekActive, onClearPeek, clientError 
           >
             Back to active run
           </button>
+        </div>
+      )}
+      {activePlaybackRunRoot && (
+        <div className="mb-3 flex items-center justify-between gap-3 border-b border-gray-700/60 pb-2">
+          <span className="text-xs text-sky-200/90">
+            {autoFollowPlayback
+              ? `Following active playback run${playbackLabel ? ` ${playbackLabel}` : ''}`
+              : `Active playback run detected${playbackLabel ? `: ${playbackLabel}` : ''}`}
+          </span>
+          {!autoFollowPlayback && onEnableAutoFollow && (
+            <button
+              type="button"
+              className="text-xs text-sky-400 hover:text-sky-300"
+              onClick={onEnableAutoFollow}
+            >
+              Follow active playback
+            </button>
+          )}
         </div>
       )}
       <div className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm md:grid-cols-3 lg:grid-cols-6">

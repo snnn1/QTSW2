@@ -355,6 +355,17 @@ public sealed class MismatchEscalationCoordinator
         return _stateByInstrument.TryGetValue(instrument.Trim(), out var s) && s.Blocked;
     }
 
+    public bool IsSubmitBlockedByMismatch(string instrument, string? submitPath)
+    {
+        if (string.IsNullOrWhiteSpace(instrument))
+            return false;
+
+        if (!_stateByInstrument.TryGetValue(instrument.Trim(), out var state) || !state.Blocked)
+            return false;
+
+        return !CanBypassMismatchExecutionBlockForSubmit(instrument.Trim(), state, submitPath, DateTimeOffset.UtcNow);
+    }
+
     private void PublishMismatchExecutionBlockAuthorityIfChanged(string inst, MismatchInstrumentState state, bool wasBlocked,
         DateTimeOffset utcNow)
     {
@@ -854,6 +865,26 @@ public sealed class MismatchEscalationCoordinator
         var stuckOnSoftBlockerOnly = fpChanged || !releaseConditionsMet ||
                                      (releaseConditionsMet && !fpChanged && stableMs < quietWindowMs);
         return stuckOnSoftBlockerOnly;
+    }
+
+    private static bool ShouldAllowImmediateBrokerFlatRelease(
+        StateConsistencyReleaseReadinessResult readiness,
+        int pendingIeA,
+        MismatchObservation obs,
+        bool fpChanged,
+        bool releaseConditionsMet)
+    {
+        if (!releaseConditionsMet || fpChanged || pendingIeA != 0)
+            return false;
+        if (!readiness.SnapshotSufficient || !readiness.ReleaseReady || readiness.BlockerInvariantViolation)
+            return false;
+        if (readiness.DiagnosticBrokerPositionQty != 0 || readiness.DiagnosticJournalOpenQty != 0 ||
+            readiness.DiagnosticBrokerWorkingCount != 0 || readiness.DiagnosticIeaOwnedPlusAdoptedWorking != 0)
+            return false;
+        if (obs.BrokerWorkingOrderCount != 0 || obs.LocalWorkingOrderCount != 0)
+            return false;
+
+        return true;
     }
 
     private void MaybeEmitGateMaxDwellExceeded(string inst, DateTimeOffset utcNow, MismatchInstrumentState state)
@@ -1497,6 +1528,42 @@ public sealed class MismatchEscalationCoordinator
             or ReconciliationBlockerReasonCode.JournalOnlyBrokerFlat
             or ReconciliationBlockerReasonCode.AlreadyOwnedElsewhere
             or ReconciliationBlockerReasonCode.StaleSnapshot;
+
+    private bool CanBypassMismatchExecutionBlockForSubmit(
+        string inst,
+        MismatchInstrumentState state,
+        string? submitPath,
+        DateTimeOffset utcNow)
+    {
+        if (!string.Equals(submitPath, "SUBMIT_ENTRY_STOP", StringComparison.Ordinal))
+            return false;
+        if (state.GateLifecyclePhase == GateLifecyclePhase.FailClosed ||
+            state.EscalationState == MismatchEscalationState.FAIL_CLOSED)
+            return false;
+        if (_evaluateReleaseReadiness == null)
+            return false;
+
+        StateConsistencyReleaseReadinessResult readiness;
+        try
+        {
+            readiness = _evaluateReleaseReadiness(inst, _getSnapshot(), utcNow, false);
+        }
+        catch
+        {
+            return false;
+        }
+
+        if (!readiness.SnapshotSufficient || readiness.BlockerInvariantViolation)
+            return false;
+        if (readiness.DiagnosticBrokerPositionQty != 0 || readiness.DiagnosticBrokerWorkingCount != 0)
+            return false;
+        if (readiness.DiagnosticIeaOwnedPlusAdoptedWorking > 0)
+            return false;
+        if ((_getPendingExecutionWorkloadForInstrument?.Invoke(inst) ?? 0) != 0)
+            return false;
+
+        return readiness.ReleaseReady || IsSoftTransitionReleaseReadiness(readiness);
+    }
 
     private static bool IsFillBoundaryPositionDelta(StateConsistencyReleaseReadinessResult readiness,
         MismatchObservation obs, int pendingExecutionWorkload)
@@ -2266,7 +2333,10 @@ public sealed class MismatchEscalationCoordinator
         var softDegradeForce = ShouldForceMaxDwellSoftDegradeRelease(
             gateDwellMs, readiness, pendingIeA, obsForSig, fpChanged, releaseConditionsMet, stableMs, quietWindowMs);
 
-        if (fpChanged && !softDegradeForce)
+        var immediateBrokerFlatRelease = ShouldAllowImmediateBrokerFlatRelease(
+            readiness, pendingIeA, obsForSig, fpChanged, releaseConditionsMet);
+
+        if (fpChanged && !softDegradeForce && !immediateBrokerFlatRelease)
         {
             EmitGateReleaseReset(inst, utcNow, state, readiness, obsForSig, pendingIeA, preSigHash, postSigHash, fpNow,
                 "quiet_fingerprint_changed", state.ReleaseQuietFingerprintKey, releaseQuietFingerprint);
@@ -2277,7 +2347,7 @@ public sealed class MismatchEscalationCoordinator
             return;
         }
 
-        if (!releaseConditionsMet && !softDegradeForce)
+        if (!releaseConditionsMet && !softDegradeForce && !immediateBrokerFlatRelease)
         {
             state.FirstConsistentUtc = utcNow;
             MaybeEmitGateReleaseProgress(inst, utcNow, state, readiness, 0, quietWindowMs, obsForSig, pendingIeA,
@@ -2285,7 +2355,7 @@ public sealed class MismatchEscalationCoordinator
             return;
         }
 
-        if (stableMs < quietWindowMs && !softDegradeForce)
+        if (stableMs < quietWindowMs && !softDegradeForce && !immediateBrokerFlatRelease)
         {
             MaybeEmitGateReleaseProgress(inst, utcNow, state, readiness, stableMs, quietWindowMs, obsForSig, pendingIeA,
                 preSigHash, postSigHash, fpNow, false, null);
@@ -2298,7 +2368,9 @@ public sealed class MismatchEscalationCoordinator
 
         var releaseCompletedUnderStall = skipExpensive && IsStallLikeSkipReason(skipReason);
 
-        var releaseSource = softDegradeForce
+        var releaseSource = immediateBrokerFlatRelease
+            ? "broker_flat_fast_path"
+            : softDegradeForce
             ? "max_dwell_soft_degrade"
             : state.EscalationState == MismatchEscalationState.PERSISTENT_MISMATCH
                 ? "persistent_recovery"

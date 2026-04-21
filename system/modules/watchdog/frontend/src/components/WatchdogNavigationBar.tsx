@@ -16,19 +16,19 @@ export function WatchdogNavigationBar() {
   ]
   
   return (
-    <nav className="fixed top-0 left-0 right-0 h-6 bg-gray-900 border-b border-gray-700 z-50">
-      <div className="container mx-auto px-4 h-full">
-        <div className="flex gap-1 h-full">
+    <nav className="fixed top-0 left-0 right-0 z-50 border-b border-slate-700/70 bg-slate-950/90 backdrop-blur-md">
+      <div className="watchdog-content h-11 px-2">
+        <div className="flex h-full items-center gap-1">
           {navItems.map((item) => {
             const isActive = location.pathname === item.path
             return (
               <Link
                 key={item.path}
                 to={item.path}
-                className={`px-4 py-2 text-sm font-medium transition-colors h-full flex items-center ${
+                className={`inline-flex h-8 items-center rounded-full px-4 text-sm font-medium transition-colors ${
                   isActive
-                    ? 'bg-gray-800 text-white border-b-2 border-blue-500'
-                    : 'text-gray-400 hover:text-white hover:bg-gray-800'
+                    ? 'bg-slate-800 text-white shadow-[inset_0_0_0_1px_rgba(96,165,250,0.4)]'
+                    : 'text-slate-400 hover:bg-slate-800/80 hover:text-white'
                 }`}
               >
                 {item.label}

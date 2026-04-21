@@ -7,7 +7,7 @@ import { fetchActiveIntents } from '../services/watchdogApi'
 import { usePollingInterval } from './usePollingInterval'
 import type { IntentExposure } from '../types/watchdog'
 
-export function useActiveIntents() {
+export function useActiveIntents(runRoot?: string | null) {
   const [intents, setIntents] = useState<IntentExposure[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -18,7 +18,7 @@ export function useActiveIntents() {
     if (!hasLoadedRef.current) {
       setLoading(true)
     }
-    const { data, error: apiError } = await fetchActiveIntents()
+    const { data, error: apiError } = await fetchActiveIntents(runRoot)
     if (apiError) {
       setError(apiError)
       hasLoadedRef.current = true // Mark as loaded even on error
@@ -48,6 +48,13 @@ export function useActiveIntents() {
   useEffect(() => {
     poll()
   }, [])
+
+  useEffect(() => {
+    setIntents([])
+    setError(null)
+    setLoading(true)
+    hasLoadedRef.current = false
+  }, [runRoot])
   
   return {
     intents,

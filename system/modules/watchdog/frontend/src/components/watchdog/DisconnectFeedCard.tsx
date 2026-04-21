@@ -1,6 +1,5 @@
 /**
  * DisconnectFeedCard - Chronological list of connection events for current session
- * Shows CONNECTION_LOST, CONNECTION_LOST_SUSTAINED, CONNECTION_RECOVERED, CONNECTIVITY_INCIDENT
  */
 import { memo, useMemo } from 'react'
 import { formatChicagoDateTime } from '../../utils/timeUtils.ts'
@@ -41,8 +40,8 @@ function extractDisconnectMessage(event: WatchdogEvent): string {
       return data.trigger === 'disconnect_count_5_in_hour'
         ? `5+ disconnects in 1 hour (${data.disconnect_count_in_window ?? '?'} detected)`
         : data.trigger === 'disconnect_duration_120s'
-        ? `Single disconnect >120s (${data.disconnect_duration_seconds ?? '?'}s)`
-        : 'Connectivity incident'
+          ? `Single disconnect >120s (${data.disconnect_duration_seconds ?? '?'}s)`
+          : 'Connectivity incident'
     default:
       return event.event_type.replace(/_/g, ' ').toLowerCase()
   }
@@ -83,29 +82,36 @@ function DisconnectFeedCardComponent({ events, tradingDate }: DisconnectFeedCard
 
   if (filteredEvents.length === 0) {
     return (
-      <div className="bg-gray-800 rounded-lg p-4">
-        <h2 className="text-sm font-semibold text-gray-300 mb-2">Disconnect Feed</h2>
-        <div className="text-gray-500 text-center py-6 text-sm">No disconnects this session</div>
+      <div className="watchdog-panel">
+        <div className="watchdog-panel-header">
+          <div>
+            <div className="watchdog-panel-kicker">Feed</div>
+            <div className="watchdog-panel-title">Disconnect Feed</div>
+          </div>
+          <div className="watchdog-panel-meta">No events</div>
+        </div>
+        <div className="py-6 text-center text-sm text-gray-500">No disconnects this session</div>
       </div>
     )
   }
 
   return (
-    <div className="bg-gray-800 rounded-lg p-4">
-      <h2 className="text-sm font-semibold text-gray-300 mb-2">
-        Disconnect Feed
-        {tradingDate && (
-          <span className="ml-2 text-xs font-normal text-gray-500">· {tradingDate}</span>
-        )}
-      </h2>
-      <div className="overflow-y-auto max-h-64">
-        <table className="w-full text-sm">
-          <thead className="bg-gray-700 sticky top-0">
+    <div className="watchdog-panel">
+      <div className="watchdog-panel-header">
+        <div>
+          <div className="watchdog-panel-kicker">Feed</div>
+          <div className="watchdog-panel-title">Disconnect Feed</div>
+        </div>
+        <div className="watchdog-panel-meta">{tradingDate ?? 'Current session'}</div>
+      </div>
+      <div className="max-h-64 overflow-y-auto rounded-xl border border-gray-700/70">
+        <table className="watchdog-panel-table">
+          <thead className="sticky top-0">
             <tr>
-              <th className="px-2 py-1 text-left text-xs">Time (CT)</th>
-              <th className="px-2 py-1 text-left text-xs">Level</th>
-              <th className="px-2 py-1 text-left text-xs">Event</th>
-              <th className="px-2 py-1 text-left text-xs">Message</th>
+              <th className="px-2 py-2 text-left">Time</th>
+              <th className="px-2 py-2 text-left">Level</th>
+              <th className="px-2 py-2 text-left">Event</th>
+              <th className="px-2 py-2 text-left">Message</th>
             </tr>
           </thead>
           <tbody>
@@ -115,18 +121,18 @@ function DisconnectFeedCardComponent({ events, tradingDate }: DisconnectFeedCard
               return (
                 <tr
                   key={`${event.run_id}:${event.event_seq}`}
-                  className="border-b border-gray-700"
+                  className="border-b border-gray-700/70 text-sm"
                 >
-                  <td className="px-2 py-1 font-mono text-xs">
+                  <td className="px-2 py-2 font-mono text-xs text-gray-300">
                     {formatChicagoDateTime(event.timestamp_chicago || event.timestamp_utc)}
                   </td>
-                  <td className="px-2 py-1">
-                    <span className={`px-1 py-0.5 rounded text-xs ${getLevelBadgeColor(level)}`}>
+                  <td className="px-2 py-2">
+                    <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${getLevelBadgeColor(level)}`}>
                       {level}
                     </span>
                   </td>
-                  <td className="px-2 py-1 text-xs">{event.event_type}</td>
-                  <td className="px-2 py-1 text-xs truncate max-w-[180px]" title={message}>
+                  <td className="px-2 py-2 text-xs text-gray-300">{event.event_type}</td>
+                  <td className="max-w-[220px] truncate px-2 py-2 text-xs text-gray-400" title={message}>
                     {message}
                   </td>
                 </tr>

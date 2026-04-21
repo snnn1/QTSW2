@@ -1,6 +1,5 @@
 /**
  * RiskGatesPanel component
- * Shows execution gate status; execution severity copy/colors come from shared helper only.
  */
 import type { RiskGateStatus } from '../../types/watchdog'
 import type { OverallExecutionDerived } from '../../utils/executionSeverity'
@@ -10,28 +9,38 @@ interface RiskGatesPanelProps {
   gates: RiskGateStatus | null
   loading: boolean
   overallExecution: OverallExecutionDerived
-  /** Canonical overlay tradability from GET /status (must match overallExecution.tradable). */
   tradable?: boolean
 }
 
 function executionRowTextClass(sev: OverallExecutionDerived['overall_execution_severity']): string {
   switch (sev) {
     case 'SAFE':
-      return 'text-green-500'
+      return 'text-green-400'
     case 'WARNING':
-      return 'text-amber-500'
+      return 'text-amber-400'
     case 'CRITICAL':
-      return 'text-red-500'
+      return 'text-red-400'
     default:
       return 'text-gray-500'
   }
 }
 
+function gateCheck(allowed: boolean) {
+  return (
+    <span className={allowed ? 'text-green-400' : 'text-red-400'}>{allowed ? 'Yes' : 'No'}</span>
+  )
+}
+
 export function RiskGatesPanel({ gates, loading, overallExecution, tradable }: RiskGatesPanelProps) {
   if (loading && !gates) {
     return (
-      <div className="bg-gray-800 rounded-lg p-4">
-        <h2 className="text-lg font-semibold mb-4">Execution Gates</h2>
+      <div className="watchdog-panel">
+        <div className="watchdog-panel-header">
+          <div>
+            <div className="watchdog-panel-kicker">Controls</div>
+            <div className="watchdog-panel-title">Execution Gates</div>
+          </div>
+        </div>
         <div className="text-gray-500">Loading...</div>
       </div>
     )
@@ -39,8 +48,13 @@ export function RiskGatesPanel({ gates, loading, overallExecution, tradable }: R
 
   if (!gates) {
     return (
-      <div className="bg-gray-800 rounded-lg p-4">
-        <h2 className="text-lg font-semibold mb-4">Execution Gates</h2>
+      <div className="watchdog-panel">
+        <div className="watchdog-panel-header">
+          <div>
+            <div className="watchdog-panel-kicker">Controls</div>
+            <div className="watchdog-panel-title">Execution Gates</div>
+          </div>
+        </div>
         <div className="text-gray-500">No data</div>
       </div>
     )
@@ -54,65 +68,59 @@ export function RiskGatesPanel({ gates, loading, overallExecution, tradable }: R
   const rowClass = executionRowTextClass(overallExecution.overall_execution_severity)
 
   return (
-    <div className="bg-gray-800 rounded-lg p-4" data-testid="risk-gates-panel">
-      <h2 className="text-lg font-semibold mb-4">Execution Gates</h2>
-      <div className="space-y-2">
+    <div className="watchdog-panel" data-testid="risk-gates-panel">
+      <div className="watchdog-panel-header">
+        <div>
+          <div className="watchdog-panel-kicker">Controls</div>
+          <div className="watchdog-panel-title">Execution Gates</div>
+        </div>
+        <div className="watchdog-panel-meta">{executionSafe ? 'Tradable' : 'Blocked'}</div>
+      </div>
+      <div className="space-y-2 text-sm">
         <div className="flex items-center justify-between">
-          <span>Recovery State</span>
-          <span className={gates.recovery_state_allowed ? 'text-green-500' : 'text-red-500'}>
-            {gates.recovery_state_allowed ? '✅' : '❌'}
-          </span>
+          <span className="text-gray-300">Recovery state</span>
+          {gateCheck(gates.recovery_state_allowed)}
         </div>
         <div className="flex items-center justify-between">
-          <span>Kill Switch</span>
-          <span className={gates.kill_switch_allowed ? 'text-green-500' : 'text-red-500'}>
-            {gates.kill_switch_allowed ? '✅' : '❌'}
-          </span>
+          <span className="text-gray-300">Kill switch clear</span>
+          {gateCheck(gates.kill_switch_allowed)}
         </div>
-        <div className="flex flex-col gap-1 border-t border-gray-700/50 pt-2 mt-1">
+        <div className="mt-1 rounded-xl border border-gray-700/70 bg-slate-900/45 p-3">
           <div className="flex items-center justify-between">
-            <span className="font-medium" title="Canonical: GET /status execution_safe (overlay tradability)">
+            <span className="font-medium text-gray-200" title="Canonical /status execution_safe">
               Overlay tradable
             </span>
-            <span className={executionSafe ? 'text-green-500' : 'text-red-500'}>
-              {executionSafe ? '✅' : '❌'}
-            </span>
+            {gateCheck(executionSafe)}
           </div>
-          <div className={`text-xs ${rowClass}`} data-testid="risk-gates-execution-severity-message">
+          <div className={`mt-2 text-xs ${rowClass}`} data-testid="risk-gates-execution-severity-message">
             {reasonMsg}
           </div>
         </div>
         <div className="flex items-center justify-between">
-          <span>Timetable Validated</span>
-          <span className={gates.timetable_validated ? 'text-green-500' : 'text-red-500'}>
-            {gates.timetable_validated ? '✅' : '❌'}
-          </span>
+          <span className="text-gray-300">Timetable validated</span>
+          {gateCheck(gates.timetable_validated)}
         </div>
         <div className="flex items-center justify-between">
-          <span>Slot Time Valid</span>
-          <span className={gates.session_slot_time_valid ? 'text-green-500' : 'text-red-500'}>
-            {gates.session_slot_time_valid ? '✅' : '❌'}
-          </span>
+          <span className="text-gray-300">Slot time valid</span>
+          {gateCheck(gates.session_slot_time_valid)}
         </div>
         <div className="flex items-center justify-between">
-          <span>Trading Date Set</span>
-          <span className={gates.trading_date_set ? 'text-green-500' : 'text-red-500'}>
-            {gates.trading_date_set ? '✅' : '❌'}
-          </span>
+          <span className="text-gray-300">Trading date set</span>
+          {gateCheck(gates.trading_date_set)}
         </div>
-        <div className="mt-4">
-          <div className="text-sm font-semibold mb-2">Stream Armed:</div>
+        <div className="mt-3 border-t border-gray-700/70 pt-3">
+          <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-500">
+            Stream Armed
+          </div>
           <div className="space-y-1">
-            {Array.from(
-              new Map(gates.stream_armed.map((stream) => [stream.stream, stream])).values()
-            ).map((stream) => (
-              <div key={stream.stream} className="flex items-center justify-between text-sm">
-                <span className="font-mono">{stream.stream}</span>
-                <span className={stream.armed ? 'text-green-500' : 'text-red-500'}>
-                  {stream.armed ? '✅' : '❌'}
-                </span>
-              </div>
-            ))}
+            {Array.from(new Map(gates.stream_armed.map((stream) => [stream.stream, stream])).values()).map(
+              (stream) => (
+                <div key={stream.stream} className="flex items-center justify-between text-sm">
+                  <span className="font-mono text-gray-300">{stream.stream}</span>
+                  {gateCheck(stream.armed)}
+                </div>
+              )
+            )}
           </div>
         </div>
       </div>

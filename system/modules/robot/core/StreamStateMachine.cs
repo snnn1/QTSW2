@@ -7024,7 +7024,7 @@ public sealed class StreamStateMachine
         RangeStartChicagoTime = time.ConstructChicagoTime(tradingDate, rangeStartChicago);
         SlotTimeChicagoTime = time.ConstructChicagoTime(tradingDate, SlotTimeChicago);
         var marketCloseChicagoTime = time.ConstructChicagoTime(tradingDate, spec.entry_cutoff.market_close_time);
-        var marketReopenTimeStr = string.IsNullOrWhiteSpace(spec.entry_cutoff.market_reopen_time) ? "17:00" : spec.entry_cutoff.market_reopen_time;
+        var marketReopenTimeStr = SessionTimingPolicy.ResolveMarketReopenTime(spec);
         MarketReopenChicagoTime = time.ConstructChicagoTime(DateOnly.FromDateTime(marketCloseChicagoTime.Date), marketReopenTimeStr);
         
         // DIAGNOSTIC: Log RangeStartChicagoTime initialization

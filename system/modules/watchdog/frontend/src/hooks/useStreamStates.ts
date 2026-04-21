@@ -7,7 +7,7 @@ import { fetchStreamStates } from '../services/watchdogApi'
 import { usePollingInterval } from './usePollingInterval'
 import type { StreamState } from '../types/watchdog'
 
-export function useStreamStates() {
+export function useStreamStates(runRoot?: string | null) {
   const [streams, setStreams] = useState<StreamState[]>([])
   const [timetableUnavailable, setTimetableUnavailable] = useState(false)
   const [loading, setLoading] = useState(true)
@@ -19,7 +19,7 @@ export function useStreamStates() {
     if (!hasLoadedRef.current) {
       setLoading(true)
     }
-    const { data, error: apiError } = await fetchStreamStates()
+    const { data, error: apiError } = await fetchStreamStates(runRoot)
     if (apiError) {
       setError(apiError)
       hasLoadedRef.current = true // Mark as loaded even on error
@@ -52,6 +52,14 @@ export function useStreamStates() {
   useEffect(() => {
     poll()
   }, [])
+
+  useEffect(() => {
+    setStreams([])
+    setTimetableUnavailable(false)
+    setError(null)
+    setLoading(true)
+    hasLoadedRef.current = false
+  }, [runRoot])
   
   return {
     streams,

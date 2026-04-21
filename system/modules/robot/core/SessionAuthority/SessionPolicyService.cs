@@ -98,12 +98,12 @@ public sealed class SessionPolicyService
             : spec?.entry_cutoff?.market_close_time;
         var reopenHhmm = !string.IsNullOrWhiteSpace(match.MarketReopenChicago)
             ? match.MarketReopenChicago!.Trim()
-            : spec?.entry_cutoff?.market_reopen_time;
+            : SessionTimingPolicy.ResolveMarketReopenTime(spec);
 
         if (string.IsNullOrWhiteSpace(closeHhmm))
             closeHhmm = "16:00";
         if (string.IsNullOrWhiteSpace(reopenHhmm))
-            reopenHhmm = "17:00";
+            reopenHhmm = SessionTimingPolicy.DefaultMarketReopenTime;
 
         if (kind == "NORMAL" &&
             string.IsNullOrWhiteSpace(match.MarketCloseChicago) &&
@@ -117,15 +117,16 @@ public sealed class SessionPolicyService
         {
             var closeChicago = time.ConstructChicagoTime(tradingDate, closeHhmm);
             var closeUtc = time.ConvertChicagoToUtc(closeChicago);
+            var flattenTriggerUtc = SessionTimingPolicy.ResolveForcedFlattenTriggerUtc(tradingDate, closeUtc, time, spec, out var effectiveLeadSeconds);
             var reopenChicago = time.ConstructChicagoTime(tradingDate, reopenHhmm);
             var reopenUtc = time.ConvertChicagoToUtc(reopenChicago);
             result = new SessionCloseResult
             {
                 HasSession = true,
-                FlattenTriggerUtc = closeUtc.AddSeconds(-fallbackBufferSeconds),
+                FlattenTriggerUtc = flattenTriggerUtc,
                 ResolvedSessionCloseUtc = closeUtc,
                 NextSessionBeginUtc = reopenUtc,
-                BufferSeconds = fallbackBufferSeconds,
+                BufferSeconds = effectiveLeadSeconds,
                 BarsInstrument = barsInstrument
             };
             return true;

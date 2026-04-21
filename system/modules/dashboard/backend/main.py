@@ -37,10 +37,12 @@ from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 import uuid
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 # WebSocket imports removed - WebSocket endpoints are in routers/websocket.py
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 import uvicorn
 import logging
@@ -64,6 +66,10 @@ DATA_MERGER_SCRIPT = _SYSTEM_ROOT / "modules" / "merger" / "merger.py"
 PARALLEL_ANALYZER_SCRIPT = QTSW2_ROOT / "tools" / "run_analyzer_parallel.py"
 EVENT_LOGS_DIR = _SYSTEM_ROOT / "automation" / "logs" / "events"
 EVENT_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+DASHBOARD_FRONTEND_DIR = _SYSTEM_ROOT / "modules" / "dashboard" / "frontend"
+DASHBOARD_DIST_DIR = DASHBOARD_FRONTEND_DIR / "dist-dashboard"
+DASHBOARD_INDEX_FILE = DASHBOARD_DIST_DIR / "index-dashboard.html"
+DASHBOARD_ASSETS_DIR = DASHBOARD_DIST_DIR / "assets"
 
 
 # Streamlit app scripts
@@ -99,6 +105,24 @@ _file_counts_cache = {
 _file_counts_cache_ttl_seconds = 30  # Refresh cache if older than 30 seconds
 
 
+def get_dashboard_bundle_paths() -> Tuple[Path, Path]:
+    """Return the prebuilt dashboard HTML file and hashed asset directory."""
+    return DASHBOARD_INDEX_FILE, DASHBOARD_ASSETS_DIR
+
+
+def _localhost_loopback_redirect(request: Request) -> Optional[str]:
+    """
+    Redirect localhost UI requests to 127.0.0.1 so the prebuilt dashboard bundle
+    does not trip its stale localhost:8000 safety redirect from an older build.
+    """
+    if request.url.hostname != "localhost":
+        return None
+
+    port = request.url.port or 8000
+    query = f"?{request.url.query}" if request.url.query else ""
+    return f"{request.url.scheme}://127.0.0.1:{port}{request.url.path}{query}"
+
+
 def hydrate_in_memory_matrix_on_startup() -> None:
     """
     Load fullest master matrix from disk into process memory so timetable publish works after restart
@@ -106,6 +130,7 @@ def hydrate_in_memory_matrix_on_startup() -> None:
     """
     try:
         from modules.matrix.file_manager import (
+            get_best_matrix_file,
             load_existing_matrix,
             set_current_master_matrix_df,
         )
@@ -115,7 +140,15 @@ def hydrate_in_memory_matrix_on_startup() -> None:
         if df is None or df.empty:
             print("MATRIX_STARTUP_LOAD: No matrix found on disk", flush=True)
             return
-        set_current_master_matrix_df(df)
+        best_path = get_best_matrix_file(str(matrix_dir))
+        best_mtime = best_path.stat().st_mtime if best_path and best_path.exists() else None
+        set_current_master_matrix_df(
+            df,
+            source_path=str(best_path) if best_path else None,
+            file_mtime=best_mtime,
+            snapshot_id=best_path.name if best_path else None,
+            source_kind="disk",
+        )
         print(f"MATRIX_STARTUP_LOAD: Loaded matrix into memory ({len(df)} rows)", flush=True)
     except Exception as e:
         print(f"MATRIX_STARTUP_LOAD_FAILED: {e}", flush=True)
@@ -288,6 +321,15 @@ app.add_middleware(
 # Gzip compression middleware for faster data transfer
 app.add_middleware(GZipMiddleware, minimum_size=1000)  # Compress responses > 1KB
 
+dashboard_index_file, dashboard_assets_dir = get_dashboard_bundle_paths()
+if dashboard_assets_dir.is_dir():
+    app.mount("/assets", StaticFiles(directory=str(dashboard_assets_dir)), name="dashboard-assets")
+else:
+    logging.getLogger(__name__).warning(
+        "Dashboard assets directory not found: %s",
+        dashboard_assets_dir,
+    )
+
 # Import and include routers
 # Handle both module import (dashboard.backend.main) and direct script execution
 try:
@@ -374,6 +416,29 @@ def save_schedule_config(config: ScheduleConfig):
 @app.get("/")
 async def root():
     return {"message": "Pipeline Dashboard API", "status": "running", "test_endpoint": "/api/test-debug-log"}
+
+
+@app.get("/dashboard", include_in_schema=False)
+@app.get("/dashboard/", include_in_schema=False)
+async def dashboard_redirect(request: Request):
+    redirect_url = _localhost_loopback_redirect(request)
+    if redirect_url:
+        return RedirectResponse(url=redirect_url.replace("/dashboard", "/pipeline"), status_code=307)
+    return RedirectResponse(url="/pipeline", status_code=307)
+
+
+@app.get("/pipeline", include_in_schema=False)
+@app.get("/pipeline/", include_in_schema=False)
+async def pipeline_dashboard(request: Request):
+    redirect_url = _localhost_loopback_redirect(request)
+    if redirect_url:
+        return RedirectResponse(url=redirect_url, status_code=307)
+
+    index_file, _ = get_dashboard_bundle_paths()
+    if not index_file.is_file():
+        raise HTTPException(status_code=503, detail=f"Dashboard UI bundle not found: {index_file}")
+
+    return FileResponse(index_file)
 
 @app.get("/health")
 async def health_check():
@@ -1042,6 +1107,15 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
             status_code=400,
             detail="trading_date must be YYYY-MM-DD",
         )
+    if request.mode == "historical":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Historical mode is preview-only in the Matrix UI and must not overwrite "
+                "live timetable_current.json. Use POST /api/timetable/preview for historical "
+                "inspection, or a dedicated replay flow if you need a replay timetable file."
+            ),
+        )
     try:
         sys.path.insert(0, str(_SYSTEM_ROOT))
         from modules.matrix.file_manager import get_current_master_matrix_df
@@ -1708,4 +1782,3 @@ if __name__ == "__main__":
     
     # Set log level to info so we can see SL calculation logs
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
-

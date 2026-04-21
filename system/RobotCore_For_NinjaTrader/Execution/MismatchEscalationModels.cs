@@ -210,12 +210,18 @@ public sealed class ReconciliationForcedConvergenceResult
     public bool AlignedWithBroker { get; init; }
     public string? FailureReason { get; init; }
     public ulong PostAlignmentFingerprint { get; init; }
+    public bool RequiresDurableRiskLatch { get; init; }
 
     public static ReconciliationForcedConvergenceResult Succeeded(ulong fingerprint) =>
         new() { AlignedWithBroker = true, PostAlignmentFingerprint = fingerprint };
 
-    public static ReconciliationForcedConvergenceResult Failed(string reason) =>
-        new() { AlignedWithBroker = false, FailureReason = reason };
+    public static ReconciliationForcedConvergenceResult Failed(string reason, bool requiresDurableRiskLatch = false) =>
+        new()
+        {
+            AlignedWithBroker = false,
+            FailureReason = reason,
+            RequiresDurableRiskLatch = requiresDurableRiskLatch
+        };
 
     /// <summary>Harness / no handler: soft success — no fail-closed.</summary>
     public static ReconciliationForcedConvergenceResult NoHandler() =>

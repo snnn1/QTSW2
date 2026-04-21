@@ -439,6 +439,55 @@ export async function saveExecutionTimetable({
 }
 
 /**
+ * Preview execution timetable for a specific session date without writing timetable_current.json.
+ * Historical mode should use this for the grid so the selected date is reflected immediately.
+ */
+export async function previewExecutionTimetable({
+  tradingDate,
+  mode = 'historical',
+  streamFilters,
+} = {}) {
+  const payload = {
+    trading_date: tradingDate ?? null,
+    mode: mode === 'historical' ? 'historical' : 'live',
+  }
+  if (streamFilters != null && typeof streamFilters === 'object') {
+    const apiFilters = streamFiltersForExecutionApi(streamFilters)
+    if (Object.keys(apiFilters).length > 0) {
+      payload.stream_filters = apiFilters
+    }
+  }
+  const response = await fetch(`${API_BASE}/timetable/preview`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  })
+
+  const payloadText = await response.text()
+  if (!response.ok) {
+    let detail = payloadText
+    try {
+      const j = JSON.parse(payloadText)
+      detail = errorMessageFromPayload(j) || payloadText
+    } catch {
+      /* use raw */
+    }
+    throw new Error(
+      detail
+        ? `Failed to preview execution timetable: ${detail}`
+        : `Failed to preview execution timetable (${response.status}). Empty body — see backend logs.`
+    )
+  }
+
+  if (!payloadText.trim()) {
+    throw new Error('Execution timetable preview: success response had empty body')
+  }
+  return JSON.parse(payloadText)
+}
+
+/**
  * Reload latest matrix file from disk (without rebuilding)
  * This immediately reflects the current disk state.
  */

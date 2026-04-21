@@ -29,6 +29,7 @@ public static class ExecutionPermissionAuthority
     public static bool TryAdapterOrderSubmitPreflight(
         Func<bool>? globalKillSwitchActive,
         Func<string, bool>? mismatchExecutionBlocked,
+        Func<string, string?, bool>? mismatchExecutionBlockedForSubmit,
         Func<string, string?, bool>? instrumentFrozenOrEpaBlocked,
         string instrument,
         string submitPath,
@@ -43,8 +44,11 @@ public static class ExecutionPermissionAuthority
         }
 
         var inst = instrument?.Trim() ?? "";
+        var mismatchBlocked = !string.IsNullOrEmpty(inst) &&
+                              (mismatchExecutionBlockedForSubmit?.Invoke(inst, submitPath) ??
+                               (mismatchExecutionBlocked != null && mismatchExecutionBlocked(inst)));
         if (!skipMismatchExecutionBlock &&
-            !string.IsNullOrEmpty(inst) && mismatchExecutionBlocked != null && mismatchExecutionBlocked(inst))
+            mismatchBlocked)
         {
             denyReason = "MISMATCH_EXECUTION_BLOCK";
             return false;

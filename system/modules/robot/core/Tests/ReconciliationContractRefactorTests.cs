@@ -21,6 +21,14 @@ public static class ReconciliationContractRefactorTests
         if (!e) return (false, ee);
         var (f, ef) = Case6_TransientRetryExhaustionEscalates();
         if (!f) return (false, ef);
+        var (g, eg) = Case7_AdoptOnlyFailureStaysGateScoped();
+        if (!g) return (false, eg);
+        var (h, eh) = Case8_HardFailurePersistsDurableLatch();
+        if (!h) return (false, eh);
+        var (i, ei) = Case9_UnexplainedPositionDeltaPersistsDurableLatch();
+        if (!i) return (false, ei);
+        var (j, ej) = Case10_BrokerFlatSoftTransitionBlockersRelease();
+        if (!j) return (false, ej);
         return (true, null);
     }
 
@@ -173,6 +181,136 @@ public static class ReconciliationContractRefactorTests
             return (false, "Case6: exhausted transient must ESCALATE");
         if (ReconciliationDecisionResolver.ShouldScheduleRecoveryAdoption(new List<ReconciliationBlocker> { b }, utc))
             return (false, "Case6: must not schedule adoption after exhaustion");
+        return (true, null);
+    }
+
+    private static (bool, string?) Case7_AdoptOnlyFailureStaysGateScoped()
+    {
+        var b = new ReconciliationBlocker
+        {
+            BlockerId = "a",
+            Category = BlockingCandidateCategory.BrokerVisibleAdoptable,
+            Disposition = ReleaseAdoptionDisposition.AdoptableAndRetryable,
+            ShouldAdopt = true,
+            BlocksRelease = true,
+            ReasonCode = ReconciliationBlockerReasonCode.BrokerVisibleAdoptableExposure,
+            Source = ReconciliationBlockerSource.Journal,
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+            IntentId = "adopt-me"
+        };
+        var r = StateConsistencyReleaseEvaluator.Evaluate(new StateConsistencyReleaseEvaluationInput
+        {
+            Instrument = "MNQ",
+            SnapshotSufficient = true,
+            BrokerPositionQty = 1,
+            BrokerWorkingCount = 1,
+            JournalOpenQty = 1,
+            IeaOwnedPlusAdoptedWorking = 1,
+            ReconciliationBlockers = new List<ReconciliationBlocker> { b },
+            UseInstrumentExecutionAuthority = true
+        });
+        if (ForcedConvergenceRiskLatchPolicy.ShouldPersistDurableRiskLatch(r))
+            return (false, "Case7: ADOPT-only blocker should remain gate-scoped, not durable");
+        return (true, null);
+    }
+
+    private static (bool, string?) Case8_HardFailurePersistsDurableLatch()
+    {
+        var b = new ReconciliationBlocker
+        {
+            BlockerId = "hard",
+            Category = BlockingCandidateCategory.Unknown,
+            Disposition = ReleaseAdoptionDisposition.UnknownTreatAsHardFailure,
+            ShouldAdopt = false,
+            BlocksRelease = true,
+            ReasonCode = ReconciliationBlockerReasonCode.UnknownIntent,
+            Source = ReconciliationBlockerSource.Broker,
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+            IntentId = "unknown"
+        };
+        var r = StateConsistencyReleaseEvaluator.Evaluate(new StateConsistencyReleaseEvaluationInput
+        {
+            Instrument = "MCL",
+            SnapshotSufficient = true,
+            BrokerPositionQty = 1,
+            BrokerWorkingCount = 0,
+            JournalOpenQty = 1,
+            IeaOwnedPlusAdoptedWorking = 0,
+            ReconciliationBlockers = new List<ReconciliationBlocker> { b },
+            UseInstrumentExecutionAuthority = false
+        });
+        if (!ForcedConvergenceRiskLatchPolicy.ShouldPersistDurableRiskLatch(r))
+            return (false, "Case8: hard failure should persist a durable risk latch");
+        return (true, null);
+    }
+
+    private static (bool, string?) Case9_UnexplainedPositionDeltaPersistsDurableLatch()
+    {
+        var r = StateConsistencyReleaseEvaluator.Evaluate(new StateConsistencyReleaseEvaluationInput
+        {
+            Instrument = "MNG",
+            SnapshotSufficient = true,
+            BrokerPositionQty = 4,
+            BrokerWorkingCount = 0,
+            JournalOpenQty = 0,
+            IeaOwnedPlusAdoptedWorking = 0,
+            ReconciliationBlockers = null,
+            BlockingCandidateDiagnostics = null,
+            UseInstrumentExecutionAuthority = false
+        });
+        if (!ForcedConvergenceRiskLatchPolicy.ShouldPersistDurableRiskLatch(r))
+            return (false, "Case9: unexplained broker/journal position delta should persist a durable risk latch");
+        return (true, null);
+    }
+
+    private static (bool, string?) Case10_BrokerFlatSoftTransitionBlockersRelease()
+    {
+        var adopt = new ReconciliationBlocker
+        {
+            BlockerId = "adopt-flat",
+            Category = BlockingCandidateCategory.BrokerVisibleAdoptable,
+            Disposition = ReleaseAdoptionDisposition.AdoptableAndRetryable,
+            ShouldAdopt = true,
+            BlocksRelease = true,
+            ReasonCode = ReconciliationBlockerReasonCode.BrokerVisibleAdoptableExposure,
+            Source = ReconciliationBlockerSource.Broker,
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+            IntentId = "intent-a"
+        };
+        var lane = new ReconciliationBlocker
+        {
+            BlockerId = "lane-flat",
+            Category = BlockingCandidateCategory.AlreadyOwnedElsewhere,
+            Disposition = ReleaseAdoptionDisposition.NeedsDifferentReconciliationLane,
+            ShouldAdopt = false,
+            BlocksRelease = true,
+            ReasonCode = ReconciliationBlockerReasonCode.AlreadyOwnedElsewhere,
+            Source = ReconciliationBlockerSource.Registry,
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+            IntentId = "intent-b",
+            LaneType = ReconciliationLaneType.Other,
+            ResolutionOwner = "OWNERSHIP_ELSEWHERE",
+            IsTerminal = false
+        };
+
+        var r = StateConsistencyReleaseEvaluator.Evaluate(new StateConsistencyReleaseEvaluationInput
+        {
+            Instrument = "MNG",
+            SnapshotSufficient = true,
+            BrokerPositionQty = 0,
+            BrokerWorkingCount = 0,
+            JournalOpenQty = 0,
+            IeaOwnedPlusAdoptedWorking = 0,
+            ReconciliationBlockers = new List<ReconciliationBlocker> { adopt, lane },
+            UseInstrumentExecutionAuthority = true
+        });
+
+        if (!r.ReleaseReady)
+            return (false, "Case10: broker-flat soft-transition leftovers should release");
+        if (!string.Equals(r.Summary, "release_ready_soft_transition_broker_flat", StringComparison.Ordinal))
+            return (false, "Case10: expected broker-flat soft-transition release summary");
+        if (!r.PendingAdoptionExists)
+            return (false, "Case10: pending adoption should remain visible in diagnostics");
         return (true, null);
     }
 }

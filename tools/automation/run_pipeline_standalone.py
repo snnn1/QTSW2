@@ -9,13 +9,19 @@ Publishes scheduler events directly to backend EventBus for real-time visibility
 import sys
 import asyncio
 import logging
+import os
 from pathlib import Path
 from datetime import datetime, timezone
 
-# Add project root to path
-qtsw2_root = Path(__file__).parent.parent
-if str(qtsw2_root) not in sys.path:
-    sys.path.insert(0, str(qtsw2_root))
+# Add repo roots to path
+# tools/automation/run_pipeline_standalone.py -> automation -> tools -> QTSW2
+qtsw2_root = Path(__file__).resolve().parents[2]
+system_root = qtsw2_root / "system"
+tools_root = qtsw2_root / "tools"
+for path in (qtsw2_root, system_root, tools_root):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
 
 # Setup logging
 log_dir = qtsw2_root / "automation" / "logs"
@@ -31,6 +37,12 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _dashboard_base_url() -> str:
+    """Return the dashboard backend base URL used for event publication."""
+    port = os.getenv("DASHBOARD_PORT", "8000").strip() or "8000"
+    return f"http://localhost:{port}"
 
 
 async def _subscribe_and_republish_events(event_bus, run_id: str):
@@ -132,7 +144,7 @@ async def publish_event_to_backend(run_id: str, stage: str, event_type: str, msg
             event_data["data"] = data
         
         # Use the generic publish-event endpoint for all events
-        endpoint = "http://localhost:8001/api/pipeline/publish-event"
+        endpoint = f"{_dashboard_base_url()}/api/pipeline/publish-event"
         
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.post(
@@ -151,7 +163,7 @@ async def publish_event_to_backend(run_id: str, stage: str, event_type: str, msg
             else:
                 logger.warning(f"[WARNING] Backend returned status {response.status_code} for {stage}/{event_type} event: {response.text[:200]}")
     except httpx.ConnectError as e:
-        logger.debug(f"[WARNING] Cannot connect to backend at http://localhost:8001 - {stage}/{event_type} event will appear after backend restart ({e})")
+        logger.debug(f"[WARNING] Cannot connect to backend at {_dashboard_base_url()} - {stage}/{event_type} event will appear after backend restart ({e})")
     except Exception as e:
         # Don't fail if backend is not available - scheduled runs should work independently
         # Log at DEBUG level since this is expected when backend is not running
@@ -197,7 +209,7 @@ async def publish_scheduler_event_to_backend(run_id: str, event_type: str, msg: 
         
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.post(
-                "http://localhost:8001/api/pipeline/publish-scheduler-event",
+                f"{_dashboard_base_url()}/api/pipeline/publish-scheduler-event",
                 json=event_data,
                 timeout=5.0
             )
@@ -210,7 +222,7 @@ async def publish_scheduler_event_to_backend(run_id: str, event_type: str, msg: 
             else:
                 logger.warning(f"[WARNING] Backend returned status {response.status_code} for scheduler event: {response.text[:200]}")
     except httpx.ConnectError as e:
-        logger.warning(f"[WARNING] Cannot connect to backend at http://localhost:8001 - is the dashboard backend running? ({e})")
+        logger.warning(f"[WARNING] Cannot connect to backend at {_dashboard_base_url()} - is the dashboard backend running? ({e})")
     except Exception as e:
         # Don't fail if backend is not available - scheduled runs should work independently
         # Log at WARNING level so we can see connection issues
@@ -229,7 +241,7 @@ async def notify_dashboard_backend(run_id: str):
         import httpx
         async with httpx.AsyncClient(timeout=2.0) as client:
             await client.post(
-                "http://localhost:8001/api/pipeline/notify-scheduled-run",
+                f"{_dashboard_base_url()}/api/pipeline/notify-scheduled-run",
                 json={"run_id": run_id, "source": "windows_scheduler"},
                 timeout=2.0
             )

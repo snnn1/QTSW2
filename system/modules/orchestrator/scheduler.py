@@ -139,8 +139,21 @@ class Scheduler:
             self.logger.error(f"[SCHEDULER] Failed to save scheduler state to {self.STATE_FILE}: {e}", exc_info=True)
     
     def is_enabled(self) -> bool:
-        """Check if Windows Task Scheduler is enabled"""
+        """Check whether automation is effectively enabled.
+
+        Prefer the authoritative Windows Task Scheduler status when it is available.
+        Fall back to the persisted dashboard state only when Windows status cannot be
+        determined (for example due to permission/query errors).
+        """
         state = self._load_state()
+        windows_status = self._check_windows_task_status()
+
+        if windows_status.get("exists") is False:
+            return False
+
+        if windows_status.get("enabled") is not None:
+            return bool(windows_status.get("enabled"))
+
         return state.get("scheduler_enabled", False)
     
     def get_state(self) -> dict:
@@ -157,6 +170,7 @@ class Scheduler:
         # Check actual Windows Task Scheduler status
         windows_status = self._check_windows_task_status()
         state["windows_task_status"] = windows_status
+        state["effective_enabled"] = self.is_enabled()
         self.logger.debug(f"[SCHEDULER] Windows Task Scheduler status: exists={windows_status.get('exists')}, enabled={windows_status.get('enabled')}, state={windows_status.get('state')}")
         
         # Log mismatch if detected (but do NOT auto-re-enable - user must explicitly enable)
@@ -193,13 +207,21 @@ class Scheduler:
                     import json
                     action_info = json.loads(action_result.stdout.strip())
                     args = action_info.get("Arguments", "")
-                    # Check if arguments are using old format (should be -m automation.run_pipeline_standalone)
-                    if args and "run_pipeline_standalone.py" in args and "-m" not in args:
-                        self.logger.warning(
-                            f"[SCHEDULER] Task arguments appear incorrect (old format detected): '{args}'. "
-                            f"Expected: '-m automation.run_pipeline_standalone'. "
-                            f"Please re-run batch\\SETUP_WINDOWS_SCHEDULER.bat as Administrator to fix."
-                        )
+                    # Validate the configured standalone runner target.
+                    expected_args = "-m tools.automation.run_pipeline_standalone"
+                    if args:
+                        if "run_pipeline_standalone.py" in args and "-m" not in args:
+                            self.logger.warning(
+                                f"[SCHEDULER] Task arguments appear incorrect (old script path detected): '{args}'. "
+                                f"Expected: '{expected_args}'. "
+                                f"Please re-run tools\\automation\\setup_task_scheduler.ps1 as Administrator to fix."
+                            )
+                        elif "automation.run_pipeline_standalone" in args and "tools.automation.run_pipeline_standalone" not in args:
+                            self.logger.warning(
+                                f"[SCHEDULER] Task arguments appear incorrect (old module path detected): '{args}'. "
+                                f"Expected: '{expected_args}'. "
+                                f"Please re-run tools\\automation\\setup_task_scheduler.ps1 as Administrator to fix."
+                            )
             except Exception as e:
                 self.logger.debug(f"[SCHEDULER] Could not validate task arguments: {e}")
             

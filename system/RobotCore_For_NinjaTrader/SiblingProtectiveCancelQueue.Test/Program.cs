@@ -4,6 +4,7 @@
 //   dotnet run --project ... -- EXECUTION_CONTEXT_CONTRACT
 //   dotnet run --project ... -- STARTUP_EXEC_CONTEXT_RACE
 //   dotnet run --project ... -- EPA_ADAPTER_PREFLIGHT
+//   dotnet run --project ... -- MARKET_REENTRY_SUBMIT_PATH
 //   dotnet run --project ... -- SCENARIO_HARNESS_SIX
 //   dotnet run --project ... -- AUTHORITY_CONTRADICTIONS
 // (mirrors modules/robot/core/Tests/SiblingProtectiveCancelQueueTests.cs; runnable when harness core snapshot is broken.)
@@ -82,6 +83,19 @@ internal static class Program
             if (pass)
             {
                 Console.WriteLine("PASS: EPA adapter preflight (Phase 8)");
+                return 0;
+            }
+
+            Console.Error.WriteLine("FAIL: " + err);
+            return 1;
+        }
+
+        if (args.Length > 0 && args[0].Equals("MARKET_REENTRY_SUBMIT_PATH", StringComparison.OrdinalIgnoreCase))
+        {
+            var (pass, err) = MarketReentrySubmitPathTests.RunAll();
+            if (pass)
+            {
+                Console.WriteLine("PASS: MARKET_REENTRY_SUBMIT_PATH");
                 return 0;
             }
 

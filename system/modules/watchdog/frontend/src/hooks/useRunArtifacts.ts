@@ -16,13 +16,17 @@ export function useRunArtifacts(peekRunRoot: string | null) {
   const [keyEventsError, setKeyEventsError] = useState<string | null>(null)
   const [recentRuns, setRecentRuns] = useState<RecentRunsResponse | null>(null)
   const [recentError, setRecentError] = useState<string | null>(null)
+  const [activeSummary, setActiveSummary] = useState<RunSummaryResult | null>(null)
+  const [activePersistenceRoot, setActivePersistenceRoot] = useState<string | null>(null)
 
   const poll = useCallback(async () => {
     const root = peekRunRoot
-    const [s, k, r] = await Promise.all([
+    const [s, k, r, activeSummaryResponse, activeKeyEventsResponse] = await Promise.all([
       fetchRunSummary(root),
       fetchKeyEvents(KEY_EVENTS_LIMIT, root),
       fetchRecentRuns(5),
+      fetchRunSummary(),
+      fetchKeyEvents(1),
     ])
 
     if (s.data) {
@@ -45,6 +49,18 @@ export function useRunArtifacts(peekRunRoot: string | null) {
     } else {
       setRecentError(r.error ?? 'recent-runs failed')
     }
+
+    if (activeSummaryResponse.data) {
+      setActiveSummary(activeSummaryResponse.data)
+    } else {
+      setActiveSummary(null)
+    }
+
+    if (activeKeyEventsResponse.data?.persistence_root) {
+      setActivePersistenceRoot(activeKeyEventsResponse.data.persistence_root)
+    } else {
+      setActivePersistenceRoot(null)
+    }
   }, [peekRunRoot])
 
   const { lastSuccessfulPollTimestamp } = usePollingInterval(poll, POLL_MS)
@@ -56,6 +72,8 @@ export function useRunArtifacts(peekRunRoot: string | null) {
     keyEventsError,
     recentRuns,
     recentError,
+    activeSummary,
+    activePersistenceRoot,
     lastPollTime: lastSuccessfulPollTimestamp,
     refresh: poll,
   }
