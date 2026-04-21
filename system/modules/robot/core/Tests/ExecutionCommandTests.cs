@@ -81,6 +81,10 @@ public static class ExecutionCommandTests
             ExecutionInstrument = "MNQ",
             OriginalIntentId = "original-1",
             Direction = "Long",
+            EntryPrice = 20123.75m,
+            StopPrice = 20143.75m,
+            TargetPrice = 20083.75m,
+            BeTrigger = 20097.75m,
             Quantity = 1,
             Stream = "NQ1",
             Session = "RTH",
@@ -101,15 +105,17 @@ public static class ExecutionCommandTests
                 reentryCmd.Session ?? "",
                 reentryCmd.SlotTimeChicago ?? "",
                 reentryCmd.Direction ?? "Long",
-                null,
-                null,
-                null,
-                null,
+                reentryCmd.EntryPrice,
+                reentryCmd.StopPrice,
+                reentryCmd.TargetPrice,
+                reentryCmd.BeTrigger,
                 reentryCmd.TimestampUtc,
                 "SUBMIT_MARKET_REENTRY").ComputeIntentId();
         }
         if (string.IsNullOrEmpty(reentryCmd.ReentryIntentId) || reentryCmd.Direction != "Long" || reentryCmd.Quantity != 1)
             return (false, "SubmitMarketReentryCommand fields not set correctly");
+        if (reentryCmd.EntryPrice != 20123.75m || reentryCmd.BeTrigger != 20097.75m)
+            return (false, "SubmitMarketReentryCommand should preserve reentry BE metadata");
         if (!(reentryCmd is ExecutionCommandBase))
             return (false, "SubmitMarketReentryCommand should inherit ExecutionCommandBase");
 

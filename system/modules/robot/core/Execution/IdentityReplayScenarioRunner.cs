@@ -194,10 +194,10 @@ public static class IdentityReplayScenarioRunner
                 "S1",
                 "09:00",
                 "Long",
-                null,
-                null,
-                null,
-                null,
+                4932.25m,
+                4942.25m,
+                4912.25m,
+                4919.25m,
                 utc,
                 "SUBMIT_MARKET_REENTRY");
             var canonicalId = reentryIntent.ComputeIntentId();
@@ -213,6 +213,10 @@ public static class IdentityReplayScenarioRunner
                 ReentryIntentId = canonicalId,
                 OriginalIntentId = IdentityReplayScenarioDefinitions.DeterministicCanonicalIntentId,
                 Direction = "Long",
+                EntryPrice = 4932.25m,
+                StopPrice = 4942.25m,
+                TargetPrice = 4912.25m,
+                BeTrigger = 4919.25m,
                 Quantity = 1,
                 Reason = "MARKET_REENTRY"
             };
@@ -230,7 +234,7 @@ public static class IdentityReplayScenarioRunner
                 cmd.Session ?? "",
                 cmd.SlotTimeChicago ?? "",
                 string.IsNullOrEmpty(cmd.Direction) ? "Long" : cmd.Direction!,
-                null, null, null, null,
+                cmd.EntryPrice, cmd.StopPrice, cmd.TargetPrice, cmd.BeTrigger,
                 utc,
                 "SUBMIT_MARKET_REENTRY");
             if (!string.Equals(re2.ComputeIntentId(), canonicalId, StringComparison.Ordinal))

@@ -56,6 +56,10 @@ public static class ForcedFlattenSlotExpiryReentryAlignmentTests
         {
             OriginalIntentId = "orig-1",
             Direction = "Short",
+            EntryPrice = 4932.25m,
+            StopPrice = 4942.25m,
+            TargetPrice = 4912.25m,
+            BeTrigger = 4919.25m,
             Quantity = 2,
             ExecutionInstrument = "MES",
             Instrument = "MES",
@@ -78,10 +82,10 @@ public static class ForcedFlattenSlotExpiryReentryAlignmentTests
                 reentryCmd.Session ?? "",
                 reentryCmd.SlotTimeChicago ?? "",
                 reentryCmd.Direction ?? "Long",
-                null,
-                null,
-                null,
-                null,
+                reentryCmd.EntryPrice,
+                reentryCmd.StopPrice,
+                reentryCmd.TargetPrice,
+                reentryCmd.BeTrigger,
                 reentryCmd.TimestampUtc,
                 "SUBMIT_MARKET_REENTRY").ComputeIntentId();
         }
@@ -110,6 +114,8 @@ public static class ForcedFlattenSlotExpiryReentryAlignmentTests
             return (false, "CapturingExecutionAdapter did not record SubmitMarketReentryCommand");
         if (capturedReentry.ReentryIntentId != reentryCmd.ReentryIntentId || capturedReentry.Direction != "Short" || capturedReentry.Quantity != 2)
             return (false, "CapturingExecutionAdapter recorded incorrect SubmitMarketReentryCommand fields");
+        if (capturedReentry.EntryPrice != 4932.25m || capturedReentry.BeTrigger != 4919.25m)
+            return (false, "CapturingExecutionAdapter lost reentry BE metadata");
 
         // 6. RequestSessionCloseFlattenImmediate: NullExecutionAdapter returns success (same-cycle path)
         var immediateResult = nullAdapter.RequestSessionCloseFlattenImmediate("intent-1", "MES", utcNow);

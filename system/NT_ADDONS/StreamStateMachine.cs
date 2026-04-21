@@ -7855,6 +7855,10 @@ public sealed class StreamStateMachine
 
         var direction = originalEntry.Direction ?? "Long";
         var quantity = originalEntry.EntryFilledQuantityTotal;
+        var reentryEntryPrice = originalEntry.EntryPrice;
+        var reentryStopPrice = originalEntry.StopPrice;
+        var reentryTargetPrice = originalEntry.TargetPrice;
+        var reentryBeTrigger = originalEntry.BETriggerPrice;
 
         if (quantity <= 0)
         {
@@ -7878,10 +7882,10 @@ public sealed class StreamStateMachine
             Session,
             SlotTimeChicago,
             direction,
-            null,
-            null,
-            null,
-            null,
+            reentryEntryPrice,
+            reentryStopPrice,
+            reentryTargetPrice,
+            reentryBeTrigger,
             utcNow,
             "SUBMIT_MARKET_REENTRY");
         _journal.ReentryIntentId = reentryIntentForCanonicalId.ComputeIntentId();
@@ -7910,6 +7914,10 @@ public sealed class StreamStateMachine
             ReentryIntentId = _journal.ReentryIntentId,
             OriginalIntentId = _journal.OriginalIntentId,
             Direction = direction,
+            EntryPrice = reentryEntryPrice,
+            StopPrice = reentryStopPrice,
+            TargetPrice = reentryTargetPrice,
+            BeTrigger = reentryBeTrigger,
             Quantity = (int)quantity,
             Reason = "MARKET_REENTRY",
             CallerContext = "CheckMarketOpenReentry"

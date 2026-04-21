@@ -53,6 +53,10 @@ public sealed class SubmitMarketReentryCommand : ExecutionCommandBase
     public string? ReentryIntentId { get; set; }
     public string? OriginalIntentId { get; set; }
     public string? Direction { get; set; }
+    public decimal? EntryPrice { get; set; }
+    public decimal? StopPrice { get; set; }
+    public decimal? TargetPrice { get; set; }
+    public decimal? BeTrigger { get; set; }
     public int Quantity { get; set; }
 }
 

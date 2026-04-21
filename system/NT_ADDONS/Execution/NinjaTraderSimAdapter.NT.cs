@@ -1593,10 +1593,10 @@ public sealed partial class NinjaTraderSimAdapter
             cmd.Session ?? "",
             cmd.SlotTimeChicago ?? "",
             direction,
-            null,
-            null,
-            null,
-            null,
+            cmd.EntryPrice,
+            cmd.StopPrice,
+            cmd.TargetPrice,
+            cmd.BeTrigger,
             utcNow,
             "SUBMIT_MARKET_REENTRY");
         var canonicalIntentId = reentryIntent.ComputeIntentId();
