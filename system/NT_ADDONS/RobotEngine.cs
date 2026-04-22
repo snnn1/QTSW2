@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -255,7 +255,17 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         new { source = "engine_timer", timetable_hash = _currentTimetableHash, trading_date = tradingDate }));
             }
             if (_executionPolicy?.UseInstrumentExecutionAuthority == true && !string.IsNullOrEmpty(_accountName))
-                InstrumentExecutionAuthorityRegistry.RetryDeferredAdoptionScansForAccount(_accountName!, _log);
+            {
+                var liveRecoveryScope = GetLiveRecoveryExecutionInstrumentKeys();
+                if (liveRecoveryScope.Count > 0)
+                {
+                    var scopeSet = new HashSet<string>(liveRecoveryScope, StringComparer.OrdinalIgnoreCase);
+                    InstrumentExecutionAuthorityRegistry.RetryDeferredAdoptionScansForAccount(
+                        _accountName!,
+                        _log,
+                        executionInstrumentKey => scopeSet.Contains(executionInstrumentKey));
+                }
+            }
             else
                 _executionAdapter?.TryRetryDeferredAdoptionScan();
         }
@@ -911,6 +921,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     
     // Guard against multiple execution policy failure notifications per startup
     private bool _executionPolicyFailureReported = false;
+    private int _shutdownRequested;
 
     // Logging configuration
     private readonly LoggingConfig _loggingConfig;
@@ -1133,6 +1144,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                    _recoveryState == ConnectionRecoveryState.RECOVERY_COMPLETE;
         }
     }
+
+    public bool IsShutdownRequested => Volatile.Read(ref _shutdownRequested) != 0;
     
     /// <summary>
     /// Mark BarsRequest as pending for an instrument.
@@ -1301,7 +1314,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         _timetablePoller = new TimetableFilePoller(timetablePollInterval);
 
         _specPath = Path.Combine(_root, "configs", "analyzer_robot_parity.json");
-        _timetablePath = customTimetablePath ?? Path.Combine(_root, "data", "timetable", "timetable_current.json");
+        _timetablePath = ResolveDefaultTimetablePath(_root, customTimetablePath, _playbackAccountDetected);
         var policyFromEnv = Environment.GetEnvironmentVariable("QTSW2_EXECUTION_POLICY_PATH");
         _executionPolicyPath = string.IsNullOrWhiteSpace(policyFromEnv)
             ? Path.Combine(_root, "configs", "execution_policy.json")
@@ -1503,6 +1516,43 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
 
         return set.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    private IReadOnlyList<string> GetLiveRecoveryExecutionInstrumentKeys()
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        lock (_engineLock)
+        {
+            foreach (var s in _streams.Values)
+            {
+                if (s.Committed && !s.ExecutionInterruptedByClose)
+                    continue;
+
+                var ex = s.ExecutionInstrument?.Trim();
+                if (!string.IsNullOrEmpty(ex))
+                    set.Add(ex);
+            }
+        }
+
+        return set.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    private bool IsExecutionInstrumentInLiveRecoveryScope(string instrument)
+    {
+        if (string.IsNullOrWhiteSpace(instrument)) return false;
+        var key = instrument.Trim();
+        lock (_engineLock)
+        {
+            foreach (var s in _streams.Values)
+            {
+                if (s.Committed && !s.ExecutionInterruptedByClose)
+                    continue;
+                if (string.Equals(s.ExecutionInstrument?.Trim(), key, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+        }
+
+        return false;
     }
 
     private bool IsExecutionInstrumentInThisEngineScope(string instrument)
@@ -1878,6 +1928,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     public void Start()
     {
+        Volatile.Write(ref _shutdownRequested, 0);
         // CRITICAL: Set run_id before any Start-path logs (RebindPersistenceIfNeeded → ApplyOptionalRunIdFromEnvironment refines from env after this)
         AssignRunIdAtSessionStart(out var runIdAssignmentSource);
         _engineStartUtc = _playbackStartTimeUtc ?? DateTimeOffset.UtcNow;
@@ -2418,6 +2469,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 redundancySuppression: _releaseReconRedundancy,
                 getCanonicalInstrumentForJournalAggregation: s => GetCanonicalInstrument(s),
                 getPendingExecutionWorkloadForInstrument: GetPendingIeAWorkloadForBrokerInstrument,
+                isInstrumentRecoveryRelevant: IsExecutionInstrumentInLiveRecoveryScope,
                 getRunIdForReconciliationDiagnostics: () => _runId,
                 ownershipLedger: _ownershipLedger,
                 getOwnershipAccountKey: () => OwnershipAccountKey);
@@ -2478,6 +2530,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 },
                 onMismatchExecutionBlockAuthorityChanged: OnMismatchExecutionBlockAuthorityChanged,
                 isInstrumentInEngineScope: IsExecutionInstrumentInThisEngineScope,
+                isInstrumentRecoveryRelevant: IsExecutionInstrumentInLiveRecoveryScope,
                 getPendingExecutionWorkloadForInstrument: GetPendingIeAWorkloadForBrokerInstrument,
                 getRunIdForMismatchDiagnostics: () => _runId,
                 probeCanonicallyUnexplainedExposure: (inst, utc) => ProbeMismatchConvergenceCanonicalExposure(inst, utc));
@@ -2814,6 +2867,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     public void Stop()
     {
+        if (Interlocked.Exchange(ref _shutdownRequested, 1) != 0)
+        {
+            StopEngineHeartbeatTimer();
+            return;
+        }
         StopEngineHeartbeatTimer();
         var utcNow = DateTimeOffset.UtcNow;
         _runtimeAudit?.EmitEngineAuditSummary(utcNow, TradingDateString);
@@ -6513,6 +6571,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     private void StandDown()
     {
+        Volatile.Write(ref _shutdownRequested, 1);
         StopEngineHeartbeatTimer();
         var utcNow = DateTimeOffset.UtcNow;
         var streamCount = _streams.Count;
@@ -9729,6 +9788,26 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         {
             return _timetablePath ?? "";
         }
+    }
+
+    private static string ResolveDefaultTimetablePath(string projectRoot, string? customTimetablePath, bool playbackAccountDetected)
+    {
+        if (!string.IsNullOrWhiteSpace(customTimetablePath))
+            return customTimetablePath;
+
+        var timetableDir = Path.Combine(projectRoot, "data", "timetable");
+        if (playbackAccountDetected)
+        {
+            var replayCurrent = Path.Combine(timetableDir, "timetable_replay_current.json");
+            if (File.Exists(replayCurrent))
+                return replayCurrent;
+
+            var replayTemplate = Path.Combine(timetableDir, "timetable_replay.json");
+            if (File.Exists(replayTemplate))
+                return replayTemplate;
+        }
+
+        return Path.Combine(timetableDir, "timetable_current.json");
     }
 
     /// <summary>

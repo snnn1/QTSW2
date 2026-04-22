@@ -4513,7 +4513,21 @@ public sealed class StreamStateMachine
             // Persist to execution journal for idempotency (record both attempts)
             // PHASE 2: Journal uses ExecutionInstrument for execution tracking
             if (longRes.Success)
-                _executionJournal.RecordSubmission(longIntentId, TradingDate, Stream, ExecutionInstrument, "ENTRY_STOP_LONG", longRes.BrokerOrderId, utcNow);
+                _executionJournal.RecordSubmission(
+                    longIntentId,
+                    TradingDate,
+                    Stream,
+                    ExecutionInstrument,
+                    "ENTRY_STOP_LONG",
+                    longRes.BrokerOrderId,
+                    utcNow,
+                    expectedEntryPrice: brkLong,
+                    entryPrice: brkLong,
+                    stopPrice: longStop,
+                    targetPrice: longTarget,
+                    beTriggerPrice: longBeTrigger,
+                    direction: "Long",
+                    ocoGroup: ocoGroup);
             else
             {
                 var longErr = longRes.ErrorMessage ?? "ENTRY_STOP_LONG_FAILED";
@@ -4525,7 +4539,21 @@ public sealed class StreamStateMachine
             }
 
             if (shortRes.Success)
-                _executionJournal.RecordSubmission(shortIntentId, TradingDate, Stream, ExecutionInstrument, "ENTRY_STOP_SHORT", shortRes.BrokerOrderId, utcNow);
+                _executionJournal.RecordSubmission(
+                    shortIntentId,
+                    TradingDate,
+                    Stream,
+                    ExecutionInstrument,
+                    "ENTRY_STOP_SHORT",
+                    shortRes.BrokerOrderId,
+                    utcNow,
+                    expectedEntryPrice: brkShort,
+                    entryPrice: brkShort,
+                    stopPrice: shortStop,
+                    targetPrice: shortTarget,
+                    beTriggerPrice: shortBeTrigger,
+                    direction: "Short",
+                    ocoGroup: ocoGroup);
             else
             {
                 var shortErr = shortRes.ErrorMessage ?? "ENTRY_STOP_SHORT_FAILED";

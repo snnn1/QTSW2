@@ -312,7 +312,14 @@ root_logger.setLevel(logging.DEBUG)
 # CORS middleware for React frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:5174", "http://localhost:3000", "http://192.168.1.171:5174"],  # Vite default ports + network
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
+        "http://localhost:3000",
+        "http://192.168.1.171:5174",
+    ],  # Matrix/dashboard local UIs + network dev host
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -894,7 +901,7 @@ class ExecutionTimetableStream(BaseModel):
 
 
 class ExecutionTimetableRequest(BaseModel):
-    """Trigger publish from on-disk master matrix. Client ``streams`` / per-row enabled flags are ignored."""
+    """Trigger live timetable_current publish from the authoritative in-memory master matrix."""
 
     trading_date: Optional[str] = None  # required: explicit YYYY-MM-DD session calendar date (no SessionAuthority read)
     mode: Literal["live", "historical"]
@@ -926,6 +933,72 @@ class TimetableRollbackRequest(BaseModel):
     timestamp: str
 
 
+def _build_execution_publish_authority_state(
+    *,
+    project_root: Path,
+    trading_date: str,
+    replay: bool,
+    publish_mode: str,
+    source: Optional[str],
+    reason: Optional[str],
+    set_by: str,
+):
+    from modules.session_authority import build_persisted_authority_state
+
+    normalized_source = (source or "matrix").strip() or "matrix"
+    normalized_reason = (reason or "publish").strip() or "publish"
+    replay_publish = bool(replay) or publish_mode == "historical"
+    return build_persisted_authority_state(
+        project_root=project_root,
+        mode="replay" if replay_publish else "manual",
+        session_trading_date=trading_date,
+        source="replay" if replay_publish else "user",
+        locked=True,
+        set_by=set_by,
+        reason="replay_publish" if replay_publish else "manual_execution_publish",
+        metadata={
+            "publish_mode": publish_mode,
+            "requested_source": normalized_source,
+            "requested_reason": normalized_reason,
+            "requested_replay": bool(replay),
+            "endpoint": set_by,
+        },
+    )
+
+
+def _write_publish_authority_with_rollback(project_root: Path, state, publish_fn):
+    from modules.session_authority import save_authority, session_authority_path
+
+    auth_path = session_authority_path(project_root)
+    prior_bytes = auth_path.read_bytes() if auth_path.is_file() else None
+    save_authority(project_root, state)
+    try:
+        return publish_fn()
+    except Exception:
+        try:
+            auth_path.parent.mkdir(parents=True, exist_ok=True)
+            if prior_bytes is None:
+                if auth_path.exists():
+                    auth_path.unlink()
+            else:
+                auth_path.write_bytes(prior_bytes)
+            logging.error(
+                "SESSION_AUTHORITY_RESTORED_AFTER_FAILED_PUBLISH mode=%s session=%s path=%s",
+                state.mode,
+                state.session_trading_date,
+                auth_path,
+            )
+        except Exception as restore_error:
+            logging.error(
+                "SESSION_AUTHORITY_RESTORE_FAILED_AFTER_PUBLISH_ERROR mode=%s session=%s path=%s error=%s",
+                state.mode,
+                state.session_trading_date,
+                auth_path,
+                restore_error,
+            )
+        raise
+
+
 # Master Matrix endpoints moved to modules.matrix.api router
 # All matrix endpoints are now in: modules/matrix/api.py
 # - POST /api/matrix/build
@@ -937,12 +1010,6 @@ class TimetableRollbackRequest(BaseModel):
 @app.post("/api/timetable/generate")
 async def generate_timetable(request: TimetableRequest):
     """Generate timetable for a trading day. Matrix-first: no analyzer reads when matrix exists."""
-    # TEMP audit (remove after debugging)
-    print("BACKEND_ENDPOINT_HIT", "generate")
-    print(
-        "REQUEST_BODY",
-        request.model_dump() if hasattr(request, "model_dump") else request.dict(),
-    )
     try:
         import sys
         sys.path.insert(0, str(_SYSTEM_ROOT))
@@ -958,14 +1025,10 @@ async def generate_timetable(request: TimetableRequest):
         
         def _generate_timetable_sync():
             """Matrix-first: use matrix when available (no analyzer reads for RS/SCF)"""
-            from datetime import datetime, timezone
-
-            from modules.session_authority.models import SessionAuthorityState
             from modules.session_authority.store import (
                 SessionAuthorityRequiredError,
+                build_persisted_authority_state,
                 load_persisted_strict,
-                read_next_version,
-                save_authority,
             )
             from modules.timetable.timetable_supervisor import timetable_publish_blocking
 
@@ -978,19 +1041,26 @@ async def generate_timetable(request: TimetableRequest):
                     )
                 if not matrix_df.empty:
                     explicit_date = bool((request.date or "").strip())
+                    gen_mode = (
+                        request.mode
+                        if request.mode is not None
+                        else ("historical" if explicit_date else "live")
+                    )
                     if explicit_date:
                         d = (request.date or "").strip()
-                        st = SessionAuthorityState(
+                        st = build_persisted_authority_state(
+                            project_root=QTSW2_ROOT,
                             mode="manual",
                             session_trading_date=d,
                             source="user",
                             locked=True,
-                            set_at_utc=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                             set_by="POST /api/timetable/generate",
                             reason="manual_generate_request",
-                            version=read_next_version(QTSW2_ROOT),
+                            metadata={
+                                "publish_mode": gen_mode,
+                                "endpoint": "POST /api/timetable/generate",
+                            },
                         )
-                        save_authority(QTSW2_ROOT, st)
                         session_td = d
                     else:
                         try:
@@ -1007,30 +1077,31 @@ async def generate_timetable(request: TimetableRequest):
                         "caller": "POST /api/timetable/generate",
                         "matrix_source": "in_memory",
                     }
-                    gen_mode = (
-                        request.mode
-                        if request.mode is not None
-                        else ("historical" if explicit_date else "live")
-                    )
                     logging.info(
                         "TIMETABLE_MODE_SELECTED mode=%s date=%s endpoint=POST /api/timetable/generate",
                         gen_mode,
                         session_td,
                     )
-                    engine.write_execution_timetable_from_master_matrix(
-                        matrix_df,
-                        trade_date=session_td,
-                        execution_mode=True,
-                        publish_context=_gen_pub,
-                        mode=gen_mode,
-                    )
-                    return engine.build_timetable_dataframe_from_master_matrix(
-                        matrix_df,
-                        trade_date=session_td,
-                        execution_mode=True,
-                        publish_context=_gen_pub,
-                        mode=gen_mode,
-                    )
+                    
+                    def _write_and_build():
+                        engine.write_execution_timetable_from_master_matrix(
+                            matrix_df,
+                            trade_date=session_td,
+                            execution_mode=True,
+                            publish_context=_gen_pub,
+                            mode=gen_mode,
+                        )
+                        return engine.build_timetable_dataframe_from_master_matrix(
+                            matrix_df,
+                            trade_date=session_td,
+                            execution_mode=True,
+                            publish_context=_gen_pub,
+                            mode=gen_mode,
+                        )
+
+                    if explicit_date:
+                        return _write_publish_authority_with_rollback(QTSW2_ROOT, st, _write_and_build)
+                    return _write_and_build()
                 raise ValueError(
                     "Master matrix is empty in memory — build or reload the matrix in this server, then try again."
                 )
@@ -1081,13 +1152,7 @@ async def generate_timetable(request: TimetableRequest):
 
 @app.post("/api/timetable/execution")
 async def save_execution_timetable(request: ExecutionTimetableRequest):
-    """Publish execution timetable from in-memory master matrix (same snapshot as save_master_matrix)."""
-    # TEMP audit (remove after debugging)
-    print("BACKEND_ENDPOINT_HIT", "execution")
-    print(
-        "REQUEST_BODY",
-        request.model_dump() if hasattr(request, "model_dump") else request.dict(),
-    )
+    """Publish execution timetable from the in-memory master matrix (live current or replay current)."""
     td_req = (request.trading_date or "").strip()
     if not td_req:
         logging.error(
@@ -1106,15 +1171,6 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
         raise HTTPException(
             status_code=400,
             detail="trading_date must be YYYY-MM-DD",
-        )
-    if request.mode == "historical":
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Historical mode is preview-only in the Matrix UI and must not overwrite "
-                "live timetable_current.json. Use POST /api/timetable/preview for historical "
-                "inspection, or a dedicated replay flow if you need a replay timetable file."
-            ),
         )
     try:
         sys.path.insert(0, str(_SYSTEM_ROOT))
@@ -1161,14 +1217,6 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
         )
 
         def _publish_sync():
-            from datetime import datetime, timezone
-
-            from modules.session_authority.models import SessionAuthorityState
-            from modules.session_authority.store import (
-                read_next_version,
-                save_authority,
-            )
-
             with timetable_publish_blocking():
                 matrix_df = get_current_master_matrix_df()
                 if matrix_df is None:
@@ -1186,33 +1234,40 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
                     project_root=str(QTSW2_ROOT),
                 )
                 td = td_req
-                if request.replay:
-                    st = SessionAuthorityState(
-                        mode="replay",
-                        session_trading_date=td,
-                        source="replay",
-                        locked=True,
-                        set_at_utc=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                        set_by="POST /api/timetable/execution",
-                        reason="replay_publish",
-                        version=read_next_version(QTSW2_ROOT),
-                    )
-                    save_authority(QTSW2_ROOT, st)
+                replay_publish = bool(request.replay) or request.mode == "historical"
                 logging.info(
                     "TIMETABLE_EXECUTION_PUBLISH explicit_trading_date=%s request.replay=%s mode=%s",
                     td,
-                    request.replay,
+                    replay_publish,
                     request.mode,
                 )
-                # Matrix row selection and metadata.replay follow ``mode`` only (engine; no fallback).
-                return engine.write_execution_timetable_from_master_matrix(
-                    matrix_df,
-                    trade_date=td,
-                    execution_mode=True,
-                    replay=request.replay,
-                    stream_filters=request.stream_filters,
-                    publish_context=pub_ctx,
-                    mode=request.mode,
+
+                authority_state = _build_execution_publish_authority_state(
+                    project_root=QTSW2_ROOT,
+                    trading_date=td,
+                    replay=replay_publish,
+                    publish_mode=request.mode,
+                    source=pub_ctx["source"],
+                    reason=pub_ctx["reason"],
+                    set_by="POST /api/timetable/execution",
+                )
+
+                def _publish_once():
+                    # Matrix row selection and metadata.replay follow ``mode`` only (engine; no fallback).
+                    return engine.write_execution_timetable_from_master_matrix(
+                        matrix_df,
+                        trade_date=td,
+                        execution_mode=True,
+                        replay=replay_publish,
+                        stream_filters=request.stream_filters,
+                        publish_context=pub_ctx,
+                        mode=request.mode,
+                    )
+
+                return _write_publish_authority_with_rollback(
+                    QTSW2_ROOT,
+                    authority_state,
+                    _publish_once,
                 )
 
         try:
@@ -1232,7 +1287,12 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
             logging.error("TIMETABLE_EXECUTION_SAVE_REJECTED: %s", e)
             raise HTTPException(status_code=400, detail=str(e)) from e
 
-        final_file = output_dir / "timetable_current.json"
+        final_filename = (
+            "timetable_replay_current.json"
+            if request.mode == "historical" or request.replay
+            else "timetable_current.json"
+        )
+        final_file = output_dir / final_filename
 
         if pub_res is None:
             raise HTTPException(

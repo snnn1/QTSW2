@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import pytz
 
 from .config import QTSW2_ROOT
+from .run_context import WatchdogRunContext, context_prefers_replay_timetable
 
 from modules.timetable.cme_session import get_cme_trading_date, resolve_live_execution_session_trading_date
 from modules.timetable.stream_id_derived import (
@@ -54,7 +55,7 @@ def _timetable_doc_is_replay(timetable: Dict[str, Any]) -> bool:
 
 
 def _timetable_json_source(timetable: Dict[str, Any]) -> Optional[str]:
-    """Publisher lineage from timetable_current.json ``source`` (e.g. master_matrix, dashboard_ui)."""
+    """Publisher lineage from the active timetable file ``source`` (e.g. master_matrix, dashboard_ui)."""
     raw = timetable.get("source")
     if raw is None:
         return None
@@ -62,14 +63,39 @@ def _timetable_json_source(timetable: Dict[str, Any]) -> Optional[str]:
     return s or None
 
 
+def resolve_watchdog_timetable_path(context: Optional[WatchdogRunContext] = None) -> Path:
+    """
+    Resolve the timetable file the watchdog should observe for the active context.
+
+    Playback/run-scoped watchdog contexts should follow the replay timetable, matching
+    the robot's playback default. Live/sim-at-root contexts continue to use
+    ``timetable_current.json``.
+    """
+    timetable_dir = QTSW2_ROOT / "data" / "timetable"
+    if context_prefers_replay_timetable(context):
+        replay_current = timetable_dir / "timetable_replay_current.json"
+        if replay_current.is_file():
+            return replay_current
+        replay_template = timetable_dir / "timetable_replay.json"
+        if replay_template.is_file():
+            return replay_template
+    return timetable_dir / "timetable_current.json"
+
+
 class TimetablePoller:
-    """Polls timetable_current.json and extracts enabled streams."""
+    """Polls the active watchdog timetable file and extracts enabled streams."""
 
     def __init__(self):
-        self._timetable_path = QTSW2_ROOT / "data" / "timetable" / "timetable_current.json"
+        self._timetable_path: Optional[Path] = None
+
+    def _resolve_timetable_path(self, context: Optional[WatchdogRunContext] = None) -> Path:
+        if self._timetable_path is not None:
+            return self._timetable_path
+        return resolve_watchdog_timetable_path(context)
 
     def poll(
         self,
+        context: Optional[WatchdogRunContext] = None,
     ) -> Tuple[
         Optional[str],
         Optional[Set[str]],
@@ -100,18 +126,19 @@ class TimetablePoller:
         chicago_now = datetime.now(CHICAGO_TZ)
         utc_now = datetime.now(timezone.utc)
         expected_cme = get_cme_trading_date(utc_now)
+        timetable_path = self._resolve_timetable_path(context)
 
-        if not self._timetable_path.exists():
+        if not timetable_path.exists():
             logger.warning(
                 "TIMETABLE_POLL_FAIL: timetable_unavailable=True enabled_streams_unknown=True "
                 "expected_cme_session=%s reason=file_missing path=%s",
                 expected_cme,
-                self._timetable_path,
+                timetable_path,
             )
             return (None, None, None, None, None, None, None)
 
         try:
-            with open(self._timetable_path, "rb") as f:
+            with open(timetable_path, "rb") as f:
                 file_contents = f.read()
 
             try:
@@ -122,7 +149,7 @@ class TimetablePoller:
                     "expected_cme_session=%s parse_error=%s path=%s",
                     expected_cme,
                     e,
-                    self._timetable_path,
+                    timetable_path,
                 )
                 return (None, None, None, None, None, None, None)
 
@@ -153,7 +180,7 @@ class TimetablePoller:
                     expected_cme,
                     raw_st,
                     raw_td,
-                    self._timetable_path,
+                    timetable_path,
                 )
                 return (None, None, None, None, None, None, None)
 
@@ -169,7 +196,7 @@ class TimetablePoller:
                     expected_cme,
                     session_str,
                     resolve_reason,
-                    self._timetable_path,
+                    timetable_path,
                 )
                 return (None, None, None, None, None, None, None)
 
@@ -204,7 +231,7 @@ class TimetablePoller:
                     "timetable_enabled_row_count=%s path=%s",
                     len(enabled_streams),
                     timetable_enabled_row_count,
-                    self._timetable_path,
+                    timetable_path,
                 )
 
             logger.info(
@@ -233,7 +260,7 @@ class TimetablePoller:
                 "unexpected_error=%s path=%s",
                 expected_cme,
                 e,
-                self._timetable_path,
+                timetable_path,
                 exc_info=True,
             )
             return (None, None, None, None, None, None, None)
@@ -308,14 +335,16 @@ class TimetablePoller:
                 continue
             raw_id = stream_entry.get("stream")
             stream_id = str(raw_id).strip() if raw_id is not None else ""
-            enabled = stream_entry.get("enabled", False)
-            if stream_id and enabled:
+            enabled = bool(stream_entry.get("enabled", False))
+            if stream_id:
                 inst = (stream_entry.get("instrument") or "").strip()
                 sess = (stream_entry.get("session") or "").strip()
                 metadata[stream_id] = {
                     "instrument": inst or instrument_from_stream_id(stream_id),
                     "session": sess or session_from_stream_id(stream_id),
                     "slot_time": stream_entry.get("slot_time", ""),
-                    "enabled": True,
+                    "decision_time": stream_entry.get("decision_time", ""),
+                    "enabled": enabled,
+                    "block_reason": stream_entry.get("block_reason"),
                 }
         return metadata

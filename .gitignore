@@ -39,6 +39,13 @@ ENV/
 htmlcov/
 *.cover
 .hypothesis/
+.pytest_local_watchdog/
+.tmp_pytest*/
+pytest-cache-files-*/
+UsersjakejQTSW2.tmp_pytest_audit*/
+tmp/pytest_cache/
+tmp/pytest_watchdog/
+tmp/local/pytest/
 
 # Data files - exclude all data files (too large for git)
 # Exclude all CSV, parquet, and data files in data directories
@@ -128,4 +135,3 @@ configs/watchdog/notifications.secrets.json
 ops/diagnostics/
 ops/archive/
 ops/maintenance/clear_pipeline_lock.py
-

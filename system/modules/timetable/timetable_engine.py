@@ -20,6 +20,12 @@ import sys
 import json
 import pytz
 
+try:
+    from modules.pathing import resolve_qtsw2_root
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+    from modules.pathing import resolve_qtsw2_root  # type: ignore
+
 # Import centralized config
 # Handle both direct import and relative import
 try:
@@ -263,10 +269,22 @@ def _execution_mode_row_get_time(series: pd.Series) -> Any:
 
 
 def _execution_merged_stream_filters_nonempty(merged: Dict[str, Any]) -> bool:
-    """True when merged dict has at least one truthy entry (execution calendar must not run on empty config)."""
+    """True when merged execution config exists at all."""
     if not merged:
         return False
-    return not all(not v for v in merged.values())
+    return True
+
+
+def _execution_merged_stream_filters_has_effective_rules(merged: Dict[str, Any]) -> bool:
+    """True when at least one merged entry contains a non-empty exclusion rule."""
+    if not isinstance(merged, dict):
+        return False
+    for value in merged.values():
+        if not isinstance(value, dict):
+            continue
+        if value.get("exclude_days_of_week") or value.get("exclude_days_of_month") or value.get("exclude_times"):
+            return True
+    return False
 
 
 def _merge_stream_filters_for_execution(
@@ -328,6 +346,11 @@ def _merge_stream_filters_for_execution(
     if require_non_empty and not _execution_merged_stream_filters_nonempty(merged):
         raise RuntimeError(
             "TIMETABLE_PUBLISH_BLOCKED: No valid stream_filters loaded. Refusing to publish timetable."
+        )
+    if merged and not _execution_merged_stream_filters_has_effective_rules(merged):
+        logger.warning(
+            "EXECUTION_STREAM_FILTERS_NO_EFFECT: merged config contains no active exclusions; "
+            "execution publish will proceed with allow-all calendar behavior"
         )
     return merged
 
@@ -602,6 +625,7 @@ def get_execution_stream_enablement(
     filter_dow: int,
     filter_dom: int,
     as_of_session_day: Optional[date] = None,
+    latest_row: Optional[pd.Series] = None,
 ) -> Tuple[bool, Optional[str], Dict[str, Any]]:
     """
     Latest-row matrix (non-calendar) gate + session calendar (DOW/DOM) and ``block_reason``.
@@ -615,7 +639,7 @@ def get_execution_stream_enablement(
         m_fr,
         m_suf,
     ) = _matrix_latest_row_execution_non_calendar_split(
-        master_matrix_df, stream_id, as_of_session_day
+        master_matrix_df, stream_id, as_of_session_day, latest_row=latest_row
     )
 
     calendar_eval = _execution_session_calendar_filters_eval(
@@ -701,6 +725,7 @@ def _matrix_latest_row_execution_non_calendar_split(
     master_matrix_df: pd.DataFrame,
     stream_id: str,
     as_of_session_day: Optional[date] = None,
+    latest_row: Optional[pd.Series] = None,
 ) -> Tuple[bool, bool, str, str]:
     """
     Latest row (max trade_date) split for execution gating.
@@ -713,9 +738,12 @@ def _matrix_latest_row_execution_non_calendar_split(
         matrix_non_calendar_block_suffix: text for ``matrix_filter_blocked:`` only;
             stripped of dow_filter/dom_filter; empty when not blocked on non-calendar causes.
     """
-    raw_ok, fr = _matrix_latest_row_final_allowed_for_stream(
-        master_matrix_df, stream_id, as_of_session_day
-    )
+    if latest_row is None:
+        raw_ok, fr = _matrix_latest_row_final_allowed_for_stream(
+            master_matrix_df, stream_id, as_of_session_day
+        )
+    else:
+        raw_ok, fr = _matrix_row_series_to_final_allowed(latest_row)
     fr = fr or ""
     fr_st = fr.strip()
     ncal_only = _strip_matrix_row_calendar_filter_reason_tokens(fr)
@@ -777,6 +805,46 @@ def _matrix_latest_row_series_for_stream(
             return None
         return eligible.sort_values("trade_date", ascending=False).iloc[0]
     return sub_td.sort_values("trade_date", ascending=False).iloc[0]
+
+
+def _matrix_latest_rows_by_stream(
+    master_matrix_df: pd.DataFrame,
+    stream_ids: List[str],
+    as_of_session_day: Optional[date] = None,
+) -> Dict[str, pd.Series]:
+    """
+    Latest row per stream, optionally capped at ``trade_date <= as_of_session_day``.
+
+    Used to avoid repeated full-matrix filtering during execution publish paths.
+    """
+    if (
+        master_matrix_df.empty
+        or "Stream" not in master_matrix_df.columns
+        or "trade_date" not in master_matrix_df.columns
+    ):
+        return {}
+
+    sub = master_matrix_df[master_matrix_df["Stream"].isin(stream_ids)].copy()
+    if sub.empty:
+        return {}
+    sub = sub.dropna(subset=["trade_date"])
+    if sub.empty:
+        return {}
+    if as_of_session_day is not None:
+        sub = sub[sub["trade_date"].dt.date <= as_of_session_day]
+        if sub.empty:
+            return {}
+
+    latest = (
+        sub.sort_values(["Stream", "trade_date"], ascending=[True, False])
+        .groupby("Stream", sort=False, as_index=False)
+        .head(1)
+    )
+    return {
+        str(row["Stream"]): row
+        for _, row in latest.iterrows()
+        if str(row.get("Stream") or "").strip()
+    }
 
 
 def _scf_tuple_from_matrix_row(r: Optional[pd.Series]) -> Tuple[Optional[float], Optional[float]]:
@@ -870,7 +938,7 @@ class TimetableEngine:
         self.master_matrix_dir = Path(master_matrix_dir)
         self.analyzer_runs_dir = Path(analyzer_runs_dir)
         self.timetable_output_dir = timetable_output_dir
-        self._project_root = Path(project_root).resolve() if project_root else Path(__file__).resolve().parents[2]
+        self._project_root = resolve_qtsw2_root(project_root, default_file=__file__)
         
         # Streams to process
         self.streams = [
@@ -1423,8 +1491,6 @@ class TimetableEngine:
                             "TIMETABLE_HISTORICAL_INVARIANT: stream=%s row trade_date %s after session %s"
                             % (sid, rdd, sd_check)
                         )
-        # TEMP audit (remove after debugging)
-        print("WRITING_TIMETABLE_SESSION_DATE", session_trading_date)
         eligibility_trade_date = eligibility_trade_date_ymd_from_matrix_df(master_matrix_df)
         if execution_mode:
             _log_execution_timetable_audit_snapshot(
@@ -1503,6 +1569,7 @@ class TimetableEngine:
             ledger_source="master_matrix",
             enforce_cme_live=False,
             replay_document=replay_document_for_publish,
+            replay_current_file=bool(replay),
             publish_context=pub_out,
             eligibility_trade_date=eligibility_trade_date,
         )
@@ -1558,10 +1625,11 @@ class TimetableEngine:
         if not master_matrix_df.empty and "trade_date" in master_matrix_df.columns:
             if execution_mode:
                 as_of_for_scf: Optional[date] = trade_date_obj if resolved_df_as_of else None
+                latest_rows = _matrix_latest_rows_by_stream(
+                    master_matrix_df, self.streams, as_of_for_scf
+                )
                 for stream_id in self.streams:
-                    r = _matrix_latest_row_series_for_stream(
-                        master_matrix_df, stream_id, as_of_for_scf
-                    )
+                    r = latest_rows.get(stream_id)
                     scf_lookup[stream_id] = _scf_tuple_from_matrix_row(r)
             else:
                 date_df = master_matrix_df[master_matrix_df["trade_date"].dt.date == trade_date_obj]
@@ -2047,10 +2115,11 @@ class TimetableEngine:
         )
 
         streams_dict: Dict[str, Dict[str, Any]] = {}
+        latest_rows = _matrix_latest_rows_by_stream(master_matrix_df, self.streams, as_of_day)
 
         for stream_id in self.streams:
             session = "S1" if stream_id.endswith("1") else "S2"
-            r = _matrix_latest_row_series_for_stream(master_matrix_df, stream_id, as_of_day)
+            r = latest_rows.get(stream_id)
             time, has_valid_slot = get_execution_slot_from_latest_row(
                 r,
                 stream_id,
@@ -2067,6 +2136,7 @@ class TimetableEngine:
                 filter_dow,
                 filter_dom,
                 as_of_session_day=as_of_day,
+                latest_row=r,
             )
             logger.debug(
                 "STREAM_EXECUTION stream=%s slot_date=%s has_slot=%s m_final_allowed_raw=%s "
@@ -2136,10 +2206,11 @@ class TimetableEngine:
         ledger_source: Optional[str] = None,
         enforce_cme_live: bool = False,
         replay_document: bool = False,
+        replay_current_file: bool = False,
         publish_context: Optional[Dict[str, Any]] = None,
         eligibility_trade_date: Optional[str] = None,
     ) -> TimetablePublishResult:
-        """Write data/timetable/timetable_current.json with history/, skip if content unchanged."""
+        """Write the canonical execution timetable file with history/, skip if content unchanged."""
         from modules.timetable.timetable_content_hash import (
             compute_timetable_hash_sorted,
             timetable_hash_from_document,
@@ -2158,7 +2229,8 @@ class TimetableEngine:
         timetable_hash = compute_timetable_hash_sorted(session_trading_date, tz_label, streams_copy)
 
         timetable_dir = self._project_root / "data" / "timetable"
-        final_file = timetable_dir / "timetable_current.json"
+        final_filename = "timetable_replay_current.json" if replay_current_file else "timetable_current.json"
+        final_file = timetable_dir / final_filename
         previous_hash: Optional[str] = None
         if final_file.exists():
             try:
@@ -2180,18 +2252,22 @@ class TimetableEngine:
             for s in streams_copy[:2]
         ]
         _will_skip = previous_hash is not None and timetable_hash == previous_hash
-        print(
-            f"TIMETABLE_CURRENT_PUBLISH_AUDIT ts_utc={_audit_ts} session_trading_date={session_trading_date} "
-            f"caller={caller_label!r} hash_prefix={timetable_hash[:16]}... "
-            f"outcome={'skip_no_change' if _will_skip else 'publish'} first_streams={_first_two!r}",
-            flush=True,
+        logger.info(
+            "TIMETABLE_CURRENT_PUBLISH_AUDIT ts_utc=%s session_trading_date=%s caller=%r "
+            "hash_prefix=%s outcome=%s first_streams=%s",
+            _audit_ts,
+            session_trading_date,
+            caller_label,
+            timetable_hash[:16],
+            "skip_no_change" if _will_skip else "publish",
+            _first_two,
         )
         _fa = ctx.get("_filter_audit") or {}
         _fa_keys = _fa.get("filter_keys")
         if not isinstance(_fa_keys, list):
             _fa_keys = []
-        print(
-            "TIMETABLE_CURRENT_PUBLISH_AUDIT",
+        logger.info(
+            "TIMETABLE_CURRENT_PUBLISH_AUDIT %s",
             json.dumps(
                 {
                     "caller": ctx.get("caller"),
@@ -2204,7 +2280,6 @@ class TimetableEngine:
                 sort_keys=True,
                 default=str,
             ),
-            flush=True,
         )
 
         if previous_hash is not None and timetable_hash == previous_hash:
@@ -2290,6 +2365,7 @@ class TimetableEngine:
             execution_document_source=doc_source,
             enforce_cme_live=enforce_cme_live,
             replay_document=replay_document,
+            replay_current_file=replay_current_file,
             eligibility_trade_date=eligibility_trade_date,
             extra_document_fields=extra_write,
         )
@@ -2319,6 +2395,7 @@ class TimetableEngine:
         ledger_source: Optional[str] = None,
         enforce_cme_live: bool = False,
         replay_document: bool = False,
+        replay_current_file: bool = False,
         eligibility_trade_date: Optional[str] = None,
         extra_document_fields: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -2336,7 +2413,10 @@ class TimetableEngine:
         session_trading_date = str(session_trading_date).strip()
 
         output_dir = Path(self.timetable_output_dir) if self.timetable_output_dir else Path("data/timetable")
-        filename_base = "timetable_copy" if self.timetable_output_dir else "timetable_current"
+        if self.timetable_output_dir:
+            filename_base = "timetable_copy"
+        else:
+            filename_base = "timetable_replay_current" if replay_current_file else "timetable_current"
         output_dir.mkdir(parents=True, exist_ok=True)
 
         utc_now = datetime.now(timezone.utc)
@@ -2507,11 +2587,17 @@ class TimetableEngine:
             return
         
         removed_count = 0
+        preserved_names = {
+            f"{keep_filename}.json",
+            f"{keep_filename}.tmp",
+            "timetable_current.json",
+            "timetable_current.tmp",
+            "timetable_replay_current.json",
+            "timetable_replay_current.tmp",
+        }
         for file_path in output_dir.iterdir():
-            # Skip the canonical file and its temp file
-            if file_path.name == f"{keep_filename}.json":
-                continue
-            if file_path.name == f"{keep_filename}.tmp":
+            # Keep the canonical file, its temp file, and the alternate live/replay execution artifact.
+            if file_path.name in preserved_names:
                 continue
             # Never delete eligibility files (immutable per trading_date; robot fails closed without them)
             if file_path.name.startswith("eligibility_"):
@@ -2576,6 +2662,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-

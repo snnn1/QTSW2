@@ -11,7 +11,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from modules.session_authority.models import SessionAuthorityState
 from modules.session_authority.observability import session_authority_path
@@ -120,6 +120,36 @@ def save_authority(project_root: Path, state: SessionAuthorityState) -> None:
     )
 
 
+def build_persisted_authority_state(
+    *,
+    project_root: Path,
+    mode: str,
+    session_trading_date: str,
+    source: str,
+    locked: bool,
+    set_by: str,
+    reason: str,
+    expected_canonical_session: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    expires_at_utc: Optional[str] = None,
+) -> SessionAuthorityState:
+    """Build a new persisted authority state with the next monotonic version."""
+    utc_now = datetime.now(timezone.utc)
+    return SessionAuthorityState(
+        mode=mode,
+        session_trading_date=session_trading_date,
+        source=source,
+        locked=locked,
+        set_at_utc=utc_now.isoformat().replace("+00:00", "Z"),
+        set_by=set_by,
+        reason=reason,
+        version=read_next_version(project_root),
+        expires_at_utc=expires_at_utc,
+        expected_canonical_session=expected_canonical_session,
+        metadata=dict(metadata) if metadata else None,
+    )
+
+
 def build_auto_authority_from_canonical(
     *,
     project_root: Path,
@@ -130,16 +160,14 @@ def build_auto_authority_from_canonical(
 
     utc_now = datetime.now(timezone.utc)
     canonical = get_cme_trading_date(utc_now)
-    ver = read_next_version(project_root)
-    return SessionAuthorityState(
+    return build_persisted_authority_state(
+        project_root=project_root,
         mode="auto",
         session_trading_date=canonical,
         source="system",
         locked=False,
-        set_at_utc=utc_now.isoformat().replace("+00:00", "Z"),
         set_by=set_by,
         reason=reason,
-        version=ver,
         expected_canonical_session=canonical,
         metadata=None,
     )

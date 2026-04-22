@@ -28,7 +28,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _default_engine_log() -> Path:
-    return _REPO_ROOT / "logs" / "robot" / "robot_ENGINE.jsonl"
+    try:
+        from modules.watchdog.run_context import resolve_active_run_context
+
+        return resolve_active_run_context().robot_logs_dir / "robot_ENGINE.jsonl"
+    except Exception:
+        return _REPO_ROOT / "logs" / "robot" / "robot_ENGINE.jsonl"
 
 
 TRACKED_TYPES = frozenset(

@@ -416,7 +416,13 @@ class EventFeedGenerator:
             with open(ROBOT_LOG_READ_POSITIONS_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             if isinstance(data, dict):
-                self._last_read_positions = {k: int(v) for k, v in data.items()}
+                if "__contexts__" in data:
+                    scope_key = str(resolve_active_run_context().persistence_base)
+                    scoped = data.get("__contexts__", {}).get(scope_key, {})
+                    if isinstance(scoped, dict):
+                        self._last_read_positions = {k: int(v) for k, v in scoped.items()}
+                else:
+                    self._last_read_positions = {k: int(v) for k, v in data.items()}
                 logger.debug(f"Loaded read positions for {len(self._last_read_positions)} log file(s)")
         except Exception as e:
             logger.warning(f"Failed to load read positions: {e}")
@@ -425,8 +431,22 @@ class EventFeedGenerator:
         """Persist read positions to disk (including empty dict after rotation)."""
         try:
             ROBOT_LOG_READ_POSITIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            payload: Dict[str, Any] = {}
+            if ROBOT_LOG_READ_POSITIONS_FILE.exists():
+                try:
+                    with open(ROBOT_LOG_READ_POSITIONS_FILE, 'r', encoding='utf-8') as f:
+                        existing = json.load(f)
+                    if isinstance(existing, dict):
+                        payload = existing
+                except Exception:
+                    payload = {}
+            contexts = payload.get("__contexts__")
+            if not isinstance(contexts, dict):
+                contexts = {}
+            contexts[str(resolve_active_run_context().persistence_base)] = dict(self._last_read_positions)
+            payload = {"__contexts__": contexts}
             with open(ROBOT_LOG_READ_POSITIONS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self._last_read_positions, f, indent=0)
+                json.dump(payload, f, indent=0)
         except Exception as e:
             logger.warning(f"Failed to save read positions: {e}")
     

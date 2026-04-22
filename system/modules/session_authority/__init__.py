@@ -7,6 +7,7 @@ from modules.session_authority.observability import (
 )
 from modules.session_authority.policy import NO_FILE_OBSERVABILITY_MODE
 from modules.session_authority.store import (
+    build_persisted_authority_state,
     SessionAuthorityRequiredError,
     initialize_auto_authority,
     load_persisted_strict,
@@ -16,6 +17,7 @@ from modules.session_authority.store import (
 
 __all__ = [
     "NO_FILE_OBSERVABILITY_MODE",
+    "build_persisted_authority_state",
     "SessionAuthorityObservation",
     "SessionAuthorityRequiredError",
     "SessionAuthorityState",

@@ -37,6 +37,23 @@ public static class StateConsistencyGateTests
             Summary = "release_ready"
         };
 
+        StateConsistencyReleaseReadinessResult ImmediateBrokerFlatReady(string inst) => new()
+        {
+            Instrument = inst,
+            SnapshotSufficient = true,
+            ReleaseReady = true,
+            IsExplainable = true,
+            BrokerPositionExplainable = true,
+            BrokerWorkingExplainable = true,
+            LocalStateCoherent = true,
+            PendingAdoptionExists = false,
+            DiagnosticBrokerPositionQty = 0,
+            DiagnosticJournalOpenQty = 0,
+            DiagnosticBrokerWorkingCount = 0,
+            DiagnosticIeaOwnedPlusAdoptedWorking = 0,
+            Summary = "release_ready"
+        };
+
         StateConsistencyReleaseReadinessResult NotReady(string inst, string why) => new()
         {
             Instrument = inst,
@@ -689,6 +706,94 @@ public static class StateConsistencyGateTests
             return (false, "19: generic opening entry should remain mismatch-blocked");
         if (coord19.IsSubmitBlockedByMismatch("ST7", "SUBMIT_ENTRY_STOP"))
             return (false, "19: soft-transition lock entry stop should bypass mismatch block");
+
+        // 20) Immediate broker-flat release should not require a second evaluation tick.
+        var coord20 = new MismatchEscalationCoordinator(
+            getSnapshot: () => snap,
+            getActiveInstruments: () => Array.Empty<string>(),
+            getMismatchObservations: (_, _) => Array.Empty<MismatchObservation>(),
+            isInstrumentBlocked: _ => false,
+            isFlattenInProgress: _ => false,
+            isRecoveryInProgress: _ => false,
+            log: null,
+            runInstrumentGateReconciliation: (_, _, _) =>
+                new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Success },
+            evaluateReleaseReadiness: (_, _, _, _) => ImmediateBrokerFlatReady("ST8"),
+            stateConsistencyStableWindowMs: 500);
+        coord20.ProcessObservationForTest(new MismatchObservation
+        {
+            Instrument = "ST8",
+            MismatchType = MismatchType.BROKER_AHEAD,
+            Present = true,
+            ObservedUtc = t0
+        });
+        coord20.AdvanceStateConsistencyGateForTest("ST8", snap, t0, new MismatchObservation
+        {
+            Instrument = "ST8",
+            MismatchType = MismatchType.BROKER_AHEAD,
+            Present = true,
+            ObservedUtc = t0,
+            BrokerWorkingOrderCount = 0,
+            LocalWorkingOrderCount = 0,
+            NetBrokerQty = 0,
+            NetJournalQty = 0
+        });
+        st = coord20.GetStateForTest("ST8");
+        if (st == null || st.Blocked)
+            return (false, "20: immediate broker-flat readiness should release on first stable tick");
+        if (st.GateLifecyclePhase != GateLifecyclePhase.None)
+            return (false, $"20: expected gate phase None after same-tick broker-flat release, got {st.GateLifecyclePhase}");
+
+        // 21) Soft-transition persistent mismatch should force an expensive reconciliation pass even under throttle stall.
+        var softTransitionReconCalls = 0;
+        var coord21 = new MismatchEscalationCoordinator(
+            getSnapshot: () => snapStall,
+            getActiveInstruments: () => Array.Empty<string>(),
+            getMismatchObservations: (_, _) => Array.Empty<MismatchObservation>(),
+            isInstrumentBlocked: _ => false,
+            isFlattenInProgress: _ => false,
+            isRecoveryInProgress: _ => false,
+            log: null,
+            runInstrumentGateReconciliation: (_, _, _) =>
+            {
+                softTransitionReconCalls++;
+                return new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Partial };
+            },
+            evaluateReleaseReadiness: (_, _, _, _) => SoftTransitionFlat("ST9"),
+            stateConsistencyStableWindowMs: 200);
+        var tPersist21 = t0.AddMilliseconds(MismatchEscalationPolicy.MISMATCH_FAIL_CLOSED_THRESHOLD_MS + 200);
+        coord21.ProcessObservationForTest(new MismatchObservation
+        {
+            Instrument = "ST9",
+            MismatchType = MismatchType.BROKER_AHEAD,
+            Present = true,
+            ObservedUtc = t0
+        });
+        coord21.ProcessObservationForTest(new MismatchObservation
+        {
+            Instrument = "ST9",
+            MismatchType = MismatchType.BROKER_AHEAD,
+            Present = true,
+            ObservedUtc = tPersist21
+        });
+        st = coord21.GetStateForTest("ST9");
+        if (st == null)
+            return (false, "21: expected ST9 state");
+        st.GateProgress.NextAllowedExpensiveReconciliationUtc = tPersist21.AddMinutes(1);
+        softTransitionReconCalls = 0;
+        coord21.AdvanceStateConsistencyGateForTest("ST9", snapStall, tPersist21, new MismatchObservation
+        {
+            Instrument = "ST9",
+            MismatchType = MismatchType.BROKER_AHEAD,
+            Present = true,
+            ObservedUtc = tPersist21,
+            BrokerWorkingOrderCount = 0,
+            LocalWorkingOrderCount = 0,
+            NetBrokerQty = 0,
+            NetJournalQty = 0
+        });
+        if (softTransitionReconCalls == 0)
+            return (false, "21: soft-transition persistent mismatch should force a reconciliation pass under throttle stall");
 
         return (true, null);
         }

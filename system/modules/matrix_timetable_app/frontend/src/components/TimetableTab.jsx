@@ -3,10 +3,11 @@ import { formatChicagoTime } from '../utils/dateUtils'
 /**
  * Presentational Trading Timetable grid.
  *
- * **Rows must be derived only from `GET /api/timetable/current`** (e.g. map
- * `apiDocToExecutionTimetable` → `{ Stream, Time, Enabled, BlockReason }`).
- * Do **not** pass worker / matrix recomputed timetable data — that path is deprecated
- * and removed from the main app.
+ * **Rows must be derived only from timetable API payloads** (live current or
+ * historical preview), e.g. map `apiDocToExecutionTimetable` to
+ * `{ Stream, Time, Enabled, BlockReason }`.
+ * Do **not** pass worker / matrix recomputed timetable data - that path is
+ * deprecated and removed from the main app.
  *
  * `App.jsx` inlines the timetable tab; this component exists for extraction / reuse
  * without reintroducing worker execution logic.
@@ -20,9 +21,9 @@ export default function TimetableTab({
   masterLoading = false,
   masterError = null,
   onRetryLoad,
-  /** Loading state for GET /api/timetable/current */
+  /** Loading state for timetable API fetches */
   timetableApiLoading = false,
-  /** Error message when API missing or failed */
+  /** Error message when the timetable API is missing or failed */
   timetableApiError = null,
   /** @type {TimetableRow[]} */
   timetableRows = [],

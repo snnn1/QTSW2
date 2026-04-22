@@ -10,6 +10,12 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+try:
+    from modules.pathing import resolve_qtsw2_root
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+    from modules.pathing import resolve_qtsw2_root  # type: ignore
+
 
 def setup_matrix_logger(
     logger_name: str,
@@ -40,7 +46,7 @@ def setup_matrix_logger(
     
     # Use default log file if not provided
     if log_file is None:
-        log_file = Path(__file__).parent.parent.parent / "logs" / "master_matrix.log"
+        log_file = resolve_qtsw2_root(default_file=__file__) / "logs" / "master_matrix.log"
     
     # Ensure log directory exists
     log_file.parent.mkdir(parents=True, exist_ok=True)

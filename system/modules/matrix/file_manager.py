@@ -19,6 +19,12 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
+try:
+    from modules.pathing import resolve_qtsw2_root
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+    from modules.pathing import resolve_qtsw2_root  # type: ignore
+
 from .utils import _enforce_trade_date_invariants
 from .config import SAVE_JSON_ON_BUILD
 
@@ -122,8 +128,8 @@ def _trigger_eligibility_builder_async(trading_date: str, output_dir: str) -> No
     """
     def _run():
         try:
-            project_root = Path(__file__).resolve().parent.parent.parent
-            script_path = project_root / "scripts" / "eligibility_builder.py"
+            project_root = resolve_qtsw2_root(default_file=__file__)
+            script_path = project_root / "tools" / "scripts_repo" / "eligibility_builder.py"
             if not script_path.exists():
                 logger.warning("ELIGIBILITY_BUILDER_SKIP: script not found at %s", script_path)
                 return
@@ -290,17 +296,14 @@ def save_master_matrix(
         source_kind="disk",
     )
 
-    # Persist execution timetable from matrix in background (non-blocking).
-    # Keeps timetable_current.json aligned with disk matrix when builds only call save_master_matrix.
-    # Server-side hash skip avoids pointless rewrites when content unchanged; TIMETABLE_CURRENT_PUBLISH_AUDIT
-    # can still show a near-simultaneous dashboard publish vs this caller for debugging.
-    def _run_timetable_persist():
+    # Persist execution timetable from matrix before returning so the saved matrix snapshot
+    # and live timetable_current.json stay aligned in one deterministic call path.
+    def _persist_timetable_after_save():
         try:
             import time
             from .build_journal import journal_event
             journal_event(event_type="timetable_start", mode="from_matrix")
             t_timetable = time.perf_counter()
-            time.sleep(0.1)  # Brief delay to let filesystem settle
             sys.path.insert(0, str(Path(__file__).parent.parent.parent))
             from modules.timetable.timetable_engine import TimetableEngine
             df_copy = df.copy()
@@ -308,7 +311,7 @@ def save_master_matrix(
                 df_copy["trade_date"]
             ):
                 df_copy["trade_date"] = pd.to_datetime(df_copy["trade_date"], errors="raise")
-            root = Path(__file__).resolve().parents[2]
+            root = resolve_qtsw2_root(default_file=__file__)
             engine = (
                 TimetableEngine(timetable_output_dir=timetable_output_dir, project_root=str(root))
                 if timetable_output_dir
@@ -359,24 +362,12 @@ def save_master_matrix(
                 )
                 return
 
-            if auth.mode == "manual" and auth.locked:
-                duration_ms = int((time.perf_counter() - t_timetable) * 1000)
-                logger.info("TIMETABLE_PERSIST_SKIP: manual locked session authority; not overwriting")
-                journal_event(
-                    event_type="timetable_complete",
-                    mode="from_matrix",
-                    duration_ms=duration_ms,
-                    skipped="manual_authority_locked",
-                )
-                log_timing_event(
-                    phase="timetable_generation",
-                    duration_ms=duration_ms,
-                    mode="from_matrix_skipped",
-                )
-                return
-
             session_td = auth.session_trading_date
-            print("RESEQUENCE_SESSION_DATE_USED", session_td)
+            if auth.mode == "manual" and auth.locked:
+                logger.info(
+                    "TIMETABLE_PERSIST_MANUAL_LOCKED: republishing latest matrix for locked manual session=%s",
+                    session_td,
+                )
             with timetable_publish_blocking():
                 engine.write_execution_timetable_from_master_matrix(
                     df_copy,
@@ -387,7 +378,7 @@ def save_master_matrix(
                     publish_context={
                         "source": "matrix",
                         "reason": "publish",
-                        "caller": "matrix.file_manager.save_master_matrix:background_thread",
+                        "caller": "matrix.file_manager.save_master_matrix",
                         "matrix_source": "in_memory",
                         # LEGACY audit only — matrix row selection is mode=live only here.
                         "authority_mode": auth.mode,
@@ -404,7 +395,7 @@ def save_master_matrix(
             import traceback
             logger.debug(f"Timetable persistence traceback: {traceback.format_exc()}")
 
-    threading.Thread(target=_run_timetable_persist, daemon=True).start()
+    _persist_timetable_after_save()
 
     return parquet_file, json_file
 
@@ -528,5 +519,3 @@ def get_best_matrix_file(output_dir: str) -> Optional[Path]:
         except Exception:
             pass
     return best_path
-
-

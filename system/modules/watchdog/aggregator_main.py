@@ -25,7 +25,7 @@ from .event_feed import EventFeedGenerator
 from .event_processor import EventProcessor, get_flatten_lookup_reason_counts, stream_session_flatten_fields
 from modules.watchdog.aggregator.session_flatten_state import SessionFlattenStateTracker
 from .state_manager import WatchdogStateManager, CursorManager, _is_trading_date_within_max_age
-from .timetable_poller import TimetablePoller, compute_timetable_trading_date
+from .timetable_poller import TimetablePoller, compute_timetable_trading_date, resolve_watchdog_timetable_path
 from .market_calendar import get_market_state
 from .run_context import WatchdogRunContext, resolve_active_run_context
 from .config import (
@@ -769,7 +769,7 @@ class WatchdogAggregator:
             polled_source,
             polled_ordered,
             polled_identity_hash,
-        ) = self._timetable_poller.poll()
+        ) = self._timetable_poller.poll(self._run_context)
         snapshot._state_manager.update_timetable_streams(
             polled_enabled_streams,
             polled_trading_date,
@@ -825,14 +825,12 @@ class WatchdogAggregator:
 
     def _get_startup_timetable_session_and_replay(self) -> Tuple[Optional[str], bool]:
         """
-        Load timetable_current.json once for startup check.
+        Load the active watchdog timetable once for startup check.
         Returns (session_trading_date or None if missing/invalid, is_replay).
         When is_replay is True, skip live startup matrix sync (same as timetable_auto_roll).
         """
         try:
-            from .config import QTSW2_ROOT
-
-            path = QTSW2_ROOT / "data" / "timetable" / "timetable_current.json"
+            path = resolve_watchdog_timetable_path(self._refresh_run_context())
             if not path.is_file():
                 return None, False
             doc = json.loads(path.read_text(encoding="utf-8"))
@@ -1608,7 +1606,7 @@ class WatchdogAggregator:
                     timetable_file_source,
                     enabled_streams_ordered,
                     timetable_identity_hash,
-                ) = self._timetable_poller.poll()
+                ) = self._timetable_poller.poll(self._refresh_run_context())
                 enabled_streams_unknown = enabled_streams_set is None
 
                 if not trading_date:

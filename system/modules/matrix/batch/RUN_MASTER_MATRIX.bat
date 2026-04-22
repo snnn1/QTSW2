@@ -55,15 +55,11 @@ echo [1/3] Starting backend on port %BACKEND_PORT% in visible window...
 start "Master Matrix Backend (Port %BACKEND_PORT%)" cmd /k "cd /d %PROJECT_ROOT% && python -m uvicorn modules.dashboard.backend.main:app --host 0.0.0.0 --port %BACKEND_PORT%"
 timeout /t 3 /nobreak >nul
 
-echo [2/3] Opening browser...
-timeout /t 2 /nobreak >nul
-start http://localhost:5174
-
-echo [3/3] Starting frontend...
-echo Frontend will run in this window...
+echo [2/3] Building frontend...
+echo Frontend will be built and then served in this window...
 echo.
-echo Setting VITE_API_PORT=%BACKEND_PORT% for frontend...
-set "VITE_API_PORT=%BACKEND_PORT%"
+echo Setting VITE_API_BASE=http://localhost:%BACKEND_PORT%/api for frontend...
+set "VITE_API_BASE=http://localhost:%BACKEND_PORT%/api"
 echo.
 
 echo.
@@ -158,9 +154,9 @@ if not exist "node_modules" (
     echo.
 )
 
-REM Set environment variable for frontend BEFORE starting npm
-REM Vite reads environment variables at startup, so this must be set before npm run dev
-set "VITE_API_PORT=%BACKEND_PORT%"
+REM Set environment variable for frontend BEFORE building
+REM The built UI must call the selected backend port directly.
+set "VITE_API_BASE=http://localhost:%BACKEND_PORT%/api"
 
 REM Verify backend is responding before starting frontend
 echo.
@@ -172,34 +168,52 @@ if errorlevel 1 (
     timeout /t 3 /nobreak >nul
 )
 
-REM Run frontend - this will keep the window open while running
+REM Build then serve frontend - this will keep the window open while running
 echo.
 echo ================================================
-echo Starting frontend development server...
+echo Building frontend bundle...
 echo ================================================
 echo.
-echo Frontend will run in this window (do not close it)
+echo Frontend will be served from the built dist/ folder in this window
 echo If you see errors, they will be displayed below.
-echo Press Ctrl+C to stop the frontend.
+echo Press Ctrl+C to stop the frontend server.
 echo.
-echo Running: npm run dev
-echo Environment: VITE_API_PORT=%VITE_API_PORT%
+echo Running: npm run build
+echo Environment: VITE_API_BASE=%VITE_API_BASE%
 echo Backend should be on: http://localhost:%BACKEND_PORT%
-echo Frontend will connect to: http://localhost:%VITE_API_PORT%/api
+echo Frontend will connect to: %VITE_API_BASE%
 echo Current directory: %CD%
 echo.
 echo ================================================
 echo.
 
-REM Use call to ensure batch file continues and window stays open
-REM npm run dev should keep running and block, keeping window open
-REM IMPORTANT: VITE_API_PORT must be set in the environment before npm starts
-call npm run dev
+call npm run build
+if errorlevel 1 (
+    echo.
+    echo ================================================
+    echo npm run build failed
+    echo ================================================
+    set "ERROR_OCCURRED=1"
+    goto :error_exit
+)
 
-REM If we reach here, npm run dev has exited
+echo.
+echo [3/3] Opening browser...
+start http://localhost:5174
+
 echo.
 echo ================================================
-echo npm run dev has exited
+echo Starting frontend static server...
+echo ================================================
+echo.
+echo Running: python -m http.server 5174 --bind 127.0.0.1 --directory dist
+echo.
+python -m http.server 5174 --bind 127.0.0.1 --directory dist
+
+REM If we reach here, the static server has exited
+echo.
+echo ================================================
+echo frontend static server has exited
 echo ================================================
 set "ERROR_OCCURRED=1"
 goto :error_exit
@@ -223,14 +237,15 @@ if "%ERROR_OCCURRED%"=="1" (
     echo To troubleshoot:
     echo   1. Check if npm is installed: npm --version
     echo   2. Check if node_modules exists: dir node_modules
-    echo   3. Try running manually: npm run dev
-    echo   4. Check if port 5174 is in use: netstat -ano ^| findstr :5174
+    echo   3. Try running manually: set VITE_API_BASE=http://localhost:%BACKEND_PORT%/api ^&^& npm run build
+    echo   4. Then serve it manually: python -m http.server 5174 --bind 127.0.0.1 --directory dist
+    echo   5. Check if port 5174 is in use: netstat -ano ^| findstr :5174
     echo.
 ) else (
     echo Possible reasons:
     echo   - You pressed Ctrl+C to stop it
     echo   - Port 5174 was already in use
-    echo   - npm run dev exited
+    echo   - The static server exited
     echo.
     echo Backend is still running in the other window.
     echo.

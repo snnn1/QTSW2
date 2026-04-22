@@ -5,7 +5,7 @@ Runtime validation: one stream's forced-flatten chain across ENGINE, per-instrum
 Usage (after a live day with session-close flatten):
   python -m modules.watchdog.validate_forced_flatten_runtime --date 2026-04-08 --stream MES1
 
-Defaults: logs/robot/robot_ENGINE.jsonl, logs/robot/frontend_feed.jsonl, and the first robot_<INST>.jsonl
+Defaults: the active run context's robot_ENGINE.jsonl, frontend_feed.jsonl, and the first robot_<INST>.jsonl
 matching --instrument if set, else heuristics from ENGINE lines.
 
 Does not modify state; read-only.
@@ -123,7 +123,9 @@ def _collect(
 
 
 def _find_instrument_log(instrument: str) -> Optional[Path]:
-    logs = _REPO / "logs" / "robot"
+    from modules.watchdog.run_context import resolve_active_run_context
+
+    logs = resolve_active_run_context().robot_logs_dir
     if not logs.is_dir():
         return None
     # e.g. MES -> robot_MES.jsonl
@@ -147,8 +149,11 @@ def main() -> int:
     date = args.date.strip()
     stream = args.stream.strip() or None
 
-    engine_path = args.engine or (_REPO / "logs" / "robot" / "robot_ENGINE.jsonl")
-    feed_path = args.feed or (_REPO / "logs" / "robot" / "frontend_feed.jsonl")
+    from modules.watchdog.run_context import resolve_active_run_context
+
+    context = resolve_active_run_context()
+    engine_path = args.engine or (context.robot_logs_dir / "robot_ENGINE.jsonl")
+    feed_path = args.feed or context.frontend_feed_file
 
     inst = args.instrument.strip()
     inst_log = args.instrument_log

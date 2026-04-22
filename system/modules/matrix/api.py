@@ -304,35 +304,20 @@ async def reload_latest_matrix():
     allowing the frontend to immediately see the current disk state.
     """
     try:
-        root_matrix_dir = QTSW2_ROOT / "data" / "master_matrix"
-        
-        if not root_matrix_dir.exists():
-            logger.warning(f"Matrix directory does not exist: {root_matrix_dir}")
-            raise HTTPException(
-                status_code=404, 
-                detail=f"Master matrix directory not found: {root_matrix_dir.resolve()}. Please build the matrix first."
-            )
-        
-        from modules.matrix.file_manager import get_best_matrix_file
-        file_to_load = get_best_matrix_file(str(root_matrix_dir))
-        
-        if file_to_load is None:
-            logger.warning(f"No matrix files found in: {root_matrix_dir}")
-            raise HTTPException(
-                status_code=404, 
-                detail=f"No master matrix files found in {root_matrix_dir.resolve()}. Please build the matrix first using 'Rebuild Matrix' button."
-            )
-        
-        file_mtime = file_to_load.stat().st_mtime
-        matrix_file_id = file_to_load.name
+        _, matrix_meta = _resolve_matrix_source()
+        file_mtime = matrix_meta.get("file_mtime")
+        matrix_file_id = matrix_meta.get("matrix_file_id") or matrix_meta.get("file_name")
         
         return {
             "status": "success",
             "matrix_file_id": matrix_file_id,
-            "file": file_to_load.name,
+            "file": matrix_meta.get("file_name"),
             "file_mtime": file_mtime,
-            "message": "Latest matrix file identified. Use GET /api/matrix/data to load it."
+            "matrix_source": matrix_meta.get("matrix_source"),
+            "message": "Current matrix snapshot identified. Use GET /api/matrix/data to load it."
         }
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
     except HTTPException:
         raise
     except Exception as e:
@@ -456,33 +441,23 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
     global _api_cache_hits, _api_cache_misses, _last_matrix_row_count
     try:
         import pandas as pd
-        
-        # Determine file to load
-        root_matrix_dir = QTSW2_ROOT / "data" / "master_matrix"
-        
-        if not root_matrix_dir.exists():
-            return _matrix_data_error_response(
-                404, f"Master matrix directory not found: {root_matrix_dir}"
-            )
 
-        if file_path:
-            # Use specified file
-            file_to_load = Path(file_path)
-            if not file_to_load.exists():
-                return _matrix_data_error_response(404, f"File not found: {file_path}")
-        else:
-            # Prefer fullest file (most rows) so truncated resequences don't replace full rebuilds
-            from modules.matrix.file_manager import get_best_matrix_file
-            file_to_load = get_best_matrix_file(str(root_matrix_dir))
-            if file_to_load is None:
-                return _matrix_data_error_response(
-                    404,
-                    f"No master matrix files found. Checked: {root_matrix_dir}. Build the matrix first.",
-                )
-            logger.info(f"Selected fullest file: {file_to_load.name}")
-        
-        file_mtime = file_to_load.stat().st_mtime
-        cache_key = (str(file_to_load), file_mtime, tuple(sorted(stream_include_list or [])), contract_multiplier, include_filtered_executed, include_stats)
+        try:
+            df_resolved, matrix_meta = _resolve_matrix_source(file_path)
+        except FileNotFoundError as e:
+            return _matrix_data_error_response(404, str(e))
+
+        matrix_file_id = matrix_meta.get("matrix_file_id") or matrix_meta.get("file_name")
+        file_name = matrix_meta.get("file_name") or matrix_file_id
+        file_mtime = matrix_meta.get("file_mtime")
+        cache_key = (
+            matrix_file_id,
+            file_mtime,
+            tuple(sorted(stream_include_list or [])),
+            contract_multiplier,
+            include_filtered_executed,
+            include_stats,
+        )
         
         # Check cache (skip if nocache=True)
         df_full = None
@@ -493,7 +468,7 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
             df_full, stats_full, years = _matrix_data_cache[cache_key]
             if not include_stats:
                 stats_full = None
-            logger.info(f"Matrix data cache hit for {file_to_load.name}")
+            logger.info(f"Matrix data cache hit for {file_name}")
             try:
                 from modules.matrix.instrumentation import log_timing_event
                 log_timing_event(phase="api_matrix_load", duration_ms=0, cache_hit=True, row_count=len(df_full) if df_full is not None else 0)
@@ -502,36 +477,17 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
         
         if df_full is None:
             import time
-            from modules.matrix.matrix_state import get_matrix_state
             t_load = time.perf_counter()
-            # MatrixState: use in-process df when file unchanged; else load in thread (populates state)
-            try:
-                df_from_state, path_used, from_cache = await asyncio.to_thread(
-                    get_matrix_state, str(root_matrix_dir), file_to_load
-                )
-            except Exception as e:
-                return _matrix_data_error_response(
-                    500, f"Failed to read matrix state: {str(e)}"
-                )
-            if df_from_state is not None:
-                df = df_from_state.copy()
-            else:
-                from modules.matrix.file_manager import read_parquet_matrix_file
-
-                def _load_parquet_sync():
-                    return read_parquet_matrix_file(file_to_load)
-
-                try:
-                    df = await asyncio.to_thread(_load_parquet_sync)
-                except Exception as e:
-                    return _matrix_data_error_response(
-                        500, f"Failed to read file {file_to_load.name}: {str(e)}"
-                    )
+            df = df_resolved.copy()
 
             if df.empty:
-                return _matrix_data_error_response(404, f"File {file_to_load.name} is empty")
+                return _matrix_data_error_response(404, f"File {file_name} is empty")
             
             df_full = df.copy()
+            try:
+                _validate_api_trade_date_contract(df_full, "matrix_api_load")
+            except ValueError as e:
+                return _matrix_data_error_response(500, str(e))
 
             # Integrity validation (non-blocking, logs issues)
             try:
@@ -591,7 +547,7 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
             try:
                 from modules.matrix.instrumentation import log_timing_event
                 duration_ms = int((time.perf_counter() - t_load) * 1000)
-                log_timing_event(phase="api_matrix_load", duration_ms=duration_ms, cache_hit=False, row_count=len(df_full), file_path=str(file_to_load))
+                log_timing_event(phase="api_matrix_load", duration_ms=duration_ms, cache_hit=False, row_count=len(df_full), file_path=str(file_name))
             except Exception:
                 pass
         
@@ -613,27 +569,11 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
         # limit=0 means no limit - return all trades
         if limit > 0:
             if order == "newest":
-                # Sort by trade_date descending to get newest rows first
-                # Ensure trade_date is datetime for proper sorting
-                # DATE OWNERSHIP: trade_date should already be normalized in saved parquet files
-                # Validate dtype but don't parse
-                if 'trade_date' in df.columns:
-                    from modules.matrix.data_loader import _validate_trade_date_dtype
-                    try:
-                        _validate_trade_date_dtype(df, "api_load")
-                    except ValueError:
-                        # If validation fails, log warning but continue (file may be from old version)
-                        logger.warning("API: trade_date validation failed - file may be from old version")
-                    df = df.sort_values('trade_date', ascending=False, na_position='last').head(limit)
-                elif 'Date' in df.columns:
-                    # Fallback for old files without trade_date
-                    logger.warning("API: Using Date column as fallback - file may be from old version")
-                    df = df.copy()
-                    df['trade_date'] = pd.to_datetime(df['Date'], errors='coerce')
-                    df = df.sort_values('trade_date', ascending=False, na_position='last').head(limit)
-                else:
-                    logger.warning("No date column found for newest-first sorting, using tail() fallback")
-                    df = df.tail(limit)
+                try:
+                    _validate_api_trade_date_contract(df, "matrix_api_return")
+                except ValueError as e:
+                    return _matrix_data_error_response(500, str(e))
+                df = df.sort_values('trade_date', ascending=False, na_position='last').head(limit)
             else:
                 df = df.head(limit)
         
@@ -651,31 +591,23 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
             # Always include all columns that exist (don't drop any)
             df = df[available_cols]
         
-        # Generate stable file ID (filename) for change detection (file_mtime already set above)
-        matrix_file_id = file_to_load.name
-        
         # Extract date ranges for debugging/metadata
         full_min_trade_date = None
         full_max_trade_date = None
         returned_min_trade_date = None
         returned_max_trade_date = None
         
-        # DATE OWNERSHIP: trade_date should already be normalized in saved parquet files
-        # Validate dtype but don't parse
+        try:
+            _validate_api_trade_date_contract(df_full, "matrix_api_full")
+            _validate_api_trade_date_contract(df, "matrix_api_returned")
+        except ValueError as e:
+            return _matrix_data_error_response(500, str(e))
+
         if 'trade_date' in df_full.columns:
-            from modules.matrix.data_loader import _validate_trade_date_dtype
-            try:
-                _validate_trade_date_dtype(df_full, "api_full")
-            except ValueError:
-                logger.warning("API: trade_date validation failed for full dataset - file may be from old version")
             full_min_trade_date = df_full['trade_date'].min()
             full_max_trade_date = df_full['trade_date'].max()
         
         if 'trade_date' in df.columns:
-            try:
-                _validate_trade_date_dtype(df, "api_returned")
-            except ValueError:
-                logger.warning("API: trade_date validation failed for returned dataset - file may be from old version")
             returned_min_trade_date = df['trade_date'].min()
             returned_max_trade_date = df['trade_date'].max()
         
@@ -734,9 +666,10 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
             "data": records,
             "total": total_after_date_filter if (start_date or end_date) else len(df_full),
             "loaded": len(records),
-            "file": file_to_load.name,
+            "file": file_name,
             "matrix_file_id": matrix_file_id,  # Stable file identifier for change detection
             "file_mtime": file_mtime,
+            "matrix_source": matrix_meta.get("matrix_source"),
             "streams": streams,
             "instruments": instruments,
             "years": years,
@@ -784,39 +717,30 @@ async def calculate_profit_breakdown(request: BreakdownRequest):
                         f"DOY is analysis-only - day filters will be ignored."
                     )
         
-        # Find fullest matrix file (same logic as /data endpoint)
-        root_matrix_dir = QTSW2_ROOT / "data" / "master_matrix"
-        
-        if not root_matrix_dir.exists():
-            raise HTTPException(status_code=404, detail=f"Master matrix directory not found: {root_matrix_dir}")
-        
-        from modules.matrix.file_manager import get_best_matrix_file
-        file_to_load = get_best_matrix_file(str(root_matrix_dir))
-        
-        if file_to_load is None:
-            raise HTTPException(status_code=404, detail=f"No master matrix files found. Build the matrix first.")
-        
-        file_mtime = file_to_load.stat().st_mtime
+        try:
+            df_resolved, matrix_meta = _resolve_matrix_source()
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+
+        file_mtime = matrix_meta.get("file_mtime")
+        matrix_file_id = matrix_meta.get("matrix_file_id") or matrix_meta.get("file_name")
         stream_include_tuple = tuple(sorted(request.stream_include or []))
         sf_hash = 0
         if request.stream_filters:
             import json
             sf_serialized = {k: (v.model_dump() if hasattr(v, 'model_dump') else v) for k, v in request.stream_filters.items()}
             sf_hash = hash(json.dumps(sf_serialized, sort_keys=True))
-        cache_key = (str(file_to_load), file_mtime, request.breakdown_type, stream_include_tuple, request.contract_multiplier, request.use_filtered, sf_hash)
+        cache_key = (matrix_file_id, file_mtime, request.breakdown_type, stream_include_tuple, request.contract_multiplier, request.use_filtered, sf_hash)
         if cache_key in _breakdown_cache:
             cached = _breakdown_cache[cache_key]
             logger.info(f"Breakdown cache hit for {request.breakdown_type}")
             return cached
         
-        # Load full dataset
-        def _load_parquet_sync():
-            return pd.read_parquet(file_to_load)
-        
-        df = await asyncio.to_thread(_load_parquet_sync)
+        df = df_resolved.copy()
+        _validate_api_trade_date_contract(df, "matrix_breakdown")
         
         if df.empty:
-            raise HTTPException(status_code=404, detail=f"File {file_to_load.name} is empty")
+            raise HTTPException(status_code=404, detail=f"File {matrix_meta.get('file_name')} is empty")
         
         # Apply stream inclusion filter if specified (before other processing)
         if request.stream_include and len(request.stream_include) > 0 and 'Stream' in df.columns:
@@ -865,35 +789,26 @@ async def get_stream_stats(request: StreamStatsRequest):
         import pandas as pd
         from modules.matrix import statistics
         
-        # Find fullest matrix file (same logic as /data endpoint)
-        root_matrix_dir = QTSW2_ROOT / "data" / "master_matrix"
-        
-        if not root_matrix_dir.exists():
-            raise HTTPException(status_code=404, detail=f"Master matrix directory not found: {root_matrix_dir}")
-        
-        from modules.matrix.file_manager import get_best_matrix_file
-        file_to_load = get_best_matrix_file(str(root_matrix_dir))
-        
-        if file_to_load is None:
-            raise HTTPException(status_code=404, detail=f"No master matrix files found. Build the matrix first.")
-        
-        file_mtime = file_to_load.stat().st_mtime
-        stats_cache_key = (str(file_to_load), file_mtime, request.stream_id, request.include_filtered_executed, request.contract_multiplier)
+        try:
+            df_resolved, matrix_meta = _resolve_matrix_source()
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+
+        file_mtime = matrix_meta.get("file_mtime")
+        matrix_file_id = matrix_meta.get("matrix_file_id") or matrix_meta.get("file_name")
+        stats_cache_key = (matrix_file_id, file_mtime, request.stream_id, request.include_filtered_executed, request.contract_multiplier)
         if stats_cache_key in _stream_stats_cache:
             cached = _stream_stats_cache[stats_cache_key]
             logger.info(f"Stream stats cache hit for {request.stream_id}")
             return JSONResponse(content=cached, media_type="application/json")
         
-        # Load full dataset (no limit, no column filtering - get everything)
-        def _load_parquet_sync():
-            return pd.read_parquet(file_to_load)
-        
-        df = await asyncio.to_thread(_load_parquet_sync)
+        df = df_resolved.copy()
+        _validate_api_trade_date_contract(df, "matrix_stream_stats")
         
         logger.info(f"Loaded full parquet file: {len(df)} total rows")
         
         if df.empty:
-            raise HTTPException(status_code=404, detail=f"File {file_to_load.name} is empty")
+            raise HTTPException(status_code=404, detail=f"File {matrix_meta.get('file_name')} is empty")
         
         # Filter to specific stream
         if 'Stream' not in df.columns:

@@ -15,14 +15,21 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 try:
+    from modules.pathing import resolve_qtsw2_root
+except ImportError:
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+    from modules.pathing import resolve_qtsw2_root  # type: ignore
+
+try:
     from zoneinfo import ZoneInfo
 except ImportError:  # Python < 3.9
     ZoneInfo = None  # type: ignore
 
 logger = logging.getLogger(__name__)
 
-# Repo root: modules/timetable/eligibility_writer.py -> parents[2] == QTSW2
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = resolve_qtsw2_root(default_file=__file__)
 
 
 def _append_trading_date_roll_journal(

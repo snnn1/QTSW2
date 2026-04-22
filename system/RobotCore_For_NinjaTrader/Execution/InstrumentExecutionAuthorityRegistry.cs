@@ -60,7 +60,8 @@ public static class InstrumentExecutionAuthorityRegistry
     /// Engine heartbeat: for each IEA on the account with a deferred adoption scan, try to enqueue <see cref="InstrumentExecutionAuthority.TryRetryDeferredAdoptionScanIfDeferred"/>.
     /// Logs one structured event when any deferred IEA was considered (per-IEA enqueue outcome).
     /// </summary>
-    public static void RetryDeferredAdoptionScansForAccount(string accountName, RobotLogger? log)
+    public static void RetryDeferredAdoptionScansForAccount(string accountName, RobotLogger? log,
+        Func<string, bool>? executionInstrumentFilter = null)
     {
         var account = accountName ?? "";
         if (string.IsNullOrWhiteSpace(account)) return;
@@ -69,6 +70,9 @@ public static class InstrumentExecutionAuthorityRegistry
         var rows = new List<object>();
         foreach (var iea in GetAllForAccount(account))
         {
+            if (executionInstrumentFilter != null &&
+                !executionInstrumentFilter(iea.ExecutionInstrumentKey))
+                continue;
             if (!iea.HasDeferredAdoptionScanPending) continue;
             var enqueued = iea.TryRetryDeferredAdoptionScanIfDeferred();
             iea.RecordDeferralHeartbeatRetryForProof(utcNow);

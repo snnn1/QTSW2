@@ -16,13 +16,21 @@ if not exist "node_modules" (
 )
 
 echo.
-echo Starting frontend development server...
+echo Building frontend bundle...
 echo Browser will open automatically at:
 echo    http://localhost:5174
 echo.
 
-REM Start frontend
-start "" /min "Frontend Dev Server" cmd /c "npm run dev"
+set "VITE_API_BASE=http://localhost:8000/api"
+call npm run build
+if errorlevel 1 (
+    echo Frontend build failed.
+    pause
+    exit /b 1
+)
+
+REM Start static frontend server
+start "" /min "Frontend Static Server" cmd /c "python -m http.server 5174 --bind 127.0.0.1 --directory dist"
 
 REM Wait for frontend dev server to start (give it a moment)
 timeout /t 3 /nobreak >nul

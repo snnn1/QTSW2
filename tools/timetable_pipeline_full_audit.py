@@ -24,6 +24,12 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+ROOT = _project_root()
+SYSTEM_ROOT = ROOT / "system"
+if str(SYSTEM_ROOT) not in sys.path:
+    sys.path.insert(0, str(SYSTEM_ROOT))
+
+
 def _reason_filter(ev: Dict[str, Any]) -> str:
     if ev.get("overall_pass"):
         return "pass"

@@ -2770,12 +2770,15 @@ public sealed partial class NinjaTraderSimAdapter
 
             // Journal: ENTRY_SUBMITTED (store expected entry price for slippage calculation)
             var (tradingDate, stream, intentEntryPrice, intentStopPrice, intentTargetPrice, intentDirection, _) = GetIntentInfo(intentId);
+            var intentBeTrigger = _intentMap.TryGetValue(intentId, out var submissionIntent)
+                ? submissionIntent.BeTrigger
+                : null;
             var finalEntryPrice = intentEntryPrice ?? entryPrice;
             var finalDirection = intentDirection ?? direction;
             
             _executionJournal.RecordSubmission(intentId, tradingDate, stream, instrument, "ENTRY", order.OrderId, acknowledgedAt, 
                 expectedEntryPrice: entryPrice, entryPrice: finalEntryPrice, stopPrice: intentStopPrice, 
-                targetPrice: intentTargetPrice, direction: finalDirection, ocoGroup: ocoGroup);
+                targetPrice: intentTargetPrice, beTriggerPrice: intentBeTrigger, direction: finalDirection, ocoGroup: ocoGroup);
 
             orderInfo.OrderId = order.OrderId ?? orderInfo.OrderId;
             _iea?.RegisterOrder(order.OrderId, intentId, instrument, stream, OrderRole.ENTRY, OrderOwnershipStatus.OWNED, "SubmitEntryOrder", orderInfo, utcNow);
@@ -3641,6 +3644,8 @@ public sealed partial class NinjaTraderSimAdapter
             if (orderInfo.IsEntryOrder && orderInfo.FilledQuantity == 0)
             {
                 var (tdCx, streamCx, _, _, _, _, _) = GetIntentInfo(intentId);
+                if (!string.IsNullOrWhiteSpace(tdCx) && !string.IsNullOrWhiteSpace(streamCx))
+                    _executionJournal.RecordCancelledUnfilledEntry(intentId, tdCx, streamCx, utcNow);
                 TryAppendKeyEventEntryTerminated(utcNow, orderInfo.Instrument ?? "", string.IsNullOrEmpty(streamCx) ? null : streamCx,
                     intentId, tdCx ?? "", "cancelled");
             }
@@ -4545,7 +4550,10 @@ public sealed partial class NinjaTraderSimAdapter
                         var adoptPartial = order != null && adoptQtyInt < order.Quantity;
                         TryAppendKeyEventEntryFilled(utcNow, instrumentForResolve, stream, adoptedRecord.IntentId, tradingDate,
                             adoptQtyInt, fillPrice, brokerOrderIdStr, adoptPartial);
-                        _coordinator?.OnEntryFill(adoptedRecord.IntentId, fillQuantity, stream, context.CanonicalInstrument ?? context.ExecutionInstrument, context.Direction ?? "", utcNow);
+                        var exposureInstrument = !string.IsNullOrWhiteSpace(context.ExecutionInstrument)
+                            ? context.ExecutionInstrument
+                            : context.CanonicalInstrument;
+                        _coordinator?.OnEntryFill(adoptedRecord.IntentId, fillQuantity, stream, exposureInstrument ?? "", context.Direction ?? "", utcNow);
                         _iea?.HandleEntryFill(adoptedRecord.IntentId, intent, fillPrice, fillQuantity, fillQuantity, utcNow);
                         return;
                         }
@@ -4843,7 +4851,9 @@ public sealed partial class NinjaTraderSimAdapter
                         allocContext.IntentId, allocContext.Stream, dir, allocQty, utcNow, executionSeq);
                 }
                 entryFillJournalRecordedQty += allocQty;
-                var exposureInstrument = allocContext.CanonicalInstrument ?? allocIntent.Instrument ?? allocContext.ExecutionInstrument;
+                var exposureInstrument = !string.IsNullOrWhiteSpace(allocContext.ExecutionInstrument)
+                    ? allocContext.ExecutionInstrument
+                    : (allocIntent.ExecutionInstrument ?? allocIntent.Instrument ?? allocContext.CanonicalInstrument);
                 _coordinator?.OnEntryFill(allocContext.IntentId, allocQty, allocContext.Stream, exposureInstrument, allocContext.Direction ?? "", utcNow);
             }
 
@@ -5086,8 +5096,43 @@ public sealed partial class NinjaTraderSimAdapter
             // LATE-FILL PROTECTION: If intent already completed, this is a stale/late fill (race with sibling cancel).
             var tradingDate = context.TradingDate ?? "";
             var stream = context.Stream ?? "";
-            if (_executionJournal.IsIntentCompleted(intentId, tradingDate, stream))
+            var completedEntry = _executionJournal.GetEntry(intentId, tradingDate, stream);
+            if (completedEntry != null && completedEntry.TradeCompleted)
             {
+                var boundedLateTerminalFill = false;
+                var completionAgeMs = -1L;
+                if (string.Equals(completedEntry.CompletionReason, CompletionReasons.RECONCILIATION_BROKER_FLAT, StringComparison.OrdinalIgnoreCase) &&
+                    !string.IsNullOrWhiteSpace(completedEntry.CompletedAtUtc) &&
+                    DateTimeOffset.TryParse(completedEntry.CompletedAtUtc, out var completedAtUtc))
+                {
+                    completionAgeMs = Math.Max(0L, (long)(utcNow - completedAtUtc).TotalMilliseconds);
+                    boundedLateTerminalFill = completionAgeMs <= 5000;
+                }
+
+                if (boundedLateTerminalFill)
+                {
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "COMPLETED_INTENT_LATE_TERMINAL_FILL_RECONCILED", "ENGINE",
+                        new
+                        {
+                            intent_id = intentId,
+                            broker_order_id = order.OrderId,
+                            instrument = orderInfo.Instrument,
+                            stream = stream,
+                            fill_price = fillPrice,
+                            fill_quantity = fillQuantity,
+                            side = orderInfo.Direction,
+                            exit_order_type = orderTypeForContext,
+                            execution_timestamp_utc = utcNow.ToString("o"),
+                            prior_completion_reason = completedEntry.CompletionReason,
+                            completed_at_utc = completedEntry.CompletedAtUtc,
+                            completion_age_ms = completionAgeMs,
+                            mapped = true,
+                            action = "BOUNDED_LATE_TERMINAL_FILL_IGNORED",
+                            note = "Late terminal fill arrived shortly after reconciliation broker-flat completion; ignored to avoid false critical under playback timing compression."
+                        }));
+                    return;
+                }
+
                 _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "COMPLETED_INTENT_RECEIVED_FILL", "ENGINE",
                     new
                     {
@@ -8779,29 +8824,6 @@ public sealed partial class NinjaTraderSimAdapter
                     note = $"INSTRUMENT_MISMATCH logging rate-limited to once per {INSTRUMENT_MISMATCH_RATE_LIMIT_MINUTES} minute(s) per instrument to prevent log flooding"
                 }));
             }
-            else
-            {
-                // DIAGNOSTIC: Log when rate-limiting is active (verifies rate-limiting fix is working)
-                // Log this diagnostic once per 10 minutes to confirm rate-limiting without flooding
-                var shouldLogDiag = !_lastInstrumentMismatchDiagLogUtc.TryGetValue(instrument, out var lastDiagLogUtc) ||
-                                   (utcNow - lastDiagLogUtc).TotalMinutes >= 10.0;
-                
-                if (shouldLogDiag)
-                {
-                    _lastInstrumentMismatchDiagLogUtc[instrument] = utcNow;
-                    var minutesSinceLastLog = lastLogUtc != DateTimeOffset.MinValue ? (utcNow - lastLogUtc).TotalMinutes : 0;
-                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "INSTRUMENT_MISMATCH_RATE_LIMITED", new
-                    {
-                        requested_instrument = instrument,
-                        strategy_instrument = (_ntInstrument as Instrument)?.FullName ?? "NULL",
-                        reason = "INSTRUMENT_MISMATCH",
-                        rate_limiting_active = true,
-                        minutes_since_last_log = Math.Round(minutesSinceLastLog, 1),
-                        rate_limit_minutes = INSTRUMENT_MISMATCH_RATE_LIMIT_MINUTES,
-                        note = $"DIAGNOSTIC: INSTRUMENT_MISMATCH rate-limiting is working. Last log was {Math.Round(minutesSinceLastLog, 1)} minutes ago. This block is suppressed."
-                    }));
-                }
-            }
             
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
@@ -9417,9 +9439,12 @@ public sealed partial class NinjaTraderSimAdapter
             }
 
             var (tradingDate19, stream19, intentEntryPrice3, intentStopPrice4, intentTargetPrice4, intentDirection2, ocoGroup3) = GetIntentInfo(intentId);
+            var intentBeTrigger3 = _intentMap.TryGetValue(intentId, out var stopIntent)
+                ? stopIntent.BeTrigger
+                : null;
             _executionJournal.RecordSubmission(intentId, tradingDate19, stream19, instrument, "ENTRY_STOP", order.OrderId, acknowledgedAt, 
                 expectedEntryPrice: null, entryPrice: intentEntryPrice3, stopPrice: intentStopPrice4 ?? stopPrice, 
-                targetPrice: intentTargetPrice4, direction: intentDirection2 ?? direction, ocoGroup: ocoGroup3 ?? ocoGroup);
+                targetPrice: intentTargetPrice4, beTriggerPrice: intentBeTrigger3, direction: intentDirection2 ?? direction, ocoGroup: ocoGroup3 ?? ocoGroup);
 
             _log.Write(RobotEvents.ExecutionBase(acknowledgedAt, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
             {

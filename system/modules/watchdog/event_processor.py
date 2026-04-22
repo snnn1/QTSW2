@@ -418,6 +418,11 @@ class EventProcessor:
                 td_val = None
             if th_val or td_val:
                 self._state_manager.update_robot_heartbeat_timetable(th_val, td_val, timestamp_utc)
+
+        elif event_type == "ENGINE_BUILD_STAMP":
+            policy_hash = data.get("execution_policy_hash") or event.get("execution_policy_hash")
+            if policy_hash:
+                self._state_manager.update_robot_execution_policy_hash(policy_hash, timestamp_utc)
         
         elif event_type == "IDENTITY_INVARIANTS_STATUS":
             # PHASE 3.1: Update identity invariants status

@@ -380,10 +380,8 @@ export function streamFiltersForExecutionApi(streamFilters = {}) {
 }
 
 /**
- * Trigger execution timetable publish from on-disk master matrix (server-side).
- * Optional `tradingDate` only when `replay` is true.
+ * Trigger live execution timetable publish from the authoritative in-memory master matrix snapshot.
  * Pass `streamFilters` (Matrix UI state) so calendar rules match background publish when configs/stream_filters.json is missing.
- * `mode` is required by the API: `live` (latest matrix row per stream) or `historical` (as-of session day).
  */
 export async function saveExecutionTimetable({
   tradingDate,
@@ -393,10 +391,11 @@ export async function saveExecutionTimetable({
   source,
   streamFilters
 } = {}) {
+  const replayPublish = replay || mode === 'historical'
   const payload = {
     trading_date: tradingDate ?? null,
     mode: mode === 'historical' ? 'historical' : 'live',
-    replay,
+    replay: replayPublish,
     reason: reason ?? null,
     source: source ?? null
   }

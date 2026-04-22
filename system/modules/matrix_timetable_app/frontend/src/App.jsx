@@ -1,5 +1,4 @@
 import { useState, useEffect, useRef, useCallback, useMemo, useTransition, useDeferredValue } from 'react'
-import { List } from 'react-window'
 import './App.css'
 import { STREAMS, DAYS_OF_WEEK, AVAILABLE_TIMES, ANALYZER_COLUMN_ORDER, DEFAULT_COLUMNS } from './utils/constants'
 import { getDefaultFilters, loadAllFilters, saveAllFilters, getStreamFiltersFromStorage } from './utils/filterUtils'
@@ -30,6 +29,12 @@ import MatrixMetricsDashboard from './components/MatrixMetricsDashboard'
 import * as matrixApi from './api/matrixApi'
 import { API_BASE, getBackendProbeUrl } from './api/matrixApi'
 import { getChicagoDateYMD, getCmeMarketState } from './utils/cmeMarketState'
+import {
+  readStoredBoolean,
+  readStoredChoice,
+  readStoredJsonObject,
+  readStoredNumber,
+} from './utils/storageUtils'
 
 // API base: shared with matrixApi.js (VITE_API_BASE or same-origin /api for Vite proxy)
 /** Poll Watchdog-backed market state (dev: Vite proxies /api/watchdog → :8002). */
@@ -54,7 +59,7 @@ function formatTimetableAsOfChicago(asOfIso) {
   return `${monthDay}, ${hm} CT`
 }
 
-/** Map GET /api/timetable/current payload to timetable tab header meta. */
+/** Map timetable API payloads (live current or preview) to timetable tab header meta. */
 function timetableApiDocToSourceMeta(tt) {
   if (!tt || typeof tt !== 'object') return null
   const st = tt.session_trading_date != null ? String(tt.session_trading_date).trim() : ''
@@ -138,18 +143,12 @@ function AppContent() {
   
   // Auto-update toggle (persisted in localStorage, default: enabled)
   const [autoUpdateEnabled, setAutoUpdateEnabled] = useState(() => {
-    const saved = localStorage.getItem('matrix_auto_update_enabled')
-    // Default to true (enabled) if not set yet
-    if (saved === null) {
-      return true
-    }
-    return saved === 'true'
+    return readStoredBoolean('matrix_auto_update_enabled', true)
   })
   
   // Include filtered executed trades in stats (default: true)
   const [includeFilteredExecuted, setIncludeFilteredExecuted] = useState(() => {
-    const saved = localStorage.getItem('matrix_include_filtered_executed')
-    return saved !== null ? JSON.parse(saved) : true
+    return readStoredBoolean('matrix_include_filtered_executed', true)
   })
   
   // Track previous includeFilteredExecuted to detect changes and force refetch
@@ -157,44 +156,36 @@ function AppContent() {
   
   // Contract multiplier for master stream (default 1 contract)
   const [masterContractMultiplier, setMasterContractMultiplier] = useState(() => {
-    const saved = localStorage.getItem('matrix_master_contract_multiplier')
-    return saved ? parseFloat(saved) || 1 : 1
+    return readStoredNumber('matrix_master_contract_multiplier', 1)
   })
   
   // Show/Hide filtered days toggle (default: ON/show filtered days)
   const [showFilteredDays, setShowFilteredDays] = useState(() => {
-    const saved = localStorage.getItem('matrix_show_filtered_days')
-    if (saved !== null) {
-      return saved === 'true'
-    }
-    return true // Default: show filtered days
+    return readStoredBoolean('matrix_show_filtered_days', true)
   })
 
   // Show/Hide blocked rows in timetable (default: ON/show blocked)
-  /** From GET /api/timetable/current only (session_trading_date, as_of, trading_date). */
+  /** From timetable API payloads (session_trading_date, as_of, trading_date). */
   const [timetableSourceMeta, setTimetableSourceMeta] = useState(null)
   /** Manual POST /api/timetable/execution feedback. */
   const [timetableManualPublishLoading, setTimetableManualPublishLoading] = useState(false)
   const [timetableManualPublishBanner, setTimetableManualPublishBanner] = useState(null)
-  /** Historical mode only: explicit session calendar date for POST /api/timetable/execution. */
+  /** Historical mode only: explicit session calendar date for preview-only inspection. */
   const [timetableGenerateDate, setTimetableGenerateDate] = useState('')
-  /** Timetable publish mode: live = latest matrix row + current effective session; historical = as-of + explicit date. */
+  /** Timetable mode: live publishes current authority; historical previews an as-of session date. */
   const [timetableMode, setTimetableMode] = useState(() => {
-    const saved = localStorage.getItem('matrix_timetable_mode')
-    return saved === 'historical' ? 'historical' : 'live'
+    return readStoredChoice('matrix_timetable_mode', ['live', 'historical'], 'live')
   })
   /** GET /api/timetable/current only — Trading Timetable grid has no worker/matrix fallback. */
   const [timetableApiStatus, setTimetableApiStatus] = useState({ loading: false, error: null })
   /** From GET /api/watchdog/market-state; null → use getCmeMarketState fallback. */
   const [watchdogMarket, setWatchdogMarket] = useState(null)
+  const [currentTradingDay, setCurrentTradingDay] = useState(null)
 
   const [showBlockedTimetableRows, setShowBlockedTimetableRows] = useState(() => {
-    const saved = localStorage.getItem('matrix_show_blocked_timetable')
-    if (saved !== null) {
-      return saved === 'true'
-    }
-    return true // Default: show blocked rows
+    return readStoredBoolean('matrix_show_blocked_timetable', true)
   })
+  const hasValidHistoricalDate = /^\d{4}-\d{2}-\d{2}$/.test(timetableGenerateDate.trim())
 
   // Matrix controller hook - handles all matrix orchestration
   const {
@@ -258,21 +249,29 @@ function AppContent() {
     setTimetableManualPublishBanner(null)
     setTimetableManualPublishLoading(true)
     try {
-      let res
+      let appliedDoc = null
+      let bannerText = ''
       if (timetableMode === 'historical') {
         const d = timetableGenerateDate.trim()
         if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) {
           throw new Error('Historical mode requires a valid session date (YYYY-MM-DD).')
         }
-        const execPayload = {
+        const res = await matrixApi.saveExecutionTimetable({
           tradingDate: d,
           mode: 'historical',
-          reason: 'manual_ui',
+          replay: true,
+          reason: 'manual_ui_playback',
           source: 'matrix_ui',
           streamFilters,
-        }
-        console.log('CALLING_ENDPOINT', '/api/timetable/execution', execPayload)
-        res = await matrixApi.saveExecutionTimetable(execPayload)
+        })
+        appliedDoc = await matrixApi.previewExecutionTimetable({
+          tradingDate: d,
+          mode: 'historical',
+          streamFilters,
+        })
+        const st = res.status === 'published' ? 'Published' : 'Unchanged'
+        const h = res.hash ? `${String(res.hash).slice(0, 16)}...` : '-'
+        bannerText = `${st} replay timetable for ${d}. Playback file: timetable_replay_current.json. Content hash prefix: ${h}`
       } else {
         const cur = await matrixApi.getCurrentTimetable()
         const tdRaw =
@@ -293,17 +292,21 @@ function AppContent() {
           streamFilters,
         }
         console.log('CALLING_ENDPOINT', '/api/timetable/execution', execPayload)
-        res = await matrixApi.saveExecutionTimetable(execPayload)
+        const res = await matrixApi.saveExecutionTimetable(execPayload)
+        appliedDoc = await matrixApi.getCurrentTimetable()
+        const st = res.status === 'published' ? 'Published' : 'Unchanged'
+        const h = res.hash ? `${String(res.hash).slice(0, 16)}...` : '-'
+        bannerText = `${st} (live mode). Content hash prefix: ${h}`
       }
-      const tt = await matrixApi.getCurrentTimetable()
-      setTimetableSourceMeta(timetableApiDocToSourceMeta(tt))
-      workerApplyExecutionTimetableFromApi(tt)
+      if (!appliedDoc || typeof appliedDoc !== 'object') {
+        throw new Error('Timetable API returned no document to display.')
+      }
+      setTimetableSourceMeta(timetableApiDocToSourceMeta(appliedDoc))
+      workerApplyExecutionTimetableFromApi(appliedDoc)
       setTimetableApiStatus({ loading: false, error: null })
-      const st = res.status === 'published' ? 'Published' : 'Unchanged'
-      const h = res.hash ? `${String(res.hash).slice(0, 16)}…` : '—'
       setTimetableManualPublishBanner({
         type: 'ok',
-        text: `${st} (${timetableMode} mode). Content hash prefix: ${h}`,
+        text: bannerText,
       })
     } catch (e) {
       setTimetableManualPublishBanner({
@@ -315,7 +318,7 @@ function AppContent() {
     }
   }, [streamFilters, workerApplyExecutionTimetableFromApi, timetableGenerateDate, timetableMode])
 
-  /** Timetable tab: rows only from GET /api/timetable/current (via workerExecutionTimetable). No worker merge. */
+  /** Timetable tab: rows come only from timetable API payloads (live current or historical preview). */
   const timetableRowsForDisplay = useMemo(() => {
     const streams = workerExecutionTimetable?.streams
     if (!streams?.length) return []
@@ -329,6 +332,13 @@ function AppContent() {
           : null,
     }))
   }, [workerExecutionTimetable])
+  const displayedTradingDay = useMemo(() => {
+    if (timetableMode === 'historical' && hasValidHistoricalDate) {
+      const parsed = parseYYYYMMDD(timetableGenerateDate.trim())
+      if (parsed) return applyCmeWeekendTradingDay(parsed)
+    }
+    return currentTradingDay
+  }, [currentTradingDay, hasValidHistoricalDate, timetableGenerateDate, timetableMode])
   
   // Save auto-update preference to localStorage
   useEffect(() => {
@@ -337,15 +347,7 @@ function AppContent() {
 
   // Per-stream selected columns (persisted in localStorage)
   const [selectedColumns, setSelectedColumns] = useState(() => {
-    const saved = localStorage.getItem('matrix_selected_columns')
-    if (saved) {
-      try {
-        return JSON.parse(saved)
-      } catch {
-        return {}
-      }
-    }
-    return {}
+    return readStoredJsonObject('matrix_selected_columns', {})
   })
   
   // Column selector visibility
@@ -372,34 +374,17 @@ function AppContent() {
   const [backendStreamStatsLoading, setBackendStreamStatsLoading] = useState({}) // Map of streamId -> loading state
   
   const [showStats, setShowStats] = useState(() => {
-    const saved = localStorage.getItem('matrix_show_stats')
-    if (saved) {
-      try {
-        return JSON.parse(saved)
-      } catch {
-        return {}
-      }
-    }
-    return {}
+    return readStoredJsonObject('matrix_show_stats', {})
   })
   
   // Show/hide filters per stream (persisted in localStorage)
   const [showFilters, setShowFilters] = useState(() => {
-    const saved = localStorage.getItem('matrix_show_filters')
-    if (saved) {
-      try {
-        return JSON.parse(saved)
-      } catch {
-        return {}
-      }
-    }
-    return {}
+    return readStoredJsonObject('matrix_show_filters', {})
   })
   
   // Temporary input value for multiplier (doesn't trigger recalculations)
   const [multiplierInput, setMultiplierInput] = useState(() => {
-    const saved = localStorage.getItem('matrix_master_contract_multiplier')
-    return saved ? parseFloat(saved) || 1 : 1
+    return readStoredNumber('matrix_master_contract_multiplier', 1)
   })
   
   // Infinite scroll
@@ -2913,8 +2898,6 @@ function AppContent() {
   }, [profitBreakdowns, workerReady, memoizedMasterFilteredData, masterContractMultiplier])
 
   // Trading day: GET /api/timetable/current only (`effective_session_trading_date`). No browser CME fallback.
-  const [currentTradingDay, setCurrentTradingDay] = useState(null)
-
   const [showTradingDateDebugOverlay, setShowTradingDateDebugOverlay] = useState(false)
   useEffect(() => {
     const on =
@@ -3293,7 +3276,7 @@ function AppContent() {
                 </div>
                 <div className="text-gray-400">Wall ISO UTC: {formatUtcWallIso(currentTime)}</div>
                 <div className="text-gray-400">
-                  UI day: {currentTradingDay ? dateToYYYYMMDD(currentTradingDay) : '—'}
+                  UI day: {displayedTradingDay ? dateToYYYYMMDD(displayedTradingDay) : '-'}
                   {' '}
                   (backend <code className="text-gray-500">effective_session_trading_date</code>)
                 </div>
@@ -3356,8 +3339,8 @@ function AppContent() {
                         }`}
                         title={
                           timetableMode === 'live'
-                            ? 'Disabled in Live mode — publish uses effective_session_trading_date from GET /api/timetable/current.'
-                            : 'Required for Historical mode — POST /api/timetable/execution with mode historical.'
+                            ? 'Disabled in Live mode - publish uses effective_session_trading_date from GET /api/timetable/current.'
+                            : 'Required for Historical mode - publish writes timetable_replay_current.json for playback.'
                         }
                       />
                     </label>
@@ -3367,18 +3350,27 @@ function AppContent() {
                       disabled={
                         timetableManualPublishLoading ||
                         masterLoading ||
-                        (timetableMode === 'historical' &&
-                          !/^\d{4}-\d{2}-\d{2}$/.test(timetableGenerateDate.trim()))
+                        (timetableMode === 'historical' && !hasValidHistoricalDate)
                       }
                       className="px-4 py-2 rounded font-medium text-sm bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed"
-                      title="Always POST /api/timetable/execution — Live uses current effective session; Historical uses the date above."
+                      title={
+                        timetableMode === 'live'
+                          ? 'POST /api/timetable/execution - publishes the live timetable.'
+                          : 'POST /api/timetable/execution - publishes timetable_replay_current.json for playback.'
+                      }
                     >
-                      {timetableManualPublishLoading ? 'Publishing…' : 'Publish timetable'}
+                      {timetableManualPublishLoading
+                        ? timetableMode === 'live'
+                          ? 'Publishing...'
+                          : 'Publishing replay...'
+                        : timetableMode === 'live'
+                          ? 'Publish timetable'
+                          : 'Publish replay'}
                     </button>
                   </div>
                   <div
                     className="mt-1 px-3 py-2 rounded border border-dashed border-gray-600 bg-gray-950/90 font-mono text-[11px] sm:text-xs text-gray-300 leading-snug"
-                    title="Publish path: Live = latest matrix row for current session; Historical = matrix row as-of the chosen session date."
+                    title="Mode summary: Live publishes timetable_current.json; Historical publishes timetable_replay_current.json for playback from the matrix row as-of the chosen session date."
                   >
                     <div>
                       <span className="text-gray-500">Mode:</span>{' '}
@@ -3397,10 +3389,10 @@ function AppContent() {
                           ? timetableSourceMeta?.effective_session_trading_date ||
                             timetableSourceMeta?.session_trading_date ||
                             timetableSourceMeta?.trading_date ||
-                            '—'
-                          : /^\d{4}-\d{2}-\d{2}$/.test(timetableGenerateDate.trim())
+                            '-'
+                          : hasValidHistoricalDate
                             ? timetableGenerateDate.trim()
-                            : '—'}
+                            : '-'}
                       </span>
                     </div>
                     <div>
@@ -3417,9 +3409,9 @@ function AppContent() {
                 </div>
                 <div className="text-center">
                   <div className="text-lg font-semibold text-gray-300">
-                    {currentTradingDay
-                      ? currentTradingDay.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
-                      : 'Loading session…'}
+                    {displayedTradingDay
+                      ? displayedTradingDay.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
+                      : 'Loading session...'}
                   </div>
                 </div>
                 <div className="text-right">
@@ -3476,15 +3468,13 @@ function AppContent() {
               </div>
 
               <div className="mb-4 px-4 py-2 rounded bg-gray-800 text-sm text-gray-300">
-                Live <code className="text-gray-400">timetable_current.json</code> is written by the dashboard from the on-disk{' '}
-                <span className="font-semibold text-green-400">master matrix</span>. Use{' '}
-                <span className="font-semibold text-emerald-400">Publish timetable</span> above (
-                <code className="text-gray-400">POST /api/timetable/execution</code>
-                ): <span className="text-emerald-400/90">Live</span> uses{' '}
-                <code className="text-gray-400">effective_session_trading_date</code> from{' '}
-                <code className="text-gray-400">GET /api/timetable/current</code>;{' '}
-                <span className="text-amber-400/90">Historical</span> uses the session date you pick. The grid below is read-only from{' '}
-                <code className="text-gray-400">GET /api/timetable/current</code> — no client-side recomputation.
+                Live <code className="text-gray-400">timetable_current.json</code> is written by the dashboard from the authoritative{' '}
+                <span className="font-semibold text-green-400">in-memory master matrix snapshot</span>.{' '}
+                <span className="text-emerald-400/90">Live</span> mode publishes with{' '}
+                <code className="text-gray-400">POST /api/timetable/execution</code>;{' '}
+                <span className="text-amber-400/90">Historical</span> mode publishes{' '}
+                <code className="text-gray-400">timetable_replay_current.json</code> for playback and then refreshes the grid with{' '}
+                <code className="text-gray-400">POST /api/timetable/preview</code>, so it does not overwrite the live timetable.
               </div>
               {timetableManualPublishBanner ? (
                 <div

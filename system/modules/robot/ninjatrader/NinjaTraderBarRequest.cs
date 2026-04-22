@@ -76,6 +76,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 // Use ManualResetEvent to wait for async callback
                 var waitHandle = new System.Threading.ManualResetEventSlim(false);
+                Exception? callbackException = null;
                 
                 // Request bars asynchronously using callback
                 barsRequest.Request((request, errorCode, errorMessage) =>
@@ -84,7 +85,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     string? firstCloseTimeUtc = null;
                     string? lastCloseTimeUtc = null;
                     int barsCountReceived = 0;
-                    Exception? callbackException = null;
                     
                     try
                     {
@@ -135,7 +135,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 note = "Error occurred in BarsRequest callback handler"
                             });
                         }
-                        throw new InvalidOperationException($"BarsRequest callback error: {callbackEx.Message}", callbackEx);
                     }
                     finally
                     {
@@ -161,6 +160,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (!waitHandle.Wait(TimeSpan.FromSeconds(30)))
                 {
                     throw new TimeoutException("BarsRequest timed out after 30 seconds");
+                }
+
+                if (callbackException != null)
+                {
+                    throw new InvalidOperationException($"BarsRequest callback error: {callbackException.Message}", callbackException);
                 }
 
                 // Log raw result after Request() completes

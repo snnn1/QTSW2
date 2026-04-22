@@ -57,7 +57,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool _engineReady = false; // Single latch: true once engine is fully initialized and ready
         private bool _initFailed = false; // HARDENING FIX 3: Fail-closed flag - if true, strategy will not function
         
-        // Track filtered callbacks for misconfiguration detection
+        // Track filtered account-wide callbacks for diagnostics
         private int _filteredOrderUpdateCount = 0;
         private int _filteredExecutionUpdateCount = 0;
         
@@ -205,6 +205,66 @@ namespace NinjaTrader.NinjaScript.Strategies
             return false;
         }
 
+        /// <summary>
+        /// Queue BarsRequest work back onto the NinjaTrader strategy thread.
+        /// BarsRequest has been unstable when invoked from background worker threads during playback.
+        /// </summary>
+        private void QueueBarsRequestOnStrategyThread(string instrumentName, DateTimeOffset barsRequestEventUtc, string failureEventType, string contextNote)
+        {
+            if (_engine == null) return;
+
+            try
+            {
+                TriggerCustomEvent(_ =>
+                {
+                    if (_engine == null)
+                        return;
+
+                    if (_engine.IsShutdownRequested || _initFailed || !_engineReady)
+                    {
+                        _engine.LogEngineEvent(barsRequestEventUtc, failureEventType, new Dictionary<string, object>
+                        {
+                            { "instrument", instrumentName },
+                            { "reason", "Engine shutting down before BarsRequest execution" },
+                            { "note", contextNote }
+                        });
+                        _engine.MarkBarsRequestCompleted(instrumentName, barsRequestEventUtc);
+                        return;
+                    }
+
+                    try
+                    {
+                        RequestHistoricalBarsForPreHydration(instrumentName, barsRequestEventUtc);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log($"WARNING: Strategy-thread BarsRequest failed for {instrumentName}: {ex.Message}", LogLevel.Warning);
+                        _engine.LogEngineEvent(barsRequestEventUtc, failureEventType, new Dictionary<string, object>
+                        {
+                            { "instrument", instrumentName },
+                            { "error", ex.Message },
+                            { "error_type", ex.GetType().Name },
+                            { "note", contextNote }
+                        });
+                        _engine.MarkBarsRequestCompleted(instrumentName, barsRequestEventUtc);
+                    }
+                }, null);
+            }
+            catch (Exception ex)
+            {
+                Log($"WARNING: Failed to marshal BarsRequest onto strategy thread for {instrumentName}: {ex.Message}", LogLevel.Warning);
+                _engine.LogEngineEvent(barsRequestEventUtc, failureEventType, new Dictionary<string, object>
+                {
+                    { "instrument", instrumentName },
+                    { "error", ex.Message },
+                    { "error_type", ex.GetType().Name },
+                    { "reason", "TriggerCustomEvent scheduling failure" },
+                    { "note", contextNote }
+                });
+                _engine.MarkBarsRequestCompleted(instrumentName, barsRequestEventUtc);
+            }
+        }
+
 #if NINJATRADER
         /// <summary>
         /// Detect Market Replay (Playback Connection). Primary signal: <see cref="Connection.Options"/>.Name contains "Playback"
@@ -311,6 +371,16 @@ namespace NinjaTrader.NinjaScript.Strategies
             catch { /* never throw from trace */ }
         }
 
+        // Keep NinjaTrader's visible log focused on actionable warnings/errors by default.
+        // Detailed startup and BarsRequest tracing remains available in engine events and lifecycle files.
+        private const bool EmitVerboseNtStartupLogs = false;
+
+        private void LogVerboseNtStartup(string message)
+        {
+            if (EmitVerboseNtStartupLogs)
+                Log(message, LogLevel.Information);
+        }
+
         public RobotSimStrategy()
         {
             // Generate unique instance ID for forensics
@@ -384,7 +454,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
 
                     _simAccountVerified = true;
-                    Log($"Non-live account verified: {Account.Name}", LogLevel.Information);
+                    LogVerboseNtStartup($"Non-live account verified: {Account.Name}");
                     
                     // FUTURE HARDENING: Check for duplicate instance deployment
                     // INVARIANT: (account, executionInstrument) must be unique
@@ -458,11 +528,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                     
                     // FUTURE HARDENING: Log instance ID once at startup for forensics
-                    Log($"Strategy instance initialized: InstanceId={_instanceId}, Account={accountName}, ExecutionInstrument={executionInstrumentFullName}", LogLevel.Information);
+                    LogVerboseNtStartup($"Strategy instance initialized: InstanceId={_instanceId}, Account={accountName}, ExecutionInstrument={executionInstrumentFullName}");
 
                     // Diagnostic: Log NINJATRADER compilation status
 #if NINJATRADER
-                    Log("NINJATRADER preprocessor directive is DEFINED - real NT API will be used", LogLevel.Information);
+                    LogVerboseNtStartup("NINJATRADER preprocessor directive is DEFINED - real NT API will be used");
 #else
                     Log("WARNING: NINJATRADER preprocessor directive is NOT DEFINED - mock implementation will be used. " +
                         "Add <DefineConstants>NINJATRADER</DefineConstants> to your .csproj file and rebuild.", LogLevel.Warning);
@@ -539,7 +609,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 var tradingDateFromEngine = _engine.GetTradingDate();
                 var streamCount = _engine.GetStreamCount();
                 if (!string.IsNullOrEmpty(timetablePath))
-                    Log($"Timetable read: path={timetablePath}, trading_date={(string.IsNullOrEmpty(tradingDateFromEngine) ? "(not locked)" : tradingDateFromEngine)}, stream_count={streamCount}", LogLevel.Information);
+                    LogVerboseNtStartup($"Timetable read: path={timetablePath}, trading_date={(string.IsNullOrEmpty(tradingDateFromEngine) ? "(not locked)" : tradingDateFromEngine)}, stream_count={streamCount}");
                 else
                     Log("Timetable path not set - engine may not have loaded timetable", LogLevel.Warning);
                 TraceLifecycle("DataLoaded_AFTER_TIMETABLE_LOG", engineInstrumentName, "DataLoaded");
@@ -556,14 +626,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (string.IsNullOrEmpty(tradingDateStr))
                 {
                     var errorMsg = "CRITICAL: Engine started but trading date not locked. " +
-                                 "This indicates timetable was invalid or missing trading_date. " +
+                                 "Startup validation failed before trading date lock. " +
                                  "Cannot request historical bars without trading date. " +
-                                 "Check logs for TIMETABLE_INVALID or TIMETABLE_MISSING_TRADING_DATE events.";
+                                 $"Timetable path: {timetablePath ?? "(unset)"}, stream_count: {streamCount}. " +
+                                 "Check logs for TIMETABLE_INVALID, TIMETABLE_MISSING_TRADING_DATE, TIMETABLE_AUTHORITY_SESSION_MISMATCH, or ENGINE_STAND_DOWN events.";
                     Log(errorMsg, LogLevel.Error);
-                    // CRITICAL FIX: Don't throw exception - log error and continue
-                    // Throwing prevents strategy from transitioning to Realtime state
-                    // Strategy will continue but may not function properly
-                    Log("WARNING: Continuing despite trading date not locked - strategy may not function properly", LogLevel.Warning);
+                    // Don't throw here: throwing prevents transition to Realtime and hides the primary
+                    // timetable failure. The critical error above is the operator-facing signal.
                 }
                 TraceLifecycle("DataLoaded_BEFORE_EXECUTION_CONTEXT_WIRE", engineInstrumentName, "DataLoaded");
 
@@ -608,7 +677,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _engineReady = true;
                 TraceLifecycle("DataLoaded_ENGINE_READY_TRUE", Instrument?.MasterInstrument?.Name, "DataLoaded");
                 var instrumentName = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
-                Log($"Engine ready (execution context wired) - proceeding to BarsRequest. Instrument={instrumentName}, EngineReady={_engineReady}, InitFailed={_initFailed}", LogLevel.Information);
+                LogVerboseNtStartup($"Engine ready (execution context wired) - proceeding to BarsRequest. Instrument={instrumentName}, EngineReady={_engineReady}, InitFailed={_initFailed}");
 
                 if (_engine != null)
                 {
@@ -631,14 +700,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     if (!TryGetBarsRequestEventTimeUtc(out var barsReqEventUtcDl))
                     {
-                        Log("BARSREQUEST skipped: primary series bar time unavailable — cannot align BarsRequest to playback/event clock.", LogLevel.Warning);
+                        LogVerboseNtStartup("BARSREQUEST skipped: primary series bar time unavailable yet; cannot align BarsRequest to playback/event clock.");
                     }
                     else
                     {
                     var executionInstruments = _engine.GetAllExecutionInstrumentsForBarsRequest();
                     
                     // NQ2 FIX: Enhanced logging for BarsRequest initiation
-                    Log($"BARSREQUEST_INIT: Attempting to request bars. Execution instruments count: {executionInstruments.Count}", LogLevel.Information);
+                    LogVerboseNtStartup($"BARSREQUEST_INIT: Attempting to request bars. Execution instruments count: {executionInstruments.Count}");
                     
                     if (_engine != null)
                     {
@@ -659,7 +728,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         {
                             // Mark as pending immediately (synchronously) before queuing BarsRequest
                             _engine.MarkBarsRequestPending(instrument, barsReqEventUtcDl);
-                            Log($"BarsRequest marked as pending for {instrument} (before queuing)", LogLevel.Information);
+                            LogVerboseNtStartup($"BarsRequest marked as pending for {instrument} (before queuing)");
                         }
                         catch (Exception markEx)
                         {
@@ -669,13 +738,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                     
                     if (executionInstruments.Count == 0)
                     {
-                        var warningMsg = $"WARNING: No execution instruments found for BarsRequest. " +
-                                       $"This may indicate: " +
-                                       $"1) Timetable has no enabled streams, " +
-                                       $"2) Streams were not created during engine.Start(), " +
-                                       $"3) All streams are committed. " +
-                                       $"Skipping BarsRequest - engine will continue without pre-hydration bars. " +
-                                       $"Check logs for STREAMS_CREATED events.";
+                        var startupBlocked = string.IsNullOrEmpty(tradingDateStr) || streamCount == 0;
+                        var warningMsg = startupBlocked
+                            ? $"WARNING: No execution instruments found for BarsRequest because engine startup did not create streams. " +
+                              $"Timetable path: {timetablePath ?? "(unset)"}, trading_date={(string.IsNullOrEmpty(tradingDateStr) ? "(not locked)" : tradingDateStr)}, stream_count={streamCount}. " +
+                              $"Check logs for TIMETABLE_INVALID, TIMETABLE_MISSING_TRADING_DATE, TIMETABLE_AUTHORITY_SESSION_MISMATCH, ENGINE_STAND_DOWN, or STREAMS_CREATED events."
+                            : $"WARNING: No execution instruments found for BarsRequest. " +
+                              $"This may indicate: " +
+                              $"1) Timetable has no enabled streams, " +
+                              $"2) Streams were not created during engine.Start(), " +
+                              $"3) All streams are committed. " +
+                              $"Skipping BarsRequest - engine will continue without pre-hydration bars. " +
+                              $"Check logs for STREAMS_CREATED events.";
                         Log(warningMsg, LogLevel.Warning);
                         
                         _engine.LogEngineEvent(barsReqEventUtcDl, "BARSREQUEST_SKIPPED", new Dictionary<string, object>
@@ -685,16 +759,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                         });
                         
                         // Critical event (HealthMonitor removed; tail logs for CRITICAL_ENGINE_EVENT to alert)
-                        _engine?.LogEngineEvent(barsReqEventUtcDl, "CRITICAL_ENGINE_EVENT", new Dictionary<string, object>
+                        if (!startupBlocked)
                         {
-                            ["critical_event_type"] = "BARSREQUEST_SKIPPED_NO_INSTRUMENTS",
-                            ["reason"] = "No execution instruments found",
-                            ["note"] = "BarsRequest was skipped - streams may not have historical bars"
-                        });
+                            _engine?.LogEngineEvent(barsReqEventUtcDl, "CRITICAL_ENGINE_EVENT", new Dictionary<string, object>
+                            {
+                                ["critical_event_type"] = "BARSREQUEST_SKIPPED_NO_INSTRUMENTS",
+                                ["reason"] = "No execution instruments found",
+                                ["note"] = "BarsRequest was skipped - streams may not have historical bars"
+                            });
+                        }
                     }
                     else
                     {
-                        Log($"Requesting historical bars for {executionInstruments.Count} execution instrument(s): {string.Join(", ", executionInstruments)}", LogLevel.Information);
+                        LogVerboseNtStartup($"Requesting historical bars for {executionInstruments.Count} execution instrument(s): {string.Join(", ", executionInstruments)}");
                         
                         // NOTE: BarsRequest already marked as pending above (before checking count)
                         // This ensures streams wait even if they process ticks before BarsRequest completes
@@ -733,43 +810,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                                     continue;
                                 }
                                 
-                                // Fire-and-forget BarsRequest - don't block DataLoaded initialization
-                                // Capture executionInstrument in local variable for closure
-                                var instrument = executionInstrument;
-                                
-                                // NOTE: BarsRequest already marked as pending above (before this loop)
-                                // This ensures streams wait even if they initialize before BarsRequest is queued
-                                
-                                var capturedBarsReqUtc = barsReqEventUtcDl;
-                                ThreadPool.QueueUserWorkItem(_ =>
-                                {
-                                    try
-                                    {
-                                        RequestHistoricalBarsForPreHydration(instrument, capturedBarsReqUtc);
-                                    }
-                                    catch (Exception ex)
-                                    {
-                                        // Log error but don't affect strategy initialization
-                                        Log($"WARNING: Background BarsRequest failed for {instrument}: {ex.Message}", LogLevel.Warning);
-                                        
-                                        if (_engine != null)
-                                        {
-                                            _engine.LogEngineEvent(capturedBarsReqUtc, "BARSREQUEST_BACKGROUND_FAILED", new Dictionary<string, object>
-                                            {
-                                                { "instrument", instrument },
-                                                { "error", ex.Message },
-                                                { "error_type", ex.GetType().Name },
-                                                { "note", "BarsRequest failed in background thread - strategy continues with live bars only" }
-                                            });
-                                            
-                                            // Mark as completed (failed) so range lock can proceed
-                                            // This prevents indefinite blocking if BarsRequest fails
-                                            _engine.MarkBarsRequestCompleted(instrument, capturedBarsReqUtc);
-                                        }
-                                    }
-                                });
-                                
-                                Log($"BarsRequest queued for background execution: {executionInstrument}", LogLevel.Information);
+                                QueueBarsRequestOnStrategyThread(
+                                    executionInstrument,
+                                    barsReqEventUtcDl,
+                                    "BARSREQUEST_BACKGROUND_FAILED",
+                                    "BarsRequest failed after strategy-thread scheduling - strategy continues with live bars only");
+
+                                LogVerboseNtStartup($"BarsRequest queued for strategy-thread execution: {executionInstrument}");
                             }
                             catch (Exception ex)
                             {
@@ -779,7 +826,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                             }
                         }
                         
-                        Log($"BarsRequest queued for {executionInstruments.Count} instrument(s) - continuing initialization without waiting", LogLevel.Information);
+                        LogVerboseNtStartup($"BarsRequest queued for {executionInstruments.Count} instrument(s) on strategy thread - continuing initialization without waiting");
                     }
                     }
                 }
@@ -827,7 +874,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 TraceLifecycle("REALTIME_ENTER", Instrument?.MasterInstrument?.Name, "Realtime");
                 // DIAGNOSTIC: Log Realtime state transition to help diagnose "stuck in loading" issues
                 var instrumentName = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
-                Log($"REALTIME_STATE_REACHED: Strategy transitioned to Realtime state. Instrument={instrumentName}, EngineReady={_engineReady}, InitFailed={_initFailed}", LogLevel.Information);
+                LogVerboseNtStartup($"REALTIME_STATE_REACHED: Strategy transitioned to Realtime state. Instrument={instrumentName}, EngineReady={_engineReady}, InitFailed={_initFailed}");
                 
                 if (_engine != null)
                 {
@@ -863,14 +910,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                     {
                         if (!TryGetBarsRequestEventTimeUtc(out var barsReqEventUtcRt))
                         {
-                            Log("RESTART_BARSREQUEST skipped: primary series bar time unavailable for playback/event clock.", LogLevel.Warning);
+                            LogVerboseNtStartup("RESTART_BARSREQUEST skipped: primary series bar time unavailable yet for playback/event clock.");
                         }
                         else
                         {
                         var instrumentsNeedingBarsRequest = _engine.GetInstrumentsNeedingRestartBarsRequest();
                         if (instrumentsNeedingBarsRequest.Count > 0)
                         {
-                            Log($"RESTART_BARSREQUEST: Detected {instrumentsNeedingBarsRequest.Count} instrument(s) needing BarsRequest for restart", LogLevel.Information);
+                            LogVerboseNtStartup($"RESTART_BARSREQUEST: Detected {instrumentsNeedingBarsRequest.Count} instrument(s) needing BarsRequest for restart");
                             
                             foreach (var instrument in instrumentsNeedingBarsRequest)
                             {
@@ -878,7 +925,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 var canonicalInstrument = Instrument?.MasterInstrument?.Name ?? "";
                                 if (string.Equals(instrument, canonicalInstrument, StringComparison.OrdinalIgnoreCase))
                                 {
-                                    Log($"RESTART_BARSREQUEST: Triggering BarsRequest for {instrument} due to restart", LogLevel.Information);
+                                    LogVerboseNtStartup($"RESTART_BARSREQUEST: Triggering BarsRequest for {instrument} due to restart");
                                     _engine?.LogEngineEvent(barsReqEventUtcRt, "BARS_REQUEST_TRIGGERED_FOR_REBUILD", new Dictionary<string, object>
                                     {
                                         { "instrument", instrument },
@@ -891,35 +938,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                                         _engine.MarkBarsRequestPending(instrument, barsReqEventUtcRt);
                                     }
                                     
-                                    // Trigger BarsRequest in background thread (non-blocking)
-                                    var instrumentForClosure = instrument;
-                                    var capturedRestartUtc = barsReqEventUtcRt;
-                                    ThreadPool.QueueUserWorkItem(_ =>
-                                    {
-                                        try
-                                        {
-                                            RequestHistoricalBarsForPreHydration(instrumentForClosure, capturedRestartUtc);
-                                        }
-                                        catch (Exception ex)
-                                        {
-                                            Log($"WARNING: Restart BarsRequest failed for {instrumentForClosure}: {ex.Message}", LogLevel.Warning);
-                                            
-                                            if (_engine != null)
-                                            {
-                                                _engine.LogEngineEvent(capturedRestartUtc, "BARSREQUEST_RESTART_FAILED", new Dictionary<string, object>
-                                                {
-                                                    { "instrument", instrumentForClosure },
-                                                    { "error", ex.Message },
-                                                    { "error_type", ex.GetType().Name },
-                                                    { "note", "Restart BarsRequest failed - strategy continues with live bars only" }
-                                                });
-                                                
-                                                // Mark as completed (failed) so range lock can proceed
-                                                // This prevents indefinite blocking if BarsRequest fails
-                                                _engine.MarkBarsRequestCompleted(instrumentForClosure, capturedRestartUtc);
-                                            }
-                                        }
-                                    });
+                                    QueueBarsRequestOnStrategyThread(
+                                        instrument,
+                                        barsReqEventUtcRt,
+                                        "BARSREQUEST_RESTART_FAILED",
+                                        "Restart BarsRequest failed after strategy-thread scheduling - strategy continues with live bars only");
                                 }
                             }
                         }
@@ -938,7 +961,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Terminated)
             {
+                _engineReady = false;
+                _initFailed = true;
                 TraceLifecycle("Terminated_ENTER", Instrument?.MasterInstrument?.Name, "Terminated", _instanceId);
+                if (Account != null)
+                {
+                    try { Account.OrderUpdate -= OnOrderUpdate; } catch { }
+                    try { Account.ExecutionUpdate -= OnExecutionUpdate; } catch { }
+                }
                 // Log to robot JSONL for ops: NinjaTrader disabled strategy (common cause: lost price connection 4+ times in 5 min)
                 _engine?.LogEngineEvent(DateTimeOffset.UtcNow, "STRATEGY_DISABLED_BY_NINJATRADER", new Dictionary<string, object>
                 {
@@ -963,7 +993,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                             _activeInstanceOwnerByKey.Remove(instanceKey);
                     }
                     
-                    // Log filtered callback counts if any occurred (useful signal for misconfiguration)
+                    // Log filtered callback counts if any occurred for shutdown diagnostics.
                     if (_filteredOrderUpdateCount > 0 || _filteredExecutionUpdateCount > 0)
                     {
                         Log($"Instance terminated: InstanceId={_instanceId}, FilteredOrderUpdates={_filteredOrderUpdateCount}, FilteredExecutionUpdates={_filteredExecutionUpdateCount}", LogLevel.Information);
@@ -980,6 +1010,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         /// </summary>
         private void RequestHistoricalBarsForPreHydration(string instrumentName, DateTimeOffset barsRequestEventUtc)
         {
+            var requestedInstrumentName = instrumentName?.Trim().ToUpperInvariant() ?? "";
             
             // FIX #3: Ensure every code path logs a final disposition event
             // Early return guard - log skipped
@@ -998,6 +1029,45 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 return;
             }
+
+            var strategyInstrumentName = ((Instrument.FullName?.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault())
+                                          ?? Instrument.MasterInstrument?.Name
+                                          ?? string.Empty).Trim().ToUpperInvariant();
+            if (string.IsNullOrWhiteSpace(requestedInstrumentName))
+            {
+                _engine.LogEngineEvent(barsRequestEventUtc, "BARSREQUEST_SKIPPED", new Dictionary<string, object>
+                {
+                    { "instrument", requestedInstrumentName },
+                    { "reason", "Requested instrument name is empty" },
+                    { "note", "Skipping BarsRequest - invalid instrument request" }
+                });
+                return;
+            }
+            if (!string.Equals(requestedInstrumentName, strategyInstrumentName, StringComparison.OrdinalIgnoreCase))
+            {
+                _engine.LogEngineEvent(barsRequestEventUtc, "BARSREQUEST_SKIPPED", new Dictionary<string, object>
+                {
+                    { "instrument", requestedInstrumentName },
+                    { "strategy_instrument", strategyInstrumentName },
+                    { "reason", "Requested instrument does not match strategy instrument" },
+                    { "note", "Skipping BarsRequest to avoid cross-instrument NinjaTrader access on the wrong strategy instance" }
+                });
+                _engine.MarkBarsRequestCompleted(requestedInstrumentName, barsRequestEventUtc);
+                return;
+            }
+            if (_engine.IsShutdownRequested)
+            {
+                _engine.LogEngineEvent(barsRequestEventUtc, "BARSREQUEST_SKIPPED", new Dictionary<string, object>
+                {
+                    { "instrument", requestedInstrumentName },
+                    { "reason", "Engine shutdown requested" },
+                    { "note", "Skipping BarsRequest because strategy termination has started" }
+                });
+                _engine.MarkBarsRequestCompleted(requestedInstrumentName, barsRequestEventUtc);
+                return;
+            }
+
+            instrumentName = requestedInstrumentName;
             
             // HARDENING FIX 2: BarsRequest is non-blocking - skip if instrument can't be resolved
             // Use strategy's Instrument directly - don't call Instrument.GetInstrument() here
@@ -1055,7 +1125,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // CRITICAL: Get time range covering ALL enabled streams for this instrument
                 // This ensures S1 (02:00) and S2 (08:00) streams both get their historical bars
                 // The range covers from earliest range_start to latest slot_time across all enabled streams
-                instrumentName = Instrument.MasterInstrument.Name.ToUpperInvariant();
                 var timeRange = _engine.GetBarsRequestTimeRange(instrumentName);
                 
                 // HARDENING FIX 2: BarsRequest is non-blocking - skip if time range can't be determined
@@ -1112,7 +1181,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return;
                 }
                 
-                Log($"Using BarsRequest time range covering all enabled streams: range_start={rangeStartChicago}, latest_slot={slotTimeChicago}", LogLevel.Information);
+                LogVerboseNtStartup($"Using BarsRequest time range covering all enabled streams: range_start={rangeStartChicago}, latest_slot={slotTimeChicago}");
 
                 // CRITICAL: Only request bars up to "now" to avoid injecting future bars
                 // If we request bars up to slotTimeChicago (07:30) but strategy starts at 07:25,
@@ -1172,10 +1241,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Log restart detection if restarting after slot time (on same trading date)
                 if (nowChicagoDate == tradingDate && nowChicago >= slotTimeChicagoTime)
                 {
-                    Log($"RESTART_POLICY: Restarting after slot time ({slotTimeChicago}) - BarsRequest requesting bars up to current time (current_utc: {currentTimeUtcHhmm}, current_chicago: {currentTimeChicagoHhmm}) for visibility", LogLevel.Information);
+                    LogVerboseNtStartup($"RESTART_POLICY: Restarting after slot time ({slotTimeChicago}) - BarsRequest requesting bars up to current time (current_utc: {currentTimeUtcHhmm}, current_chicago: {currentTimeChicagoHhmm}) for visibility");
                 }
                 
-                Log($"Requesting historical bars from NinjaTrader for {tradingDateStr} ({rangeStartChicago} to {endTimeChicago})", LogLevel.Information);
+                LogVerboseNtStartup($"Requesting historical bars from NinjaTrader for {tradingDateStr} ({rangeStartChicago} to {endTimeChicago})");
                 
                 // Log BarsRequest initialization event
                 if (_engine != null)
@@ -1200,6 +1269,22 @@ namespace NinjaTrader.NinjaScript.Strategies
                 var requestStartUtc = timeService.ConvertChicagoToUtc(requestStartChicago);
                 var requestEndChicago = timeService.ConstructChicagoTime(tradingDate, endTimeChicago);
                 var requestEndUtc = timeService.ConvertChicagoToUtc(requestEndChicago);
+                var requestedBarCount = Math.Max(0, (int)Math.Round((requestEndChicago - requestStartChicago).TotalMinutes, MidpointRounding.AwayFromZero));
+                if (requestStartUtc >= requestEndUtc)
+                {
+                    _engine.LogEngineEvent(barsReqEventUtc, "BARSREQUEST_SKIPPED", new Dictionary<string, object>
+                    {
+                        { "instrument", instrumentName },
+                        { "trading_date", tradingDateStr },
+                        { "range_start_time", rangeStartChicago },
+                        { "end_time", endTimeChicago },
+                        { "start_utc", requestStartUtc.ToString("o") },
+                        { "end_utc", requestEndUtc.ToString("o") },
+                        { "reason", "BarsRequest range is empty or inverted" },
+                        { "note", "Skipping BarsRequest to avoid invalid NinjaTrader BarsRequest boundaries" }
+                    });
+                    return;
+                }
                 
                 // Log BARSREQUEST_REQUESTED event
                 try
@@ -1214,6 +1299,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         { "request_end_chicago", endTimeChicago },
                         { "start_utc", requestStartUtc.ToString("o") },
                         { "end_utc", requestEndUtc.ToString("o") },
+                        { "requested_bar_count", requestedBarCount },
                         { "bars_period", "1m" },
                         { "trading_hours_template", Instrument.MasterInstrument.TradingHours?.Name ?? "UNKNOWN" },
                         { "execution_mode", "SIM" }
@@ -1222,7 +1308,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 catch
                 {
                     // LogEngineEvent not available - log using NT Log method instead
-                    Log($"BARSREQUEST_REQUESTED: {tradingDateStr} ({rangeStartChicago} to {endTimeChicago})", LogLevel.Information);
+                    LogVerboseNtStartup($"BARSREQUEST_REQUESTED: {tradingDateStr} ({rangeStartChicago} to {endTimeChicago})");
                 }
 
                 // Request bars using helper class (only up to current time)
@@ -1321,17 +1407,15 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 if (bars.Count == 0)
                 {
-                    // No bars returned - this may be acceptable if started after slot_time, but log as warning for visibility
+                    // No bars returned - this may be acceptable if started after slot_time.
+                    // Keep the NT console message short; detailed timing stays in structured engine logs.
                     var isAfterSlot = false;
                     if (TimeSpan.TryParse(endTimeChicago.Contains(":") ? endTimeChicago : endTimeChicago + ":00", out var slotEnd))
                         isAfterSlot = nowChicago.TimeOfDay > slotEnd;
-                    var expectedNote = isAfterSlot
-                        ? $" current_utc: {currentTimeUtcHhmm}, current_chicago: {currentTimeChicagoHhmm} is after slot end {endTimeChicago} (Chicago) — this is expected when starting the strategy late."
-                        : "";
-                    var errorMsg = $"BarsRequest returned 0 bars for {tradingDateStr} {rangeStartChicago} to {endTimeChicago} (current_utc: {currentTimeUtcHhmm}, current_chicago: {currentTimeChicagoHhmm}).{expectedNote} " +
-                                 $"If started before slot: confirm historical data exists for this date. " +
-                                 $"Range will use live bars only; breakout levels may be delayed until first bar.";
-                    Log(errorMsg, LogLevel.Warning);
+                    var logMsg = isAfterSlot
+                        ? $"BarsRequest requested {requestedBarCount} 1m bars for {tradingDateStr} {rangeStartChicago} to {endTimeChicago} and received 0. Started after slot end, so this can be expected. Using live bars only until the first bar arrives."
+                        : $"BarsRequest requested {requestedBarCount} 1m bars for {tradingDateStr} {rangeStartChicago} to {endTimeChicago} and received 0. Confirm historical data exists for this date. Using live bars only until the first bar arrives.";
+                    Log(logMsg, isAfterSlot ? LogLevel.Information : LogLevel.Warning);
                     
                     // FIX #3: Log final disposition - EXECUTED with zero count
                     if (_engine != null)
@@ -1340,6 +1424,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         {
                             { "instrument", instrumentName },
                             { "trading_date", tradingDateStr },
+                            { "requested_bar_count", requestedBarCount },
                             { "bars_returned", 0 },
                             { "first_bar_utc", (string?)null },
                             { "last_bar_utc", (string?)null },
@@ -1365,7 +1450,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // This ensures micro futures (MYM) route to base instrument streams (YM) via canonical mapping
                     // Note: Streams should exist by now (created in engine.Start())
                     _engine.LoadPreHydrationBars(instrumentName, bars, barsReqEventUtc);
-                    Log($"Loaded {bars.Count} historical bars from NinjaTrader for pre-hydration", LogLevel.Information);
+                    Log($"BarsRequest requested {requestedBarCount} 1m bars for {tradingDateStr} {rangeStartChicago} to {endTimeChicago} and received {bars.Count}.", LogLevel.Information);
                     
                     // FIX #3: Log final disposition - EXECUTED with bar count and timestamps
                     if (_engine != null)
@@ -1377,6 +1462,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         {
                             { "instrument", instrumentName },
                             { "trading_date", tradingDateStr },
+                            { "requested_bar_count", requestedBarCount },
                             { "bars_returned", bars.Count },
                             { "first_bar_utc", firstBarUtc },
                             { "last_bar_utc", lastBarUtc },
@@ -1390,12 +1476,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                         
                         // Also log if count is unexpectedly low (less than 50% of expected)
                         // Calculate expected bar count (rough estimate: 1 bar per minute)
-                        var rangeStartTime = timeService.ConstructChicagoTime(tradingDate, rangeStartChicago);
-                        var endTime = (nowChicagoDate == tradingDate && nowChicago < slotTimeChicagoTime)
-                            ? nowChicago
-                            : timeService.ConstructChicagoTime(tradingDate, endTimeChicago);
-                        var expectedMinutes = (int)(endTime - rangeStartTime).TotalMinutes;
-                        var expectedBarCount = Math.Max(0, expectedMinutes);
+                        var expectedBarCount = requestedBarCount;
                         
                         if (bars.Count < expectedBarCount * 0.5 && expectedBarCount > 10)
                         {
@@ -1492,7 +1573,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             
             var instrumentName = Instrument?.MasterInstrument?.Name ?? "UNKNOWN";
             var adapterType = rawAdapter?.GetType().Name ?? "UNKNOWN";
-            Log($"NT context wired to adapter: Account={Account.Name}, Instrument={instrumentName}, Adapter={adapterType}", LogLevel.Information);
+            LogVerboseNtStartup($"NT context wired to adapter: Account={Account.Name}, Instrument={instrumentName}, Adapter={adapterType}");
             
             // DIAGNOSTIC: Log adapter wiring completion
             if (_engine != null)
@@ -1511,7 +1592,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             try
             {
                 // Dormant: init failed or engine not ready — skip all work immediately (Tier 2.1)
-                if (_initFailed || !_engineReady || _engine is null) return;
+                if (_initFailed || !_engineReady || _engine is null || _engine.IsShutdownRequested) return;
 
                 // 1-second series: deterministic drain cadence when primary series stalls (no ticks / thin liquidity).
                 if (BarsInProgress == VERIFY_SECONDARY_BARS_IN_PROGRESS)
@@ -2518,6 +2599,19 @@ namespace NinjaTrader.NinjaScript.Strategies
         }
 
         /// <summary>
+        /// Resolve the execution instrument key owned by this strategy instance.
+        /// Order callbacks are account-wide in NinjaTrader, so filtering must align
+        /// with execution ownership rather than raw chart Instrument object identity.
+        /// </summary>
+        private string GetStrategyExecutionInstrumentKey()
+        {
+            return ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(
+                Account?.Name,
+                Instrument,
+                _engine?.GetExecutionInstrument());
+        }
+
+        /// <summary>
         /// NT OrderUpdate event handler - forwards to adapter.
         /// </summary>
         private void OnOrderUpdate(object sender, OrderEventArgs e)
@@ -2529,24 +2623,19 @@ namespace NinjaTrader.NinjaScript.Strategies
                 
                 if (_engine is null) return;
                 
-                // CRITICAL FIX: Filter orders by instrument to prevent cross-instance order tracking failures
-                // When multiple strategy instances run on the same account, all instances receive OrderUpdate
-                // callbacks for ALL orders. Each instance should only process orders for its own instrument.
-                // This prevents "EXECUTION_UPDATE_UNKNOWN_ORDER" errors when Instance B receives updates
-                // for orders submitted by Instance A.
-                if (e.Order?.Instrument != Instrument)
+                // NinjaTrader fans out account-wide OrderUpdate callbacks to every strategy instance on the
+                // account. Process only the callbacks that belong to this instance's execution instrument.
+                if (e?.Order?.Instrument == null)
                 {
-                    // FUTURE HARDENING: Warn (not error) if filtered callback occurs
-                    // Useful signal if someone misconfigures charts (e.g., same instrument, multiple instances)
                     _filteredOrderUpdateCount++;
-                    if (_filteredOrderUpdateCount == 1 || _filteredOrderUpdateCount % 10 == 0)
-                    {
-                        // Log first occurrence and every 10th occurrence (rate-limited)
-                        Log($"WARNING: OrderUpdate filtered - order instrument '{e.Order?.Instrument?.FullName ?? "NULL"}' " +
-                            $"does not match strategy instrument '{Instrument?.FullName ?? "NULL"}'. " +
-                            $"This may indicate misconfiguration (multiple instances on same instrument). " +
-                            $"Filtered count: {_filteredOrderUpdateCount}, InstanceId={_instanceId}", LogLevel.Warning);
-                    }
+                    return;
+                }
+
+                var orderInstrumentKey = ExecutionUpdateRouter.GetExecutionInstrumentKeyFromOrder(e.Order.Instrument);
+                var strategyInstrumentKey = GetStrategyExecutionInstrumentKey();
+                if (!string.Equals(orderInstrumentKey, strategyInstrumentKey, StringComparison.OrdinalIgnoreCase))
+                {
+                    _filteredOrderUpdateCount++;
                     return;
                 }
 
@@ -2579,13 +2668,21 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     try
                     {
+                        var orderId = "N/A";
+                        var orderState = "N/A";
+                        if (e != null && e.Order != null)
+                        {
+                            orderId = e.Order.OrderId ?? "N/A";
+                            orderState = e.Order.OrderState.ToString();
+                        }
+
                         _engine.LogEngineEvent(DateTimeOffset.UtcNow, "ONORDERUPDATE_EXCEPTION", new Dictionary<string, object>
                         {
                             { "exception_type", ex.GetType().Name },
                             { "exception_message", ex.Message },
                             { "stack_trace", ex.StackTrace ?? "N/A" },
-                            { "order_id", e?.Order?.OrderId ?? "N/A" },
-                            { "order_state", e?.Order?.OrderState.ToString() ?? "N/A" },
+                            { "order_id", orderId },
+                            { "order_state", orderState },
                             { "note", "Exception caught to prevent chart crash - strategy will continue" }
                         });
                     }

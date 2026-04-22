@@ -16,13 +16,13 @@ The Watchdog is a **standalone monitoring and alerting system** for the trading 
 
 ### Core Components
 
-1. **WatchdogAggregator** (`modules/watchdog/aggregator.py`)
+1. **WatchdogAggregator** (`modules/watchdog/aggregator_main.py`)
    - Main service coordinator
    - Manages event feed, event processing, and state management
    - Provides computed status endpoints
 
 2. **EventFeedGenerator** (`modules/watchdog/event_feed.py`)
-   - Reads from `logs/robot/frontend_feed.jsonl`
+   - Reads from the active run context feed (`runs/<run_id>/logs/robot/frontend_feed.jsonl` for isolated playback, otherwise repo-root `logs/robot/frontend_feed.jsonl`)
    - Generates filtered events for frontend consumption
    - Maintains cursor position for incremental reads
 

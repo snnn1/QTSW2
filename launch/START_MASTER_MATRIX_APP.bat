@@ -1,10 +1,13 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
-title Start Master Matrix UI (Vite 5174)
+title Start Master Matrix UI (:5174)
 REM Parent of launch\ is repo root - PYTHONPATH must point at repo\system
 cd /d "%~dp0.."
 set "PYTHONPATH=%CD%\system"
 set "BACKEND_PROBE_URL=http://127.0.0.1:8000/api/matrix/test"
+set "FRONTEND_DIR=%CD%\system\modules\matrix_timetable_app\frontend"
+set "FRONTEND_URL=http://localhost:5174/"
+set "FRONTEND_API_BASE=http://localhost:8000/api"
 
 echo [%TIME%] Repo: %CD%
 echo [%TIME%] PYTHONPATH=%PYTHONPATH%
@@ -52,12 +55,26 @@ if "%API_ACTION%"=="4" (
   exit /b 1
 )
 
-echo [%TIME%] Starting Master Matrix frontend (system\modules\matrix_timetable_app\frontend) on :5174 ...
-start "Master Matrix UI (Vite 5174)" cmd /k "cd /d ""%CD%\system\modules\matrix_timetable_app\frontend"" && npm run dev"
+if not exist "%FRONTEND_DIR%\package.json" (
+  echo [%TIME%] Matrix frontend package.json not found at %FRONTEND_DIR%.
+  endlocal
+  exit /b 1
+)
+
+echo [%TIME%] Building Master Matrix frontend with API base %FRONTEND_API_BASE% ...
+cmd /c "cd /d ""%FRONTEND_DIR%"" && set VITE_API_BASE=%FRONTEND_API_BASE% && npm run build"
+if errorlevel 1 (
+  echo [%TIME%] Frontend build failed. Check the terminal output above.
+  endlocal
+  exit /b 1
+)
+
+echo [%TIME%] Starting Master Matrix frontend static server on :5174 ...
+start "Master Matrix UI (:5174)" cmd /k "cd /d ""%FRONTEND_DIR%"" && python -m http.server 5174 --bind 127.0.0.1 --directory dist"
 
 timeout /t 5 /nobreak >nul
-echo [%TIME%] Opening http://localhost:5174/
-start "" "http://localhost:5174/"
+echo [%TIME%] Opening %FRONTEND_URL%
+start "" "%FRONTEND_URL%"
 
 echo [%TIME%] Done.
 endlocal

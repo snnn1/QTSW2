@@ -12,7 +12,7 @@ from modules.watchdog.run_context import build_run_context, resolve_active_run_c
 
 
 def _workspace_temp_dir() -> Path:
-    base = Path.cwd() / ".pytest_local_watchdog"
+    base = Path.cwd() / "tmp" / "pytest_watchdog"
     base.mkdir(parents=True, exist_ok=True)
     path = base / uuid.uuid4().hex
     path.mkdir(parents=True, exist_ok=False)

@@ -34,6 +34,11 @@ export class ErrorBoundary extends Component {
           <p className="text-gray-300 mb-4 max-w-2xl text-center">
             An unexpected error occurred. You can try reloading the page to recover.
           </p>
+          {this.state.error?.message ? (
+            <div className="mb-4 max-w-3xl rounded border border-red-900 bg-red-950/40 px-4 py-3 text-sm text-red-200">
+              <span className="font-semibold">Error details:</span> {this.state.error.message}
+            </div>
+          ) : null}
           <button
             onClick={this.handleReload}
             className="px-6 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-white font-medium transition-colors"

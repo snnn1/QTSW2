@@ -73,6 +73,7 @@ if (argsList.Contains("--help") || argsList.Contains("-h"))
 // --test INTENT_LIFECYCLE: run intent lifecycle state machine tests (transitions, command legality)
 // --test EXECUTION_ORDERING: run execution event ordering hardening tests (deferred resolution, dedup)
 // --test SIBLING_PROTECTIVE_CANCEL_QUEUE: urgent lane drains sibling protective cancel before normal NT actions (requires modules/robot/core to compile; else use RobotCore_For_NinjaTrader/SiblingProtectiveCancelQueue.Test)
+// --test RECONCILIATION_PENDING_IEA_COOLDOWN: repeated unchanged pending IEA work triggers gate-recovery backoff instead of hot-loop snapshots
 var testIndex = argsList.IndexOf("--test");
 if (testIndex >= 0 && testIndex + 1 < argsList.Count)
 {
@@ -219,6 +220,12 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
     {
         var (pass, err) = ReconciliationRecoveryScenarioTests.RunReconciliationRecoveryScenarioTests();
         Console.WriteLine(pass ? "PASS: Reconciliation recovery scenario tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("RECONCILIATION_PENDING_IEA_COOLDOWN", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = ReconciliationPendingIeaCooldownTests.RunReconciliationPendingIeaCooldownTests();
+        Console.WriteLine(pass ? "PASS: Reconciliation pending IEA cooldown tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
     else if (testName.Equals("DATA_STALL_DETECTION", StringComparison.OrdinalIgnoreCase))

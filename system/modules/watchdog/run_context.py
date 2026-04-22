@@ -24,6 +24,20 @@ class WatchdogRunContext:
         return self.robot_logs_dir / f"ranges_{trading_date}.jsonl"
 
 
+def context_prefers_replay_timetable(context: Optional[WatchdogRunContext]) -> bool:
+    """
+    Match the watchdog UI's notion of an active playback root.
+
+    Playback runs use isolated/run-scoped persistence (for example ``runs/<run_id>``)
+    or explicit ``data/playback/...`` roots. Those contexts should observe the replay
+    timetable, not the live timetable file.
+    """
+    if context is None:
+        return False
+    normalized = str(context.persistence_base).replace("\\", "/").lower()
+    return "/runs/" in normalized or "/data/playback/" in normalized
+
+
 def _extract_run_id_from_persistence_base(persistence_base: Path) -> Optional[str]:
     try:
         parts = persistence_base.resolve().parts

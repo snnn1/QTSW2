@@ -26,6 +26,7 @@ public sealed class ReconciliationRunner
     /// <summary>Maps execution root (e.g. MES) to canonical (e.g. ES) for journal open-qty aggregation; when null, only literal execution key matches.</summary>
     private readonly Func<string, string?>? _getCanonicalInstrumentForJournalAggregation;
     private readonly Func<string, int>? _getPendingExecutionWorkloadForInstrument;
+    private readonly Func<string, bool>? _isInstrumentRecoveryRelevant;
     private readonly Func<string?>? _getRunIdForReconciliationDiagnostics;
     private readonly InstrumentOwnershipLedger? _ownershipLedger;
     private readonly Func<string>? _getOwnershipAccountKey;
@@ -42,13 +43,36 @@ public sealed class ReconciliationRunner
         public DateTimeOffset LastSecondarySkipLogUtc;
     }
 
+    private sealed class PendingIeaDeferState
+    {
+        public int PendingExecutionCount;
+        public DateTimeOffset FirstObservedUtc;
+        public DateTimeOffset LastObservedUtc;
+        public DateTimeOffset LastDiagnosticUtc;
+        public DateTimeOffset NextGateRecoveryEligibleUtc;
+    }
+
+    private readonly struct PendingIeaDeferDecision
+    {
+        public bool EmitDiagnostic { get; init; }
+        public bool SkipGateRecovery { get; init; }
+        public bool GateRecoveryBackoffArmed { get; init; }
+        public double StableSignatureMs { get; init; }
+        public double GateRecoveryCooldownRemainingMs { get; init; }
+    }
+
     private readonly Dictionary<string, SecondaryMismatchFastPathEntry> _secondaryMismatchFastPath =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, PendingIeaDeferState> _pendingIeaDeferStates =
         new(StringComparer.OrdinalIgnoreCase);
 
     private static readonly TimeSpan SecondaryMismatchFastPathMaxStale =
         ReconciliationStateTracker.DefaultDebounceWindow;
 
     private static readonly TimeSpan SecondarySkipLogCoalesce = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan PendingIeaStableSignatureWindow = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan PendingIeaGateRecoveryCooldown = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan PendingIeaDiagnosticCoalesce = TimeSpan.FromSeconds(15);
 
     public ReconciliationRunner(IExecutionAdapter adapter, ExecutionJournal journal, RobotLogger log,
         Action<string, DateTimeOffset, string, int, int>? onQuantityMismatch = null,
@@ -62,6 +86,7 @@ public sealed class ReconciliationRunner
         ReleaseReconciliationRedundancySuppression? redundancySuppression = null,
         Func<string, string?>? getCanonicalInstrumentForJournalAggregation = null,
         Func<string, int>? getPendingExecutionWorkloadForInstrument = null,
+        Func<string, bool>? isInstrumentRecoveryRelevant = null,
         Func<string?>? getRunIdForReconciliationDiagnostics = null,
         InstrumentOwnershipLedger? ownershipLedger = null,
         Func<string>? getOwnershipAccountKey = null)
@@ -80,6 +105,7 @@ public sealed class ReconciliationRunner
         _redundancySuppression = redundancySuppression;
         _getCanonicalInstrumentForJournalAggregation = getCanonicalInstrumentForJournalAggregation;
         _getPendingExecutionWorkloadForInstrument = getPendingExecutionWorkloadForInstrument;
+        _isInstrumentRecoveryRelevant = isInstrumentRecoveryRelevant;
         _getRunIdForReconciliationDiagnostics = getRunIdForReconciliationDiagnostics;
         _ownershipLedger = ownershipLedger;
         _getOwnershipAccountKey = getOwnershipAccountKey;
@@ -162,19 +188,145 @@ public sealed class ReconciliationRunner
     public void ForceRunGateRecoveryForInstrument(DateTimeOffset utcNow, string instrument)
     {
         if (string.IsNullOrWhiteSpace(instrument)) return;
+        var inst = instrument.Trim();
+        var pendingIeA = _getPendingExecutionWorkloadForInstrument?.Invoke(inst) ?? 0;
+        var pendingDecision = ObservePendingIeaDefer(inst, pendingIeA, utcNow, forGateRecovery: true);
+        if (pendingDecision.EmitDiagnostic)
+            LogPendingIeaDeferred(inst, pendingIeA, utcNow, snapshotSkipped: pendingDecision.SkipGateRecovery, pendingDecision);
+        if (pendingDecision.SkipGateRecovery)
+            return;
         RunInternal(utcNow, new ReconciliationRunOptions { GateRecoveryInstrument = instrument.Trim() });
+    }
+
+    private PendingIeaDeferDecision ObservePendingIeaDefer(string instrument, int pendingIeA, DateTimeOffset utcNow, bool forGateRecovery)
+    {
+        var inst = instrument?.Trim() ?? string.Empty;
+        if (string.IsNullOrEmpty(inst))
+            return default;
+
+        if (pendingIeA <= 0)
+        {
+            _pendingIeaDeferStates.Remove(inst);
+            return default;
+        }
+
+        if (!_pendingIeaDeferStates.TryGetValue(inst, out var state) ||
+            state.PendingExecutionCount != pendingIeA)
+        {
+            state = new PendingIeaDeferState
+            {
+                PendingExecutionCount = pendingIeA,
+                FirstObservedUtc = utcNow,
+                LastObservedUtc = utcNow,
+                LastDiagnosticUtc = utcNow,
+                NextGateRecoveryEligibleUtc = utcNow
+            };
+            _pendingIeaDeferStates[inst] = state;
+            return new PendingIeaDeferDecision
+            {
+                EmitDiagnostic = true,
+                StableSignatureMs = 0
+            };
+        }
+
+        state.LastObservedUtc = utcNow;
+        var stableSignatureMs = Math.Max(0, (utcNow - state.FirstObservedUtc).TotalMilliseconds);
+        var gateRecoveryBackoffArmed = false;
+        var skipGateRecovery = false;
+
+        if (forGateRecovery && stableSignatureMs >= PendingIeaStableSignatureWindow.TotalMilliseconds)
+        {
+            if (utcNow < state.NextGateRecoveryEligibleUtc)
+            {
+                skipGateRecovery = true;
+            }
+            else
+            {
+                state.NextGateRecoveryEligibleUtc = utcNow + PendingIeaGateRecoveryCooldown;
+                gateRecoveryBackoffArmed = true;
+            }
+        }
+
+        var emitDiagnostic = gateRecoveryBackoffArmed ||
+            (utcNow - state.LastDiagnosticUtc) >= PendingIeaDiagnosticCoalesce;
+        if (emitDiagnostic)
+            state.LastDiagnosticUtc = utcNow;
+
+        _pendingIeaDeferStates[inst] = state;
+        return new PendingIeaDeferDecision
+        {
+            EmitDiagnostic = emitDiagnostic,
+            SkipGateRecovery = skipGateRecovery,
+            GateRecoveryBackoffArmed = gateRecoveryBackoffArmed,
+            StableSignatureMs = stableSignatureMs,
+            GateRecoveryCooldownRemainingMs = skipGateRecovery
+                ? Math.Max(0, (state.NextGateRecoveryEligibleUtc - utcNow).TotalMilliseconds)
+                : 0
+        };
+    }
+
+    private void LogPendingIeaDeferred(string inst, int pendingIeA, DateTimeOffset utcNow, bool snapshotSkipped, PendingIeaDeferDecision decision)
+    {
+        _log.Write(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_DEFERRED_PENDING_IEA_EXECUTION", "ENGINE",
+            new
+            {
+                instrument = inst,
+                pending_execution_count = pendingIeA,
+                run_id = _getRunIdForReconciliationDiagnostics?.Invoke() ?? "",
+                ts_utc = utcNow.ToString("o"),
+                snapshot_skipped = snapshotSkipped,
+                gate_recovery_backoff_armed = decision.GateRecoveryBackoffArmed,
+                stable_pending_signature_ms = decision.StableSignatureMs > 0 ? Math.Round(decision.StableSignatureMs, 0) : 0,
+                gate_recovery_cooldown_remaining_ms = decision.GateRecoveryCooldownRemainingMs > 0
+                    ? Math.Round(decision.GateRecoveryCooldownRemainingMs, 0)
+                    : 0,
+                note = snapshotSkipped
+                    ? "Skipping repeated gate recovery until pending execution signature changes or cooldown elapses"
+                    : "Skipping periodic qty reconciliation until IEA execution queue drains for instrument"
+            }));
+    }
+
+    private bool TrySkipFullPassForStablePendingIea(
+        Dictionary<string, int> accountQtyByInstrument,
+        DateTimeOffset utcNow,
+        bool gateMode,
+        bool bypassRedundancy)
+    {
+        if (gateMode || bypassRedundancy || accountQtyByInstrument.Count == 0)
+            return false;
+
+        var allDeferredStable = true;
+        foreach (var inst in accountQtyByInstrument.Keys)
+        {
+            var pendingIeA = _getPendingExecutionWorkloadForInstrument?.Invoke(inst) ?? 0;
+            if (pendingIeA > 0 && !(_isInstrumentRecoveryRelevant?.Invoke(inst) ?? true))
+            {
+                ObservePendingIeaDefer(inst, 0, utcNow, forGateRecovery: false);
+                continue;
+            }
+            if (pendingIeA <= 0)
+            {
+                ObservePendingIeaDefer(inst, 0, utcNow, forGateRecovery: false);
+                allDeferredStable = false;
+                continue;
+            }
+
+            var pendingDecision = ObservePendingIeaDefer(inst, pendingIeA, utcNow, forGateRecovery: true);
+            if (pendingDecision.EmitDiagnostic)
+                LogPendingIeaDeferred(inst, pendingIeA, utcNow, snapshotSkipped: pendingDecision.SkipGateRecovery, pendingDecision);
+            if (!pendingDecision.SkipGateRecovery)
+                allDeferredStable = false;
+        }
+
+        return allDeferredStable;
     }
 
     private void RunInternal(DateTimeOffset utcNow, ReconciliationRunOptions? options)
     {
-        if (!_adapter.IsExecutionContextReady)
-            return;
-
         var gateInst = options?.GateRecoveryInstrument?.Trim();
         var gateMode = !string.IsNullOrEmpty(gateInst);
         var bypassRedundancy = options?.BypassRedundancySuppression ?? false;
         _lastRunUtc = utcNow;
-        _runtimeAudit?.NotifyReconciliationRunCompleted();
         var cpuStart = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
 
         AccountSnapshot snap;
@@ -200,6 +352,13 @@ public sealed class ReconciliationRunner
         var workingOrders = snap.WorkingOrders ?? new List<WorkingOrderSnapshot>();
 
         var accountQtyByInstrument = BrokerPositionResolver.BuildReconciliationAbsTotalsByCanonicalKey(positions);
+        if (TrySkipFullPassForStablePendingIea(accountQtyByInstrument, utcNow, gateMode, bypassRedundancy))
+        {
+            if (cpuStart != 0) _runtimeAudit?.CpuEnd(cpuStart, RuntimeAuditSubsystem.Reconciliation);
+            return;
+        }
+
+        _runtimeAudit?.NotifyReconciliationRunCompleted();
 
         try
         {
@@ -234,17 +393,16 @@ public sealed class ReconciliationRunner
             var canonicalForJournal = CanonicalInstrumentForJournal(instRoot) ?? instRoot;
 
             var pendingIeA = _getPendingExecutionWorkloadForInstrument?.Invoke(inst) ?? 0;
+            if (pendingIeA > 0 && !(_isInstrumentRecoveryRelevant?.Invoke(inst) ?? true))
+            {
+                ObservePendingIeaDefer(inst, 0, utcNow, forGateRecovery: false);
+                pendingIeA = 0;
+            }
             if (pendingIeA > 0)
             {
-                _log.Write(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_DEFERRED_PENDING_IEA_EXECUTION", "ENGINE",
-                    new
-                    {
-                        instrument = inst,
-                        pending_execution_count = pendingIeA,
-                        run_id = _getRunIdForReconciliationDiagnostics?.Invoke() ?? "",
-                        ts_utc = utcNow.ToString("o"),
-                        note = "Skipping periodic qty reconciliation until IEA execution queue drains for instrument"
-                    }));
+                var pendingDecision = ObservePendingIeaDefer(inst, pendingIeA, utcNow, forGateRecovery: true);
+                if (pendingDecision.EmitDiagnostic)
+                    LogPendingIeaDeferred(inst, pendingIeA, utcNow, snapshotSkipped: pendingDecision.SkipGateRecovery, pendingDecision);
                 continue;
             }
 

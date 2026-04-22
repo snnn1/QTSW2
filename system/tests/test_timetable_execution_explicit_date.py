@@ -27,6 +27,55 @@ def test_api_execution_rejects_missing_trading_date():
     assert "trading_date" in str(detail).lower()
 
 
+def test_historical_publish_writes_replay_current_and_preserves_live_current(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    from tests.stream_filters_fixtures import install_min_stream_filters
+    from modules.timetable.timetable_engine import TimetableEngine, TimetablePublishResult
+    from tests.timetable_matrix_test_utils import matrix_time_valid_for_execution
+
+    install_min_stream_filters(tmp_path)
+    timetable_dir = tmp_path / "data" / "timetable"
+    timetable_dir.mkdir(parents=True)
+    live_path = timetable_dir / "timetable_current.json"
+    replay_path = timetable_dir / "timetable_replay_current.json"
+    live_path.write_text(
+        json.dumps({"session_trading_date": "2026-04-21", "streams": [{"stream": "ES1", "slot_time": "08:00"}]}),
+        encoding="utf-8",
+    )
+    before_live = live_path.read_text(encoding="utf-8")
+
+    eng = TimetableEngine(project_root=str(tmp_path))
+    d = pd.Timestamp("2026-04-02")
+    rows = []
+    for sid in eng.streams:
+        slot0 = matrix_time_valid_for_execution(eng, sid)
+        rows.append(
+            {
+                "Stream": sid,
+                "trade_date": d,
+                "Time": slot0,
+                "Time Change": "",
+                "final_allowed": True,
+                "filter_reasons": "",
+            }
+        )
+    df = pd.DataFrame(rows)
+    pub = eng.write_execution_timetable_from_master_matrix(
+        df,
+        trade_date="2026-04-02",
+        execution_mode=True,
+        replay=True,
+        mode="historical",
+        publish_context={"source": "test_replay"},
+    )
+    assert isinstance(pub, TimetablePublishResult)
+    assert live_path.read_text(encoding="utf-8") == before_live
+    assert replay_path.exists()
+    replay_doc = json.loads(replay_path.read_text(encoding="utf-8"))
+    assert replay_doc["session_trading_date"] == "2026-04-02"
+    assert replay_doc["metadata"]["replay"] is True
+
+
 def test_preview_matches_build_streams_replay(monkeypatch, tmp_path):
     """Preview-only uses same stream-building path as execution (no disk write)."""
     monkeypatch.chdir(tmp_path)

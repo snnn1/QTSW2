@@ -5,6 +5,7 @@ Maintains in-memory state for derived fields and cursor management.
 """
 import json
 import logging
+import hashlib
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -13,6 +14,7 @@ from collections import defaultdict, deque
 import pytz
 
 from .config import (
+    QTSW2_ROOT,
     EXECUTION_JOURNALS_DIR,
     FRONTEND_CURSOR_FILE,
     ROBOT_JOURNAL_DIR,
@@ -39,17 +41,81 @@ from .config import (
 )
 from .market_session import is_market_open
 from .timetable_poller import compute_timetable_trading_date
+from modules.matrix.config import SLOT_ENDS as MATRIX_SLOT_ENDS
+from modules.matrix.utils import normalize_time
 
 logger = logging.getLogger(__name__)
 
-# Slot times - watchdog defines its own (standalone, no matrix dependency)
-# These match the canonical trading time slots but watchdog owns this definition
+# Canonical matrix slot times - watchdog observes these, it does not redefine them.
 SLOT_ENDS = {
-    "S1": ["07:30", "08:00", "09:00"],
-    "S2": ["09:30", "10:00", "10:30", "11:00"],
+    session: [normalize_time(str(slot)) for slot in slots]
+    for session, slots in MATRIX_SLOT_ENDS.items()
 }
 
 CHICAGO_TZ = pytz.timezone("America/Chicago")
+
+
+def _execution_policy_path() -> Path:
+    return QTSW2_ROOT / "configs" / "execution_policy.json"
+
+
+def _session_authority_path() -> Path:
+    return QTSW2_ROOT / "data" / "session" / "session_authority.json"
+
+
+def _load_json_file(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def _stable_json_hash(payload: Dict[str, Any]) -> str:
+    normalized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _earliest_session_slot_time(session: str) -> Optional[time]:
+    slots = SLOT_ENDS.get(session, [])
+    parsed: List[time] = []
+    for raw in slots:
+        try:
+            hh, mm = normalize_time(str(raw)).split(":")
+            parsed.append(time(int(hh), int(mm)))
+        except Exception:
+            continue
+    return min(parsed) if parsed else None
+
+
+def _read_session_authority_snapshot() -> Dict[str, Any]:
+    path = _session_authority_path()
+    payload = _load_json_file(path)
+    if payload is None:
+        return {
+            "file_present": False,
+            "mode": None,
+            "source": None,
+            "session_trading_date": None,
+        }
+    return {
+        "file_present": True,
+        "mode": str(payload.get("mode") or "").strip() or None,
+        "source": str(payload.get("source") or "").strip() or None,
+        "session_trading_date": str(payload.get("session_trading_date") or "").strip() or None,
+    }
+
+
+def _read_local_execution_policy_hash() -> Optional[str]:
+    path = _execution_policy_path()
+    payload = _load_json_file(path)
+    if payload is None:
+        return None
+    try:
+        return _stable_json_hash(payload)
+    except Exception:
+        return None
 
 
 def _normalize_position_authority_key(instrument: Optional[str]) -> str:
@@ -104,12 +170,13 @@ def _get_execution_instrument_for_canonical(canonical: str) -> Optional[str]:
 def _infer_session_from_chicago(chicago_dt: datetime) -> str:
     """
     Infer CME session from Chicago time.
-    S1 = before 09:30 CT (overnight/early), S2 = 09:30+ CT (regular trading).
+    Boundary comes from the canonical earliest S2 slot time.
     """
     t = chicago_dt.time() if hasattr(chicago_dt, 'time') else chicago_dt
     if isinstance(t, datetime):
         t = t.time()
-    if t < time(9, 30):
+    s2_start = _earliest_session_slot_time("S2") or time(9, 30)
+    if t < s2_start:
         return "S1"
     return "S2"
 
@@ -250,6 +317,8 @@ class WatchdogStateManager:
         # Execution policy validation failures (keep last 10 failures)
         self._execution_policy_failures: List['ExecutionPolicyFailureInfo'] = []
         self._max_execution_policy_failures = 10  # Keep last 10 failures
+        self._last_robot_execution_policy_hash: Optional[str] = None
+        self._last_robot_execution_policy_hash_utc: Optional[datetime] = None
         
         # Status smoothing/debouncing to prevent flickering
         # Track last N status computations to smooth out temporary threshold violations
@@ -959,15 +1028,39 @@ class WatchdogStateManager:
                     stream = "_".join(parts[1:-1])
                     if entry.get("TradeCompleted"):
                         # Journal shows trade completed (reconciliation or normal exit) - close intent and stream
+                        completion_time = None
+                        for timestamp_field in ("CompletedAtUtc", "ExitFilledAtUtc", "completed_at_utc", "exit_filled_at"):
+                            raw_timestamp = entry.get(timestamp_field)
+                            if not raw_timestamp:
+                                continue
+                            try:
+                                completion_time = datetime.fromisoformat(str(raw_timestamp).replace("Z", "+00:00"))
+                                if completion_time.tzinfo is None:
+                                    completion_time = completion_time.replace(tzinfo=timezone.utc)
+                                break
+                            except (ValueError, TypeError):
+                                continue
                         if intent_id in self._intent_exposures:
                             self._intent_exposures[intent_id].state = "CLOSED"
                             closed_from_journal += 1
                         key = (trading_date, stream)
-                        if key in self._stream_states and _is_trading_date_within_max_age(trading_date, current_trading_date):
+                        if _is_trading_date_within_max_age(trading_date, current_trading_date):
+                            if key not in self._stream_states:
+                                self._stream_states[key] = StreamStateInfo(
+                                    trading_date=trading_date,
+                                    stream=stream,
+                                    state="DONE",
+                                    committed=True,
+                                    commit_reason=entry.get("CompletionReason") or entry.get("completion_reason") or "TRADE_COMPLETED",
+                                    state_entry_time_utc=completion_time or datetime.now(timezone.utc),
+                                    execution_instrument=entry.get("Instrument", "UNKNOWN") or "UNKNOWN",
+                                )
                             info = self._stream_states[key]
                             info.state = "DONE"
                             info.committed = True
                             info.commit_reason = entry.get("CompletionReason") or entry.get("completion_reason") or "TRADE_COMPLETED"
+                            if completion_time is not None:
+                                info.state_entry_time_utc = completion_time
                         continue
                     entry_qty = entry.get("EntryFilledQuantityTotal") or entry.get("FillQuantity") or 0
                     if entry_qty <= 0:
@@ -1339,6 +1432,14 @@ class WatchdogStateManager:
             f"Execution policy validation failure recorded: {len(errors)} error(s), "
             f"execution_instruments={execution_instruments}, failed_at={timestamp_utc.isoformat()}"
         )
+
+    def update_robot_execution_policy_hash(self, execution_policy_hash: Optional[str], timestamp_utc: datetime):
+        """Track the robot-emitted execution policy hash for parity/debug visibility."""
+        value = str(execution_policy_hash or "").strip()
+        if not value:
+            return
+        self._last_robot_execution_policy_hash = value
+        self._last_robot_execution_policy_hash_utc = timestamp_utc
     
     def update_last_bar(self, execution_instrument_full_name: str, timestamp_utc: datetime):
         """
@@ -1584,6 +1685,9 @@ class WatchdogStateManager:
             if getattr(exp, "state", "") == "ACTIVE" and getattr(exp, "trading_date", None) and getattr(exp, "stream_id", None):
                 active_stream_keys.add((exp.trading_date, exp.stream_id))
 
+        def _is_terminal_stream(info: "StreamStateInfo") -> bool:
+            return info.state in {"DONE", "NO_TRADE", "INVALIDATED"} or info.committed
+
         # Remove streams from different trading dates (unless they have active intents AND are within max age)
         keys_to_remove = []
         for (trading_date, stream), info in self._stream_states.items():
@@ -1606,6 +1710,12 @@ class WatchdogStateManager:
             # If clear_all_for_date is True (ENGINE_START), only remove streams that haven't been updated recently
             # This prevents clearing active streams that are still transitioning
             elif clear_all_for_date and trading_date == current_trading_date:
+                if _is_terminal_stream(info):
+                    logger.debug(
+                        f"Preserving terminal stream on ENGINE_START: {stream} "
+                        f"(state: {info.state}, committed: {info.committed}, trading_date: {trading_date})"
+                    )
+                    continue
                 # Only clear if stream hasn't been updated in the last 30 seconds
                 # This allows streams to be re-initialized after restart while preserving active ones
                 time_since_update = (utc_now - info.state_entry_time_utc).total_seconds()
@@ -2768,6 +2878,18 @@ class WatchdogStateManager:
             smoothed_data_status=smoothed_data_status,
             feed_health_classification=feed_health_classification,
         )
+        local_execution_policy_hash = _read_local_execution_policy_hash()
+        execution_policy_hash_match = (
+            local_execution_policy_hash == self._last_robot_execution_policy_hash
+            if local_execution_policy_hash and self._last_robot_execution_policy_hash
+            else None
+        )
+        session_authority_snapshot = _read_session_authority_snapshot()
+        session_authority_snapshot["matches_timetable"] = (
+            session_authority_snapshot.get("session_trading_date") == self._trading_date
+            if session_authority_snapshot.get("session_trading_date") and self._trading_date
+            else None
+        )
         
         return {
             "engine_alive": engine_alive,
@@ -2878,7 +3000,28 @@ class WatchdogStateManager:
                 }
                 for failure in self._execution_policy_failures
             ],
-            "execution_policy_failures_count": len(self._execution_policy_failures)
+            "execution_policy_failures_count": len(self._execution_policy_failures),
+            "robot_execution_policy_hash": self._last_robot_execution_policy_hash,
+            "robot_execution_policy_hash_observed_chicago": (
+                self._last_robot_execution_policy_hash_utc.astimezone(CHICAGO_TZ).isoformat()
+                if self._last_robot_execution_policy_hash_utc
+                else None
+            ),
+            "local_execution_policy_hash": local_execution_policy_hash,
+            "execution_policy_hash_match": execution_policy_hash_match,
+            "session_authority": session_authority_snapshot,
+            "timetable_stream_diagnostics": [
+                {
+                    "stream": stream_id,
+                    "instrument": meta.get("instrument"),
+                    "session": meta.get("session"),
+                    "slot_time": meta.get("slot_time"),
+                    "decision_time": meta.get("decision_time"),
+                    "enabled": bool(meta.get("enabled")),
+                    "block_reason": meta.get("block_reason"),
+                }
+                for stream_id, meta in sorted(self._timetable_streams.items())
+            ],
         }
     
     def compute_unprotected_positions(self) -> List[Dict]:
@@ -2994,15 +3137,29 @@ class CursorManager:
     def __init__(self):
         self._cursor_file = FRONTEND_CURSOR_FILE
         self._cursor_file.parent.mkdir(parents=True, exist_ok=True)
+
+    def _context_scope_key(self) -> str:
+        from .run_context import resolve_active_run_context
+
+        return str(resolve_active_run_context().persistence_base)
+
+    def _load_cursor_file(self) -> Dict[str, Any]:
+        if not self._cursor_file.exists():
+            return {}
+        with open(self._cursor_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
     
     def load_cursor(self) -> Dict[str, int]:
         """Load cursor state from file. Returns {} if missing or invalid (triggers safe init)."""
-        if not self._cursor_file.exists():
-            return {}
-        
         try:
-            with open(self._cursor_file, 'r') as f:
-                data = json.load(f)
+            data = self._load_cursor_file()
+            if "__contexts__" in data:
+                scoped = data.get("__contexts__", {}).get(self._context_scope_key(), {})
+                if not _is_cursor_valid(scoped):
+                    logger.warning("Scoped cursor content malformed - treating as empty")
+                    return {}
+                return scoped
             if not _is_cursor_valid(data):
                 logger.warning("Cursor content malformed (invalid keys/values) - treating as empty")
                 return {}
@@ -3016,14 +3173,24 @@ class CursorManager:
     
     def save_cursor(self, cursor: Dict[str, int]) -> bool:
         """Save cursor state atomically (write to temp, then rename). Returns True on success."""
-        if not isinstance(cursor, dict):
+        if not _is_cursor_valid(cursor):
             return False
         tmp_file = self._cursor_file.with_suffix(".json.tmp")
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                with open(tmp_file, 'w') as f:
-                    json.dump(cursor, f, indent=2)
+                existing = {}
+                try:
+                    existing = self._load_cursor_file()
+                except Exception:
+                    existing = {}
+                contexts = existing.get("__contexts__")
+                if not isinstance(contexts, dict):
+                    contexts = {}
+                contexts[self._context_scope_key()] = dict(cursor)
+                payload = {"__contexts__": contexts}
+                with open(tmp_file, 'w', encoding='utf-8') as f:
+                    json.dump(payload, f, indent=2)
                 tmp_file.replace(self._cursor_file)
                 return True
             except Exception as e:

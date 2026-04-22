@@ -386,6 +386,7 @@ public sealed class ExecutionJournal
         decimal? entryPrice = null,
         decimal? stopPrice = null,
         decimal? targetPrice = null,
+        decimal? beTriggerPrice = null,
         string? direction = null,
         string? ocoGroup = null)
     {
@@ -506,6 +507,10 @@ public sealed class ExecutionJournal
             if (targetPrice.HasValue && !entry.TargetPrice.HasValue)
             {
                 entry.TargetPrice = targetPrice.Value;
+            }
+            if (beTriggerPrice.HasValue && !entry.BETriggerPrice.HasValue)
+            {
+                entry.BETriggerPrice = beTriggerPrice.Value;
             }
             if (!string.IsNullOrWhiteSpace(direction) && string.IsNullOrWhiteSpace(entry.Direction))
             {
@@ -1099,6 +1104,70 @@ public sealed class ExecutionJournal
                 _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
                 return; // Fail-closed
             }
+
+            // Late/duplicate terminal fills can still arrive after a broker-flat reconciliation close under
+            // playback compression. Do not double-count those fills into an overfill emergency.
+            if (entry.TradeCompleted)
+            {
+                var completionAgeMs = -1L;
+                var boundedLateTerminalFill = false;
+                if (string.Equals(entry.CompletionReason, CompletionReasons.RECONCILIATION_BROKER_FLAT, StringComparison.OrdinalIgnoreCase) &&
+                    !string.IsNullOrWhiteSpace(entry.CompletedAtUtc) &&
+                    DateTimeOffset.TryParse(entry.CompletedAtUtc, out var completedAtUtc))
+                {
+                    completionAgeMs = Math.Max(0L, (long)(utcNow - completedAtUtc).TotalMilliseconds);
+                    boundedLateTerminalFill = completionAgeMs <= 5000;
+                }
+
+                if (boundedLateTerminalFill)
+                {
+                    var priorExitType = entry.ExitOrderType;
+                    if (!string.IsNullOrWhiteSpace(exitOrderType) &&
+                        !string.Equals(priorExitType, exitOrderType, StringComparison.OrdinalIgnoreCase))
+                    {
+                        entry.ExitOrderType = exitOrderType;
+                        if (string.Equals(entry.CompletionReason, CompletionReasons.RECONCILIATION_BROKER_FLAT, StringComparison.OrdinalIgnoreCase))
+                            entry.CompletionReason = exitOrderType;
+                    }
+
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "COMPLETED_INTENT_LATE_TERMINAL_FILL_RECONCILED", "ENGINE",
+                        new
+                        {
+                            intent_id = intentId,
+                            stream,
+                            fill_price = exitFillPrice,
+                            fill_quantity = exitFillQuantity,
+                            prior_completion_reason = CompletionReasons.RECONCILIATION_BROKER_FLAT,
+                            prior_exit_order_type = priorExitType,
+                            reconciled_exit_order_type = entry.ExitOrderType,
+                            completion_age_ms = completionAgeMs,
+                            action = "JOURNAL_TERMINAL_FILL_SUPPRESSED",
+                            note = "ExecutionJournal suppressed bounded late terminal fill after reconciliation broker-flat completion to avoid double-count overfill."
+                        }));
+
+                    _cache[key] = entry;
+                    SaveJournal(journalPath, entry);
+                    return;
+                }
+
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "COMPLETED_INTENT_RECEIVED_FILL", "ENGINE",
+                    new
+                    {
+                        error = "Exit fill received after journal already TradeCompleted",
+                        intent_id = intentId,
+                        stream,
+                        fill_price = exitFillPrice,
+                        fill_quantity = exitFillQuantity,
+                        exit_order_type = exitOrderType,
+                        prior_completion_reason = entry.CompletionReason,
+                        action = "POST_COMPLETION_FILL_IGNORED",
+                        note = "ExecutionJournal ignored a post-completion fill to avoid double-counting terminal quantity."
+                    }));
+
+                _cache[key] = entry;
+                SaveJournal(journalPath, entry);
+                return;
+            }
             
             // Update exit cumulatives (delta-based accumulation)
             entry.ExitFilledQuantityTotal += exitFillQuantity;
@@ -1401,6 +1470,76 @@ public sealed class ExecutionJournal
 
             _cache[key] = entry;
             SaveJournal(journalPath, entry);
+        }
+    }
+
+    /// <summary>
+    /// Mark an entry order terminal when the broker cancels it before any fill occurs.
+    /// This prevents dead opposite-side entry stops from lingering as adoption candidates.
+    /// </summary>
+    public bool RecordCancelledUnfilledEntry(
+        string intentId,
+        string tradingDate,
+        string stream,
+        DateTimeOffset utcNow,
+        string completionReason = CompletionReasons.ENTRY_CANCELLED_UNFILLED)
+    {
+        lock (_lock)
+        {
+            var key = $"{tradingDate}_{stream}_{intentId}";
+            var journalPath = GetJournalPath(tradingDate, stream, intentId);
+
+            ExecutionJournalEntry? entry = null;
+            if (_cache.TryGetValue(key, out var cached))
+            {
+                entry = cached;
+            }
+            else if (File.Exists(journalPath))
+            {
+                try
+                {
+                    var json = File.ReadAllText(journalPath);
+                    entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                }
+                catch (Exception ex)
+                {
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_CORRUPTION", "ENGINE",
+                        new
+                        {
+                            error = ex.Message,
+                            exception_type = ex.GetType().Name,
+                            intent_id = intentId,
+                            stream = stream,
+                            trading_date = tradingDate,
+                            journal_path = journalPath,
+                            action = "STREAM_STAND_DOWN",
+                            note = "Journal corruption during RecordCancelledUnfilledEntry - standing down stream (fail-closed)"
+                        }));
+
+                    _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
+                    return false;
+                }
+            }
+
+            if (entry == null || entry.TradeCompleted || !entry.EntrySubmitted)
+                return false;
+
+            if (entry.EntryFilled || entry.EntryFilledQuantityTotal > 0)
+                return false;
+
+            entry.ExitOrderType = completionReason;
+            entry.TradeCompleted = true;
+            entry.CompletedAtUtc = utcNow.ToString("o");
+            entry.CompletionReason = completionReason;
+            entry.RealizedPnLPoints = null;
+            entry.RealizedPnLGross = null;
+            entry.RealizedPnLNet = null;
+
+            _cache[key] = entry;
+            SyncAdoptionCandidateIndexForIntentLocked(intentId, entry);
+            SaveJournal(journalPath, entry);
+            BumpReleaseSuppressionActivity();
+            return true;
         }
     }
 
@@ -2564,6 +2703,72 @@ public sealed class ExecutionJournal
         }
         if (closed > 0)
             BumpReleaseSuppressionActivity();
+        return closed;
+    }
+
+    /// <summary>
+    /// When broker-flat proof is already present for the instrument and no working orders remain, retire lingering
+    /// journal-only exposure rows that still report open quantity but have no live tag/registry ownership evidence.
+    /// This keeps broker-flat recovery from waiting on stale journal residue that no longer maps to real exposure.
+    /// </summary>
+    public int ReconcileBrokerFlatJournalRowsForRelease(
+        string executionInstrumentPrimary,
+        string? canonicalInstrument,
+        int brokerPositionQtyAbs,
+        int brokerWorkingCount,
+        IReadOnlyCollection<string> robotTaggedIntentIdsOnInstrument,
+        IReadOnlyCollection<string>? registryMismatchTrustedIntentIds,
+        DateTimeOffset utcNow,
+        string? triggerSource = null,
+        bool suppressWhileFlattenPending = false)
+    {
+        if (brokerPositionQtyAbs != 0 || brokerWorkingCount != 0 || suppressWhileFlattenPending)
+            return 0;
+
+        var candidates = GetAdoptionCandidateIntentIdsUnionForExecutionKeys(executionInstrumentPrimary, canonicalInstrument);
+        if (candidates.Count == 0)
+            return 0;
+
+        var tagSet = robotTaggedIntentIdsOnInstrument as HashSet<string> ??
+                     new HashSet<string>(robotTaggedIntentIdsOnInstrument ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
+        var processed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var closed = 0;
+
+        foreach (var intentId in candidates)
+        {
+            // Broker-flat + no working is stronger proof than stale registry trust. Keep only actively tagged intents
+            // protected here so old mismatch-trusted rows can retire instead of pinning JournalOnlyBrokerFlat forever.
+            if (tagSet.Contains(intentId))
+                continue;
+
+            var located = TryGetAdoptionCandidateEntry(intentId, executionInstrumentPrimary, canonicalInstrument);
+            if (located == null)
+                continue;
+
+            var (tradingDate, stream, entry) = located.Value;
+            var rowKey = $"{tradingDate}_{stream}_{intentId}";
+            if (!processed.Add(rowKey))
+                continue;
+            if (entry == null || !entry.EntryFilled || entry.TradeCompleted || entry.EntryFilledQuantityTotal <= 0)
+                continue;
+
+            var remaining = GetEntryRemainingOpenQuantity(entry);
+            if (remaining <= 0)
+                continue;
+
+            if (RecordReconciliationComplete(
+                    tradingDate,
+                    stream,
+                    intentId,
+                    utcNow,
+                    brokerPositionQtyAbsAtDecision: 0,
+                    journalOpenQtyBeforeClose: remaining,
+                    triggerSource: triggerSource ?? "BrokerFlatReleaseReadiness"))
+            {
+                closed++;
+            }
+        }
+
         return closed;
     }
 
@@ -4540,6 +4745,11 @@ public static class CompletionReasons
     /// closed so release gate and recovery index can converge (no fill event changed).
     /// </summary>
     public const string RECONCILIATION_STALE_JOURNAL_RELEASE = "RECONCILIATION_STALE_JOURNAL_RELEASE";
+
+    /// <summary>
+    /// Entry order was canceled by the broker before any fill occurred; row is terminal and must not stay adoptable.
+    /// </summary>
+    public const string ENTRY_CANCELLED_UNFILLED = "ENTRY_CANCELLED_UNFILLED";
 
     /// <summary>
     /// Open journal quantity exceeded broker position; excess exit quantity applied so release readiness reflects broker truth.

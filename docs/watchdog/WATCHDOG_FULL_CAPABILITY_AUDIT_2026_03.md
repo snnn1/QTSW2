@@ -18,7 +18,7 @@
 | Event feed | `modules/watchdog/event_feed.py` |
 | Event processor | `modules/watchdog/event_processor.py` |
 | State manager | `modules/watchdog/state_manager.py` |
-| Aggregator | `modules/watchdog/aggregator.py` |
+| Aggregator | `modules/watchdog/aggregator_main.py` |
 | Config | `modules/watchdog/config.py` |
 | Timetable poller | `modules/watchdog/timetable_poller.py` |
 
@@ -40,7 +40,7 @@ Robot (NinjaTrader) → logs/robot/robot_*.jsonl
                               ↓
                     Filter LIVE_CRITICAL_EVENT_TYPES, rate-limit noisy events
                               ↓
-                    Append to logs/robot/frontend_feed.jsonl
+                    Append to active run context `frontend_feed.jsonl`
                               ↓
                     WatchdogAggregator._process_feed_events_sync()
                               ↓
