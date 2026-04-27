@@ -16,6 +16,7 @@ public static class RunRootArtifacts
     public const string SummaryFileName = "summary.json";
     public const string AuditManifestFileName = "AUDIT_MANIFEST.json";
     public const string LatestRunPointerFileName = "LATEST_RUN.txt";
+    public const string RunShutdownSignalFileName = "RUN_SHUTDOWN.json";
 
     private static readonly string NotesTemplate =
         "# Run notes" + Environment.NewLine + Environment.NewLine +
@@ -160,6 +161,59 @@ public static class RunRootArtifacts
         catch
         {
             // best-effort shutdown path
+        }
+    }
+
+    public static bool HasRunShutdownSignal(string persistenceBase)
+    {
+        try
+        {
+            return File.Exists(Path.Combine(persistenceBase, RunShutdownSignalFileName));
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public static void ClearRunShutdownSignal(string persistenceBase)
+    {
+        try
+        {
+            var path = Path.Combine(persistenceBase, RunShutdownSignalFileName);
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+        catch
+        {
+            // best-effort startup hygiene
+        }
+    }
+
+    public static void WriteRunShutdownSignal(
+        string persistenceBase,
+        string? fullRunId,
+        DateTimeOffset utcNow,
+        string reason,
+        string source)
+    {
+        try
+        {
+            var dto = new Dictionary<string, object?>
+            {
+                ["run_id"] = fullRunId ?? "",
+                ["ts_utc"] = utcNow.ToString("o"),
+                ["reason"] = reason,
+                ["source"] = source
+            };
+
+            File.WriteAllText(
+                Path.Combine(persistenceBase, RunShutdownSignalFileName),
+                JsonUtil.Serialize(dto));
+        }
+        catch
+        {
+            // best-effort cross-instance shutdown signal
         }
     }
 }

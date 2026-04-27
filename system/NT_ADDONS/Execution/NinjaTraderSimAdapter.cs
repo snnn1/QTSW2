@@ -32,8 +32,13 @@ namespace QTSW2.Robot.Core.Execution;
 /// - All orders must be namespaced by (intent_id, stream) for isolation
 /// - OCO grouping must be stream-local (no cross-stream interference)
 /// </summary>
-public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrderExecutor, INtActionExecutor, IIntentRegistrationAdapter
+public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrderExecutor, INtActionExecutor, INtMarketReentryExecutionGate, IIntentRegistrationAdapter
 {
+    internal static bool ShouldDeferReentryProtectionForPartialFill(int cumulativeFilledQuantity, int expectedQuantity) =>
+        expectedQuantity > 0 &&
+        cumulativeFilledQuantity > 0 &&
+        cumulativeFilledQuantity < expectedQuantity;
+
     /// <summary>At most one delayed critical flatten re-enqueue per (account, canonical) until the retry fires (stale-owner takeover window).</summary>
     private readonly ConcurrentDictionary<string, byte> _criticalFlattenCoordinationRetryInflight = new(StringComparer.OrdinalIgnoreCase);
 
@@ -193,6 +198,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     
     // G3/G5: Recovery readiness from engine callback only (same as IExecutionRecoveryGuard); do not infer recovery completion locally. Kill switch: _isGlobalKillSwitchActive.
     private Func<bool>? _isRecoveryExecutionAllowedCallback;
+    private Func<bool>? _isPlaybackStallNtCallBlockedCallback;
 
     /// <summary>Optional: per-instrument journal integrity / reconciliation repair in progress (execution safety gate).</summary>
     private Func<string, bool>? _journalIntegrityRepairActiveForInstrumentCallback;
@@ -529,6 +535,153 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
 
     /// <summary>Reentry intents for which we have already invoked the protection-accepted callback (idempotency).</summary>
     private readonly HashSet<string> _reentryProtectionAcceptedNotified = new(StringComparer.OrdinalIgnoreCase);
+
+    private sealed class MarketReentryExecutionLatch
+    {
+        public string InstrumentKey = "";
+        public string IntentId = "";
+        public string? Stream;
+        public string CorrelationId = "";
+        public DateTimeOffset AcquiredAtUtc;
+        public DateTimeOffset CommandUtc;
+        public int DeferralCount;
+    }
+
+    private readonly object _marketReentryExecutionLatchLock = new();
+    private readonly Dictionary<string, MarketReentryExecutionLatch> _marketReentryExecutionLatchByInstrument =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private static string NormalizeMarketReentryExecutionInstrument(string? instrument) =>
+        string.IsNullOrWhiteSpace(instrument) ? "" : instrument.Trim().ToUpperInvariant();
+
+    bool INtMarketReentryExecutionGate.TryBeginMarketReentryExecution(
+        NtSubmitMarketReentryCommand cmd,
+        DateTimeOffset utcNow,
+        out string deferReason,
+        out string? activeIntentId)
+    {
+        deferReason = "";
+        activeIntentId = null;
+        var intentId = cmd.IntentId ?? cmd.Command.ReentryIntentId ?? "";
+        var inst = NormalizeMarketReentryExecutionInstrument(cmd.InstrumentKey ?? cmd.Command.ExecutionInstrument ?? cmd.Command.Instrument);
+        if (string.IsNullOrEmpty(inst) || string.IsNullOrEmpty(intentId))
+            return true;
+
+        MarketReentryExecutionLatch? acquired = null;
+        lock (_marketReentryExecutionLatchLock)
+        {
+            if (_marketReentryExecutionLatchByInstrument.TryGetValue(inst, out var active))
+            {
+                if (MarketReentryLatchMatches(active, intentId, cmd.CorrelationId))
+                    return true;
+
+                active.DeferralCount++;
+                activeIntentId = active.IntentId;
+                deferReason = "active_reentry_waiting_for_protection";
+                return false;
+            }
+
+            acquired = new MarketReentryExecutionLatch
+            {
+                InstrumentKey = inst,
+                IntentId = intentId,
+                Stream = cmd.Command.Stream,
+                CorrelationId = cmd.CorrelationId,
+                AcquiredAtUtc = utcNow,
+                CommandUtc = cmd.Command.TimestampUtc
+            };
+            _marketReentryExecutionLatchByInstrument[inst] = acquired;
+        }
+
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, inst, "REENTRY_BATCH_LATCH_ACQUIRED",
+            new
+            {
+                reentry_intent_id = intentId,
+                stream = acquired.Stream,
+                correlation_id = acquired.CorrelationId,
+                command_utc = acquired.CommandUtc,
+                note = "Same-instrument market reentry owns the batch latch until protection is accepted or submit/protection fails"
+            }));
+        return true;
+    }
+
+    void INtMarketReentryExecutionGate.ReleaseMarketReentryExecution(NtSubmitMarketReentryCommand cmd, DateTimeOffset utcNow, string reason)
+    {
+        ReleaseMarketReentryExecutionLatch(
+            cmd.IntentId ?? cmd.Command.ReentryIntentId ?? "",
+            cmd.InstrumentKey ?? cmd.Command.ExecutionInstrument ?? cmd.Command.Instrument,
+            utcNow,
+            reason,
+            cmd.CorrelationId);
+    }
+
+    private static bool MarketReentryLatchMatches(MarketReentryExecutionLatch active, string intentId, string? correlationId)
+    {
+        return (!string.IsNullOrEmpty(intentId) && string.Equals(active.IntentId, intentId, StringComparison.OrdinalIgnoreCase))
+               || (!string.IsNullOrEmpty(correlationId) && string.Equals(active.CorrelationId, correlationId, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private void ReleaseMarketReentryExecutionLatch(string intentId, string? instrument, DateTimeOffset utcNow, string reason, string? correlationId = null)
+    {
+        MarketReentryExecutionLatch? released = null;
+        var inst = NormalizeMarketReentryExecutionInstrument(instrument);
+
+        lock (_marketReentryExecutionLatchLock)
+        {
+            if (!string.IsNullOrEmpty(inst) &&
+                _marketReentryExecutionLatchByInstrument.TryGetValue(inst, out var active) &&
+                MarketReentryLatchMatches(active, intentId, correlationId))
+            {
+                _marketReentryExecutionLatchByInstrument.Remove(inst);
+                released = active;
+            }
+            else
+            {
+                string? releaseKey = null;
+                foreach (var kvp in _marketReentryExecutionLatchByInstrument)
+                {
+                    if (!MarketReentryLatchMatches(kvp.Value, intentId, correlationId))
+                        continue;
+
+                    releaseKey = kvp.Key;
+                    released = kvp.Value;
+                    break;
+                }
+
+                if (!string.IsNullOrEmpty(releaseKey))
+                    _marketReentryExecutionLatchByInstrument.Remove(releaseKey);
+            }
+        }
+
+        if (released == null)
+            return;
+
+        _log.Write(RobotEvents.ExecutionBase(utcNow, released.IntentId, released.InstrumentKey, "REENTRY_BATCH_LATCH_RELEASED",
+            new
+            {
+                reentry_intent_id = released.IntentId,
+                stream = released.Stream,
+                correlation_id = released.CorrelationId,
+                reason,
+                held_ms = (utcNow - released.AcquiredAtUtc).TotalMilliseconds,
+                deferral_count = released.DeferralCount,
+                note = "Same-instrument market reentry latch released; next queued sibling may now be evaluated"
+            }));
+    }
+
+    private bool IsMarketReentryIntentForLatch(string intentId)
+    {
+        return !string.IsNullOrEmpty(intentId) &&
+               IntentMap.TryGetValue(intentId, out var intent) &&
+               intent != null &&
+               string.Equals(intent.TriggerReason, "SUBMIT_MARKET_REENTRY", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void ReleaseMarketReentryExecutionLatchIfProtectionFailed(string intentId, string? instrument, DateTimeOffset utcNow, string reason)
+    {
+        if (IsMarketReentryIntentForLatch(intentId))
+            ReleaseMarketReentryExecutionLatch(intentId, instrument, utcNow, reason);
+    }
     
     // Intent exposure coordinator
     private InstrumentIntentCoordinator? _coordinator;
@@ -667,9 +820,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     /// <returns>true if action ran; false if enqueued (caller should return without touching NT APIs).</returns>
     private bool EnsureStrategyThreadOrEnqueue(string methodName, string? intentId, string? instrument, string? correlationId, Action ntAction)
     {
-        var currentThreadId = System.Threading.Thread.CurrentThread.ManagedThreadId;
-        var inContext = _strategyThreadContextCount > 0 && _strategyThreadId == currentThreadId;
-        if (inContext)
+        if (IsStrategyThreadContext())
         {
             ntAction();
             return true;
@@ -692,6 +843,12 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             _ntActionQueue.EnqueueNtAction(new NtDeferredAction(cid, intentId, instrument, $"THREAD_VIOLATION:{methodName}", ntAction), out _);
         _guardViolationCallback?.Invoke(methodName);
         return false;
+    }
+
+    private bool IsStrategyThreadContext()
+    {
+        var currentThreadId = System.Threading.Thread.CurrentThread.ManagedThreadId;
+        return _strategyThreadContextCount > 0 && _strategyThreadId == currentThreadId;
     }
 
     /// <summary>Optional callback for canary tests. Invoked when guard triggers (NT_THREAD_VIOLATION).</summary>
@@ -948,7 +1105,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         Func<string, bool>? isMismatchExecutionBlocked = null,
         Func<string, string?, bool>? isMismatchExecutionBlockedForSubmit = null,
         Func<string, string?, bool>? isInstrumentFrozenOrEpaBlocked = null,
-        Action<string, DateTimeOffset, bool, string?>? onReentrySubmitCompletedCallback = null)
+        Action<string, DateTimeOffset, bool, string?>? onReentrySubmitCompletedCallback = null,
+        Func<bool>? isPlaybackStallNtCallBlocked = null)
     {
         _standDownStreamCallback = standDownStreamCallback;
         _getNotificationServiceCallback = getNotificationServiceCallback;
@@ -966,6 +1124,7 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         _isMismatchExecutionBlocked = isMismatchExecutionBlocked;
         _isMismatchExecutionBlockedForSubmit = isMismatchExecutionBlockedForSubmit;
         _isInstrumentFrozenOrEpaBlocked = isInstrumentFrozenOrEpaBlocked;
+        _isPlaybackStallNtCallBlockedCallback = isPlaybackStallNtCallBlocked;
     }
 
     /// <summary>
@@ -2271,13 +2430,29 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
 
         if (!ExecutionStructuralLayer.TryEvaluateFlattenStructure(req, out snap, out var flatReason))
         {
+            var reason = string.IsNullOrEmpty(flatReason) ? snap.Reason : flatReason;
+            if (string.Equals(reason, "broker_flat", StringComparison.OrdinalIgnoreCase))
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId ?? "", inst, "FLATTEN_SKIPPED_BROKER_FLAT",
+                    new
+                    {
+                        instrument = inst,
+                        reason,
+                        correlation_id = correlationId,
+                        broker_qty = snap.BrokerQty,
+                        journal_qty = snap.JournalQty,
+                        authority_state = snap.AuthorityState
+                    }));
+                return false;
+            }
+
             TryEmitCriticalUnsafeStateDetected(inst, snap.Reason ?? flatReason, utcNow);
             EmitExecutionBlockedUnsafeState(blockedWhat, intentId, snap, utcNow);
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId ?? "", inst, "FLATTEN_BLOCKED_UNSAFE_STATE",
                 new
                 {
                     instrument = inst,
-                    reason = string.IsNullOrEmpty(flatReason) ? snap.Reason : flatReason,
+                    reason,
                     correlation_id = correlationId,
                     broker_qty = snap.BrokerQty,
                     journal_qty = snap.JournalQty,
@@ -2322,6 +2497,19 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         DateTimeOffset utcNow,
         string submitPath)
     {
+        if (_isPlaybackStallNtCallBlockedCallback != null && _isPlaybackStallNtCallBlockedCallback())
+        {
+            const string error = "NT_CALL_BLOCKED:PLAYBACK_STALL_QUIESCENCE";
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
+            {
+                error,
+                reason = "PLAYBACK_STALL_QUIESCENCE",
+                submit_path = submitPath,
+                note = "Playback stall quiescence is armed; blocking NT-touching submit path."
+            }));
+            return OrderSubmissionResult.FailureResult(error, utcNow);
+        }
+
         if (!TryIntentIdConsistencyGuard(intentId, instrument, "entry", utcNow, out var intentIdFail))
             return intentIdFail!;
         if (!TrySessionIdentityGate(intentId, instrument, "entry", utcNow, null, out var sessionFail))
@@ -3221,14 +3409,21 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         }
 
         if (!TryExecutionSafetyGateForOrderSubmit(intentId, instrument, "SUBMIT_PROTECTIVE_STOP", utcNow, out var safetyFailProt))
+        {
+            ReleaseMarketReentryExecutionLatchIfProtectionFailed(intentId, instrument, utcNow, "REENTRY_PROTECTIVE_STOP_DENIED");
             return safetyFailProt!;
+        }
 
         try
         {
-            return SubmitProtectiveStopReal(intentId, instrument, direction, stopPrice, quantity, ocoGroup, utcNow);
+            var result = SubmitProtectiveStopReal(intentId, instrument, direction, stopPrice, quantity, ocoGroup, utcNow);
+            if (!result.Success)
+                ReleaseMarketReentryExecutionLatchIfProtectionFailed(intentId, instrument, utcNow, "REENTRY_PROTECTIVE_STOP_FAILED");
+            return result;
         }
         catch (Exception ex)
         {
+            ReleaseMarketReentryExecutionLatchIfProtectionFailed(intentId, instrument, utcNow, "REENTRY_PROTECTIVE_STOP_EXCEPTION");
             // Journal: STOP_SUBMIT_FAILED
             // Get Intent info for journal logging
             string tradingDate = "";
@@ -3309,14 +3504,21 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         }
 
         if (!TryExecutionSafetyGateForOrderSubmit(intentId, instrument, "SUBMIT_TARGET", utcNow, out var safetyFailTgt2))
+        {
+            ReleaseMarketReentryExecutionLatchIfProtectionFailed(intentId, instrument, utcNow, "REENTRY_TARGET_DENIED");
             return safetyFailTgt2!;
+        }
 
         try
         {
-            return SubmitTargetOrderReal(intentId, instrument, direction, targetPrice, quantity, ocoGroup, utcNow);
+            var result = SubmitTargetOrderReal(intentId, instrument, direction, targetPrice, quantity, ocoGroup, utcNow);
+            if (!result.Success)
+                ReleaseMarketReentryExecutionLatchIfProtectionFailed(intentId, instrument, utcNow, "REENTRY_TARGET_FAILED");
+            return result;
         }
         catch (Exception ex)
         {
+            ReleaseMarketReentryExecutionLatchIfProtectionFailed(intentId, instrument, utcNow, "REENTRY_TARGET_EXCEPTION");
             // Journal: TARGET_SUBMIT_FAILED
             // Get Intent info for journal logging
             string tradingDate = "";
@@ -3580,6 +3782,18 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         string instrument,
         DateTimeOffset utcNow)
     {
+        if (_isPlaybackStallNtCallBlockedCallback != null && _isPlaybackStallNtCallBlockedCallback())
+        {
+            const string error = "NT_CALL_BLOCKED:PLAYBACK_STALL_QUIESCENCE";
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "FLATTEN_FAIL", new
+            {
+                error,
+                reason = "PLAYBACK_STALL_QUIESCENCE",
+                note = "Playback stall quiescence is armed; blocking NT-touching flatten path."
+            }));
+            return FlattenResult.FailureResult(error, utcNow);
+        }
+
         _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "FLATTEN_ATTEMPT", new
         {
             account = "SIM"
@@ -3667,6 +3881,16 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     
     public AccountSnapshot GetAccountSnapshot(DateTimeOffset utcNow)
     {
+        if (_isPlaybackStallNtCallBlockedCallback != null && _isPlaybackStallNtCallBlockedCallback())
+        {
+            return new AccountSnapshot
+            {
+                Positions = new List<PositionSnapshot>(),
+                WorkingOrders = new List<WorkingOrderSnapshot>(),
+                CapturedAtUtc = utcNow
+            };
+        }
+
 #if !NINJATRADER
         var error = "CRITICAL: NINJATRADER preprocessor directive is NOT defined. " +
                    "Add <DefineConstants>NINJATRADER</DefineConstants> to your .csproj file and rebuild. " +
@@ -3735,6 +3959,17 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     
     public void CancelRobotOwnedWorkingOrders(AccountSnapshot snap, DateTimeOffset utcNow)
     {
+        if (_isPlaybackStallNtCallBlockedCallback != null && _isPlaybackStallNtCallBlockedCallback())
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ORDER_CANCEL_BLOCKED", state: "ENGINE",
+                new
+                {
+                    reason = "PLAYBACK_STALL_QUIESCENCE",
+                    note = "Playback stall quiescence is armed; blocking NT-touching cancel path."
+                }));
+            return;
+        }
+
 #if !NINJATRADER
         var error = "CRITICAL: NINJATRADER preprocessor directive is NOT defined. " +
                    "Add <DefineConstants>NINJATRADER</DefineConstants> to your .csproj file and rebuild. " +
@@ -3759,6 +3994,17 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
 
     public void CancelOrders(IEnumerable<string> orderIds, DateTimeOffset utcNow)
     {
+        if (_isPlaybackStallNtCallBlockedCallback != null && _isPlaybackStallNtCallBlockedCallback())
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ORDER_CANCEL_BLOCKED", state: "ENGINE",
+                new
+                {
+                    reason = "PLAYBACK_STALL_QUIESCENCE",
+                    note = "Playback stall quiescence is armed; blocking NT-touching cancel path."
+                }));
+            return;
+        }
+
 #if !NINJATRADER
         var error = "CRITICAL: NINJATRADER preprocessor directive is NOT defined.";
         _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",

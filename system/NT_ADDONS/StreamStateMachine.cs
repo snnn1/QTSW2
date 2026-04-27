@@ -2337,6 +2337,8 @@ public sealed class StreamStateMachine
                     // Check if market is closed - if so, commit as NO_TRADE_MARKET_CLOSE instead of transitioning to RANGE_BUILDING
                     if (utcNow >= MarketCloseUtc)
                     {
+                        if (TryCommitCompletedTradeAtMarketClose(utcNow)) return;
+                        if (HasEntryFillForCurrentStream()) return;
                         LogNoTradeMarketClose(utcNow);
                         if (!Commit(utcNow, "NO_TRADE_MARKET_CLOSE", "MARKET_CLOSE_NO_TRADE")) return;
                         return;
@@ -2412,8 +2414,10 @@ public sealed class StreamStateMachine
     {
         // Check for market close cutoff (all execution modes)
         // If market has closed and no entry detected, commit as NO_TRADE_MARKET_CLOSE
-        if (!_entryDetected && utcNow >= MarketCloseUtc)
+        if (utcNow >= MarketCloseUtc)
         {
+            if (TryCommitCompletedTradeAtMarketClose(utcNow)) return;
+            if (HasEntryFillForCurrentStream()) return;
             LogNoTradeMarketClose(utcNow);
             if (!Commit(utcNow, "NO_TRADE_MARKET_CLOSE", "MARKET_CLOSE_NO_TRADE")) return;
             return;
@@ -2681,8 +2685,10 @@ public sealed class StreamStateMachine
         }
         
         // Check for market close cutoff (all execution modes)
-        if (!_entryDetected && utcNow >= MarketCloseUtc)
+        if (utcNow >= MarketCloseUtc)
         {
+            if (TryCommitCompletedTradeAtMarketClose(utcNow)) return;
+            if (HasEntryFillForCurrentStream()) return;
             LogNoTradeMarketClose(utcNow);
             if (!Commit(utcNow, "NO_TRADE_MARKET_CLOSE", "MARKET_CLOSE_NO_TRADE")) return;
         }
@@ -6626,6 +6632,65 @@ public sealed class StreamStateMachine
         _journal.SlotStatus = r.SlotStatus;
     }
 
+    private bool HasCompletedTradeForCurrentStream()
+    {
+        if (_executionJournal == null)
+            return false;
+
+        if (_journal.ExecutionInterruptedByClose && !_journal.ReentryFilled)
+            return false;
+
+        if (!string.IsNullOrWhiteSpace(_journal.ReentryIntentId))
+        {
+            if (_journal.ReentryFilled)
+                return _executionJournal.IsIntentCompleted(_journal.ReentryIntentId, TradingDate, Stream);
+
+            if (_journal.ReentrySubmitted || _journal.ReentrySubmitFailureCount > 0)
+                return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(_journal.OriginalIntentId))
+            return _executionJournal.IsIntentCompleted(_journal.OriginalIntentId, TradingDate, Stream);
+
+        return _executionJournal.HasCompletedTradeForStream(TradingDate, Stream);
+    }
+
+    private bool HasEntryFillForCurrentStream()
+    {
+        if (_executionJournal == null)
+            return _entryDetected;
+
+        if (!string.IsNullOrWhiteSpace(_journal.ReentryIntentId))
+        {
+            var reentry = _executionJournal.GetEntry(_journal.ReentryIntentId, TradingDate, Stream);
+            if (reentry?.EntryFilled == true)
+                return true;
+
+            if (_journal.ReentrySubmitted || _journal.ReentrySubmitFailureCount > 0)
+                return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(_journal.OriginalIntentId))
+        {
+            var original = _executionJournal.GetEntry(_journal.OriginalIntentId, TradingDate, Stream);
+            if (original?.EntryFilled == true)
+                return true;
+        }
+
+        return _executionJournal.HasEntryFillForStream(TradingDate, Stream) || _entryDetected;
+    }
+
+    private bool TryCommitCompletedTradeAtMarketClose(DateTimeOffset utcNow)
+    {
+        if (!HasCompletedTradeForCurrentStream())
+            return false;
+
+        var reason = _journal.ReentryFilled
+            ? "REENTRY_TRADE_COMPLETED_MARKET_CLOSE"
+            : "TRADE_COMPLETED_MARKET_CLOSE";
+        return Commit(utcNow, reason, "TRADE_COMPLETED");
+    }
+
     /// <summary>
     /// Terminal commit: persists <see cref="StreamJournal"/> with Committed=true, then sets <see cref="State"/> to DONE.
     /// Option A: if <see cref="JournalStore.Save"/> fails, in-memory journal is rolled back and state is not DONE.
@@ -6640,6 +6705,16 @@ public sealed class StreamStateMachine
         }
 
         var rollback = CaptureJournalCommitRollback();
+        var hasCompletedTradeForStream = HasCompletedTradeForCurrentStream();
+
+        if (hasCompletedTradeForStream &&
+            (commitReason == "NO_TRADE_MARKET_CLOSE" || commitReason.Contains("NO_TRADE")))
+        {
+            commitReason = _journal.ReentryFilled
+                ? "REENTRY_TRADE_COMPLETED_MARKET_CLOSE"
+                : "TRADE_COMPLETED_MARKET_CLOSE";
+            eventType = "TRADE_COMPLETED";
+        }
 
         _journal.Committed = true;
         _journal.CommitReason = commitReason;
@@ -6659,7 +6734,11 @@ public sealed class StreamStateMachine
         // SLOT PERSISTENCE: Set SlotStatus based on commit reason
         var previousSlotStatus = rollback.SlotStatus;
         SlotStatus newSlotStatus;
-        if (commitReason == "SLOT_EXPIRED")
+        if (hasCompletedTradeForStream)
+        {
+            newSlotStatus = SlotStatus.COMPLETE;
+        }
+        else if (commitReason == "SLOT_EXPIRED")
         {
             newSlotStatus = SlotStatus.EXPIRED;
         }
@@ -6670,10 +6749,6 @@ public sealed class StreamStateMachine
         else if (commitReason.Contains("FAILED") || commitReason.Contains("ERROR") || commitReason.Contains("CORRUPTION") || commitReason == "STREAM_STAND_DOWN")
         {
             newSlotStatus = SlotStatus.FAILED_RUNTIME;
-        }
-        else if (_executionJournal != null && _executionJournal.HasCompletedTradeForStream(TradingDate, Stream))
-        {
-            newSlotStatus = SlotStatus.COMPLETE;
         }
         else
         {
@@ -6747,11 +6822,7 @@ public sealed class StreamStateMachine
     private StreamTerminalState DetermineTerminalState(string commitReason, DateTimeOffset utcNow)
     {
         // Check if trade was completed (from execution journal)
-        bool tradeCompleted = false;
-        if (_executionJournal != null)
-        {
-            tradeCompleted = _executionJournal.HasCompletedTradeForStream(TradingDate, Stream);
-        }
+        var tradeCompleted = HasCompletedTradeForCurrentStream();
 
         // Classify based on commit reason and trade completion
         if (tradeCompleted)

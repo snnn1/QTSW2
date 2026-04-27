@@ -24,6 +24,8 @@ public static class PendingAlignmentAuthority
     {
         if (JournalParityPendingLedger.HasPendingTrustedFillEntries(instrument))
             return true;
+        if (QuantExecutionControlStore.IsBrokerExecutionCallbackPendingActive(instrument, utcNow))
+            return true;
         return PostFillAlignmentGate.IsActiveAlignmentWindow(instrument, utcNow);
     }
 
@@ -35,5 +37,6 @@ public static class PendingAlignmentAuthority
     /// </summary>
     public static bool IsJournalLagExplainedMismatchType(MismatchType t) =>
         t is MismatchType.NET_POSITION_MISMATCH or MismatchType.BROKER_AHEAD or MismatchType.JOURNAL_AHEAD
-            or MismatchType.GROSS_POSITION_DIVERGENCE or MismatchType.ORDER_REGISTRY_MISSING;
+            or MismatchType.GROSS_POSITION_DIVERGENCE or MismatchType.ORDER_REGISTRY_MISSING
+            or MismatchType.WORKING_ORDER_COUNT_CONVERGENCE;
 }

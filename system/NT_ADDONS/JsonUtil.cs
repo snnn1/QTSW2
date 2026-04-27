@@ -7,7 +7,7 @@ namespace QTSW2.Robot.Core
             try
             {
                 // Try System.Web.Extensions first (works in .NET Framework and NinjaTrader)
-                var serializerType = System.Type.GetType("System.Web.Script.Serialization.JavaScriptSerializer, System.Web.Extensions");
+                var serializerType = ResolveJavaScriptSerializerType();
                 if (serializerType != null)
                 {
                     var serializer = System.Activator.CreateInstance(serializerType);
@@ -53,7 +53,7 @@ namespace QTSW2.Robot.Core
             try
             {
                 // Try System.Web.Extensions first (works in .NET Framework and NinjaTrader)
-                var serializerType = System.Type.GetType("System.Web.Script.Serialization.JavaScriptSerializer, System.Web.Extensions");
+                var serializerType = ResolveJavaScriptSerializerType();
                 if (serializerType != null)
                 {
                     var serializer = System.Activator.CreateInstance(serializerType);
@@ -92,6 +92,50 @@ namespace QTSW2.Robot.Core
             }
 
             throw new System.InvalidOperationException("No JSON deserializer available (System.Web.Extensions or System.Text.Json).");
+        }
+
+        private static System.Type? ResolveJavaScriptSerializerType()
+        {
+            const string typeName = "System.Web.Script.Serialization.JavaScriptSerializer";
+
+            var serializerType = System.Type.GetType(typeName + ", System.Web.Extensions");
+            if (serializerType != null)
+                return serializerType;
+
+            foreach (var assembly in System.AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try
+                {
+                    serializerType = assembly.GetType(typeName, false);
+                    if (serializerType != null)
+                        return serializerType;
+                }
+                catch
+                {
+                    // Continue probing; JSON fallback will throw if nothing is available.
+                }
+            }
+
+            serializerType = TryLoadJavaScriptSerializerType("System.Web.Extensions", typeName);
+            if (serializerType != null)
+                return serializerType;
+
+            return TryLoadJavaScriptSerializerType(
+                "System.Web.Extensions, Version=4.0.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35",
+                typeName);
+        }
+
+        private static System.Type? TryLoadJavaScriptSerializerType(string assemblyName, string typeName)
+        {
+            try
+            {
+                var assembly = System.Reflection.Assembly.Load(assemblyName);
+                return assembly.GetType(typeName, false);
+            }
+            catch
+            {
+                return null;
+            }
         }
     }
 }

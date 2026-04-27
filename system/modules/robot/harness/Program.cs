@@ -69,11 +69,14 @@ if (argsList.Contains("--help") || argsList.Contains("-h"))
 // --test EXECUTION_SAFETY_GATE: kill-switch, snapshot freshness, recovery block, manual unlock policy
 // --test RELEASE_BLOCKING_ADOPTION: stale journal rows vs live tag/registry release-blocking policy
 // --test JOURNAL_REOPEN_EXPOSURE_REHYDRATE: tagged broker journal reopen normalization + exposure rehydration
+// --test LATE_SESSION_CLOSE_JOURNAL_REPAIR: broker-flat journal repair plus ownership mirror close
 // --test EXECUTION_EVENT_REPLAY: run Gap 5 canonical event replay tests
 // --test INTENT_LIFECYCLE: run intent lifecycle state machine tests (transitions, command legality)
 // --test EXECUTION_ORDERING: run execution event ordering hardening tests (deferred resolution, dedup)
 // --test SIBLING_PROTECTIVE_CANCEL_QUEUE: urgent lane drains sibling protective cancel before normal NT actions (requires modules/robot/core to compile; else use RobotCore_For_NinjaTrader/SiblingProtectiveCancelQueue.Test)
 // --test RECONCILIATION_PENDING_IEA_COOLDOWN: repeated unchanged pending IEA work triggers gate-recovery backoff instead of hot-loop snapshots
+// --test REENTRY_MARKET_CLOSE_COMMIT: market-close stream commit must use current reentry intent completion, not any historical completed row in the stream
+// --test MARKET_REENTRY_SUBMIT_PATH: reentry submit may pass recovery gate while normal entry remains denied
 var testIndex = argsList.IndexOf("--test");
 if (testIndex >= 0 && testIndex + 1 < argsList.Count)
 {
@@ -270,6 +273,18 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
         Console.WriteLine(pass ? "PASS: Reentry protection acceptance tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
+    else if (testName.Equals("REENTRY_MARKET_CLOSE_COMMIT", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = ReentryMarketCloseCommitTests.RunAll();
+        Console.WriteLine(pass ? "PASS: Reentry market-close commit tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("MARKET_REENTRY_SUBMIT_PATH", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = MarketReentrySubmitPathTests.RunAll();
+        Console.WriteLine(pass ? "PASS: Market reentry submit path tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
     else if (testName.Equals("REENTRY_TIMING", StringComparison.OrdinalIgnoreCase))
     {
         var (pass, err) = ReentryTimingTests.RunReentryTimingTests();
@@ -336,7 +351,7 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
         if (!paPass)
         {
             Console.WriteLine("POSITION_AUTHORITY_DERIVATION: FAIL " + paErr);
-            return 1;
+            Environment.Exit(1);
         }
 
         var (pass, err) = ExecutionSafetyGateTests.RunAll();
@@ -377,6 +392,12 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
     {
         var (pass, err) = JournalReopenAndExposureRehydrateTests.RunAll();
         Console.WriteLine(pass ? "PASS: Journal reopen + exposure rehydrate tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("LATE_SESSION_CLOSE_JOURNAL_REPAIR", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = LateSessionCloseJournalRepairTests.RunAll();
+        Console.WriteLine(pass ? "PASS: Late-session close journal repair tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
     else if (testName.Equals("EXECUTION_EVENT_REPLAY", StringComparison.OrdinalIgnoreCase))
@@ -461,6 +482,12 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
     {
         var (pass, err) = AuthorityContradictionTests.RunAll();
         Console.WriteLine(pass ? "PASS: Authority contradiction tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("RUN_SUMMARY", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = RunSummaryBuilderTests.RunAll();
+        Console.WriteLine(pass ? "PASS: Run summary builder tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
 }

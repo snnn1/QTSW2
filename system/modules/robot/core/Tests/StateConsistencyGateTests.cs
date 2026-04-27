@@ -54,6 +54,40 @@ public static class StateConsistencyGateTests
             Summary = "release_ready"
         };
 
+        StateConsistencyReleaseReadinessResult ImmediateBrokerFlatReadyUnknownIea(string inst) => new()
+        {
+            Instrument = inst,
+            SnapshotSufficient = true,
+            ReleaseReady = true,
+            IsExplainable = true,
+            BrokerPositionExplainable = true,
+            BrokerWorkingExplainable = true,
+            LocalStateCoherent = true,
+            PendingAdoptionExists = false,
+            DiagnosticBrokerPositionQty = 0,
+            DiagnosticJournalOpenQty = 0,
+            DiagnosticBrokerWorkingCount = 0,
+            DiagnosticIeaOwnedPlusAdoptedWorking = -1,
+            Summary = "release_ready"
+        };
+
+        StateConsistencyReleaseReadinessResult ImmediateBrokerFlatReadyStaleDiagnosticWorking(string inst) => new()
+        {
+            Instrument = inst,
+            SnapshotSufficient = true,
+            ReleaseReady = true,
+            IsExplainable = true,
+            BrokerPositionExplainable = true,
+            BrokerWorkingExplainable = true,
+            LocalStateCoherent = true,
+            PendingAdoptionExists = false,
+            DiagnosticBrokerPositionQty = 0,
+            DiagnosticJournalOpenQty = 0,
+            DiagnosticBrokerWorkingCount = 2,
+            DiagnosticIeaOwnedPlusAdoptedWorking = 0,
+            Summary = "release_ready"
+        };
+
         StateConsistencyReleaseReadinessResult NotReady(string inst, string why) => new()
         {
             Instrument = inst,
@@ -90,6 +124,57 @@ public static class StateConsistencyGateTests
                     IsTerminal = false
                 }, ReconciliationDecision.ADOPT)
             }
+        };
+
+        StateConsistencyReleaseReadinessResult SoftTransitionCoherentNonFlat(string inst) => new()
+        {
+            Instrument = inst,
+            SnapshotSufficient = true,
+            ReleaseReady = false,
+            IsExplainable = true,
+            BrokerPositionExplainable = true,
+            BrokerWorkingExplainable = true,
+            LocalStateCoherent = true,
+            PendingAdoptionExists = true,
+            DiagnosticBrokerPositionQty = 2,
+            DiagnosticJournalOpenQty = 2,
+            DiagnosticBrokerWorkingCount = 0,
+            DiagnosticIeaOwnedPlusAdoptedWorking = 0,
+            DiagnosticPendingAdoptionCandidateCount = 1,
+            DiagnosticAdoptDecisionCount = 1,
+            UnexplainedBrokerPositionQty = 0,
+            UnexplainedBrokerWorkingCount = 0,
+            Summary = "pending_adoption_adopt_decision;blocker_adopt:BrokerVisibleAdoptableExposure:test-nonflat",
+            Contradictions = new List<string> { "pending_adoption_adopt_decision", "blocker_adopt:BrokerVisibleAdoptableExposure:test-nonflat" },
+            ResolvedBlockers = new List<(ReconciliationBlocker Blocker, ReconciliationDecision Decision)>
+            {
+                (new ReconciliationBlocker
+                {
+                    ReasonCode = ReconciliationBlockerReasonCode.BrokerVisibleAdoptableExposure,
+                    IntentId = "soft-transition-nonflat-test",
+                    IsTerminal = false
+                }, ReconciliationDecision.ADOPT)
+            }
+        };
+
+        StateConsistencyReleaseReadinessResult ResidualCleanupReady(string inst) => new()
+        {
+            Instrument = inst,
+            SnapshotSufficient = true,
+            ReleaseReady = true,
+            ResidualCleanupOnly = true,
+            ResidualCleanupClass = ResidualCleanupMismatchClass.MISMATCH_RESIDUAL_JOURNAL_AND_ADOPTION_RETIREMENT.ToString(),
+            IsExplainable = true,
+            BrokerPositionExplainable = true,
+            BrokerWorkingExplainable = true,
+            LocalStateCoherent = true,
+            PendingAdoptionExists = true,
+            DiagnosticBrokerPositionQty = 0,
+            DiagnosticJournalOpenQty = 2,
+            DiagnosticBrokerWorkingCount = 0,
+            DiagnosticIeaOwnedPlusAdoptedWorking = 0,
+            DiagnosticPendingAdoptionCandidateCount = 2,
+            Summary = "release_ready_residual_cleanup:" + ResidualCleanupMismatchClass.MISMATCH_RESIDUAL_JOURNAL_AND_ADOPTION_RETIREMENT
         };
 
         // 1) First mismatch engages immediately + DetectedBlocked
@@ -256,7 +341,7 @@ public static class StateConsistencyGateTests
         if (coord6.IsInstrumentBlockedByMismatch("NQ"))
             return (false, "6: NQ should not be blocked");
 
-        // 7) Pending adoption blocks release (evaluator)
+        // 7) Raw pending-adoption count without classifier evidence is observability only.
         var inp = new StateConsistencyReleaseEvaluationInput
         {
             Instrument = "GC",
@@ -269,7 +354,35 @@ public static class StateConsistencyGateTests
             UseInstrumentExecutionAuthority = true
         };
         var ev = StateConsistencyReleaseEvaluator.Evaluate(inp);
-        if (ev.ReleaseReady) return (false, "7: pending adoption must block");
+        if (!ev.ReleaseReady) return (false, "7: legacy pending adoption residue without blockers must not veto release");
+        if (!ev.LegacyClassifierGap) return (false, "7: legacy classifier gap should be surfaced diagnostically");
+
+        // 7b) Classifier-backed adoption still blocks release.
+        inp = new StateConsistencyReleaseEvaluationInput
+        {
+            Instrument = "GC",
+            BrokerPositionQty = 0,
+            BrokerWorkingCount = 1,
+            JournalOpenQty = 0,
+            IeaOwnedPlusAdoptedWorking = 0,
+            PendingAdoptionCandidateCount = 1,
+            SnapshotSufficient = true,
+            UseInstrumentExecutionAuthority = true,
+            ReconciliationBlockers = new List<ReconciliationBlocker>
+            {
+                new()
+                {
+                    ReasonCode = ReconciliationBlockerReasonCode.BrokerVisibleAdoptableExposure,
+                    IntentId = "adopt-blocker-test",
+                    BlocksRelease = true,
+                    ShouldAdopt = true,
+                    Disposition = ReleaseAdoptionDisposition.AdoptableAndRetryable,
+                    IsTerminal = false
+                }
+            }
+        };
+        ev = StateConsistencyReleaseEvaluator.Evaluate(inp);
+        if (ev.ReleaseReady) return (false, "7b: classifier-backed pending adoption must block");
 
         // 8) Unexplained working blocks release
         inp = new StateConsistencyReleaseEvaluationInput
@@ -285,6 +398,44 @@ public static class StateConsistencyGateTests
         };
         ev = StateConsistencyReleaseEvaluator.Evaluate(inp);
         if (ev.ReleaseReady) return (false, "8: unexplained working");
+
+        // 8b) Broker-flat cleanup lag should classify as residual cleanup, not active mismatch.
+        inp = new StateConsistencyReleaseEvaluationInput
+        {
+            Instrument = "MNG",
+            BrokerPositionQty = 0,
+            BrokerWorkingCount = 0,
+            PendingExecutionWorkload = 0,
+            JournalOpenQty = 2,
+            IeaOwnedPlusAdoptedWorking = 0,
+            PendingAdoptionCandidateCount = 2,
+            SnapshotSufficient = true,
+            UseInstrumentExecutionAuthority = true,
+            ReconciliationBlockers = new List<ReconciliationBlocker>
+            {
+                new()
+                {
+                    ReasonCode = ReconciliationBlockerReasonCode.JournalOnlyBrokerFlat,
+                    IntentId = "journal-row",
+                    Disposition = ReleaseAdoptionDisposition.NeedsDifferentReconciliationLane,
+                    BlocksRelease = true,
+                    ShouldAdopt = false
+                },
+                new()
+                {
+                    ReasonCode = ReconciliationBlockerReasonCode.BrokerVisibleAdoptableExposure,
+                    IntentId = "adoption-row",
+                    Disposition = ReleaseAdoptionDisposition.AdoptableAndRetryable,
+                    BlocksRelease = true,
+                    ShouldAdopt = false
+                }
+            }
+        };
+        ev = StateConsistencyReleaseEvaluator.Evaluate(inp);
+        if (!ev.ReleaseReady || !ev.ResidualCleanupOnly)
+            return (false, "8b: residual cleanup should release");
+        if (ev.ResidualCleanupClass != ResidualCleanupMismatchClass.MISMATCH_RESIDUAL_JOURNAL_AND_ADOPTION_RETIREMENT.ToString())
+            return (false, "8b: residual cleanup class");
 
         // 9) PERSISTENT_MISMATCH + release_ready: after stability window, gate releases (no stuck-forever)
         var coord9 = new MismatchEscalationCoordinator(
@@ -360,6 +511,35 @@ public static class StateConsistencyGateTests
         st = coord10.GetStateForTest("HG");
         if (!st!.Blocked || st.EscalationState != MismatchEscalationState.PERSISTENT_MISMATCH)
             return (false, "10: must stay blocked on persistent when not release-ready");
+
+        // 10b) Residual cleanup should release immediately once broker-flat/no-work is already coherent.
+        var coord10b = new MismatchEscalationCoordinator(
+            getSnapshot: () => snap,
+            getActiveInstruments: () => Array.Empty<string>(),
+            getMismatchObservations: (_, _) => Array.Empty<MismatchObservation>(),
+            isInstrumentBlocked: _ => false,
+            isFlattenInProgress: _ => false,
+            isRecoveryInProgress: _ => false,
+            log: null,
+            runInstrumentGateReconciliation: (_, _, _) => new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Success },
+            evaluateReleaseReadiness: (_, _, _, _) => ResidualCleanupReady("MNG"),
+            getPendingExecutionWorkloadForInstrument: _ => 0,
+            stateConsistencyStableWindowMs: 500);
+        coord10b.ProcessObservationForTest(new MismatchObservation
+        {
+            Instrument = "MNG",
+            MismatchType = MismatchType.JOURNAL_AHEAD,
+            Present = true,
+            BrokerQty = 0,
+            LocalQty = 2,
+            BrokerWorkingOrderCount = 0,
+            LocalWorkingOrderCount = 0,
+            ObservedUtc = t0
+        });
+        coord10b.AdvanceStateConsistencyGateForTest("MNG", snap, t0);
+        st = coord10b.GetStateForTest("MNG");
+        if (st!.Blocked || st.GateLifecyclePhase != GateLifecyclePhase.None)
+            return (false, "10b: residual cleanup should fast-release");
 
         // 11) PERSISTENT_MISMATCH + release_ready but stableMs < window: no release
         var coord11 = new MismatchEscalationCoordinator(
@@ -483,7 +663,7 @@ public static class StateConsistencyGateTests
         coord13.SetForcedConvergenceStallForTest("ST1", true, fp13);
         coord13.ResetTestGateTelemetryCounters();
         for (var i = 0; i < 10; i++)
-            coord13.AdvanceStateConsistencyGateForTest("ST1", snapStall, t0.AddMilliseconds(i * 35_000), st13);
+            coord13.AdvanceStateConsistencyGateForTest("ST1", snapStall, t0.AddMilliseconds(i * 1_000), st13);
         if (coord13.TestGateResultEmitCount > 2)
             return (false, $"13: at most 2 RESULT emits expected, got {coord13.TestGateResultEmitCount}");
         if (coord13.TestGateResultSuppressCount < 8)
@@ -581,10 +761,10 @@ public static class StateConsistencyGateTests
         });
         coord16.SetForcedConvergenceStallForTest("ST4", true, fp16);
         coord16.AdvanceStateConsistencyGateForTest("ST4", snapStall, t0, st16a);
-        coord16.AdvanceStateConsistencyGateForTest("ST4", snapStall, t0.AddMilliseconds(35_000), st16a);
+        coord16.AdvanceStateConsistencyGateForTest("ST4", snapStall, t0.AddMilliseconds(5_000), st16a);
         coord16.ResetTestGateTelemetryCounters();
-        var st16b = StallObs("ST4", 2, 0, t0.AddMilliseconds(70_000));
-        coord16.AdvanceStateConsistencyGateForTest("ST4", snapStall, t0.AddMilliseconds(70_000), st16b);
+        var st16b = StallObs("ST4", 2, 0, t0.AddMilliseconds(10_000));
+        coord16.AdvanceStateConsistencyGateForTest("ST4", snapStall, t0.AddMilliseconds(10_000), st16b);
         if (coord16.TestGateResultEmitCount < 1)
             return (false, "16: external/state change should emit at least one RESULT");
 
@@ -645,7 +825,7 @@ public static class StateConsistencyGateTests
             log: null,
             runInstrumentGateReconciliation: (_, _, _) =>
                 new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Success },
-            evaluateReleaseReadiness: (_, _, _, _) => Ready("ST6"),
+            evaluateReleaseReadiness: (_, _, _, _) => ImmediateBrokerFlatReady("ST6"),
             stateConsistencyStableWindowMs: 500);
         coord18.ProcessObservationForTest(new MismatchObservation
         {
@@ -707,6 +887,33 @@ public static class StateConsistencyGateTests
         if (coord19.IsSubmitBlockedByMismatch("ST7", "SUBMIT_ENTRY_STOP"))
             return (false, "19: soft-transition lock entry stop should bypass mismatch block");
 
+        // 19b) Coherent non-flat soft-transition state should also bypass mismatch authority for lock-time entry stops.
+        var coord19b = new MismatchEscalationCoordinator(
+            getSnapshot: () => snap,
+            getActiveInstruments: () => Array.Empty<string>(),
+            getMismatchObservations: (_, _) => Array.Empty<MismatchObservation>(),
+            isInstrumentBlocked: _ => false,
+            isFlattenInProgress: _ => false,
+            isRecoveryInProgress: _ => false,
+            log: null,
+            runInstrumentGateReconciliation: (_, _, _) =>
+                new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Partial },
+            evaluateReleaseReadiness: (_, _, _, _) => SoftTransitionCoherentNonFlat("ST7B"),
+            stateConsistencyStableWindowMs: 500);
+        coord19b.ProcessObservationForTest(new MismatchObservation
+        {
+            Instrument = "ST7B",
+            MismatchType = MismatchType.BROKER_AHEAD,
+            Present = true,
+            BrokerQty = 2,
+            LocalQty = 2,
+            ObservedUtc = t0
+        });
+        if (!coord19b.IsSubmitBlockedByMismatch("ST7B", "SUBMIT_ENTRY"))
+            return (false, "19b: generic non-flat opening entry should remain mismatch-blocked");
+        if (coord19b.IsSubmitBlockedByMismatch("ST7B", "SUBMIT_ENTRY_STOP"))
+            return (false, "19b: coherent non-flat lock entry stop should bypass mismatch block");
+
         // 20) Immediate broker-flat release should not require a second evaluation tick.
         var coord20 = new MismatchEscalationCoordinator(
             getSnapshot: () => snap,
@@ -743,6 +950,146 @@ public static class StateConsistencyGateTests
             return (false, "20: immediate broker-flat readiness should release on first stable tick");
         if (st.GateLifecyclePhase != GateLifecyclePhase.None)
             return (false, $"20: expected gate phase None after same-tick broker-flat release, got {st.GateLifecyclePhase}");
+
+        // 20b) Immediate broker-flat release should still fire when the coherent broker-flat state arrives on a later tick
+        // even if the quiet fingerprint changes between the first stable sample and the now-clean sample.
+        var coord20b = new MismatchEscalationCoordinator(
+            getSnapshot: () => snap,
+            getActiveInstruments: () => Array.Empty<string>(),
+            getMismatchObservations: (_, _) => Array.Empty<MismatchObservation>(),
+            isInstrumentBlocked: _ => false,
+            isFlattenInProgress: _ => false,
+            isRecoveryInProgress: _ => false,
+            log: null,
+            runInstrumentGateReconciliation: (_, _, _) =>
+                new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Success },
+            evaluateReleaseReadiness: (_, _, _, _) => ImmediateBrokerFlatReady("ST8B"),
+            stateConsistencyStableWindowMs: 500);
+        coord20b.ProcessObservationForTest(new MismatchObservation
+        {
+            Instrument = "ST8B",
+            MismatchType = MismatchType.BROKER_AHEAD,
+            Present = true,
+            ObservedUtc = t0
+        });
+        coord20b.AdvanceStateConsistencyGateForTest("ST8B", snap, t0, new MismatchObservation
+        {
+            Instrument = "ST8B",
+            MismatchType = MismatchType.BROKER_AHEAD,
+            Present = true,
+            ObservedUtc = t0,
+            BrokerWorkingOrderCount = 1,
+            LocalWorkingOrderCount = 0,
+            NetBrokerQty = 0,
+            NetJournalQty = 0
+        });
+        st = coord20b.GetStateForTest("ST8B");
+        if (st == null || !st.Blocked || st.GateLifecyclePhase != GateLifecyclePhase.StablePendingRelease)
+            return (false, "20b: first stable sample with remaining broker working should still be pending release");
+        coord20b.AdvanceStateConsistencyGateForTest("ST8B", snap, t0.AddMilliseconds(100), new MismatchObservation
+        {
+            Instrument = "ST8B",
+            MismatchType = MismatchType.BROKER_AHEAD,
+            Present = true,
+            ObservedUtc = t0.AddMilliseconds(100),
+            BrokerWorkingOrderCount = 0,
+            LocalWorkingOrderCount = 0,
+            NetBrokerQty = 0,
+            NetJournalQty = 0
+        });
+        st = coord20b.GetStateForTest("ST8B");
+        if (st == null || st.Blocked)
+            return (false, "20c: coherent broker-flat state should release immediately even after fingerprint change");
+        if (st.GateLifecyclePhase != GateLifecyclePhase.None)
+            return (false, $"20c: expected gate phase None after later broker-flat release, got {st.GateLifecyclePhase}");
+
+        // 20d) Immediate broker-flat release should not be blocked by unknown IEA diagnostics when readiness is already coherent.
+        var coord20d = new MismatchEscalationCoordinator(
+            getSnapshot: () => snap,
+            getActiveInstruments: () => Array.Empty<string>(),
+            getMismatchObservations: (_, _) => Array.Empty<MismatchObservation>(),
+            isInstrumentBlocked: _ => false,
+            isFlattenInProgress: _ => false,
+            isRecoveryInProgress: _ => false,
+            log: null,
+            runInstrumentGateReconciliation: (_, _, _) =>
+                new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Success },
+            evaluateReleaseReadiness: (_, _, _, _) => ImmediateBrokerFlatReadyUnknownIea("ST8C"),
+            stateConsistencyStableWindowMs: 500);
+        coord20d.ProcessObservationForTest(new MismatchObservation
+        {
+            Instrument = "ST8C",
+            MismatchType = MismatchType.BROKER_AHEAD,
+            Present = true,
+            ObservedUtc = t0
+        });
+        coord20d.AdvanceStateConsistencyGateForTest("ST8C", snap, t0, new MismatchObservation
+        {
+            Instrument = "ST8C",
+            MismatchType = MismatchType.BROKER_AHEAD,
+            Present = true,
+            ObservedUtc = t0,
+            BrokerWorkingOrderCount = 1,
+            LocalWorkingOrderCount = 0,
+            NetBrokerQty = 0,
+            NetJournalQty = 0
+        });
+        st = coord20d.GetStateForTest("ST8C");
+        if (st == null || !st.Blocked || st.GateLifecyclePhase != GateLifecyclePhase.StablePendingRelease)
+            return (false, "20d: first pre-clean sample should still be pending release");
+        coord20d.AdvanceStateConsistencyGateForTest("ST8C", snap, t0.AddMilliseconds(100), new MismatchObservation
+        {
+            Instrument = "ST8C",
+            MismatchType = MismatchType.BROKER_AHEAD,
+            Present = true,
+            ObservedUtc = t0.AddMilliseconds(100),
+            BrokerWorkingOrderCount = 0,
+            LocalWorkingOrderCount = 0,
+            NetBrokerQty = 0,
+            NetJournalQty = 0
+        });
+        st = coord20d.GetStateForTest("ST8C");
+        if (st == null || st.Blocked)
+            return (false, "20e: unknown-but-nonpositive IEA diagnostics should not block immediate broker-flat release");
+        if (st.GateLifecyclePhase != GateLifecyclePhase.None)
+            return (false, $"20e: expected gate phase None after unknown-IEA broker-flat release, got {st.GateLifecyclePhase}");
+
+        // 20f) Stale broker-working diagnostics inside readiness should not strand an otherwise coherent flat release.
+        var coord20f = new MismatchEscalationCoordinator(
+            getSnapshot: () => snap,
+            getActiveInstruments: () => Array.Empty<string>(),
+            getMismatchObservations: (_, _) => Array.Empty<MismatchObservation>(),
+            isInstrumentBlocked: _ => false,
+            isFlattenInProgress: _ => false,
+            isRecoveryInProgress: _ => false,
+            log: null,
+            runInstrumentGateReconciliation: (_, _, _) =>
+                new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Success },
+            evaluateReleaseReadiness: (_, _, _, _) => ImmediateBrokerFlatReadyStaleDiagnosticWorking("ST8D"),
+            stateConsistencyStableWindowMs: 500);
+        coord20f.ProcessObservationForTest(new MismatchObservation
+        {
+            Instrument = "ST8D",
+            MismatchType = MismatchType.BROKER_AHEAD,
+            Present = true,
+            ObservedUtc = t0
+        });
+        coord20f.AdvanceStateConsistencyGateForTest("ST8D", snap, t0, new MismatchObservation
+        {
+            Instrument = "ST8D",
+            MismatchType = MismatchType.BROKER_AHEAD,
+            Present = true,
+            ObservedUtc = t0,
+            BrokerWorkingOrderCount = 0,
+            LocalWorkingOrderCount = 0,
+            NetBrokerQty = 0,
+            NetJournalQty = 0
+        });
+        st = coord20f.GetStateForTest("ST8D");
+        if (st == null || st.Blocked)
+            return (false, "20f: stale readiness broker-working diagnostics should not block immediate broker-flat release");
+        if (st.GateLifecyclePhase != GateLifecyclePhase.None)
+            return (false, $"20f: expected gate phase None after stale-diagnostic broker-flat release, got {st.GateLifecyclePhase}");
 
         // 21) Soft-transition persistent mismatch should force an expensive reconciliation pass even under throttle stall.
         var softTransitionReconCalls = 0;

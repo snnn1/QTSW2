@@ -25,6 +25,7 @@ public sealed class RiskGate
     private readonly KillSwitch _killSwitch;
     private readonly IExecutionRecoveryGuard? _guard;
     private readonly Func<string, bool>? _isInstrumentFrozen;
+    private Action<string, string, string>? _onGlobalKillSwitchBlocked;
 
     public RiskGate(ParitySpec spec, TimeService time, RobotLogger log, KillSwitch killSwitch, IExecutionRecoveryGuard? guard = null, Func<string, bool>? isInstrumentFrozen = null)
     {
@@ -35,6 +36,9 @@ public sealed class RiskGate
         _guard = guard;
         _isInstrumentFrozen = isInstrumentFrozen;
     }
+
+    public void SetOnGlobalKillSwitchBlocked(Action<string, string, string>? callback) =>
+        _onGlobalKillSwitchBlocked = callback;
 
     /// <summary>
     /// Check all risk gates. Returns (allowed, reason, failedGates) tuple.
@@ -74,6 +78,7 @@ public sealed class RiskGate
         if (!killSwitchOk)
         {
             failedGates.Add("KILL_SWITCH");
+            _onGlobalKillSwitchBlocked?.Invoke("GLOBAL_KILL_SWITCH_ACTIVATED", instrument, stream);
             LogRiskCheck(stream, instrument, session, slotTimeChicago, tradingDate, false, failedGates, utcNow);
             return (false, "KILL_SWITCH_ACTIVE", failedGates);
         }

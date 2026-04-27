@@ -32,6 +32,18 @@ public static class StructuralLagBypassTests
             e = Case_NoPendingAlignment_PositionMismatchStillDenies();
             if (e != null) return (false, e);
 
+            e = Case_MarketReentry_CanonicalFlatRunnerJournalLag_AllowsStructural();
+            if (e != null) return (false, e);
+
+            e = Case_MarketReentry_SiblingTransitionNonFlatLag_AllowsStructural();
+            if (e != null) return (false, e);
+
+            e = Case_RiskCoverage_Target_PendingAlignmentPartialJournalLag_AllowsStructural();
+            if (e != null) return (false, e);
+
+            e = Case_Flatten_BrokerFlatJournalLag_IsNoOpNotParityDeny();
+            if (e != null) return (false, e);
+
             return (true, null);
         }
         finally
@@ -260,6 +272,303 @@ public static class StructuralLagBypassTests
                 return "expected structural deny without pending alignment lag context";
             if (s.Reason != ExecutionStructuralLayer.StructuralBlocker.ParityNotOk)
                 return "expected parity_not_ok, got " + s.Reason;
+            return null;
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(root))
+                    Directory.Delete(root, true);
+            }
+            catch
+            {
+                /* best effort */
+            }
+        }
+    }
+
+    private static string? Case_MarketReentry_CanonicalFlatRunnerJournalLag_AllowsStructural()
+    {
+        JournalParityPendingLedger.Clear();
+        var prevLedger = FeatureFlags.StructuralLayerUseLedgerOwnership;
+        FeatureFlags.StructuralLayerUseLedgerOwnership = true;
+        var utc = DateTimeOffset.Parse("2099-07-07T12:00:00Z");
+        var inst = "MES_REENTRY_LAG";
+        JournalParityPendingLedger.TryRecordTrustedFill(inst, "dedupe-reentry-flat", 1, "intent-flat", utc);
+
+        var root = Path.Combine(Path.GetTempPath(), "struct_lag_reentry_flat_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var log = new RobotLogger(root);
+            var journal = new ExecutionJournal(root, log);
+            journal.RecordSubmission("intent-open", "2099-07-07", "S2", inst, "ENTRY", "broker-entry", utc);
+            journal.RecordEntryFill("intent-open", "2099-07-07", "S2", 100m, 2, utc, 1m, "Short", inst, inst);
+
+            var snap = new AccountSnapshot
+            {
+                Positions = new List<PositionSnapshot>(),
+                WorkingOrders = new List<WorkingOrderSnapshot>(),
+                CapturedAtUtc = utc
+            };
+
+            var parity = JournalParityChecker.CheckJournalParity(inst, snap, journal, new TestRegistryView(false, 0), inst, utc);
+            if (parity.Status != JournalParityStatus.POSITION_MISMATCH)
+                return $"expected POSITION_MISMATCH for broker-flat runner-journal lag, got {parity.Status}";
+            if (!PendingAlignmentAuthority.IsPendingAlignment(inst, utc))
+                return "expected PendingAlignmentAuthority true for trusted flat catch-up";
+
+            var req = new ExecutionSafetyEvaluationRequest
+            {
+                Instrument = inst,
+                CanonicalInstrument = inst,
+                UtcNow = utc,
+                Journal = journal,
+                AccountSnapshot = snap,
+                UseInstrumentExecutionAuthority = false,
+                IeaOwnedPlusAdoptedWorking = 0,
+                RecoveryExecutionDisallowed = false,
+                JournalIntegrityOrReconciliationRepairActive = false,
+                LedgerOwnershipSnapshot = new InstrumentOwnershipSnapshot
+                {
+                    Account = "default",
+                    ExecutionInstrumentKey = inst,
+                    OwnershipVersion = 1,
+                    LedgerSignedNetQty = 0,
+                    SnapshotUtc = utc
+                }
+            };
+
+            if (ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_ENTRY", false, out var denyEntry))
+                return "expected plain SUBMIT_ENTRY deny under broker-flat journal lag";
+            if (denyEntry.Reason != ExecutionStructuralLayer.StructuralBlocker.ParityNotOk)
+                return "expected SUBMIT_ENTRY parity_not_ok, got " + denyEntry.Reason;
+
+            if (!ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_MARKET_REENTRY", false, out var ok))
+                return "expected market reentry allow under canonical-flat runner-journal lag, got " + ok.Reason;
+            if (ok.Detail == null || ok.Detail.IndexOf("market_reentry_structural_bookkeeping_lag_bypass_canonical_flat_runner_journal_lag", StringComparison.Ordinal) < 0)
+                return "expected canonical-flat runner-journal lag detail, got " + ok.Detail;
+            return null;
+        }
+        finally
+        {
+            FeatureFlags.StructuralLayerUseLedgerOwnership = prevLedger;
+            try
+            {
+                if (Directory.Exists(root))
+                    Directory.Delete(root, true);
+            }
+            catch
+            {
+                /* best effort */
+            }
+        }
+    }
+
+    private static string? Case_MarketReentry_SiblingTransitionNonFlatLag_AllowsStructural()
+    {
+        JournalParityPendingLedger.Clear();
+        var prevLedger = FeatureFlags.StructuralLayerUseLedgerOwnership;
+        FeatureFlags.StructuralLayerUseLedgerOwnership = true;
+        var utc = DateTimeOffset.Parse("2099-07-07T12:00:00Z");
+        var inst = "MES_REENTRY_SIBLING";
+        JournalParityPendingLedger.TryRecordTrustedFill(inst, "dedupe-reentry-sibling", 1, "intent-sibling", utc);
+
+        var root = Path.Combine(Path.GetTempPath(), "struct_lag_reentry_sibling_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var log = new RobotLogger(root);
+            var journal = new ExecutionJournal(root, log);
+
+            var snap = new AccountSnapshot
+            {
+                Positions = new List<PositionSnapshot> { new() { Instrument = inst, Quantity = -2 } },
+                WorkingOrders = new List<WorkingOrderSnapshot>(),
+                CapturedAtUtc = utc
+            };
+
+            var parity = JournalParityChecker.CheckJournalParity(inst, snap, journal, new TestRegistryView(false, 0), inst, utc);
+            if (parity.Status != JournalParityStatus.POSITION_MISMATCH)
+                return $"expected POSITION_MISMATCH for sibling-transition non-flat lag, got {parity.Status}";
+            if (!PendingAlignmentAuthority.IsPendingAlignment(inst, utc))
+                return "expected PendingAlignmentAuthority true for sibling-transition non-flat lag";
+
+            var req = new ExecutionSafetyEvaluationRequest
+            {
+                Instrument = inst,
+                CanonicalInstrument = inst,
+                UtcNow = utc,
+                Journal = journal,
+                AccountSnapshot = snap,
+                UseInstrumentExecutionAuthority = false,
+                IeaOwnedPlusAdoptedWorking = 0,
+                RecoveryExecutionDisallowed = false,
+                JournalIntegrityOrReconciliationRepairActive = false,
+                LedgerOwnershipSnapshot = new InstrumentOwnershipSnapshot
+                {
+                    Account = "default",
+                    ExecutionInstrumentKey = inst,
+                    OwnershipVersion = 1,
+                    LedgerSignedNetQty = 0,
+                    SnapshotUtc = utc
+                }
+            };
+
+            if (ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_ENTRY", false, out var denyEntry))
+                return "expected plain SUBMIT_ENTRY deny under sibling-transition non-flat lag";
+            if (denyEntry.Reason != ExecutionStructuralLayer.StructuralBlocker.ParityNotOk)
+                return "expected SUBMIT_ENTRY parity_not_ok, got " + denyEntry.Reason;
+
+            if (!ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_MARKET_REENTRY", false, out var ok))
+                return "expected market reentry allow under sibling-transition non-flat lag, got " + ok.Reason;
+            if (ok.Detail == null || ok.Detail.IndexOf("market_reentry_structural_bookkeeping_lag_bypass_sibling_transition_nonflat", StringComparison.Ordinal) < 0)
+                return "expected sibling-transition non-flat lag detail, got " + ok.Detail;
+            return null;
+        }
+        finally
+        {
+            FeatureFlags.StructuralLayerUseLedgerOwnership = prevLedger;
+            try
+            {
+                if (Directory.Exists(root))
+                    Directory.Delete(root, true);
+            }
+            catch
+            {
+                /* best effort */
+            }
+        }
+    }
+
+    private static string? Case_RiskCoverage_Target_PendingAlignmentPartialJournalLag_AllowsStructural()
+    {
+        JournalParityPendingLedger.Clear();
+        var prevLedger = FeatureFlags.StructuralLayerUseLedgerOwnership;
+        FeatureFlags.StructuralLayerUseLedgerOwnership = true;
+        var utc = DateTimeOffset.Parse("2099-07-07T14:00:00Z");
+        var inst = "MES_REENTRY_TARGET";
+        JournalParityPendingLedger.TryRecordTrustedFill(inst, "dedupe-risk-coverage-partial", 2, "intent-pending", utc);
+
+        var root = Path.Combine(Path.GetTempPath(), "struct_lag_risk_coverage_target_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var log = new RobotLogger(root);
+            var journal = new ExecutionJournal(root, log);
+            journal.RecordSubmission("intent-live", "2099-07-07", "S3", inst, "ENTRY", "broker-entry", utc);
+            journal.RecordEntryFill("intent-live", "2099-07-07", "S3", 100m, 2, utc, 1m, "Short", inst, inst);
+
+            var snap = new AccountSnapshot
+            {
+                Positions = new List<PositionSnapshot> { new() { Instrument = inst, Quantity = 4 } },
+                WorkingOrders = new List<WorkingOrderSnapshot>(),
+                CapturedAtUtc = utc
+            };
+
+            var parity = JournalParityChecker.CheckJournalParity(inst, snap, journal, new TestRegistryView(false, 0), inst, utc);
+            if (parity.Status != JournalParityStatus.POSITION_MISMATCH)
+                return $"expected POSITION_MISMATCH for broker-ahead partial journal lag, got {parity.Status}";
+            if (!PendingAlignmentAuthority.IsPendingAlignment(inst, utc))
+                return "expected PendingAlignmentAuthority true for trusted second-fill catch-up";
+
+            var req = new ExecutionSafetyEvaluationRequest
+            {
+                Instrument = inst,
+                CanonicalInstrument = inst,
+                UtcNow = utc,
+                Journal = journal,
+                AccountSnapshot = snap,
+                UseInstrumentExecutionAuthority = false,
+                IeaOwnedPlusAdoptedWorking = 0,
+                RecoveryExecutionDisallowed = false,
+                JournalIntegrityOrReconciliationRepairActive = false,
+                LedgerOwnershipSnapshot = new InstrumentOwnershipSnapshot
+                {
+                    Account = "default",
+                    ExecutionInstrumentKey = inst,
+                    OwnershipVersion = 1,
+                    LedgerSignedNetQty = -2,
+                    SnapshotUtc = utc
+                }
+            };
+
+            if (ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_ENTRY", false, out var denyEntry))
+                return "expected plain SUBMIT_ENTRY deny under partial journal lag";
+            if (denyEntry.Reason != ExecutionStructuralLayer.StructuralBlocker.ParityNotOk)
+                return "expected SUBMIT_ENTRY parity_not_ok, got " + denyEntry.Reason;
+
+            if (!ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_TARGET", false, out var okTgt))
+                return "expected target allow during pending-alignment partial journal lag, got " + okTgt.Reason;
+            if (okTgt.Detail == null || okTgt.Detail.IndexOf("risk_coverage_pending_alignment_position_mismatch_bypass_partial_journal", StringComparison.Ordinal) < 0)
+                return "expected pending-alignment risk coverage detail, got " + okTgt.Detail;
+            if (okTgt.Detail.IndexOf("risk_coverage_authority_unknown_bypass_partial_journal", StringComparison.Ordinal) < 0)
+                return "expected authority bypass detail for target, got " + okTgt.Detail;
+            if (okTgt.Detail.IndexOf("no_active_exposures_bypass_submittable_target_with_broker_position", StringComparison.Ordinal) < 0)
+                return "expected no-active-exposures target bypass detail, got " + okTgt.Detail;
+
+            if (!ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_PROTECTIVE_STOP", false, out var okProt))
+                return "expected protective stop allow during pending-alignment partial journal lag, got " + okProt.Reason;
+            if (okProt.Detail == null || okProt.Detail.IndexOf("risk_coverage_pending_alignment_position_mismatch_bypass_partial_journal", StringComparison.Ordinal) < 0)
+                return "expected protective pending-alignment risk coverage detail, got " + okProt.Detail;
+
+            return null;
+        }
+        finally
+        {
+            FeatureFlags.StructuralLayerUseLedgerOwnership = prevLedger;
+            try
+            {
+                if (Directory.Exists(root))
+                    Directory.Delete(root, true);
+            }
+            catch
+            {
+                /* best effort */
+            }
+        }
+    }
+
+    private static string? Case_Flatten_BrokerFlatJournalLag_IsNoOpNotParityDeny()
+    {
+        JournalParityPendingLedger.Clear();
+        var utc = DateTimeOffset.Parse("2099-07-07T15:00:00Z");
+        const string inst = "MES_FLAT_NOOP";
+        var root = Path.Combine(Path.GetTempPath(), "struct_flat_noop_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var log = new RobotLogger(root);
+            var journal = new ExecutionJournal(root, log);
+            journal.RecordSubmission("intent-flat-noop", "2099-07-07", "S4", inst, "ENTRY", "broker-entry", utc);
+            journal.RecordEntryFill("intent-flat-noop", "2099-07-07", "S4", 100m, 2, utc, 1m, "Long", inst, inst);
+
+            var snap = new AccountSnapshot
+            {
+                Positions = new List<PositionSnapshot> { new() { Instrument = inst, Quantity = 0 } },
+                WorkingOrders = new List<WorkingOrderSnapshot>(),
+                CapturedAtUtc = utc
+            };
+            var req = new ExecutionSafetyEvaluationRequest
+            {
+                Instrument = inst,
+                CanonicalInstrument = inst,
+                UtcNow = utc,
+                Journal = journal,
+                AccountSnapshot = snap,
+                UseInstrumentExecutionAuthority = false,
+                IeaOwnedPlusAdoptedWorking = 0,
+                RecoveryExecutionDisallowed = false,
+                JournalIntegrityOrReconciliationRepairActive = false
+            };
+
+            if (ExecutionStructuralLayer.TryEvaluateFlattenStructure(req, out var s, out var reason))
+                return "expected flatten no-op when broker is flat";
+            if (reason != "broker_flat" || s.Reason != "broker_flat")
+                return $"expected broker_flat no-op, got reason={reason} snap={s.Reason}";
+            if (s.BrokerQty != 0 || s.JournalQty != 2)
+                return $"expected broker 0 / journal 2 facts, got broker={s.BrokerQty} journal={s.JournalQty}";
             return null;
         }
         finally

@@ -56,7 +56,15 @@ public static class ReentryProtectionAcceptanceTests
             if (reentryIntentId.Length != 16)
                 return (false, "Canonical reentry intent id should be 16 chars");
 
-            // 2. Create journal with reentry state: ProtectionSubmitted=true, ExecutionInterruptedByClose=true
+            // 2. Reentry protectives must not fire from the first partial fill.
+            if (!NinjaTraderSimAdapter.ShouldDeferReentryProtectionForPartialFill(cumulativeFilledQuantity: 1, expectedQuantity: 2))
+                return (false, "Reentry protection should defer after a partial 1/2 fill");
+            if (NinjaTraderSimAdapter.ShouldDeferReentryProtectionForPartialFill(cumulativeFilledQuantity: 2, expectedQuantity: 2))
+                return (false, "Reentry protection should not defer after full 2/2 fill");
+            if (NinjaTraderSimAdapter.ShouldDeferReentryProtectionForPartialFill(cumulativeFilledQuantity: 1, expectedQuantity: 0))
+                return (false, "Reentry protection should not defer when expected quantity is unknown");
+
+            // 3. Create journal with reentry state: ProtectionSubmitted=true, ExecutionInterruptedByClose=true
 
             var journal = new StreamJournal
             {

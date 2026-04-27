@@ -172,6 +172,9 @@ public sealed partial class InstrumentExecutionAuthority
         var prev = entry!.LifecycleState;
         if (prev == newState)
             return;
+        var prevOwnership = entry.OwnershipStatus;
+        var role = entry.OrderRole;
+        var inst = entry.Instrument;
         if (!_orderRegistry.UpdateLifecycle(brokerOrderId, newState, utcNow))
         {
             if (IsBenignTerminalLifecycleReplay(prev, newState))
@@ -210,6 +213,21 @@ public sealed partial class InstrumentExecutionAuthority
             ownership_status = entry.OwnershipStatus.ToString(),
             iea_instance_id = InstanceId
         }));
+        if (newState is OrderLifecycleState.PART_FILLED or OrderLifecycleState.FILLED &&
+            prevOwnership is OrderOwnershipStatus.OWNED or OrderOwnershipStatus.ADOPTED or OrderOwnershipStatus.RECOVERABLE_ROBOT_OWNED)
+        {
+            QuantExecutionControlStore.NotifyBrokerExecutionCallbackPending(
+                inst,
+                utcNow,
+                role.ToString(),
+                newState.ToString());
+        }
+        if (newState is OrderLifecycleState.WORKING or OrderLifecycleState.PART_FILLED)
+        {
+            var trustedWorkingCount = _orderRegistry.GetMismatchTrustedWorkingCount();
+            if (trustedWorkingCount > 0)
+                QuantExecutionControlStore.NotifyWorkingOrderSubmitTransition(entry.Instrument, trustedWorkingCount, utcNow);
+        }
         NotifyReleaseSuppressionActivity();
     }
 

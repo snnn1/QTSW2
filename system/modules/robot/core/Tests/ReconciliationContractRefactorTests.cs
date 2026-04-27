@@ -307,8 +307,8 @@ public static class ReconciliationContractRefactorTests
 
         if (!r.ReleaseReady)
             return (false, "Case10: broker-flat soft-transition leftovers should release");
-        if (!string.Equals(r.Summary, "release_ready_soft_transition_broker_flat", StringComparison.Ordinal))
-            return (false, "Case10: expected broker-flat soft-transition release summary");
+        if (!string.Equals(r.Summary, "release_ready_residual_cleanup:MISMATCH_RESIDUAL_ADOPTION_RETIREMENT", StringComparison.Ordinal))
+            return (false, "Case10: expected broker-flat residual adoption cleanup release summary, got " + r.Summary);
         if (!r.PendingAdoptionExists)
             return (false, "Case10: pending adoption should remain visible in diagnostics");
         return (true, null);

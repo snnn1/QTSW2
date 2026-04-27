@@ -6,7 +6,14 @@
     <OutputType>Exe</OutputType>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="..\core\Robot.Core.csproj" />
+    <!-- Harness gate consumes the already-built core/contracts DLLs to avoid SDK project-reference
+         target discovery failures on constrained replay hosts. Build Robot.Core.csproj first. -->
+    <Reference Include="Robot.Contracts">
+      <HintPath>..\contracts\bin\Release\netstandard2.0\Robot.Contracts.dll</HintPath>
+    </Reference>
+    <Reference Include="Robot.Core">
+      <HintPath>..\core\bin\Release\net8.0\Robot.Core.dll</HintPath>
+    </Reference>
   </ItemGroup>
 </Project>
 

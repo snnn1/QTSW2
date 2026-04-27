@@ -216,9 +216,10 @@ public static class JournalParityChecker
                     unexplainedW, out var pendingResult))
                 return pendingResult;
 
-            if (!brokerHedgedSameInstrument && !journalOpposingIntents && structuralMatchesSignedMagnitude &&
-                PostFillAlignmentGate.TryClassifyPendingAlignment(inst, utcNow, posDiff, Math.Abs(signedDelta), brokerPos,
-                    journalOpen, unexplainedW, ageMs, out var gatePending))
+            if (!JournalParityPendingLedger.HasPendingTrustedFillEntries(inst) &&
+                !brokerHedgedSameInstrument && !journalOpposingIntents && structuralMatchesSignedMagnitude &&
+                PostFillAlignmentGate.TryClassifyPendingAlignment(inst, utcNow, posDiff, signedDelta, Math.Abs(signedDelta),
+                    brokerPos, journalOpen, unexplainedW, ageMs, out var gatePending))
                 return gatePending;
 
             return new JournalParityResult
@@ -675,7 +676,7 @@ public static class JournalIntegrityGuarantee
         if (allowReconstruction && snapshot != null &&
             mid.Status == JournalParityStatus.POSITION_MISMATCH &&
             mid.BrokerPositionQty > 0 &&
-            realOpenForRecovery == 0 &&
+            realOpenForRecovery < mid.BrokerPositionQty &&
             mid.OrphanOrdersDetected == 0)
         {
             recov = journal.UpsertRecoveredIntentForBrokerIntegrity(

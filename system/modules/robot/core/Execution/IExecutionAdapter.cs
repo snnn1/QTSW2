@@ -240,6 +240,11 @@ public interface IExecutionAdapter
     FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow);
 
     /// <summary>
+    /// Hard fail-closed: broker flatten once per instrument. Harness/default adapters do not touch broker state.
+    /// </summary>
+    bool TryTriggerHardFlatten(string instrument, string reason, DateTimeOffset utcNow) => false;
+
+    /// <summary>
     /// True when an untagged execution fill is likely the close from a recent self-initiated <c>Account.Flatten</c> (full NT builds).
     /// Default false for harness / stubs.
     /// </summary>

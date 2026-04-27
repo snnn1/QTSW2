@@ -49,11 +49,60 @@ public static class FlattenFillJournalRoutingTests
             if (mesOpenQty != 0)
                 return (false, $"Open journal qty for MES should be 0, got {mesOpenQty}");
 
+            var allocationPolicyResult = RunSessionForcedFlattenAllocationPolicyTest(journal, utc, tradingDate);
+            if (!allocationPolicyResult.Pass)
+                return allocationPolicyResult;
+
             return (true, null);
         }
         finally
         {
             try { Directory.Delete(root, recursive: true); } catch { /* ignore */ }
         }
+    }
+
+    private static (bool Pass, string? Error) RunSessionForcedFlattenAllocationPolicyTest(
+        ExecutionJournal journal,
+        DateTimeOffset utc,
+        string tradingDate)
+    {
+        var ng1Intent = "intent_ng1_flatten_" + Guid.NewGuid().ToString("N")[..6];
+        var ng2Intent = "intent_ng2_flatten_" + Guid.NewGuid().ToString("N")[..6];
+
+        journal.RecordSubmission(ng1Intent, tradingDate, "NG1", "MNG", "ENTRY_STOP", "b-ng1", utc);
+        journal.RecordEntryFill(ng1Intent, tradingDate, "NG1", 2.650m, 2, utc, 0.01m, "Short", "MNG", "NG",
+            brokerOrderInstrumentKey: "MNG");
+        journal.RecordSubmission(ng2Intent, tradingDate, "NG2", "MNG", "ENTRY_STOP", "b-ng2", utc);
+        journal.RecordEntryFill(ng2Intent, tradingDate, "NG2", 2.650m, 2, utc, 0.01m, "Short", "MNG", "NG",
+            brokerOrderInstrumentKey: "MNG");
+
+        var openRows = journal.GetOpenJournalEntriesByInstrument()
+            .Where(kvp => ExecutionInstrumentResolver.IsSameInstrument(kvp.Key, "MNG"))
+            .SelectMany(kvp => kvp.Value)
+            .ToList();
+        var openQty = openRows.Sum(row => ExecutionJournal.GetEntryRemainingOpenQuantity(row.Entry));
+
+        if (openRows.Count != 2 || openQty != 4)
+            return (false, $"Expected two MNG open journal rows totaling 4, got rows={openRows.Count} qty={openQty}");
+
+        if (!FlattenFillAllocationPolicy.ShouldPreferOpenJournalAllocationForRegistryLink(
+                "SESSION_FORCED_FLATTEN", 4, 2, openRows.Count, openQty))
+        {
+            return (false, "Session forced flatten must prefer open journal allocation when one broker flatten closes two stream intents");
+        }
+
+        if (FlattenFillAllocationPolicy.ShouldPreferOpenJournalAllocationForRegistryLink(
+                "MANUAL_FLATTEN", 4, 2, openRows.Count, openQty))
+        {
+            return (false, "Non-session flatten registry link should not be widened to every open journal row");
+        }
+
+        if (FlattenFillAllocationPolicy.ShouldPreferOpenJournalAllocationForRegistryLink(
+                "SESSION_FORCED_FLATTEN", 2, 2, 1, 2))
+        {
+            return (false, "Single-row session flatten should keep the exact registry intent link");
+        }
+
+        return (true, null);
     }
 }

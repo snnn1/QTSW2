@@ -227,6 +227,7 @@ public static class JournalIntegrityGuaranteeTests
 
     private static string? Case_OrphanEscalation_BoundedAttempts()
     {
+        JournalParityPendingLedger.Clear();
         JournalIntegrityGuarantee.ResetAttemptsForTests();
         var utc = DateTimeOffset.UtcNow;
         var snap = new AccountSnapshot
@@ -557,6 +558,7 @@ public static class JournalIntegrityGuaranteeTests
         var reg = new TestRegistryView(false, 0);
         JournalParityPendingLedger.TryRecordTrustedFill("ES", "kGate1", 1, "intent-gate", utc);
         tmp.Journal.RegisterParityPendingFillPersisted("kGate1");
+        JournalParityPendingLedger.TryRemoveForTests("ES", "kGate1");
         var r = JournalParityChecker.CheckJournalParity("ES", snap, tmp.Journal, reg, "ES", utc);
         if (r.Status != JournalParityStatus.PARITY_PENDING_ALIGNMENT || !r.EscalationSuppressed ||
             string.IsNullOrEmpty(r.PendingAlignmentCause))
@@ -573,6 +575,7 @@ public static class JournalIntegrityGuaranteeTests
         var reg = new TestRegistryView(false, 0);
         JournalParityPendingLedger.TryRecordTrustedFill("ES", "kCatch", 1, "ic", utc);
         tmp.Journal.RegisterParityPendingFillPersisted("kCatch");
+        JournalParityPendingLedger.TryRemoveForTests("ES", "kCatch");
         var snap = new AccountSnapshot
         {
             Positions = new List<PositionSnapshot> { new() { Instrument = "ES", Quantity = 1 } },
@@ -607,6 +610,7 @@ public static class JournalIntegrityGuaranteeTests
             var reg = new TestRegistryView(false, 0);
             JournalParityPendingLedger.TryRecordTrustedFill("ES", "kTimeout", 1, "intent-to", utc0);
             tmp.Journal.RegisterParityPendingFillPersisted("kTimeout");
+            JournalParityPendingLedger.TryRemoveForTests("ES", "kTimeout");
             var late = utc0.AddMilliseconds(400);
             var r = JournalParityChecker.CheckJournalParity("ES", snap, tmp.Journal, reg, "ES", late);
             if (r.Status != JournalParityStatus.POSITION_MISMATCH)
@@ -637,6 +641,7 @@ public static class JournalIntegrityGuaranteeTests
             var reg = new TestRegistryView(false, 0);
             JournalParityPendingLedger.TryRecordTrustedFill("ES", "kOff", 1, "intent-off", utc);
             tmp.Journal.RegisterParityPendingFillPersisted("kOff");
+            JournalParityPendingLedger.TryRemoveForTests("ES", "kOff");
             var r = JournalParityChecker.CheckJournalParity("ES", snap, tmp.Journal, reg, "ES", utc);
             if (r.Status != JournalParityStatus.POSITION_MISMATCH)
                 return "postfill_flag_off: with gate disabled, filtered ledger cannot pending-align";

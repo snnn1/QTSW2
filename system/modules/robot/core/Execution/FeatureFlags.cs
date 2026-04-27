@@ -128,6 +128,13 @@ public static class FeatureFlags
     public static bool ReconciliationRepairExecutorEnabled { get; set; } = false;
 
     /// <summary>
+    /// Playback audit mode used to force-enable <see cref="ReconciliationRepairExecutorEnabled"/>.
+    /// Keep false by default so playback can observe/classify authority drift without adding repair mutations.
+    /// Set true only for explicit repair-executor validation runs.
+    /// </summary>
+    public static bool PlaybackAuditAutoEnableReconciliationRepairExecutor { get; set; } = false;
+
+    /// <summary>
     /// Phase 8: when true, <see cref="ExecutionStructuralLayer"/> derives ownership from
     /// <see cref="InstrumentOwnershipLedger"/> snapshots instead of journal-based position authority.
     /// </summary>

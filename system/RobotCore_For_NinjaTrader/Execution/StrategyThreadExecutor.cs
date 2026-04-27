@@ -35,6 +35,20 @@ public interface INtActionExecutor
 }
 
 /// <summary>
+/// Optional executor-side gate for serializing same-instrument market reentries until protection is accepted.
+/// </summary>
+public interface INtMarketReentryExecutionGate
+{
+    bool TryBeginMarketReentryExecution(
+        NtSubmitMarketReentryCommand cmd,
+        DateTimeOffset utcNow,
+        out string deferReason,
+        out string? activeIntentId);
+
+    void ReleaseMarketReentryExecution(NtSubmitMarketReentryCommand cmd, DateTimeOffset utcNow, string reason);
+}
+
+/// <summary>
 /// Command: submit or update protective stop and target orders.
 /// </summary>
 public sealed class NtSubmitProtectivesCommand : INtAction
@@ -345,6 +359,29 @@ public sealed class StrategyThreadExecutor
         while (_urgentQueue.TryDequeue(out var action) || _queue.TryDequeue(out action))
         {
             var utcNow = _utcNow();
+            var pauseAfterMarketReentry = action is NtSubmitMarketReentryCommand;
+            if (action is NtSubmitMarketReentryCommand reentryAction &&
+                executor is INtMarketReentryExecutionGate reentryGate &&
+                !reentryGate.TryBeginMarketReentryExecution(reentryAction, utcNow, out var deferReason, out var activeIntentId))
+            {
+                _queue.Enqueue(action);
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "NT_ACTION_REENTRY_DEFERRED_WAIT_PROTECTION", state: "ENGINE",
+                    new
+                    {
+                        correlation_id = action.CorrelationId,
+                        action_type = action.ActionType,
+                        intent_id = action.IntentId,
+                        instrument_key = action.InstrumentKey,
+                        active_reentry_intent_id = activeIntentId,
+                        defer_reason = deferReason,
+                        urgent_queue_depth = _urgentQueue.Count,
+                        normal_queue_depth = _queue.Count,
+                        queue_depth = _urgentQueue.Count + _queue.Count,
+                        actions_executed_this_drain = executed,
+                        note = "Same-instrument market reentry deferred until the active sibling reentry reaches protection accepted or fails"
+                    }));
+                break;
+            }
             try
             {
                 _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "NT_ACTION_START", state: "ENGINE",
@@ -384,6 +421,12 @@ public sealed class StrategyThreadExecutor
             }
             catch (Exception ex)
             {
+                if (action is NtSubmitMarketReentryCommand failedReentry &&
+                    executor is INtMarketReentryExecutionGate failedReentryGate)
+                {
+                    failedReentryGate.ReleaseMarketReentryExecution(failedReentry, _utcNow(), "NT_ACTION_FAIL");
+                }
+
                 _log.Write(RobotEvents.EngineBase(_utcNow(), tradingDate: "", eventType: "NT_ACTION_FAIL", state: "ENGINE",
                     new
                     {
@@ -400,6 +443,24 @@ public sealed class StrategyThreadExecutor
             {
                 lock (_pendingLock)
                     _pendingCorrelationIds.Remove(action.CorrelationId);
+            }
+
+            if (pauseAfterMarketReentry)
+            {
+                _log.Write(RobotEvents.EngineBase(_utcNow(), tradingDate: "", eventType: "NT_ACTION_DRAIN_PAUSED_AFTER_REENTRY", state: "ENGINE",
+                    new
+                    {
+                        correlation_id = action.CorrelationId,
+                        action_type = action.ActionType,
+                        intent_id = action.IntentId,
+                        instrument_key = action.InstrumentKey,
+                        urgent_queue_depth = _urgentQueue.Count,
+                        normal_queue_depth = _queue.Count,
+                        queue_depth = _urgentQueue.Count + _queue.Count,
+                        actions_executed_this_drain = executed,
+                        note = "Paused strategy-thread drain after market reentry so fill callbacks can submit/register protectives before another queued reentry changes broker exposure"
+                    }));
+                break;
             }
         }
     }

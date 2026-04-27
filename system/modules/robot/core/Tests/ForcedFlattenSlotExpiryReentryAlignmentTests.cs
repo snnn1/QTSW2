@@ -169,6 +169,17 @@ internal sealed class CapturingExecutionAdapter : IExecutionAdapter
         return false;
     }
 
+    public int CommandCount
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _commands.Count;
+            }
+        }
+    }
+
     public void EnqueueExecutionCommand(ExecutionCommandBase command)
     {
         lock (_lock)

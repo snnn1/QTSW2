@@ -779,7 +779,7 @@ public sealed class RobotLoggingService : IDisposable
     /// </summary>
     private void WriteToHealthSink(RobotLogEvent evt)
     {
-        StreamWriter? writer = null;
+        string healthKey = "";
         try
         {
             var persist = GetPersistenceBaseFromLogsRobotDir();
@@ -795,13 +795,13 @@ public sealed class RobotLoggingService : IDisposable
             var slotInstanceKey = ExtractSlotInstanceKey(evt);
             
             // Build health sink key (used for writer lookup)
-            var healthKey = string.IsNullOrWhiteSpace(slotInstanceKey)
+            healthKey = string.IsNullOrWhiteSpace(slotInstanceKey)
                 ? $"{tradingDate}_{instrument}_{stream}"
                 : $"{tradingDate}_{instrument}_{stream}_{slotInstanceKey}";
             
             lock (_healthWritersLock)
             {
-                if (!_healthWriters.TryGetValue(healthKey, out writer))
+                if (!_healthWriters.TryGetValue(healthKey, out var writer))
                 {
                     var sanitizedKey = SanitizeFileName(healthKey);
                     var filePath = Path.Combine(_healthDirectory, $"{sanitizedKey}.jsonl");
@@ -809,11 +809,11 @@ public sealed class RobotLoggingService : IDisposable
                     writer = new StreamWriter(fileStream, Encoding.UTF8) { AutoFlush = false };
                     _healthWriters[healthKey] = writer;
                 }
+
+                var json = JsonUtil.Serialize(evt);
+                writer.WriteLine(json);
+                writer.Flush();
             }
-            
-            var json = JsonUtil.Serialize(evt);
-            writer.WriteLine(json);
-            writer.Flush();
         }
         catch (Exception ex)
         {
@@ -821,33 +821,33 @@ public sealed class RobotLoggingService : IDisposable
             LogErrorToFile($"Health sink write failure: {ex.Message}");
             
             // Remove broken writer
-            if (writer != null)
+            try
             {
-                try
+                lock (_healthWritersLock)
                 {
-                    lock (_healthWritersLock)
+                    if (string.IsNullOrWhiteSpace(healthKey))
+                        return;
+
+                    var keyToRemove = "";
+                    foreach (var kvp in _healthWriters)
                     {
-                        // Find and remove the broken writer
-                        var keyToRemove = "";
-                        foreach (var kvp in _healthWriters)
+                        if (string.Equals(kvp.Key, healthKey, StringComparison.OrdinalIgnoreCase))
                         {
-                            if (kvp.Value == writer)
-                            {
-                                keyToRemove = kvp.Key;
-                                break;
-                            }
-                        }
-                        if (!string.IsNullOrEmpty(keyToRemove))
-                        {
-                            _healthWriters.Remove(keyToRemove);
-                            writer.Dispose();
+                            keyToRemove = kvp.Key;
+                            break;
                         }
                     }
+
+                    if (!string.IsNullOrEmpty(keyToRemove) && _healthWriters.TryGetValue(keyToRemove, out var brokenWriter))
+                    {
+                        _healthWriters.Remove(keyToRemove);
+                        brokenWriter.Dispose();
+                    }
                 }
-                catch
-                {
-                    // Ignore cleanup errors
-                }
+            }
+            catch
+            {
+                // Ignore cleanup errors
             }
         }
     }
@@ -881,7 +881,6 @@ public sealed class RobotLoggingService : IDisposable
     
     private void WriteBatchToFile(string instrument, List<RobotLogEvent> batch)
     {
-        StreamWriter? writer = null;
         try
         {
             lock (_writersLock)
@@ -889,7 +888,7 @@ public sealed class RobotLoggingService : IDisposable
                 // Check if rotation is needed before writing
                 RotateLogFileIfNeeded(instrument);
                 
-                if (!_writers.TryGetValue(instrument, out writer))
+                if (!_writers.TryGetValue(instrument, out var writer))
                 {
                     var sanitizedInstrument = SanitizeFileName(instrument);
                     var filePath = Path.Combine(_logDirectory, $"robot_{sanitizedInstrument}.jsonl");
@@ -897,42 +896,45 @@ public sealed class RobotLoggingService : IDisposable
                     writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = false };
                     _writers[instrument] = writer;
                 }
-            }
 
-            // Serialize and write each event (compact JSON, one per line)
-            foreach (var evt in batch)
-            {
-                // Update daily summary counters from worker thread (no locks needed)
-                _dailySummary.Observe(evt);
-                var json = JsonUtil.Serialize(evt);
-                writer.WriteLine(json);
-            }
+                // Serialize and write each event (compact JSON, one per line).
+                // Keep the writer lock through WriteLine/Flush so shutdown, rotation,
+                // and direct error writes cannot touch the same StreamWriter concurrently.
+                foreach (var evt in batch)
+                {
+                    // Update daily summary counters from worker thread (no locks needed)
+                    _dailySummary.Observe(evt);
+                    var json = JsonUtil.Serialize(evt);
+                    writer.WriteLine(json);
+                }
 
-            writer.Flush();
+                writer.Flush();
+            }
         }
         catch (Exception ex)
         {
             Interlocked.Increment(ref _writeFailureCount);
             LogErrorToFile($"Write failure for {instrument}: {ex.Message}");
-            // Emit ERROR event for write failures (bypass queue since write is broken)
-            EmitWriteFailureEvent(instrument, ex);
 
             // If writer is broken, remove it so we can retry next time
-            if (writer != null)
+            try
             {
-                try
+                lock (_writersLock)
                 {
-                    lock (_writersLock)
+                    if (_writers.TryGetValue(instrument, out var brokenWriter))
                     {
                         _writers.Remove(instrument);
-                        writer.Dispose();
+                        brokenWriter.Dispose();
                     }
                 }
-                catch
-                {
-                    // Ignore cleanup errors
-                }
             }
+            catch
+            {
+                // Ignore cleanup errors
+            }
+
+            // Emit ERROR event for write failures after removing the broken writer.
+            EmitWriteFailureEvent(instrument, ex);
         }
     }
 
@@ -1214,8 +1216,14 @@ public sealed class RobotLoggingService : IDisposable
                 var sanitizedInstrument = SanitizeFileName(instrument);
                 var filePath = Path.Combine(_logDirectory, $"robot_{sanitizedInstrument}.jsonl");
 
-                // Use File.AppendAllText for direct write (thread-safe for append-only)
                 var json = JsonUtil.Serialize(evt);
+                if (_writers.TryGetValue(instrument, out var writer))
+                {
+                    writer.WriteLine(json);
+                    writer.Flush();
+                    return;
+                }
+
                 File.AppendAllText(filePath, json + Environment.NewLine);
             }
         }

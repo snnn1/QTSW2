@@ -44,6 +44,15 @@ public static class QuantExecutionControlStoreTests
             e = Case_RecoveryRequired_MarketReentry_GrossMismatchBypassesStructuralDeny();
             if (e != null) return (false, e);
 
+            e = Case_WorkingOrderSubmitWindow_IsBoundedAndNonExposure();
+            if (e != null) return (false, e);
+
+            e = Case_ProtectiveReplacementWindow_IsBoundedBrokerJournalAlignment();
+            if (e != null) return (false, e);
+
+            e = Case_RecoveryRequired_OpeningEntryStopFlatWorkingBypassesStructuralDeny();
+            if (e != null) return (false, e);
+
             e = Case_MarketReentry_UsesJournalAuthorityWhenLedgerIsStale();
             if (e != null) return (false, e);
 
@@ -59,10 +68,16 @@ public static class QuantExecutionControlStoreTests
             e = Case_RiskCoverage_UsesJournalAuthorityWhenLedgerIsStale();
             if (e != null) return (false, e);
 
+            e = Case_OpeningEntryStop_UsesJournalAuthorityWhenLedgerIsStale();
+            if (e != null) return (false, e);
+
             e = Case_MappedFill_DoesNotMutateRecoveryRequiredUnmappedOrLocked();
             if (e != null) return (false, e);
 
             e = Case_RepeatedMappedFills_TakeLaterPendingAlignmentExpiry();
+            if (e != null) return (false, e);
+
+            e = Case_BrokerExecutionCallbackPending_ArmsBoundedAlignment();
             if (e != null) return (false, e);
 
             // Last: mutates QuantExecutionControlStoreEnabled to false for the assertion.
@@ -468,6 +483,38 @@ public static class QuantExecutionControlStoreTests
         }
     }
 
+    private static string? Case_BrokerExecutionCallbackPending_ArmsBoundedAlignment()
+    {
+        JournalParityPendingLedger.Clear();
+        var utc = DateTimeOffset.UtcNow;
+        var inst = "QCB1";
+
+        QuantExecutionControlStore.NotifyBrokerExecutionCallbackPending(inst, utc, "ENTRY", "FILLED");
+        var snap = QuantExecutionControlStore.GetSnapshot(inst);
+        if (snap.Phase != QuantExecutionInstrumentPhase.PendingAlignment)
+            return $"expected PendingAlignment after broker callback, got {snap.Phase}";
+        if (snap.Expected.LastBrokerExecutionCallbackRole != "ENTRY" ||
+            snap.Expected.LastBrokerExecutionCallbackState != "FILLED")
+            return "broker callback diagnostics were not preserved";
+        if (!QuantExecutionControlStore.IsBrokerExecutionCallbackPendingActive(inst, utc.AddMilliseconds(1)))
+            return "expected broker callback pending window to be active";
+        if (!PendingAlignmentAuthority.IsPendingAlignment(inst, utc.AddMilliseconds(1)))
+            return "expected PendingAlignmentAuthority to include broker callback pending window";
+
+        var windowMs = FeatureFlags.PostFillAlignmentWindowMs > 0 ? FeatureFlags.PostFillAlignmentWindowMs : 5000;
+        if (QuantExecutionControlStore.IsBrokerExecutionCallbackPendingActive(inst, utc.AddMilliseconds(windowMs + 10)))
+            return "broker callback pending window did not expire";
+
+        QuantExecutionControlStore.NotifyParityOkBrokerJournalAligned(inst, utc.AddMilliseconds(5));
+        snap = QuantExecutionControlStore.GetSnapshot(inst);
+        if (snap.Phase != QuantExecutionInstrumentPhase.Normal)
+            return $"expected Normal after parity OK, got {snap.Phase}";
+        if (snap.Expected.LastBrokerExecutionCallbackUtc.HasValue)
+            return "parity OK did not clear broker callback pending state";
+
+        return null;
+    }
+
     private static string? Case_RecoveryRequired_MarketReentry_GrossMismatchBypassesStructuralDeny()
     {
         JournalParityPendingLedger.Clear();
@@ -483,7 +530,7 @@ public static class QuantExecutionControlStoreTests
             var qSnap = QuantExecutionControlStore.GetSnapshot(inst);
             if (qSnap.Phase != QuantExecutionInstrumentPhase.RecoveryRequired)
                 return "market reentry bypass: setup RecoveryRequired failed";
-            if (qSnap.RecoveryRequiredReason != "recovery_stabilization_window_expired_broker_gross_mismatch")
+            if (qSnap.RecoveryRequiredReason != "pending_alignment_expired_broker_gross_mismatch")
                 return "market reentry bypass: wrong recovery reason " + qSnap.RecoveryRequiredReason;
 
             var root = Path.Combine(Path.GetTempPath(), "quant_rr_reentry_" + Guid.NewGuid().ToString("N"));
@@ -515,6 +562,145 @@ public static class QuantExecutionControlStoreTests
                     return "market reentry bypass: expected allow, got " + ok.Reason;
                 if (ok.Detail == null || ok.Detail.IndexOf("market_reentry_quant_recovery_gross_mismatch_bypass", StringComparison.Ordinal) < 0)
                     return "market reentry bypass: missing bypass detail, got " + ok.Detail;
+                return null;
+            }
+            finally
+            {
+                try
+                {
+                    if (Directory.Exists(root))
+                        Directory.Delete(root, true);
+                }
+                catch
+                {
+                    /* best effort */
+                }
+            }
+        }
+        finally
+        {
+            FeatureFlags.PostFillAlignmentWindowMs = prev;
+        }
+    }
+
+    private static string? Case_WorkingOrderSubmitWindow_IsBoundedAndNonExposure()
+    {
+        JournalParityPendingLedger.Clear();
+        QuantExecutionControlStore.Clear();
+        var t0 = DateTimeOffset.Parse("2099-07-03T12:10:00Z");
+        var prev = FeatureFlags.PostFillAlignmentWindowMs;
+        FeatureFlags.PostFillAlignmentWindowMs = 500;
+        try
+        {
+            const string inst = "QM_WORK_SUBMIT";
+            QuantExecutionControlStore.NotifyWorkingOrderSubmitTransition(inst, 1, t0);
+            if (!QuantExecutionControlStore.IsWorkingOrderSubmitWindowActive(inst, t0.AddMilliseconds(100)))
+                return "working-order submit window should be active inside bounded window";
+            if (QuantExecutionControlStore.IsWorkingOrderSubmitWindowActive(inst, t0.AddMilliseconds(700)))
+                return "working-order submit window should expire";
+
+            var r = QuantExecutionControlStore.EvaluateEscalationAndApplyIfRequired(inst, t0.AddMilliseconds(700), 0, null);
+            if (r.Kind != QuantEscalationKind.NoAction || r.Reason != "pending_alignment_expired_gross_match_stale_phase")
+                return $"working-order submit should not escalate flat broker as exposure, got {r.Kind}/{r.Reason}";
+
+            var s = QuantExecutionControlStore.GetSnapshot(inst);
+            if (s.Phase == QuantExecutionInstrumentPhase.RecoveryRequired)
+                return "working-order submit transition must not create RecoveryRequired";
+            return null;
+        }
+        finally
+        {
+            FeatureFlags.PostFillAlignmentWindowMs = prev;
+        }
+    }
+
+    private static string? Case_ProtectiveReplacementWindow_IsBoundedBrokerJournalAlignment()
+    {
+        JournalParityPendingLedger.Clear();
+        QuantExecutionControlStore.Clear();
+        var t0 = DateTimeOffset.Parse("2099-07-03T12:15:00Z");
+        var prev = FeatureFlags.PostFillAlignmentWindowMs;
+        FeatureFlags.PostFillAlignmentWindowMs = 500;
+        try
+        {
+            const string inst = "MNQ_BE_REPLACE";
+            QuantExecutionControlStore.NotifyProtectiveCancelReplacePending(inst, 2, t0);
+            if (!QuantExecutionControlStore.IsProtectiveCancelReplacePendingActive(inst, t0.AddMilliseconds(100)))
+                return "protective cancel/replace window should be active inside bounded window";
+            if (!QuantExecutionControlStore.IsAnyBrokerJournalAlignmentWindowActive(inst, t0.AddMilliseconds(100)))
+                return "protective cancel/replace should count as broker/journal alignment";
+            if (QuantExecutionControlStore.IsProtectiveCancelReplacePendingActive(inst, t0.AddMilliseconds(700)))
+                return "protective cancel/replace window should expire";
+            if (QuantExecutionControlStore.IsAnyBrokerJournalAlignmentWindowActive(inst, t0.AddMilliseconds(700)))
+                return "protective cancel/replace should not keep broker/journal alignment active after expiry";
+
+            QuantExecutionControlStore.Clear();
+            QuantExecutionControlStore.NotifyProtectiveResizePending(inst, 1, t0);
+            if (!QuantExecutionControlStore.IsAnyBrokerJournalAlignmentWindowActive(inst, t0.AddMilliseconds(100)))
+                return "protective resize should count as broker/journal alignment";
+
+            return null;
+        }
+        finally
+        {
+            FeatureFlags.PostFillAlignmentWindowMs = prev;
+        }
+    }
+
+    private static string? Case_RecoveryRequired_OpeningEntryStopFlatWorkingBypassesStructuralDeny()
+    {
+        JournalParityPendingLedger.Clear();
+        QuantExecutionControlStore.Clear();
+        var t0 = DateTimeOffset.Parse("2099-07-03T12:20:00Z");
+        var prev = FeatureFlags.PostFillAlignmentWindowMs;
+        FeatureFlags.PostFillAlignmentWindowMs = 100;
+        try
+        {
+            const string inst = "QM_ENTRY_STOP_RR";
+            QuantExecutionControlStore.NotifyMappedTrustedFill(inst, 1, t0);
+            QuantExecutionControlStore.EvaluateEscalationAndApplyIfRequired(inst, t0.AddSeconds(1), 0, null);
+            var rr = QuantExecutionControlStore.GetSnapshot(inst);
+            if (rr.Phase != QuantExecutionInstrumentPhase.RecoveryRequired)
+                return "opening entry stop bypass: setup RecoveryRequired failed";
+            QuantExecutionControlStore.NotifyWorkingOrderSubmitTransition(inst, 1, t0.AddSeconds(1));
+
+            var root = Path.Combine(Path.GetTempPath(), "quant_rr_entry_stop_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            try
+            {
+                var log = new RobotLogger(root);
+                var journal = new ExecutionJournal(root, log);
+                var snap = new AccountSnapshot
+                {
+                    Positions = new List<PositionSnapshot> { new() { Instrument = inst, Quantity = 0 } },
+                    WorkingOrders = new List<WorkingOrderSnapshot>
+                    {
+                        new() { Instrument = inst, OrderId = "broker-entry-working", Tag = "QTSW2:test", Quantity = 1 }
+                    },
+                    CapturedAtUtc = t0
+                };
+                var req = new ExecutionSafetyEvaluationRequest
+                {
+                    Instrument = inst,
+                    CanonicalInstrument = inst,
+                    UtcNow = t0.AddSeconds(1),
+                    Journal = journal,
+                    AccountSnapshot = snap,
+                    UseInstrumentExecutionAuthority = true,
+                    IeaOwnedPlusAdoptedWorking = 1,
+                    RecoveryExecutionDisallowed = false,
+                    JournalIntegrityOrReconciliationRepairActive = false
+                };
+
+                if (ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_ENTRY", false, out var denyPlain))
+                    return "opening entry stop bypass: plain SUBMIT_ENTRY should still deny RecoveryRequired";
+                if (denyPlain.Reason != ExecutionStructuralLayer.StructuralBlocker.QuantRecoveryRequired)
+                    return "opening entry stop bypass: wrong plain deny reason " + denyPlain.Reason;
+
+                if (!ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_ENTRY_STOP", false, out var ok))
+                    return "opening entry stop bypass: expected allow, got " + ok.Reason;
+                if (ok.Detail == null || ok.Detail.IndexOf("opening_entry_stop_quant_recovery_bypass_flat_working_order_transition", StringComparison.Ordinal) < 0)
+                    return "opening entry stop bypass: missing detail, got " + ok.Detail;
                 return null;
             }
             finally
@@ -687,7 +873,7 @@ public static class QuantExecutionControlStoreTests
 
             var snap = new AccountSnapshot
             {
-                Positions = new List<PositionSnapshot> { new() { Instrument = inst, Quantity = 2 } },
+                Positions = new List<PositionSnapshot> { new() { Instrument = inst, Quantity = -2 } },
                 WorkingOrders = new List<WorkingOrderSnapshot>(),
                 CapturedAtUtc = t0
             };
@@ -820,6 +1006,93 @@ public static class QuantExecutionControlStoreTests
         }
     }
 
+    private static string? Case_OpeningEntryStop_UsesJournalAuthorityWhenLedgerIsStale()
+    {
+        JournalParityPendingLedger.Clear();
+        QuantExecutionControlStore.Clear();
+        var prevLedger = FeatureFlags.StructuralLayerUseLedgerOwnership;
+        FeatureFlags.StructuralLayerUseLedgerOwnership = true;
+        var t0 = DateTimeOffset.Parse("2099-07-08T12:00:00Z");
+        var root = Path.Combine(Path.GetTempPath(), "quant_entry_stop_stale_ledger_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var log = new RobotLogger(root);
+            var journal = new ExecutionJournal(root, log);
+            const string inst = "QM_ENTRY_STOP_LEDGER";
+            const string intent = "ENTRY_STOP_STALE_LEDGER";
+            journal.RecordSubmission(
+                intent,
+                "2099-07-08",
+                "QM_ENTRY_STOP_STREAM",
+                inst,
+                "ENTRY_STOP",
+                "broker-entry-stop",
+                t0,
+                expectedEntryPrice: 100m,
+                entryPrice: 100m,
+                stopPrice: 102m,
+                targetPrice: 96m,
+                beTriggerPrice: 98m,
+                direction: "SHORT");
+            journal.RecordEntryFill(intent, "2099-07-08", "QM_ENTRY_STOP_STREAM", 100m, 2, t0.AddSeconds(1), 1m,
+                "Short", inst, inst);
+
+            var snap = new AccountSnapshot
+            {
+                Positions = new List<PositionSnapshot> { new() { Instrument = inst, Quantity = -2 } },
+                WorkingOrders = new List<WorkingOrderSnapshot>(),
+                CapturedAtUtc = t0
+            };
+
+            var req = new ExecutionSafetyEvaluationRequest
+            {
+                Instrument = inst,
+                CanonicalInstrument = inst,
+                UtcNow = t0,
+                Journal = journal,
+                AccountSnapshot = snap,
+                UseInstrumentExecutionAuthority = false,
+                IeaOwnedPlusAdoptedWorking = 0,
+                RecoveryExecutionDisallowed = false,
+                JournalIntegrityOrReconciliationRepairActive = false,
+                LedgerOwnershipSnapshot = new InstrumentOwnershipSnapshot
+                {
+                    Account = "default",
+                    ExecutionInstrumentKey = inst,
+                    OwnershipVersion = 1,
+                    LedgerSignedNetQty = 0,
+                    SnapshotUtc = t0
+                }
+            };
+
+            if (ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_ENTRY", false, out var denyEntry))
+                return "opening entry stop stale ledger: expected SUBMIT_ENTRY deny under stale ledger authority";
+            if (denyEntry.Reason != ExecutionStructuralLayer.StructuralBlocker.AuthorityUnknown)
+                return "opening entry stop stale ledger: wrong SUBMIT_ENTRY deny reason " + denyEntry.Reason;
+
+            if (!ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_ENTRY_STOP", false, out var ok))
+                return "opening entry stop stale ledger: expected SUBMIT_ENTRY_STOP allow, got " + ok.Reason;
+            if (ok.Detail == null || ok.Detail.IndexOf("opening_entry_stop_authority_fallback_journal_real", StringComparison.Ordinal) < 0)
+                return "opening entry stop stale ledger: missing fallback detail, got " + ok.Detail;
+
+            return null;
+        }
+        finally
+        {
+            FeatureFlags.StructuralLayerUseLedgerOwnership = prevLedger;
+            try
+            {
+                if (Directory.Exists(root))
+                    Directory.Delete(root, true);
+            }
+            catch
+            {
+                /* best effort */
+            }
+        }
+    }
+
     private static string? Case_MarketReentry_NoActiveExposureLagBypassesWhenBrokerAlreadyOpen()
     {
         JournalParityPendingLedger.Clear();
@@ -837,7 +1110,7 @@ public static class QuantExecutionControlStoreTests
 
             var snap = new AccountSnapshot
             {
-                Positions = new List<PositionSnapshot> { new() { Instrument = inst, Quantity = 2 } },
+                Positions = new List<PositionSnapshot> { new() { Instrument = inst, Quantity = -2 } },
                 WorkingOrders = new List<WorkingOrderSnapshot>(),
                 CapturedAtUtc = t0
             };

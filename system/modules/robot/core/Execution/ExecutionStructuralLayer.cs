@@ -61,15 +61,49 @@ public static class ExecutionStructuralLayer
             return false;
         if (qSnap.Phase != QuantExecutionInstrumentPhase.RecoveryRequired)
             return false;
-        if (!string.Equals(qSnap.RecoveryRequiredReason, "recovery_stabilization_window_expired_broker_gross_mismatch", StringComparison.Ordinal))
+        if (!string.Equals(qSnap.RecoveryRequiredReason, "recovery_stabilization_window_expired_broker_gross_mismatch", StringComparison.Ordinal) &&
+            !string.Equals(qSnap.RecoveryRequiredReason, "pending_alignment_expired_broker_gross_mismatch", StringComparison.Ordinal))
             return false;
 
         detail = "market_reentry_quant_recovery_gross_mismatch_bypass";
         return true;
     }
 
+    private static bool TryBypassQuantRecoveryRequiredForOpeningEntryStop(
+        string? orderSubmitBlockedWhat,
+        ExecutionSafetyEvaluationRequest req,
+        string inst,
+        QuantExecutionControlSnapshot qSnap,
+        out string detail)
+    {
+        detail = "";
+        if (!string.Equals(orderSubmitBlockedWhat, "SUBMIT_ENTRY_STOP", StringComparison.Ordinal))
+            return false;
+        if (qSnap.Phase != QuantExecutionInstrumentPhase.RecoveryRequired)
+            return false;
+        if (!string.Equals(qSnap.RecoveryRequiredReason, "recovery_stabilization_window_expired_broker_gross_mismatch", StringComparison.Ordinal) &&
+            !string.Equals(qSnap.RecoveryRequiredReason, "pending_alignment_expired_broker_gross_mismatch", StringComparison.Ordinal))
+            return false;
+        if (!QuantExecutionControlStore.IsWorkingOrderSubmitWindowActive(inst, req.UtcNow))
+            return false;
+        if (req.AccountSnapshot == null)
+            return false;
+
+        var canonical = string.IsNullOrWhiteSpace(req.CanonicalInstrument) ? inst : req.CanonicalInstrument.Trim();
+        var brokerAbs = ExecutionJournal.SumAbsBrokerPositionForInstrument(req.AccountSnapshot, inst);
+        var (journalRealOpen, journalRecoveredOpen, _) =
+            req.Journal.GetPositionAuthorityOpenQuantitiesForInstrument(inst, canonical);
+        var trustedWorking = Math.Max(req.IeaOwnedPlusAdoptedWorking, CountInstrumentWorkingOrders(req.AccountSnapshot, inst));
+
+        if (brokerAbs != 0 || journalRealOpen + journalRecoveredOpen != 0 || trustedWorking <= 0)
+            return false;
+
+        detail = "opening_entry_stop_quant_recovery_bypass_flat_working_order_transition";
+        return true;
+    }
+
     private static bool IsJournalAuthorityFallbackSubmit(string? orderSubmitBlockedWhat) =>
-        orderSubmitBlockedWhat is "SUBMIT_MARKET_REENTRY" or "SUBMIT_PROTECTIVE_STOP" or "SUBMIT_TARGET";
+        orderSubmitBlockedWhat is "SUBMIT_MARKET_REENTRY" or "SUBMIT_PROTECTIVE_STOP" or "SUBMIT_TARGET" or "SUBMIT_ENTRY_STOP";
 
     private static bool TryFallbackToJournalAuthorityForSubmit(
         string? orderSubmitBlockedWhat,
@@ -97,6 +131,7 @@ public static class ExecutionStructuralLayer
         {
             "SUBMIT_MARKET_REENTRY" => "market_reentry_authority_fallback_journal_real",
             "SUBMIT_PROTECTIVE_STOP" or "SUBMIT_TARGET" => "risk_coverage_authority_fallback_journal_real",
+            "SUBMIT_ENTRY_STOP" => "opening_entry_stop_authority_fallback_journal_real",
             _ => ""
         };
         return true;
@@ -125,6 +160,113 @@ public static class ExecutionStructuralLayer
         return true;
     }
 
+    private static bool TryBypassPendingAlignmentRiskCoverageTransition(
+        string? orderSubmitBlockedWhat,
+        ExecutionSafetyEvaluationRequest req,
+        JournalParityResult parity,
+        out string detail)
+    {
+        detail = "";
+        if (orderSubmitBlockedWhat is not "SUBMIT_PROTECTIVE_STOP" and not "SUBMIT_TARGET")
+            return false;
+        if (string.IsNullOrWhiteSpace(req.Instrument))
+            return false;
+        if (!IsBookkeepingLagProtected(req.Instrument, req.UtcNow))
+            return false;
+        if (parity.Status != JournalParityStatus.POSITION_MISMATCH)
+            return false;
+        if (parity.IeaUnavailableWhenRequired)
+            return false;
+        if (parity.BrokerPositionQty <= 0 || parity.JournalOpenQty <= 0)
+            return false;
+        if (parity.JournalOpenQty >= parity.BrokerPositionQty)
+            return false;
+
+        detail = "risk_coverage_pending_alignment_position_mismatch_bypass_partial_journal";
+        return true;
+    }
+
+    private static bool TryBypassPendingAlignmentRiskCoverageBookkeepingLag(
+        string? orderSubmitBlockedWhat,
+        ExecutionSafetyEvaluationRequest req,
+        JournalParityResult parity,
+        string inst,
+        out string detail)
+    {
+        detail = "";
+        if (!FeatureFlags.StructuralLayerAllowSubmitDuringPendingAlignmentLag)
+            return false;
+        if (orderSubmitBlockedWhat is not "SUBMIT_PROTECTIVE_STOP" and not "SUBMIT_TARGET")
+            return false;
+        if (string.IsNullOrEmpty(inst))
+            return false;
+        if (!IsBookkeepingLagProtected(inst, req.UtcNow))
+            return false;
+        if (parity.IeaUnavailableWhenRequired)
+            return false;
+        if (parity.Status is JournalParityStatus.INSUFFICIENT_DATA or JournalParityStatus.UNKNOWN_ORDER_PRESENT)
+            return false;
+        if (parity.BrokerPositionQty <= 0)
+            return false;
+
+        detail = "structural_bookkeeping_lag_bypass_pending_alignment_risk_coverage:parity=" + parity.Status;
+        return true;
+    }
+
+    private static bool TryBypassMarketReentryFlatBrokerQuantRecoveryLag(
+        string? orderSubmitBlockedWhat,
+        ExecutionSafetyEvaluationRequest req,
+        JournalParityResult parity,
+        string inst,
+        out string detail)
+    {
+        detail = "";
+        if (!FeatureFlags.QuantExecutionControlStoreEnabled)
+            return false;
+        if (!string.Equals(orderSubmitBlockedWhat, "SUBMIT_MARKET_REENTRY", StringComparison.Ordinal))
+            return false;
+        if (string.IsNullOrEmpty(inst) || req.AccountSnapshot == null)
+            return false;
+
+        var qSnap = QuantExecutionControlStore.GetSnapshot(inst);
+        if (qSnap.Phase != QuantExecutionInstrumentPhase.RecoveryRequired)
+            return false;
+        if (!string.Equals(qSnap.RecoveryRequiredReason, "recovery_stabilization_window_expired_broker_gross_mismatch", StringComparison.Ordinal) &&
+            !string.Equals(qSnap.RecoveryRequiredReason, "pending_alignment_expired_broker_gross_mismatch", StringComparison.Ordinal))
+            return false;
+        if (parity.BrokerPositionQty != 0)
+            return false;
+        if (CountInstrumentWorkingOrders(req.AccountSnapshot, inst) != 0)
+            return false;
+        if (req.LedgerOwnershipSnapshot != null && req.LedgerOwnershipSnapshot.LedgerSignedNetQty != 0)
+            return false;
+        if (parity.Status == JournalParityStatus.INSUFFICIENT_DATA || parity.Status == JournalParityStatus.UNKNOWN_ORDER_PRESENT)
+            return false;
+
+        detail = "market_reentry_flat_broker_quant_recovery_lag_bypass:parity=" + parity.Status;
+        return true;
+    }
+
+    private static bool TryBypassAuthorityUnknownForRiskCoverageDiagnosticDemotion(
+        string? orderSubmitBlockedWhat,
+        ExecutionSafetySnapshot snapshot,
+        JournalParityResult parity,
+        out string detail)
+    {
+        detail = "";
+        if (orderSubmitBlockedWhat is not "SUBMIT_PROTECTIVE_STOP" and not "SUBMIT_TARGET")
+            return false;
+        if (parity.BrokerPositionQty == 0)
+            return false;
+        var d = snapshot.Detail ?? "";
+        if (d.IndexOf("phase3_parity_not_ok_demoted", StringComparison.Ordinal) < 0 &&
+            d.IndexOf("phase3_repair_active_demoted", StringComparison.Ordinal) < 0)
+            return false;
+
+        detail = "risk_coverage_authority_unknown_bypass_phase3_demotion";
+        return true;
+    }
+
     private static void ApplyFacts(
         ExecutionSafetySnapshot snap,
         JournalParityResult parity,
@@ -145,11 +287,25 @@ public static class ExecutionStructuralLayer
         snap.AuthorityState = authorityState;
     }
 
+    private static int CountInstrumentWorkingOrders(AccountSnapshot snapshot, string inst)
+    {
+        var count = 0;
+        foreach (var w in snapshot.WorkingOrders ?? new List<WorkingOrderSnapshot>())
+        {
+            if (string.IsNullOrWhiteSpace(w.Instrument)) continue;
+            if (!string.Equals(w.Instrument.Trim(), inst, StringComparison.OrdinalIgnoreCase)) continue;
+            count++;
+        }
+
+        return count;
+    }
+
     /// <summary>
     /// Bookkeeping-lag tolerance: broker snapshot + pending-alignment window + explainable parity — not foreign/insufficient-data faults.
     /// Does not apply to <see cref="ExecutionSafetyEvaluationRequest.RecoveryExecutionDisallowed"/> (handled separately).
     /// </summary>
     private static bool TryBookkeepingLagStructuralBypass(
+        string? orderSubmitBlockedWhat,
         ExecutionSafetyEvaluationRequest req,
         JournalParityResult parity,
         string inst,
@@ -162,7 +318,25 @@ public static class ExecutionStructuralLayer
             return false;
         if (!IsBookkeepingLagProtected(inst, req.UtcNow))
             return false;
-        if (parity.BrokerPositionQty == 0)
+        var canonicalFlatRunnerJournalLagForMarketReentry =
+            string.Equals(orderSubmitBlockedWhat, "SUBMIT_MARKET_REENTRY", StringComparison.Ordinal) &&
+            parity.BrokerPositionQty == 0 &&
+            parity.JournalOpenQty > 0 &&
+            req.AccountSnapshot != null &&
+            CountInstrumentWorkingOrders(req.AccountSnapshot, inst) == 0 &&
+            req.LedgerOwnershipSnapshot != null &&
+            req.LedgerOwnershipSnapshot.LedgerSignedNetQty == 0;
+        var siblingTransitionNonFlatLagForMarketReentry =
+            string.Equals(orderSubmitBlockedWhat, "SUBMIT_MARKET_REENTRY", StringComparison.Ordinal) &&
+            parity.BrokerPositionQty != 0 &&
+            parity.JournalOpenQty == 0 &&
+            req.AccountSnapshot != null &&
+            CountInstrumentWorkingOrders(req.AccountSnapshot, inst) == 0 &&
+            req.LedgerOwnershipSnapshot != null &&
+            req.LedgerOwnershipSnapshot.LedgerSignedNetQty == 0;
+        if (parity.BrokerPositionQty == 0 && !canonicalFlatRunnerJournalLagForMarketReentry)
+            return false;
+        if (parity.BrokerPositionQty != 0 && !siblingTransitionNonFlatLagForMarketReentry)
             return false;
         if (parity.Status == JournalParityStatus.INSUFFICIENT_DATA)
             return false;
@@ -172,7 +346,11 @@ public static class ExecutionStructuralLayer
         if (parity.Status == JournalParityStatus.UNKNOWN_ORDER_PRESENT)
             return false;
 
-        detail = "structural_bookkeeping_lag_bypass_pending_alignment:parity=" + parity.Status;
+        detail = canonicalFlatRunnerJournalLagForMarketReentry
+            ? "market_reentry_structural_bookkeeping_lag_bypass_canonical_flat_runner_journal_lag:parity=" + parity.Status
+            : siblingTransitionNonFlatLagForMarketReentry
+                ? "market_reentry_structural_bookkeeping_lag_bypass_sibling_transition_nonflat:parity=" + parity.Status
+                : "structural_bookkeeping_lag_bypass_pending_alignment:parity=" + parity.Status;
         return true;
     }
 
@@ -185,7 +363,11 @@ public static class ExecutionStructuralLayer
         bool flattenAuthorityBypass,
         out ExecutionSafetySnapshot snapshot)
     {
-        snapshot = new ExecutionSafetySnapshot { Instrument = NormalizeInstrument(req.Instrument) };
+        snapshot = new ExecutionSafetySnapshot
+        {
+            Instrument = NormalizeInstrument(req.Instrument),
+            AuthorityFrameId = req.AuthorityFrame?.FrameId ?? ""
+        };
         var inst = snapshot.Instrument;
         if (string.IsNullOrEmpty(inst))
         {
@@ -224,6 +406,12 @@ public static class ExecutionStructuralLayer
                 if (blockDirectional)
                 {
                     if (TryBypassQuantRecoveryRequiredForMarketReentry(orderSubmitBlockedWhat, qSnap, out var quantBypassDetail))
+                    {
+                        snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
+                            ? quantBypassDetail
+                            : snapshot.Detail + ";" + quantBypassDetail;
+                    }
+                    else if (TryBypassQuantRecoveryRequiredForOpeningEntryStop(orderSubmitBlockedWhat, req, inst, qSnap, out quantBypassDetail))
                     {
                         snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
                             ? quantBypassDetail
@@ -303,11 +491,29 @@ public static class ExecutionStructuralLayer
 
         if (journalRepairLatch)
         {
-            if (TryBookkeepingLagStructuralBypass(req, parity, inst, out var repairLagDetail))
+            if (TryBookkeepingLagStructuralBypass(orderSubmitBlockedWhat, req, parity, inst, out var repairLagDetail))
             {
                 snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
                     ? repairLagDetail
                     : snapshot.Detail + ";" + repairLagDetail;
+            }
+            else if (TryBypassPendingAlignmentRiskCoverageTransition(orderSubmitBlockedWhat, req, parity, out var repairRiskCoverageLagDetail))
+            {
+                snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
+                    ? repairRiskCoverageLagDetail
+                    : snapshot.Detail + ";" + repairRiskCoverageLagDetail;
+            }
+            else if (TryBypassPendingAlignmentRiskCoverageBookkeepingLag(orderSubmitBlockedWhat, req, parity, inst, out repairRiskCoverageLagDetail))
+            {
+                snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
+                    ? repairRiskCoverageLagDetail
+                    : snapshot.Detail + ";" + repairRiskCoverageLagDetail;
+            }
+            else if (TryBypassMarketReentryFlatBrokerQuantRecoveryLag(orderSubmitBlockedWhat, req, parity, inst, out var repairMarketReentryLagDetail))
+            {
+                snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
+                    ? repairMarketReentryLagDetail + ";repair_active_bypass"
+                    : snapshot.Detail + ";" + repairMarketReentryLagDetail + ";repair_active_bypass";
             }
             else if (FeatureFlags.StructuralLayerPhase3DemoteRepairActiveSubmitDeny)
             {
@@ -326,17 +532,35 @@ public static class ExecutionStructuralLayer
 
         if (!parity.IsOkOrPendingAlignment)
         {
-            if (TryBookkeepingLagStructuralBypass(req, parity, inst, out var parityLagDetail))
+            if (TryBookkeepingLagStructuralBypass(orderSubmitBlockedWhat, req, parity, inst, out var parityLagDetail))
             {
                 snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
                     ? parityLagDetail
                     : snapshot.Detail + ";" + parityLagDetail;
+            }
+            else if (TryBypassPendingAlignmentRiskCoverageTransition(orderSubmitBlockedWhat, req, parity, out var parityRiskCoverageLagDetail))
+            {
+                snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
+                    ? parityRiskCoverageLagDetail
+                    : snapshot.Detail + ";" + parityRiskCoverageLagDetail;
+            }
+            else if (TryBypassPendingAlignmentRiskCoverageBookkeepingLag(orderSubmitBlockedWhat, req, parity, inst, out parityRiskCoverageLagDetail))
+            {
+                snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
+                    ? parityRiskCoverageLagDetail
+                    : snapshot.Detail + ";" + parityRiskCoverageLagDetail;
             }
             else if (TryBypassParityNotOkForProtectedSubmit(orderSubmitBlockedWhat, parity, derived, out var parityProtectedDetail))
             {
                 snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
                     ? parityProtectedDetail
                     : snapshot.Detail + ";" + parityProtectedDetail;
+            }
+            else if (TryBypassMarketReentryFlatBrokerQuantRecoveryLag(orderSubmitBlockedWhat, req, parity, inst, out var parityMarketReentryLagDetail))
+            {
+                snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
+                    ? parityMarketReentryLagDetail + ";parity_not_ok_bypass"
+                    : snapshot.Detail + ";" + parityMarketReentryLagDetail + ";parity_not_ok_bypass";
             }
             else if (FeatureFlags.StructuralLayerPhase3DemoteParityNotOkSubmitDeny)
             {
@@ -363,8 +587,40 @@ public static class ExecutionStructuralLayer
         {
             if (!TryAuthorizeOrderSubmitByAuthority(derived, orderSubmitBlockedWhat, out var deny))
             {
-                snapshot.Reason = deny;
-                return false;
+                if (deny == StructuralBlocker.AuthorityUnknown &&
+                    TryBookkeepingLagStructuralBypass(orderSubmitBlockedWhat, req, parity, inst, out var authorityMarketReentryLagDetail))
+                {
+                    snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
+                        ? authorityMarketReentryLagDetail + ";authority_unknown_bypass_bookkeeping_lag"
+                        : snapshot.Detail + ";" + authorityMarketReentryLagDetail + ";authority_unknown_bypass_bookkeeping_lag";
+                }
+                else if (deny == StructuralBlocker.AuthorityUnknown &&
+                         TryBypassMarketReentryFlatBrokerQuantRecoveryLag(orderSubmitBlockedWhat, req, parity, inst, out var authorityFlatReentryLagDetail))
+                {
+                    snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
+                        ? authorityFlatReentryLagDetail + ";authority_unknown_bypass_market_reentry_flat_broker"
+                        : snapshot.Detail + ";" + authorityFlatReentryLagDetail + ";authority_unknown_bypass_market_reentry_flat_broker";
+                }
+                else if (deny == StructuralBlocker.AuthorityUnknown &&
+                         (TryBypassPendingAlignmentRiskCoverageTransition(orderSubmitBlockedWhat, req, parity, out var authorityRiskCoverageLagDetail) ||
+                          TryBypassPendingAlignmentRiskCoverageBookkeepingLag(orderSubmitBlockedWhat, req, parity, inst, out authorityRiskCoverageLagDetail)))
+                {
+                    snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
+                        ? authorityRiskCoverageLagDetail + ";risk_coverage_authority_unknown_bypass_partial_journal"
+                        : snapshot.Detail + ";" + authorityRiskCoverageLagDetail + ";risk_coverage_authority_unknown_bypass_partial_journal";
+                }
+                else if (deny == StructuralBlocker.AuthorityUnknown &&
+                         TryBypassAuthorityUnknownForRiskCoverageDiagnosticDemotion(orderSubmitBlockedWhat, snapshot, parity, out var authorityDemotionDetail))
+                {
+                    snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
+                        ? authorityDemotionDetail
+                        : snapshot.Detail + ";" + authorityDemotionDetail;
+                }
+                else
+                {
+                    snapshot.Reason = deny;
+                    return false;
+                }
             }
         }
         else
@@ -406,6 +662,14 @@ public static class ExecutionStructuralLayer
                 return true;
             }
 
+            if (string.Equals(orderSubmitBlockedWhat, "SUBMIT_TARGET", StringComparison.Ordinal))
+            {
+                const string target = "no_active_exposures_bypass_submittable_target_with_broker_position";
+                snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail) ? target : snapshot.Detail + ";" + target;
+                snapshot.Reason = "";
+                return true;
+            }
+
             // Stop-entry bracket setup can see an existing broker position before the stream exposure view has
             // caught up. Keep recovery/parity/mismatch gates authoritative above, but do not fail the bracket
             // solely on this lagging exposure registration snapshot.
@@ -433,6 +697,47 @@ public static class ExecutionStructuralLayer
         out string flattenBlockReason)
     {
         flattenBlockReason = "";
+        snapshot = new ExecutionSafetySnapshot
+        {
+            Instrument = NormalizeInstrument(req.Instrument),
+            AuthorityFrameId = req.AuthorityFrame?.FrameId ?? ""
+        };
+        var instEarly = snapshot.Instrument;
+        if (string.IsNullOrEmpty(instEarly))
+        {
+            flattenBlockReason = StructuralBlocker.MissingInstrument;
+            snapshot.Reason = flattenBlockReason;
+            return false;
+        }
+
+        if (req.AccountSnapshot != null &&
+            ExecutionJournal.SumAbsBrokerPositionForInstrument(req.AccountSnapshot, instEarly) <= 0 &&
+            CountInstrumentWorkingOrders(req.AccountSnapshot, instEarly) == 0)
+        {
+            var canonicalEarly = string.IsNullOrWhiteSpace(req.CanonicalInstrument) ? instEarly : req.CanonicalInstrument.Trim();
+            var registryEarly = new ParityRegistryView(req.UseInstrumentExecutionAuthority, req.IeaOwnedPlusAdoptedWorking);
+            var parityEarly = JournalParityChecker.CheckJournalParity(
+                instEarly,
+                req.AccountSnapshot,
+                req.Journal,
+                registryEarly,
+                canonicalEarly,
+                req.UtcNow,
+                req.SnapshotTakenUtc);
+            var (realOpenEarly, recoveredOpenEarly, _) =
+                req.Journal.GetPositionAuthorityOpenQuantitiesForInstrument(instEarly, canonicalEarly);
+            var authorityEarly = PositionAuthorityDerivation.DerivePositionAuthority(
+                parityEarly.BrokerPositionQty,
+                realOpenEarly,
+                recoveredOpenEarly);
+            ApplyFacts(snapshot, parityEarly, realOpenEarly, recoveredOpenEarly, authorityEarly.ToString(),
+                req.RecoveryExecutionDisallowed || req.JournalIntegrityOrReconciliationRepairActive,
+                noExposureBrokerOpen: false);
+            flattenBlockReason = "broker_flat";
+            snapshot.Reason = flattenBlockReason;
+            return false;
+        }
+
         if (!TryEvaluateOrderSubmitStructure(req, orderSubmitBlockedWhat: null, flattenAuthorityBypass: true, out snapshot))
         {
             flattenBlockReason = snapshot.Reason ?? "";
@@ -506,7 +811,7 @@ public static class ExecutionStructuralLayer
     }
 
     private static bool IsDirectionalOrderSubmit(string blockedWhat) =>
-        blockedWhat is "SUBMIT_ENTRY" or "SUBMIT_ENTRY_STOP";
+        blockedWhat is "SUBMIT_ENTRY" or "SUBMIT_ENTRY_STOP" or "SUBMIT_MARKET_REENTRY";
 
     private static bool IsOpeningEntryBracketSubmit(string? blockedWhat) =>
         blockedWhat is "SUBMIT_ENTRY_STOP";

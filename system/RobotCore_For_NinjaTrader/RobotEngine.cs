@@ -230,9 +230,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// </summary>
     private void EmitTimerHeartbeatUnsafe()
     {
+        if (IsTerminalShutdownLatched()) return;
         try
         {
             var utcNow = DateTimeOffset.UtcNow;
+            if (TryRespectRunWideShutdownSignal(utcNow, "engine_timer"))
+                return;
             _runtimeAudit?.TryEmitPeriodicWallClock(utcNow);
             var tick = Interlocked.Increment(ref _engineHeartbeatWallTick);
             if (tick % 5 == 0)
@@ -254,6 +257,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate, eventType: "ENGINE_TIMER_HEARTBEAT", state: "ENGINE",
                         new { source = "engine_timer", timetable_hash = _currentTimetableHash, trading_date = tradingDate }));
             }
+            if (TryHandlePlaybackStallQuiescence(utcNow, requestStopIfEligible: true))
+                return;
             if (_executionPolicy?.UseInstrumentExecutionAuthority == true && !string.IsNullOrEmpty(_accountName))
             {
                 var liveRecoveryScope = GetLiveRecoveryExecutionInstrumentKeys();
@@ -281,9 +286,14 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// </summary>
     public void RunReconciliationPeriodicThrottle(DateTimeOffset utcNow)
     {
+        if (IsTerminalShutdownLatched()) return;
         var rt = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
         try
         {
+            if (TryRespectRunWideShutdownSignal(utcNow, "reconciliation_throttle"))
+                return;
+            if (TryHandlePlaybackStallQuiescence(utcNow, requestStopIfEligible: false))
+                return;
             RunPendingForceReconcile(utcNow);
             if (!IsBrokerConnected) return;
             _reconciliationRunner?.RunPeriodicThrottle(utcNow);
@@ -601,6 +611,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// </summary>
     private void RunLedgerReconciliationShadow(DateTimeOffset utcNow)
     {
+        if (IsTerminalShutdownLatched()) return;
+        if (TryRespectRunWideShutdownSignal(utcNow, "ledger_reconciliation_shadow"))
+            return;
         if (_reconciliationClassifier == null || _ownershipLedger == null) return;
         if (!FeatureFlags.CanonicalOwnershipLedgerEnabled) return;
 
@@ -1003,6 +1016,20 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private readonly ConcurrentDictionary<string, byte> _journalIntegrityEnsuredForInstrument =
         new(StringComparer.OrdinalIgnoreCase);
 
+    private sealed record JournalIntegrityInvariantDebounceState(
+        string Status,
+        int BrokerQty,
+        int JournalQty,
+        DateTimeOffset FirstSeenUtc,
+        DateTimeOffset LastSeenUtc,
+        int SeenCount,
+        bool CriticalEmitted);
+
+    private readonly ConcurrentDictionary<string, JournalIntegrityInvariantDebounceState> _journalIntegrityInvariantDebounceByInstrument =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private const double JournalIntegrityInvariantCriticalAfterMilliseconds = 2000.0;
+
     private sealed class JournalParityRegistryViewImpl : IJournalParityRegistryView
     {
         public bool UseInstrumentExecutionAuthority { get; init; }
@@ -1059,6 +1086,16 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private Timer? _engineHeartbeatTimer;
     private string? _heartbeatTradingDateCache; // Lock-free read from timer callback
     private int _engineHeartbeatWallTick;
+    private DateTimeOffset _playbackStallQuiesceEligibleSinceUtc = DateTimeOffset.MinValue;
+    private DateTimeOffset _playbackStallQuiesceStopRequestedUtc = DateTimeOffset.MinValue;
+    private int _playbackStallQuiesceArmed;
+    private int _playbackStallQuiesceStopRequested;
+    private int _playbackStallQuiesceForceFinalizeRequested;
+    private int _connectivityShutdownStopRequested;
+    private int _runWideShutdownStopRequested;
+    private const int PlaybackStallQuiesceGraceSeconds = 12;
+    private const int PlaybackStallQuiesceForceFinalizeSeconds = 45;
+    private int _shutdownCompleted;
 
     // Helper class for tracking bar rejection statistics
     private class BarRejectionStats
@@ -1146,6 +1183,54 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     }
 
     public bool IsShutdownRequested => Volatile.Read(ref _shutdownRequested) != 0;
+    private bool IsTerminalShutdownLatched() =>
+        Volatile.Read(ref _shutdownRequested) != 0 ||
+        Volatile.Read(ref _shutdownCompleted) != 0 ||
+        (_isolatedPlaybackPersistence && RunRootArtifacts.HasRunShutdownSignal(_persistenceBase));
+
+    private void LatchRunWideShutdownSignal(DateTimeOffset utcNow, string reason, string source)
+    {
+        if (!_isolatedPlaybackPersistence)
+            return;
+
+        RunRootArtifacts.WriteRunShutdownSignal(_persistenceBase, _runId, utcNow, reason, source);
+    }
+
+    private bool TryRespectRunWideShutdownSignal(DateTimeOffset utcNow, string source)
+    {
+        if (!_isolatedPlaybackPersistence || Volatile.Read(ref _shutdownCompleted) != 0)
+            return false;
+        if (!RunRootArtifacts.HasRunShutdownSignal(_persistenceBase))
+            return false;
+
+        if (Volatile.Read(ref _shutdownRequested) != 0)
+            return true;
+
+        if (Interlocked.Exchange(ref _runWideShutdownStopRequested, 1) != 0)
+            return true;
+
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+            eventType: "RUN_WIDE_SHUTDOWN_SIGNAL_OBSERVED", state: "ENGINE",
+            new
+            {
+                source,
+                note = "Observed shared run shutdown signal from another engine instance. Requesting local stop."
+            }));
+
+        ThreadPool.QueueUserWorkItem(static state =>
+        {
+            try
+            {
+                ((RobotEngine)state!).Stop();
+            }
+            catch
+            {
+                // Best-effort follower stop; never throw on thread pool.
+            }
+        }, this);
+
+        return true;
+    }
     
     /// <summary>
     /// Mark BarsRequest as pending for an instrument.
@@ -1823,7 +1908,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         FeatureFlags.CanonicalOwnershipLedgerEnabled = true;
         FeatureFlags.UnifiedExecutionAuthorityShadowEnabled = true;
         FeatureFlags.UnifiedExecutionAuthorityEnabled = true;
-        FeatureFlags.ReconciliationRepairExecutorEnabled = true;
+        FeatureFlags.ReconciliationRepairExecutorEnabled =
+            repairWas || FeatureFlags.PlaybackAuditAutoEnableReconciliationRepairExecutor;
         FeatureFlags.StructuralLayerUseLedgerOwnership = true;
 
         LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "PLAYBACK_AUDIT_ACTIVE_FLAGS_APPLIED", state: "ENGINE",
@@ -1839,7 +1925,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 previous_unified_execution_authority_enabled = ueaActiveWas,
                 previous_reconciliation_repair_executor_enabled = repairWas,
                 previous_structural_layer_use_ledger_ownership = structuralLedgerWas,
-                note = "Isolated playback audit mode: canonical ledger, UEA active decisioning, reconciliation repair execution, and structural ledger ownership are enabled."
+                playback_auto_enable_reconciliation_repair_executor = FeatureFlags.PlaybackAuditAutoEnableReconciliationRepairExecutor,
+                note = "Isolated playback audit mode: canonical ledger, UEA active decisioning, and structural ledger ownership are enabled. Reconciliation repair execution is active only when explicitly enabled."
             }));
     }
 
@@ -1929,11 +2016,21 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     public void Start()
     {
         Volatile.Write(ref _shutdownRequested, 0);
+        Volatile.Write(ref _shutdownCompleted, 0);
+        _playbackStallQuiesceEligibleSinceUtc = DateTimeOffset.MinValue;
+        _playbackStallQuiesceStopRequestedUtc = DateTimeOffset.MinValue;
+        Volatile.Write(ref _playbackStallQuiesceArmed, 0);
+        Volatile.Write(ref _playbackStallQuiesceStopRequested, 0);
+        Volatile.Write(ref _playbackStallQuiesceForceFinalizeRequested, 0);
+        Volatile.Write(ref _connectivityShutdownStopRequested, 0);
+        Volatile.Write(ref _runWideShutdownStopRequested, 0);
         // CRITICAL: Set run_id before any Start-path logs (RebindPersistenceIfNeeded → ApplyOptionalRunIdFromEnvironment refines from env after this)
         AssignRunIdAtSessionStart(out var runIdAssignmentSource);
         _engineStartUtc = _playbackStartTimeUtc ?? DateTimeOffset.UtcNow;
         RebindPersistenceIfNeeded(_engineStartUtc);
         ApplyIsolatedPlaybackAuditShadowDefaults(_engineStartUtc);
+        if (_isolatedPlaybackPersistence)
+            RunRootArtifacts.ClearRunShutdownSignal(_persistenceBase);
         InitializeOwnershipAuditArtifacts(_engineStartUtc);
         LogEvent(RobotEvents.EngineBase(_engineStartUtc, tradingDate: "", eventType: "RUN_ID_ASSIGNED", state: "ENGINE",
             new
@@ -2416,7 +2513,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     isMismatchExecutionBlocked: IsMismatchExecutionAuthorityBlocked,
                     isMismatchExecutionBlockedForSubmit: (inst, submitPath) =>
                         _mismatchCoordinator != null && _mismatchCoordinator.IsSubmitBlockedByMismatch(inst, submitPath),
-                    isInstrumentFrozenOrEpaBlocked: IsInstrumentEpaAdapterSubmitBlocked);
+                    isInstrumentFrozenOrEpaBlocked: IsInstrumentEpaAdapterSubmitBlocked,
+                    isPlaybackStallNtCallBlocked: () => IsPlaybackStallQuiescenceBlockingNtCalls());
                 
                 // Wire coordinator to adapter
                 simAdapter.SetCoordinator(coordinator);
@@ -2553,8 +2651,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 simP2.SetMismatchExecutionTriggerCallback((inst, utc, d) =>
                 {
                     _releaseReconRedundancy.NotifyExecutionActivity();
-                    _mismatchCoordinator?.NotifyReconciliationAuditWake();
                     _mismatchCoordinator?.NotifyExecutionTrigger(inst, utc, d);
+                    _mismatchCoordinator?.NotifyReconciliationAuditWake();
                     TryEnsureJournalIntegrityAfterExecutionActivity(inst, utc, d);
                 });
                 simP2.SetInstrumentMismatchGateEngagedCallback(IsMismatchExecutionAuthorityBlocked);
@@ -2731,6 +2829,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         _healthMonitor.SetPlaybackTelemetryMode(_isolatedPlaybackPersistence);
                         _healthMonitor.SetActiveStreamsCallback(() => HasActiveStreams());
                         _healthMonitor.SetMarketOpenCallback(() => _time != null && TimeService.IsCmeMarketOpen(_time.ConvertUtcToChicago(DateTimeOffset.UtcNow)));
+                        _healthMonitor.SetConnectivityShutdownCallback((reason, callbackUtc, payload) =>
+                            RequestConnectivityHealthShutdown(reason, callbackUtc, payload));
                     }
                     else
                     {
@@ -2807,6 +2907,378 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                  s.State == StreamState.RANGE_LOCKED));
         }
     }
+
+    private bool TryHandlePlaybackStallQuiescence(DateTimeOffset utcNow, bool requestStopIfEligible)
+    {
+        if (!_isolatedPlaybackPersistence)
+        {
+            ResetPlaybackStallQuiescence();
+            return false;
+        }
+
+        if (!(_healthMonitor?.IsPlaybackEngineTickStallActive ?? false))
+        {
+            ResetPlaybackStallQuiescence();
+            return false;
+        }
+
+        var execIngressQueued = 0;
+        var orderIngressQueued = 0;
+        if (_executionAdapter is NinjaTraderSimAdapter ingressProbe)
+        {
+            ingressProbe.GetTotalCallbackIngressQueueLengths(out execIngressQueued, out orderIngressQueued);
+            if (execIngressQueued > 0 || orderIngressQueued > 0)
+            {
+                ResetPlaybackStallQuiescence();
+                return false;
+            }
+        }
+
+        if (_playbackStallQuiesceEligibleSinceUtc != DateTimeOffset.MinValue)
+        {
+            Volatile.Write(ref _playbackStallQuiesceArmed, 1);
+
+            if (!requestStopIfEligible)
+                return true;
+
+            var stallIdleSeconds = (utcNow - _playbackStallQuiesceEligibleSinceUtc).TotalSeconds;
+            if (Volatile.Read(ref _playbackStallQuiesceStopRequested) == 0
+                && stallIdleSeconds < PlaybackStallQuiesceGraceSeconds)
+                return true;
+
+            if (Interlocked.Exchange(ref _playbackStallQuiesceStopRequested, 1) == 0)
+            {
+                _playbackStallQuiesceStopRequestedUtc = utcNow;
+
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ENGINE_PLAYBACK_STALL_QUIESCENCE_STOP_REQUESTED", state: "ENGINE",
+                    new
+                    {
+                        source = "playback_stall_quiesce",
+                        idle_since_utc = _playbackStallQuiesceEligibleSinceUtc.ToString("o"),
+                        idle_duration_seconds = Math.Round(stallIdleSeconds, 3),
+                        callback_ingress_queued = execIngressQueued,
+                        order_ingress_queued = orderIngressQueued,
+                        note = "Playback tick stall remained active with zero active streams, zero live recovery instruments, and no callback ingress. Requesting clean engine stop."
+                    }));
+
+                ThreadPool.QueueUserWorkItem(static state =>
+                {
+                    try
+                    {
+                        ((RobotEngine)state!).Stop();
+                    }
+                    catch
+                    {
+                        // Best-effort quiescence stop; never throw on thread pool.
+                    }
+                }, this);
+            }
+
+            if (Volatile.Read(ref _shutdownCompleted) == 0
+                && _playbackStallQuiesceStopRequestedUtc != DateTimeOffset.MinValue
+                && (utcNow - _playbackStallQuiesceStopRequestedUtc).TotalSeconds >= PlaybackStallQuiesceForceFinalizeSeconds)
+            {
+                TryForcePlaybackStallQuiescenceFinalize(utcNow, execIngressQueued, orderIngressQueued, stallIdleSeconds);
+            }
+
+            return true;
+        }
+
+        AccountSnapshot? quiesceSnap = null;
+        if (_executionAdapter == null)
+        {
+            ResetPlaybackStallQuiescence();
+            return false;
+        }
+
+        try
+        {
+            quiesceSnap = _executionAdapter.GetAccountSnapshot(utcNow);
+        }
+        catch
+        {
+            ResetPlaybackStallQuiescence();
+            return false;
+        }
+
+        if (quiesceSnap == null)
+        {
+            ResetPlaybackStallQuiescence();
+            return false;
+        }
+
+        var liveRecoveryScope = GetPlaybackStallLiveRecoveryExecutionInstrumentKeys(quiesceSnap);
+        if (liveRecoveryScope.Count > 0)
+        {
+            ResetPlaybackStallQuiescence();
+            return false;
+        }
+
+        if (_playbackStallQuiesceEligibleSinceUtc == DateTimeOffset.MinValue)
+        {
+            _playbackStallQuiesceEligibleSinceUtc = utcNow;
+            Volatile.Write(ref _playbackStallQuiesceArmed, 1);
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ENGINE_PLAYBACK_STALL_QUIESCENCE_ARMED", state: "ENGINE",
+                new
+                {
+                    source = "playback_stall_quiesce",
+                    active_streams = false,
+                    live_recovery_instrument_count = 0,
+                    callback_ingress_queued = execIngressQueued,
+                    order_ingress_queued = orderIngressQueued,
+                    grace_seconds = PlaybackStallQuiesceGraceSeconds
+                }));
+        }
+
+        return true;
+    }
+
+    private void ResetPlaybackStallQuiescence()
+    {
+        _playbackStallQuiesceEligibleSinceUtc = DateTimeOffset.MinValue;
+        _playbackStallQuiesceStopRequestedUtc = DateTimeOffset.MinValue;
+        Volatile.Write(ref _playbackStallQuiesceArmed, 0);
+        Volatile.Write(ref _playbackStallQuiesceStopRequested, 0);
+        Volatile.Write(ref _playbackStallQuiesceForceFinalizeRequested, 0);
+    }
+
+    public bool IsPlaybackStallQuiescenceBlockingNtCalls() =>
+        Volatile.Read(ref _playbackStallQuiesceArmed) != 0;
+
+    private void RequestConnectivityHealthShutdown(string reason, DateTimeOffset utcNow, Dictionary<string, object> payload)
+    {
+        if (IsShutdownRequested || Volatile.Read(ref _shutdownCompleted) != 0)
+            return;
+
+        if (ShouldDeferConnectivityHealthShutdown(reason, utcNow, out var suppressionPayload))
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+                eventType: "CONNECTIVITY_SHUTDOWN_DEFERRED", state: "ENGINE", suppressionPayload));
+            return;
+        }
+
+        if (Interlocked.Exchange(ref _connectivityShutdownStopRequested, 1) != 0)
+            return;
+
+        var eventPayload = new Dictionary<string, object>(payload ?? new Dictionary<string, object>())
+        {
+            ["reason"] = reason,
+            ["source"] = "health_monitor_connectivity_guard"
+        };
+
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+            eventType: "CONNECTIVITY_SHUTDOWN_REQUESTED", state: "ENGINE", eventPayload));
+
+        LatchRunWideShutdownSignal(utcNow, reason, "health_monitor_connectivity_guard");
+
+        ThreadPool.QueueUserWorkItem(static state =>
+        {
+            try
+            {
+                ((RobotEngine)state!).Stop();
+            }
+            catch
+            {
+                // Best-effort connectivity stop; never throw on thread pool.
+            }
+        }, this);
+    }
+
+    private bool ShouldDeferConnectivityHealthShutdown(
+        string reason,
+        DateTimeOffset utcNow,
+        out Dictionary<string, object> suppressionPayload)
+    {
+        suppressionPayload = new Dictionary<string, object>
+        {
+            ["reason"] = reason,
+            ["source"] = "engine_connectivity_guard"
+        };
+
+        if (!string.Equals(reason, "DISCONNECT_CLASSIFIED_DATA_LOSS_PLAYBACK_IMMEDIATE", StringComparison.Ordinal) &&
+            !string.Equals(reason, "DISCONNECT_CLASSIFIED_DATA_LOSS_BURST", StringComparison.Ordinal))
+            return false;
+
+        AccountSnapshot? snap = null;
+        try
+        {
+            snap = _executionAdapter?.GetAccountSnapshot(utcNow);
+        }
+        catch (Exception ex)
+        {
+            suppressionPayload["snapshot_error"] = ex.GetType().Name;
+            return false;
+        }
+
+        if (snap == null)
+        {
+            suppressionPayload["snapshot_available"] = false;
+            return false;
+        }
+
+        var brokerPositionGross = 0;
+        if (snap.Positions != null)
+        {
+            foreach (var p in snap.Positions)
+            {
+                if (p == null)
+                    continue;
+                brokerPositionGross += Math.Abs(p.Quantity);
+            }
+        }
+
+        var robotWorkingOrders = 0;
+        var totalWorkingOrders = 0;
+        if (snap.WorkingOrders != null)
+        {
+            totalWorkingOrders = snap.WorkingOrders.Count;
+            foreach (var order in snap.WorkingOrders)
+            {
+                if (order != null && IsRobotOwnedOrder(order))
+                    robotWorkingOrders++;
+            }
+        }
+
+        suppressionPayload["snapshot_available"] = true;
+        suppressionPayload["broker_position_gross"] = brokerPositionGross;
+        suppressionPayload["robot_working_orders"] = robotWorkingOrders;
+        suppressionPayload["total_working_orders"] = totalWorkingOrders;
+        suppressionPayload["note"] = "Connectivity shutdown deferred because broker still shows live exposure or robot-owned working orders. Allow flatten/protective lifecycle to continue instead of terminating the run mid-trade.";
+
+        return brokerPositionGross > 0 || robotWorkingOrders > 0;
+    }
+
+    private void TryForcePlaybackStallQuiescenceFinalize(
+        DateTimeOffset utcNow,
+        int execIngressQueued,
+        int orderIngressQueued,
+        double stallIdleSeconds)
+    {
+        if (Volatile.Read(ref _shutdownCompleted) != 0)
+            return;
+
+        if (Interlocked.Exchange(ref _playbackStallQuiesceForceFinalizeRequested, 1) != 0)
+            return;
+
+        Interlocked.Exchange(ref _shutdownRequested, 1);
+        StopEngineHeartbeatTimer();
+        LatchRunWideShutdownSignal(utcNow, "playback_stall_force_finalize", "playback_stall_quiesce");
+
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ENGINE_PLAYBACK_STALL_QUIESCENCE_FORCE_FINALIZE", state: "ENGINE",
+            new
+            {
+                source = "playback_stall_quiesce",
+                idle_since_utc = _playbackStallQuiesceEligibleSinceUtc.ToString("o"),
+                stop_requested_utc = _playbackStallQuiesceStopRequestedUtc.ToString("o"),
+                idle_duration_seconds = Math.Round(stallIdleSeconds, 3),
+                callback_ingress_queued = execIngressQueued,
+                order_ingress_queued = orderIngressQueued,
+                force_finalize_after_seconds = PlaybackStallQuiesceForceFinalizeSeconds,
+                note = "Clean stop did not complete inside fallback window; writing best-effort run summary and halting heartbeat timer."
+            }));
+
+        TryWritePlaybackStallForcedRunSummary(utcNow);
+        Volatile.Write(ref _shutdownCompleted, 1);
+    }
+
+    private void TryWritePlaybackStallForcedRunSummary(DateTimeOffset utcNow)
+    {
+        try
+        {
+            _runtimeAudit?.EmitEngineAuditSummary(utcNow, TradingDateString);
+        }
+        catch
+        {
+            // Best-effort emergency finalize.
+        }
+
+        try
+        {
+            var summarySnap = _executionSummary.GetSnapshot();
+            summarySnap = HydrateExecutionSummaryFromKeyEventsIfEmpty(_persistenceBase, summarySnap);
+
+            if (_isolatedPlaybackPersistence)
+            {
+                var isolatedInstruments = new List<string>();
+                if (_spec?.instruments != null)
+                {
+                    isolatedInstruments.AddRange(_spec.instruments.Keys
+                        .Select(k => k.ToUpperInvariant())
+                        .OrderBy(x => x, StringComparer.Ordinal));
+                }
+
+                RunRootArtifacts.WriteRunSummaryJson(
+                    _persistenceBase,
+                    _root,
+                    _runId,
+                    _engineStartUtc,
+                    _executionMode,
+                    isolatedInstruments,
+                    summarySnap);
+            }
+        }
+        catch
+        {
+            // Best-effort emergency finalize.
+        }
+
+        try
+        {
+            RunRootArtifacts.WriteAuditManifestJson(
+                _persistenceBase,
+                _runId,
+                _engineStartUtc,
+                TradingDateString,
+                _isolatedPlaybackPersistence,
+                FeatureFlags.CanonicalOwnershipLedgerEnabled,
+                FeatureFlags.UnifiedExecutionAuthorityShadowEnabled,
+                FeatureFlags.UnifiedExecutionAuthorityEnabled,
+                FeatureFlags.ReconciliationRepairExecutorEnabled,
+                FeatureFlags.StructuralLayerUseLedgerOwnership);
+        }
+        catch
+        {
+            // Best-effort emergency finalize.
+        }
+    }
+
+    private IReadOnlyList<string> GetPlaybackStallLiveRecoveryExecutionInstrumentKeys(AccountSnapshot snap)
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        lock (_engineLock)
+        {
+            foreach (var s in _streams.Values)
+            {
+                if (!DoesStreamBlockPlaybackStallQuiescence(s, snap))
+                    continue;
+
+                var ex = s.ExecutionInstrument?.Trim();
+                if (!string.IsNullOrEmpty(ex))
+                    set.Add(ex);
+            }
+        }
+
+        return set.OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    private static bool DoesStreamBlockPlaybackStallQuiescence(StreamStateMachine stream, AccountSnapshot snap)
+    {
+        if (stream.Committed)
+            return false;
+
+        if (stream.ExecutionInterruptedByClose)
+            return true;
+
+        if (stream.State != StreamState.RANGE_LOCKED)
+            return true;
+
+        var instrument = stream.ExecutionInstrument?.Trim();
+        if (string.IsNullOrEmpty(instrument))
+            return true;
+
+        return SumBrokerPositionQty(snap, instrument) != 0 ||
+               CountBrokerWorkingOrders(snap, instrument) != 0;
+    }
     
     
     /// <summary>
@@ -2867,13 +3339,15 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     public void Stop()
     {
+        var utcNow = DateTimeOffset.UtcNow;
+        LatchRunWideShutdownSignal(utcNow, "engine_stop", "local_engine_instance");
+
         if (Interlocked.Exchange(ref _shutdownRequested, 1) != 0)
         {
             StopEngineHeartbeatTimer();
             return;
         }
         StopEngineHeartbeatTimer();
-        var utcNow = DateTimeOffset.UtcNow;
         _runtimeAudit?.EmitEngineAuditSummary(utcNow, TradingDateString);
         RuntimeAuditHubRef.Active = null;
 
@@ -2977,6 +3451,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             FeatureFlags.UnifiedExecutionAuthorityEnabled,
             FeatureFlags.ReconciliationRepairExecutorEnabled,
             FeatureFlags.StructuralLayerUseLedgerOwnership);
+
+        Volatile.Write(ref _shutdownCompleted, 1);
     }
 
     private static ExecutionSummarySnapshot HydrateExecutionSummaryFromKeyEventsIfEmpty(string persistenceBase, ExecutionSummarySnapshot snapshot)
@@ -3114,6 +3590,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     private void TickInternal(DateTimeOffset utcNow, bool isHistorical)
     {
+        if (IsTerminalShutdownLatched()) return;
+        if (TryRespectRunWideShutdownSignal(utcNow, "tick_entry"))
+            return;
         var tickTotalStart = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
         try
         {
@@ -3273,6 +3752,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             {
                 LogAndDrainCallbackIngressBeforeReconciliation(utcNow, nowWall);
                 RunReconciliationPeriodicThrottle(utcNow);
+                if (IsTerminalShutdownLatched() || TryRespectRunWideShutdownSignal(utcNow, "post_reconciliation_throttle"))
+                    return;
             }
 
             reconciliationRunnerMs = wRecon?.ElapsedMilliseconds ?? 0;
@@ -3312,6 +3793,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 _runtimeAudit?.CpuEnd(streamLoopStart, RuntimeAuditSubsystem.StreamLoop);
                 _runtimeAudit?.RecordStreamLoopAggregate(_streams.Count, loopMs);
             }
+            if (IsTerminalShutdownLatched() || TryRespectRunWideShutdownSignal(utcNow, "post_stream_tick"))
+                return;
 
             streamTickMs = wTimetableStream?.ElapsedMilliseconds ?? 0;
             if (cpuProf && wTimetableStream != null)
@@ -3499,6 +3982,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
             // Health monitor: evaluate data loss (rate-limited internally)
             _healthMonitor?.Evaluate(utcNow);
+            if (IsTerminalShutdownLatched() || TryRespectRunWideShutdownSignal(utcNow, "post_health_monitor"))
+                return;
 
             // Gap 3 Phase 3: Protective coverage audit metrics (rate-limited by coordinator)
             var emProt = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
@@ -3509,11 +3994,15 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             _mismatchCoordinator?.EmitMetrics(utcNow);
             if (emMis != 0)
                 _runtimeAudit?.CpuEnd(emMis, RuntimeAuditSubsystem.EmitMetricsMismatch);
+            if (IsTerminalShutdownLatched() || TryRespectRunWideShutdownSignal(utcNow, "post_metrics_emit"))
+                return;
 
             _runtimeAudit?.TryEmitPeriodicWallClock(nowWall);
 
             if (_executionAdapter is NinjaTraderSimAdapter ingressAdapter)
                 ingressAdapter.DrainCallbackIngress(nowWall);
+            if (IsTerminalShutdownLatched() || TryRespectRunWideShutdownSignal(utcNow, "post_callback_ingress_drain"))
+                return;
 
             tailCoordinatorsMs = wTail?.ElapsedMilliseconds ?? 0;
             if (cpuProf && !isHistorical &&
@@ -6836,23 +7325,39 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     canonicalInstrument,
                     interruptedIntentIds,
                     utcNow,
-                    "LateSessionCloseFlattenBrokerFlat");
+                    "LateSessionCloseFlattenBrokerFlat",
+                    (tradingDate, streamId, intentId, openQty) =>
+                        RecordOwnershipLateSessionBrokerFlatClose(tradingDate, streamId, intentId, inst, openQty, utcNow));
             }
 
+            var clearedInstrumentKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var stream in matchedStreams)
             {
-                stream.HandleLateSessionCloseFlattenConfirmed(utcNow);
-
-                var clearedKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 var streamInst = stream.Instrument?.Trim() ?? "";
                 var streamExec = stream.ExecutionInstrument?.Trim() ?? "";
                 foreach (var key in new[] { inst, streamExec, streamInst })
                 {
-                    if (string.IsNullOrWhiteSpace(key) || !clearedKeys.Add(key))
+                    if (string.IsNullOrWhiteSpace(key) || !clearedInstrumentKeys.Add(key))
                         continue;
                     _frozenInstruments.Remove(key);
                     _riskLatchManager?.Clear(key);
                 }
+            }
+
+            try
+            {
+                _reconciliationRunner?.ForceRunGateRecoveryForInstrument(utcNow, inst);
+            }
+            catch
+            {
+                // Best-effort: the stream's normal reentry gate will still fail closed if release is not actually ready yet.
+            }
+
+            foreach (var stream in matchedStreams)
+            {
+                var streamInst = stream.Instrument?.Trim() ?? "";
+                var streamExec = stream.ExecutionInstrument?.Trim() ?? "";
+                stream.HandleLateSessionCloseFlattenConfirmed(utcNow);
 
                 LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr,
                     eventType: "INSTRUMENT_UNFROZEN_LATE_SESSION_FLATTEN", state: "ENGINE",
@@ -6882,6 +7387,83 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     }));
             }
         }
+    }
+
+    private bool RecordOwnershipLateSessionBrokerFlatClose(
+        string tradingDate,
+        string stream,
+        string intentId,
+        string instrument,
+        int journalOpenBefore,
+        DateTimeOffset utcNow)
+    {
+        return RecordOwnershipBrokerFlatJournalClose(
+            tradingDate,
+            stream,
+            intentId,
+            instrument,
+            journalOpenBefore,
+            utcNow,
+            "Late session-close broker-flat journal reconciliation mirrored into ownership ledger");
+    }
+
+    private bool RecordOwnershipBrokerFlatJournalClose(
+        string tradingDate,
+        string stream,
+        string intentId,
+        string instrument,
+        int journalOpenBefore,
+        DateTimeOffset utcNow,
+        string note)
+    {
+        if (_ownershipLedger == null || journalOpenBefore <= 0 || string.IsNullOrWhiteSpace(intentId) || string.IsNullOrWhiteSpace(instrument))
+            return false;
+
+        var account = OwnershipAccountKey;
+        var snapshot = _ownershipLedger.GetOwnershipSnapshot(account, instrument);
+        var remaining = snapshot?.Slots
+            .Where(s => string.Equals(s.IntentId, intentId, StringComparison.OrdinalIgnoreCase) && s.Remaining > 0)
+            .Sum(s => s.Remaining) ?? 0;
+
+        if (remaining <= 0)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate, "OWNERSHIP_RECONCILIATION_BROKER_FLAT_CLOSE", "ENGINE",
+                new
+                {
+                    account,
+                    instrument,
+                    stream,
+                    intent_id = intentId,
+                    qty_delta = 0,
+                    journal_open_qty_before = journalOpenBefore,
+                    success = true,
+                    skipped = true,
+                    skip_reason = "already_retired",
+                    ownership_version = snapshot?.OwnershipVersion ?? 0,
+                    note = note + "; ownership mirror skipped because slot was already retired"
+                }));
+            return true;
+        }
+
+        var qtyToClose = Math.Min(journalOpenBefore, remaining);
+        var result = _ownershipLedger.RecordMappedExitFill(account, instrument, intentId, qtyToClose, utcNow, 0);
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate, "OWNERSHIP_RECONCILIATION_BROKER_FLAT_CLOSE", "ENGINE",
+            new
+            {
+                account,
+                instrument,
+                stream,
+                intent_id = intentId,
+                qty_delta = qtyToClose,
+                journal_open_qty_before = journalOpenBefore,
+                ownership_remaining_before = remaining,
+                success = result.Success,
+                skipped = false,
+                error = result.ErrorReason ?? "",
+                ownership_version = result.Snapshot?.OwnershipVersion ?? snapshot?.OwnershipVersion ?? 0,
+                note
+            }));
+        return result.Success;
     }
 
     private bool HasInterruptedSessionCloseStreamForInstrument(string instrument)
@@ -7130,6 +7712,78 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         return IsMismatchExecutionAuthorityBlocked(instrument) || IsInstrumentEpaExecutionLocked(instrument);
     }
 
+    private bool HasInstrumentSupervisoryBlock(string instrument)
+    {
+        var inst = (instrument ?? "").Trim();
+        if (string.IsNullOrEmpty(inst)) return false;
+        var account = _accountName ?? "";
+        foreach (var iea in InstrumentExecutionAuthorityRegistry.GetAllForAccount(account))
+        {
+            if (ExecutionInstrumentResolver.IsSameInstrument(iea.ExecutionInstrumentKey, inst) && iea.IsSupervisorilyBlocked)
+                return true;
+        }
+        return false;
+    }
+
+    internal static bool ShouldBypassInterruptedLateSessionCloseReentryBlock(
+        bool hasInterruptedSessionCloseStream,
+        bool hasSupervisoryBlock,
+        int brokerPositionQty,
+        int brokerWorkingCount)
+    {
+        return hasInterruptedSessionCloseStream &&
+               !hasSupervisoryBlock &&
+               brokerPositionQty == 0 &&
+               brokerWorkingCount == 0;
+    }
+
+    private bool TryBypassInterruptedLateSessionCloseReentryBlock(string instrument)
+    {
+        var inst = (instrument ?? "").Trim();
+        if (string.IsNullOrEmpty(inst) || _executionAdapter == null)
+            return false;
+        if (!HasInterruptedSessionCloseStreamForInstrument(inst))
+            return false;
+
+        var hasSupervisoryBlock = HasInstrumentSupervisoryBlock(inst);
+        if (hasSupervisoryBlock)
+            return false;
+
+        AccountSnapshot snapshot;
+        try
+        {
+            snapshot = _executionAdapter.GetAccountSnapshot(DateTimeOffset.UtcNow);
+        }
+        catch
+        {
+            return false;
+        }
+
+        var brokerPositionQty = SumBrokerPositionQty(snapshot, inst);
+        var brokerWorkingCount = CountBrokerWorkingOrders(snapshot, inst);
+        if (!ShouldBypassInterruptedLateSessionCloseReentryBlock(true, hasSupervisoryBlock, brokerPositionQty, brokerWorkingCount))
+            return false;
+
+        var auditUtc = DateTimeOffset.UtcNow;
+        lock (_engineLock)
+        {
+            _frozenInstruments.Remove(inst);
+            _riskLatchManager?.Clear(inst);
+        }
+
+        _reconciliationRunner?.ForceRunGateRecoveryForInstrument(auditUtc, inst);
+        LogEvent(RobotEvents.EngineBase(auditUtc, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "",
+            eventType: "SESSION_REENTRY_BLOCK_BYPASS", state: "ENGINE",
+            new
+            {
+                instrument = inst,
+                broker_position_qty = brokerPositionQty,
+                broker_working_count = brokerWorkingCount,
+                note = "Late session-close reentry bypassed stale freeze/reconciliation block after broker-flat confirmation."
+            }));
+        return true;
+    }
+
     /// <summary>G1: Coordinator notifies engine when mismatch <c>Blocked</c> transitions; engine owns durable authority + enforcement consumption.</summary>
     private void OnMismatchExecutionBlockAuthorityChanged(string instrument, bool blocked, string? blockReason, DateTimeOffset utcNow)
     {
@@ -7246,6 +7900,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// </summary>
     private bool IsInstrumentBlockedForReentry(string instrument)
     {
+        if (TryBypassInterruptedLateSessionCloseReentryBlock(instrument)) return false;
         if (IsInstrumentFrozenOrSupervisorilyBlocked(instrument)) return true;
         var account = _accountName ?? "";
         foreach (var iea in InstrumentExecutionAuthorityRegistry.GetAllForAccount(account))
@@ -7419,6 +8074,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     {
         var list = new List<MismatchObservation>();
         if (snap == null) return list;
+        if (TryRespectRunWideShutdownSignal(utcNow, "assemble_mismatch_observations"))
+            return list;
+        if (IsTerminalShutdownLatched()) return list;
+        if (TryHandlePlaybackStallQuiescence(utcNow, requestStopIfEligible: false))
+            return list;
 
         if (snap.Positions == null && snap.WorkingOrders == null)
             return list;
@@ -7580,6 +8240,12 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 var ieaOwnedPlusAdoptedWorking = ieaForInstrument.GetOwnedPlusAdoptedWorkingCount();
                 if (brokerWorking > 0 && ieaOwnedPlusAdoptedWorking == 0)
                 {
+                    var registryConvergenceActive =
+                        PendingAlignmentAuthority.IsPendingAlignment(inst, utcNow) ||
+                        QuantExecutionControlStore.IsPostFillAlignmentWindowActive(inst, utcNow) ||
+                        QuantExecutionControlStore.IsWorkingOrderSubmitWindowActive(inst, utcNow) ||
+                        QuantExecutionControlStore.IsBrokerExecutionCallbackPendingActive(inst, utcNow) ||
+                        QuantExecutionControlStore.IsAnyBrokerJournalAlignmentWindowActive(inst, utcNow);
                     var shouldLogInvariant = true;
                     lock (_reconciliationBrokerWorkingOwnedInvariantThrottle)
                     {
@@ -7595,14 +8261,20 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     if (shouldLogInvariant)
                     {
                         LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
-                            eventType: "RECONCILIATION_IEA_OWNED_WORKING_INVARIANT_BREACH", state: "CRITICAL",
+                            eventType: registryConvergenceActive
+                                ? "RECONCILIATION_IEA_OWNED_WORKING_TRANSIENT"
+                                : "RECONCILIATION_IEA_OWNED_WORKING_INVARIANT_BREACH",
+                            state: registryConvergenceActive ? "ENGINE" : "CRITICAL",
                             new
                             {
                                 instrument = inst,
                                 broker_working_count = brokerWorking,
                                 iea_owned_plus_adopted_working = ieaOwnedPlusAdoptedWorking,
                                 iea_mismatch_trusted_working = localWorking,
-                                note = "Broker reports working orders but IEA registry has no OWNED/ADOPTED live (SUBMITTED/WORKING/PART_FILLED) rows — check ownership/lifecycle/adoption"
+                                convergence_active = registryConvergenceActive,
+                                note = registryConvergenceActive
+                                    ? "Broker reports working orders while IEA registry is settling inside a bounded order lifecycle convergence window."
+                                    : "Broker reports working orders but IEA registry has no OWNED/ADOPTED live (SUBMITTED/WORKING/PART_FILLED) rows — check ownership/lifecycle/adoption"
                             }));
                     }
                 }
@@ -7740,8 +8412,43 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     brokerWorking,
                     effectiveLocalWorking);
 
+            if (mismatchType == MismatchType.WORKING_ORDER_COUNT_CONVERGENCE &&
+                effectiveLocalWorking > brokerWorking)
+            {
+                var pendingWorkingOrderCountConvergence =
+                    QuantExecutionControlStore.IsAnyBrokerJournalAlignmentWindowActive(inst, utcNow);
+                if (pendingWorkingOrderCountConvergence)
+                {
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "REGISTRY_PENDING_CONVERGENCE", state: "ENGINE",
+                        new
+                        {
+                            instrument = inst,
+                            mismatch_type = mismatchType.ToString(),
+                            broker_working = brokerWorking,
+                            iea_working = effectiveLocalWorking,
+                            note = "WORKING_ORDER_COUNT_CONVERGENCE observed inside bounded order lifecycle convergence window"
+                        }));
+                    continue;
+                }
+            }
+
             if (mismatchType == MismatchType.ORDER_REGISTRY_MISSING && brokerWorking > 0 && effectiveLocalWorking == 0)
             {
+                var pendingRegistryConvergence =
+                    QuantExecutionControlStore.IsAnyBrokerJournalAlignmentWindowActive(inst, utcNow);
+                if (pendingRegistryConvergence)
+                {
+                    LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "REGISTRY_PENDING_CONVERGENCE", state: "ENGINE",
+                        new
+                        {
+                            instrument = inst,
+                            broker_working = brokerWorking,
+                            iea_working = effectiveLocalWorking,
+                            note = "ORDER_REGISTRY_MISSING observed inside bounded submit/fill convergence window"
+                        }));
+                    continue;
+                }
+
                 var robotTaggedWorking = CountRobotTaggedBrokerWorkingForInstrument(snap, inst);
                 var deferFailClosed = ReconciliationDeferPolicy.ShouldDeferOrderRegistryMissingFailClosed(
                     ieaOwnershipAmbiguous, brokerWorking, robotTaggedWorking);
@@ -7884,6 +8591,19 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             }
         }
         return set;
+    }
+
+    private bool HasPendingFlattenLifecycle(string instrument)
+    {
+        if (string.IsNullOrWhiteSpace(instrument))
+            return false;
+
+        var instrumentKey = instrument.Trim();
+        if (HasInterruptedSessionCloseStreamForInstrument(instrumentKey))
+            return true;
+
+        return FlattenCoordinationTracker.Shared.TryPeekKey(_accountName ?? "", instrumentKey, out _, out _, out var state) &&
+               (state == FlattenCoordinationState.FLATTENING || state == FlattenCoordinationState.VERIFYING);
     }
 
     private static int SumBrokerPositionQty(AccountSnapshot? snap, string instrument)
@@ -8038,15 +8758,24 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 }, canonicalPost, utcNow);
             if (!parityPost.IsOkOrPendingAlignment)
             {
-                LogEvent(RobotEvents.EngineBase(utcNow, "", "JOURNAL_INTEGRITY_INVARIANT_CYCLE", "CRITICAL",
-                    new
-                    {
-                        instrument = inst,
-                        status = parityPost.Status.ToString(),
-                        broker_qty = parityPost.BrokerPositionQty,
-                        journal_qty = parityPost.JournalOpenQty,
-                        note = "CheckJournalParity != PARITY_OK after integrity pipeline and release evaluation"
-                    }));
+                var knownConvergence =
+                    PendingAlignmentAuthority.IsPendingAlignment(inst, utcNow) ||
+                    QuantExecutionControlStore.IsPostFillAlignmentWindowActive(inst, utcNow) ||
+                    QuantExecutionControlStore.IsWorkingOrderSubmitWindowActive(inst, utcNow) ||
+                    QuantExecutionControlStore.IsBrokerExecutionCallbackPendingActive(inst, utcNow);
+                if (!knownConvergence)
+                {
+                    LogJournalIntegrityInvariantOrTransient(inst, parityPost.Status.ToString(),
+                        parityPost.BrokerPositionQty, parityPost.JournalOpenQty, utcNow);
+                }
+                else
+                {
+                    ClearJournalIntegrityInvariantDebounce(inst);
+                }
+            }
+            else
+            {
+                ClearJournalIntegrityInvariantDebounce(inst);
             }
         }
 
@@ -8075,6 +8804,75 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             _releaseReconRedundancy.RecordReleaseFullEvaluation(inst, input, result, utcNow, genAtStart);
 
         return result;
+    }
+
+    private void ClearJournalIntegrityInvariantDebounce(string instrument)
+    {
+        if (!string.IsNullOrWhiteSpace(instrument))
+            _journalIntegrityInvariantDebounceByInstrument.TryRemove(instrument.Trim(), out _);
+    }
+
+    private void LogJournalIntegrityInvariantOrTransient(string instrument, string status, int brokerQty, int journalQty,
+        DateTimeOffset utcNow)
+    {
+        var inst = instrument?.Trim() ?? "";
+        if (string.IsNullOrEmpty(inst)) return;
+
+        var state = _journalIntegrityInvariantDebounceByInstrument.AddOrUpdate(inst,
+            _ => new JournalIntegrityInvariantDebounceState(status, brokerQty, journalQty, utcNow, utcNow, 1, false),
+            (_, existing) =>
+            {
+                if (!string.Equals(existing.Status, status, StringComparison.OrdinalIgnoreCase) ||
+                    existing.BrokerQty != brokerQty ||
+                    existing.JournalQty != journalQty)
+                {
+                    return new JournalIntegrityInvariantDebounceState(status, brokerQty, journalQty, utcNow, utcNow, 1, false);
+                }
+
+                return existing with
+                {
+                    LastSeenUtc = utcNow,
+                    SeenCount = existing.SeenCount + 1
+                };
+            });
+
+        var elapsedMs = Math.Max(0.0, (utcNow - state.FirstSeenUtc).TotalMilliseconds);
+        if (elapsedMs < JournalIntegrityInvariantCriticalAfterMilliseconds)
+        {
+            if (state.SeenCount == 1)
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, "", "JOURNAL_INTEGRITY_TRANSIENT_ALIGNMENT", "ENGINE",
+                    new
+                    {
+                        instrument = inst,
+                        status,
+                        broker_qty = brokerQty,
+                        journal_qty = journalQty,
+                        first_seen_utc = state.FirstSeenUtc,
+                        elapsed_ms = (long)elapsedMs,
+                        critical_after_ms = (long)JournalIntegrityInvariantCriticalAfterMilliseconds,
+                        note = "Parity is not OK after integrity evaluation, but the mismatch has not persisted long enough to classify as invariant break."
+                    }));
+            }
+            return;
+        }
+
+        if (state.CriticalEmitted) return;
+
+        LogEvent(RobotEvents.EngineBase(utcNow, "", "JOURNAL_INTEGRITY_INVARIANT_CYCLE", "CRITICAL",
+            new
+            {
+                instrument = inst,
+                status,
+                broker_qty = brokerQty,
+                journal_qty = journalQty,
+                first_seen_utc = state.FirstSeenUtc,
+                elapsed_ms = (long)elapsedMs,
+                seen_count = state.SeenCount,
+                note = "CheckJournalParity != PARITY_OK after integrity pipeline and release evaluation beyond transient alignment window"
+            }));
+
+        _journalIntegrityInvariantDebounceByInstrument[inst] = state with { CriticalEmitted = true };
     }
 
     /// <summary>Authoritative journal integrity pipeline (parity check + deterministic repair). Used by release input and post-adoption hooks.</summary>
@@ -8170,7 +8968,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         if (snap == null) return;
         var trimmed = inst.Trim();
-        if (FeatureFlags.QuantExecutionControlStoreEnabled)
+        if (FeatureFlags.QuantExecutionControlStoreEnabled && !triggerDetails.WorkingOrderSubmitTransition)
         {
             try
             {
@@ -8318,6 +9116,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
         input.BrokerPositionQty = SumBrokerPositionQty(snap, inst);
         input.BrokerWorkingCount = CountBrokerWorkingOrders(snap, inst);
+        var pendingIeAWorkload = GetPendingIeAWorkloadForBrokerInstrument(inst);
+        input.PendingExecutionWorkload = pendingIeAWorkload;
 
         var brokerSigned = SumBrokerPositionSignedQty(snap, inst);
         var execVariant = inst.StartsWith("M", StringComparison.OrdinalIgnoreCase) && inst.Length > 1 ? inst : "M" + inst;
@@ -8344,6 +9144,57 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         var staleAdoptionJournalClosedCount = integrityResult.Reconstruction?.StaleAdoptionRowsClosed ?? 0;
         var journalAlignmentWriteCount = integrityResult.Reconstruction?.JournalWritesFromAlignment ?? 0;
         var recoveredIntentWrites = integrityResult.RecoveredIntentWrites;
+        var brokerFlatJournalClosedCount = 0;
+        var residualBrokerFlatJournalClosedCount = 0;
+        var brokerJournalAlignmentActive = QuantExecutionControlStore.IsAnyBrokerJournalAlignmentWindowActive(inst, utcNow);
+        var suppressBrokerFlatJournalClose =
+            HasPendingFlattenLifecycle(inst) ||
+            pendingIeAWorkload != 0 ||
+            brokerJournalAlignmentActive;
+
+        if (input.BrokerPositionQty == 0 && input.BrokerWorkingCount == 0)
+        {
+            brokerFlatJournalClosedCount = _executionJournal.ReconcileBrokerFlatJournalRowsForRelease(
+                ieaResolved?.ExecutionInstrumentKey ?? inst,
+                canonical,
+                input.BrokerPositionQty,
+                input.BrokerWorkingCount,
+                robotIntentIds,
+                registryIntentIds,
+                utcNow,
+                "ReleaseReadinessBrokerFlat",
+                suppressBrokerFlatJournalClose,
+                onReconciled: (td, streamId, intentId, remaining) => RecordOwnershipBrokerFlatJournalClose(
+                    td,
+                    streamId,
+                    intentId,
+                    ieaResolved?.ExecutionInstrumentKey ?? inst,
+                    remaining,
+                    utcNow,
+                    "Release-readiness broker-flat journal reconciliation mirrored into ownership ledger"));
+            if (!suppressBrokerFlatJournalClose && pendingIeAWorkload == 0)
+            {
+                residualBrokerFlatJournalClosedCount = _executionJournal.ReconcileBrokerFlatJournalRowsForRelease(
+                    ieaResolved?.ExecutionInstrumentKey ?? inst,
+                    canonical,
+                    input.BrokerPositionQty,
+                    input.BrokerWorkingCount,
+                    robotIntentIds,
+                    registryIntentIds,
+                    utcNow,
+                    "ResidualBrokerFlatCleanupPulse",
+                    suppressWhileFlattenPending: false,
+                    allowTaggedResidualRetirement: true,
+                    onReconciled: (td, streamId, intentId, remaining) => RecordOwnershipBrokerFlatJournalClose(
+                        td,
+                        streamId,
+                        intentId,
+                        ieaResolved?.ExecutionInstrumentKey ?? inst,
+                        remaining,
+                        utcNow,
+                        "Residual broker-flat cleanup journal reconciliation mirrored into ownership ledger"));
+            }
+        }
 
         var openJournalMap = _executionJournal.GetOpenJournalEntriesByInstrument();
         var (journalOpenQty, journalOpenIntentHash) =
@@ -8354,6 +9205,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             journalOpenQtyBeforePreSum != journalOpenQty ||
             staleAdoptionJournalClosedCount != 0 ||
             journalAlignmentWriteCount != 0 ||
+            brokerFlatJournalClosedCount != 0 ||
+            residualBrokerFlatJournalClosedCount != 0 ||
             recoveredIntentWrites != 0)
         {
             LogEvent(RobotEvents.EngineBase(utcNow, "", "RELEASE_READINESS_JOURNAL_PRE_SUM_CHAIN", "ENGINE",
@@ -8366,6 +9219,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     journal_open_qty_before_pre_sum_chain = journalOpenQtyBeforePreSum,
                     stale_adoption_journal_closed_count = staleAdoptionJournalClosedCount,
                     journal_alignment_write_count = journalAlignmentWriteCount,
+                    broker_flat_journal_closed_count = brokerFlatJournalClosedCount,
+                    residual_broker_flat_journal_closed_count = residualBrokerFlatJournalClosedCount,
                     recovered_intent_writes = recoveredIntentWrites,
                     journal_open_qty_after_pre_sum_chain = journalOpenQty,
                     note =
@@ -10071,7 +10926,10 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
     }
     
-    public (string earliestRangeStart, string latestSlotTime)? GetBarsRequestTimeRange(string instrument)
+    public (string earliestRangeStart, string latestSlotTime)? GetBarsRequestTimeRange(
+        string instrument,
+        bool preferEarliestSlot = false,
+        bool logDiagnostics = true)
     {
         lock (_engineLock)
         {
@@ -10088,13 +10946,16 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
             if (allStreamsForInstrument.Count == 0)
             {
-                LogEngineEvent(utcNow, "BARSREQUEST_RANGE_CHECK", new
+                if (logDiagnostics)
                 {
-                    instrument = instrumentUpper,
-                    result = "NO_STREAMS_FOUND",
-                    total_streams_in_engine = _streams.Count,
-                    note = "No streams found for this instrument. Check timetable configuration."
-                });
+                    LogEngineEvent(utcNow, "BARSREQUEST_RANGE_CHECK", new
+                    {
+                        instrument = instrumentUpper,
+                        result = "NO_STREAMS_FOUND",
+                        total_streams_in_engine = _streams.Count,
+                        note = "No streams found for this instrument. Check timetable configuration."
+                    });
+                }
                 return null;
             }
 
@@ -10109,12 +10970,15 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 state = s.State.ToString()
             }).ToList();
 
-            LogEngineEvent(utcNow, "BARSREQUEST_STREAM_STATUS", new
+            if (logDiagnostics)
             {
-                instrument = instrumentUpper,
-                total_streams = allStreamsForInstrument.Count,
-                streams = streamDetails
-            });
+                LogEngineEvent(utcNow, "BARSREQUEST_STREAM_STATUS", new
+                {
+                    instrument = instrumentUpper,
+                    total_streams = allStreamsForInstrument.Count,
+                    streams = streamDetails
+                });
+            }
 
             var enabledStreams = allStreamsForInstrument
                 .Where(s => !s.Committed)
@@ -10122,13 +10986,16 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
             if (enabledStreams.Count == 0)
             {
-                LogEngineEvent(utcNow, "BARSREQUEST_RANGE_CHECK", new
+                if (logDiagnostics)
                 {
-                    instrument = instrumentUpper,
-                    result = "ALL_STREAMS_COMMITTED",
-                    total_streams = allStreamsForInstrument.Count,
-                    note = "All streams are committed - no active streams for BarsRequest"
-                });
+                    LogEngineEvent(utcNow, "BARSREQUEST_RANGE_CHECK", new
+                    {
+                        instrument = instrumentUpper,
+                        result = "ALL_STREAMS_COMMITTED",
+                        total_streams = allStreamsForInstrument.Count,
+                        note = "All streams are committed - no active streams for BarsRequest"
+                    });
+                }
                 return null;
             }
 
@@ -10158,14 +11025,17 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             
             if (streamWindows.Count == 0)
             {
-                LogEngineEvent(utcNow, "BARSREQUEST_RANGE_CHECK", new
+                if (logDiagnostics)
                 {
-                    instrument = instrumentUpper,
-                    result = "NO_VALID_WINDOWS_FOUND",
-                    enabled_streams = enabledStreams.Count,
-                    sessions_used = sessionsUsed,
-                    note = "No valid [range_start, slot_time) windows found for enabled streams"
-                });
+                    LogEngineEvent(utcNow, "BARSREQUEST_RANGE_CHECK", new
+                    {
+                        instrument = instrumentUpper,
+                        result = "NO_VALID_WINDOWS_FOUND",
+                        enabled_streams = enabledStreams.Count,
+                        sessions_used = sessionsUsed,
+                        note = "No valid [range_start, slot_time) windows found for enabled streams"
+                    });
+                }
                 return null;
             }
             
@@ -10176,30 +11046,41 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 .OrderBy(rs => rs, StringComparer.Ordinal)
                 .First();
             
-            var latestSlotTime = streamWindows
-                .Select(w => w.slotTime)
-                .OrderByDescending(st => st, StringComparer.Ordinal)
-                .First();
+            var selectedSlotTime = preferEarliestSlot
+                ? streamWindows
+                    .Select(w => w.slotTime)
+                    .OrderBy(st => st, StringComparer.Ordinal)
+                    .First()
+                : streamWindows
+                    .Select(w => w.slotTime)
+                    .OrderByDescending(st => st, StringComparer.Ordinal)
+                    .First();
             
             // Log successful range determination with stream details
-            LogEngineEvent(utcNow, "BARSREQUEST_RANGE_DETERMINED", new
+            if (logDiagnostics)
             {
-                instrument = instrumentUpper,
-                earliest_range_start = earliestRangeStart,
-                latest_slot_time = latestSlotTime,
-                enabled_stream_count = enabledStreams.Count,
-                sessions_used = sessionsUsed,
-                session_range_starts = sessionRangeStarts,
-                stream_windows = streamWindows.Select(w => new { 
-                    stream_id = w.streamId, 
-                    session = w.session, 
-                    range_start = w.rangeStart,
-                    slot_time = w.slotTime 
-                }).ToList(),
-                note = "Union of all stream windows - ensures bars cover all enabled streams"
-            });
+                LogEngineEvent(utcNow, "BARSREQUEST_RANGE_DETERMINED", new
+                {
+                    instrument = instrumentUpper,
+                    earliest_range_start = earliestRangeStart,
+                    latest_slot_time = selectedSlotTime,
+                    slot_selection = preferEarliestSlot ? "EARLIEST_ACTIVE_SLOT" : "LATEST_ACTIVE_SLOT",
+                    enabled_stream_count = enabledStreams.Count,
+                    sessions_used = sessionsUsed,
+                    session_range_starts = sessionRangeStarts,
+                    stream_windows = streamWindows.Select(w => new {
+                        stream_id = w.streamId,
+                        session = w.session,
+                        range_start = w.rangeStart,
+                        slot_time = w.slotTime
+                    }).ToList(),
+                    note = preferEarliestSlot
+                        ? "Earliest active slot selected for due scheduling; prevents later sibling slot from delaying first-slot hydration."
+                        : "Union of all stream windows - ensures bars cover all streams' needs."
+                });
+            }
             
-            return (earliestRangeStart, latestSlotTime);
+            return (earliestRangeStart, selectedSlotTime);
         }
     }
 }

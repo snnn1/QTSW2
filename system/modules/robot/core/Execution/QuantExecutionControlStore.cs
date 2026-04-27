@@ -87,16 +87,102 @@ public static class QuantExecutionControlStore
             });
     }
 
-    /// <summary>Rule 1 — mapped fill: update expected immediately, enter PENDING_ALIGNMENT with bounded expiry.</summary>
+    /// <summary>
+    /// Records an intentional protective OCO cancel/replace, such as BE replacement when NT will not
+    /// accept an in-place Change() on the OCO stop. This is an audit convergence window only.
+    /// </summary>
+    public static void NotifyProtectiveCancelReplacePending(string instrument, int expectedWorkingOrderCount, DateTimeOffset utcNow)
+    {
+        if (!FeatureFlags.QuantExecutionControlStoreEnabled) return;
+        var inst = Norm(instrument);
+        if (string.IsNullOrEmpty(inst) || expectedWorkingOrderCount <= 0) return;
+
+        var windowMs = FeatureFlags.PostFillAlignmentWindowMs > 0 ? FeatureFlags.PostFillAlignmentWindowMs : 5000;
+        var expiry = utcNow.AddMilliseconds(windowMs);
+        var expectedCount = Math.Abs(expectedWorkingOrderCount);
+
+        ByInstrument.AddOrUpdate(
+            inst,
+            _ => new Entry
+            {
+                Phase = QuantExecutionInstrumentPhase.PendingAlignment,
+                Expected =
+                {
+                    ExpectedWorkingOrderCount = expectedCount,
+                    LastProtectiveCancelReplacePendingUtc = utcNow,
+                    PendingProtectiveCancelReplaceWorkingCount = expectedCount,
+                    PendingAlignmentExpiresUtc = expiry
+                },
+                LockOrUnmappedReason = null
+            },
+            (_, e) =>
+            {
+                if (e.Phase is QuantExecutionInstrumentPhase.UnmappedExecution or QuantExecutionInstrumentPhase.ExecutionLocked)
+                    return e;
+                if (e.Phase is not QuantExecutionInstrumentPhase.RecoveryRequired and not QuantExecutionInstrumentPhase.Recovered)
+                    e.Phase = QuantExecutionInstrumentPhase.PendingAlignment;
+                e.Expected.ExpectedWorkingOrderCount = Math.Max(e.Expected.ExpectedWorkingOrderCount, expectedCount);
+                e.Expected.LastProtectiveCancelReplacePendingUtc = utcNow;
+                e.Expected.PendingProtectiveCancelReplaceWorkingCount = expectedCount;
+                e.Expected.PendingAlignmentExpiresUtc =
+                    !e.Expected.PendingAlignmentExpiresUtc.HasValue || expiry > e.Expected.PendingAlignmentExpiresUtc.Value
+                        ? expiry
+                        : e.Expected.PendingAlignmentExpiresUtc;
+                return e;
+            });
+    }
+
+    /// <summary>
+    /// Records a broker working-order submit handoff before registry/order-update convergence is guaranteed.
+    /// This is not exposure; it is a short suppressor for submit/register races.
+    /// </summary>
+    public static void NotifyWorkingOrderSubmitTransition(string instrument, int expectedWorkingOrderCount, DateTimeOffset utcNow)
+    {
+        if (!FeatureFlags.QuantExecutionControlStoreEnabled) return;
+        var inst = Norm(instrument);
+        if (string.IsNullOrEmpty(inst) || expectedWorkingOrderCount <= 0) return;
+
+        var windowMs = FeatureFlags.PostFillAlignmentWindowMs > 0 ? FeatureFlags.PostFillAlignmentWindowMs : 5000;
+        var expiry = utcNow.AddMilliseconds(windowMs);
+        var expectedCount = Math.Abs(expectedWorkingOrderCount);
+
+        ByInstrument.AddOrUpdate(
+            inst,
+            _ => new Entry
+            {
+                Phase = QuantExecutionInstrumentPhase.PendingAlignment,
+                Expected =
+                {
+                    ExpectedWorkingOrderCount = expectedCount,
+                    LastWorkingOrderSubmitUtc = utcNow,
+                    PendingWorkingOrderSubmitCount = expectedCount,
+                    PendingAlignmentExpiresUtc = expiry
+                },
+                LockOrUnmappedReason = null
+            },
+            (_, e) =>
+            {
+                if (e.Phase is QuantExecutionInstrumentPhase.UnmappedExecution or QuantExecutionInstrumentPhase.ExecutionLocked)
+                    return e;
+                if (e.Phase is not QuantExecutionInstrumentPhase.RecoveryRequired and not QuantExecutionInstrumentPhase.Recovered)
+                    e.Phase = QuantExecutionInstrumentPhase.PendingAlignment;
+                e.Expected.ExpectedWorkingOrderCount = Math.Max(e.Expected.ExpectedWorkingOrderCount, expectedCount);
+                e.Expected.LastWorkingOrderSubmitUtc = utcNow;
+                e.Expected.PendingWorkingOrderSubmitCount = expectedCount;
+                e.Expected.PendingAlignmentExpiresUtc =
+                    !e.Expected.PendingAlignmentExpiresUtc.HasValue || expiry > e.Expected.PendingAlignmentExpiresUtc.Value
+                        ? expiry
+                        : e.Expected.PendingAlignmentExpiresUtc;
+                return e;
+            });
+    }
+
+    /// <summary>Rule 1: mapped fill updates expected state immediately and enters bounded pending alignment.</summary>
     /// <remarks>
-    /// <para><b>RecoveryRequired:</b> Durable Tier-1 recovery is not cleared or softened by new mapped fills — phase and
-    /// <see cref="RecoveryRequiredReason"/> stay fixed until explicitly cleared elsewhere (same contract as
-    /// <see cref="NotifyRecoveredReconnect"/> for RecoveryRequired).</para>
-    /// <para><b>Repeated fills (PendingAlignment):</b> Each mapped fill sets a new candidate deadline
-    /// <c>utcNow + PostFillAlignmentWindowMs</c>. The stored <see cref="QuantExpectedInstrumentState.PendingAlignmentExpiresUtc"/>
-    /// is the <b>later</b> of that candidate and the previous expiry. This is intentional: active staggered fills keep a single
-    /// rolling alignment horizon so transient lag does not race a fixed clock from the first fill only. There is no additional cap
-    /// beyond wall-clock monotonicity and parity/escalation transitions.</para>
+    /// <para><b>RecoveryRequired:</b> Durable Tier-1 recovery is not cleared or softened by new mapped fills; phase and
+    /// <see cref="RecoveryRequiredReason"/> stay fixed until explicitly cleared elsewhere.</para>
+    /// <para><b>Repeated fills:</b> Each mapped fill extends the stored alignment deadline to the later of the
+    /// new candidate deadline and the previous expiry.</para>
     /// </remarks>
     public static void NotifyMappedTrustedFill(string instrument, int signedDelta, DateTimeOffset utcNow)
     {
@@ -131,6 +217,63 @@ public static class QuantExecutionControlStore
                     ? expiry
                     : e.Expected.PendingAlignmentExpiresUtc;
                 e.Phase = QuantExecutionInstrumentPhase.PendingAlignment;
+                e.LockOrUnmappedReason = null;
+                return e;
+            });
+    }
+
+    /// <summary>
+    /// Broker/order lifecycle observed a fill before the execution callback may have finished journaling it.
+    /// This arms the same short alignment horizon as mapped fills, but without asserting signed quantity yet.
+    /// </summary>
+    public static void NotifyBrokerExecutionCallbackPending(
+        string instrument,
+        DateTimeOffset utcNow,
+        string? orderRole = null,
+        string? lifecycleState = null)
+    {
+        if (!FeatureFlags.QuantExecutionControlStoreEnabled) return;
+        var inst = Norm(instrument);
+        if (string.IsNullOrEmpty(inst)) return;
+
+        var windowMs = FeatureFlags.PostFillAlignmentWindowMs > 0 ? FeatureFlags.PostFillAlignmentWindowMs : 5000;
+        var expiry = utcNow.AddMilliseconds(windowMs);
+        var role = string.IsNullOrWhiteSpace(orderRole) ? null : orderRole.Trim();
+        var state = string.IsNullOrWhiteSpace(lifecycleState) ? null : lifecycleState.Trim();
+
+        ByInstrument.AddOrUpdate(
+            inst,
+            _ => new Entry
+            {
+                Phase = QuantExecutionInstrumentPhase.PendingAlignment,
+                Expected =
+                {
+                    LastBrokerExecutionCallbackUtc = utcNow,
+                    BrokerExecutionCallbackExpiresUtc = expiry,
+                    LastBrokerExecutionCallbackRole = role,
+                    LastBrokerExecutionCallbackState = state,
+                    PendingAlignmentExpiresUtc = expiry
+                },
+                LockOrUnmappedReason = null
+            },
+            (_, e) =>
+            {
+                if (e.Phase is QuantExecutionInstrumentPhase.UnmappedExecution
+                    or QuantExecutionInstrumentPhase.ExecutionLocked
+                    or QuantExecutionInstrumentPhase.RecoveryRequired)
+                    return e;
+
+                if (e.Phase != QuantExecutionInstrumentPhase.Recovered)
+                    e.Phase = QuantExecutionInstrumentPhase.PendingAlignment;
+
+                e.Expected.LastBrokerExecutionCallbackUtc = utcNow;
+                e.Expected.BrokerExecutionCallbackExpiresUtc = expiry;
+                e.Expected.LastBrokerExecutionCallbackRole = role;
+                e.Expected.LastBrokerExecutionCallbackState = state;
+                e.Expected.PendingAlignmentExpiresUtc =
+                    !e.Expected.PendingAlignmentExpiresUtc.HasValue || expiry > e.Expected.PendingAlignmentExpiresUtc.Value
+                        ? expiry
+                        : e.Expected.PendingAlignmentExpiresUtc;
                 e.LockOrUnmappedReason = null;
                 return e;
             });
@@ -216,6 +359,10 @@ public static class QuantExecutionControlStore
 
         e.Phase = QuantExecutionInstrumentPhase.Normal;
         e.Expected.PendingAlignmentExpiresUtc = null;
+        e.Expected.LastBrokerExecutionCallbackUtc = null;
+        e.Expected.BrokerExecutionCallbackExpiresUtc = null;
+        e.Expected.LastBrokerExecutionCallbackRole = null;
+        e.Expected.LastBrokerExecutionCallbackState = null;
         e.LockOrUnmappedReason = null;
     }
 
@@ -247,11 +394,19 @@ public static class QuantExecutionControlStore
         {
             ExpectedSignedNetPosition = s.ExpectedSignedNetPosition,
             ExpectedWorkingOrderCount = s.ExpectedWorkingOrderCount,
+            LastWorkingOrderSubmitUtc = s.LastWorkingOrderSubmitUtc,
+            PendingWorkingOrderSubmitCount = s.PendingWorkingOrderSubmitCount,
             LastMappedFillUtc = s.LastMappedFillUtc,
+            LastBrokerExecutionCallbackUtc = s.LastBrokerExecutionCallbackUtc,
+            BrokerExecutionCallbackExpiresUtc = s.BrokerExecutionCallbackExpiresUtc,
+            LastBrokerExecutionCallbackRole = s.LastBrokerExecutionCallbackRole,
+            LastBrokerExecutionCallbackState = s.LastBrokerExecutionCallbackState,
             PendingAlignmentExpiresUtc = s.PendingAlignmentExpiresUtc,
             LastProtectiveStopSubmitUtc = s.LastProtectiveStopSubmitUtc,
             LastProtectiveResizePendingUtc = s.LastProtectiveResizePendingUtc,
             PendingProtectiveResizeQty = s.PendingProtectiveResizeQty,
+            LastProtectiveCancelReplacePendingUtc = s.LastProtectiveCancelReplacePendingUtc,
+            PendingProtectiveCancelReplaceWorkingCount = s.PendingProtectiveCancelReplaceWorkingCount,
             RecoveryMode = s.RecoveryMode,
             RecoveryEnteredUtc = s.RecoveryEnteredUtc
         };
@@ -276,10 +431,74 @@ public static class QuantExecutionControlStore
         return (utcNow - e.Expected.LastMappedFillUtc.Value).TotalMilliseconds <= windowMs;
     }
 
+    /// <summary>True while a working-order submit/register/order-update transition is still allowed to converge.</summary>
+    public static bool IsWorkingOrderSubmitWindowActive(string instrument, DateTimeOffset utcNow)
+    {
+        if (!FeatureFlags.QuantExecutionControlStoreEnabled) return false;
+        var inst = Norm(instrument);
+        if (string.IsNullOrEmpty(inst) || !ByInstrument.TryGetValue(inst, out var e)) return false;
+        if (e.Phase is QuantExecutionInstrumentPhase.UnmappedExecution or QuantExecutionInstrumentPhase.ExecutionLocked)
+            return false;
+        if (!e.Expected.LastWorkingOrderSubmitUtc.HasValue)
+            return false;
+
+        var expiry = e.Expected.PendingAlignmentExpiresUtc;
+        if (expiry.HasValue)
+            return utcNow <= expiry.Value;
+
+        var windowMs = FeatureFlags.PostFillAlignmentWindowMs > 0 ? FeatureFlags.PostFillAlignmentWindowMs : 5000;
+        return (utcNow - e.Expected.LastWorkingOrderSubmitUtc.Value).TotalMilliseconds <= windowMs;
+    }
+
+    /// <summary>
+    /// True while broker lifecycle has observed an owned fill but execution/journal/ownership callbacks may still be catching up.
+    /// </summary>
+    public static bool IsBrokerExecutionCallbackPendingActive(string instrument, DateTimeOffset utcNow)
+    {
+        if (!FeatureFlags.QuantExecutionControlStoreEnabled) return false;
+        var inst = Norm(instrument);
+        if (string.IsNullOrEmpty(inst) || !ByInstrument.TryGetValue(inst, out var e)) return false;
+        if (e.Phase is QuantExecutionInstrumentPhase.UnmappedExecution
+            or QuantExecutionInstrumentPhase.ExecutionLocked
+            or QuantExecutionInstrumentPhase.RecoveryRequired)
+            return false;
+        if (!e.Expected.LastBrokerExecutionCallbackUtc.HasValue)
+            return false;
+
+        var expiry = e.Expected.BrokerExecutionCallbackExpiresUtc ?? e.Expected.PendingAlignmentExpiresUtc;
+        if (expiry.HasValue)
+            return utcNow <= expiry.Value;
+
+        var windowMs = FeatureFlags.PostFillAlignmentWindowMs > 0 ? FeatureFlags.PostFillAlignmentWindowMs : 5000;
+        return (utcNow - e.Expected.LastBrokerExecutionCallbackUtc.Value).TotalMilliseconds <= windowMs;
+    }
+
+    /// <summary>Any bounded broker-visible-before-bookkeeping window currently active for this instrument.</summary>
+    public static bool IsAnyBrokerJournalAlignmentWindowActive(string instrument, DateTimeOffset utcNow) =>
+        IsPostFillAlignmentWindowActive(instrument, utcNow) ||
+        IsWorkingOrderSubmitWindowActive(instrument, utcNow) ||
+        IsBrokerExecutionCallbackPendingActive(instrument, utcNow) ||
+        IsProtectiveResizePendingActive(instrument, utcNow) ||
+        IsProtectiveCancelReplacePendingActive(instrument, utcNow);
+
     /// <summary>
     /// True while a known protective cancel/recreate resize is legitimately in flight.
     /// This is a short audit suppressor only; expiration returns the audit to critical behavior.
     /// </summary>
+    public static bool IsProtectiveResizePendingActive(string instrument, DateTimeOffset utcNow)
+    {
+        if (!FeatureFlags.QuantExecutionControlStoreEnabled) return false;
+        var inst = Norm(instrument);
+        if (string.IsNullOrEmpty(inst) || !ByInstrument.TryGetValue(inst, out var e)) return false;
+        if (e.Phase is QuantExecutionInstrumentPhase.UnmappedExecution or QuantExecutionInstrumentPhase.ExecutionLocked)
+            return false;
+        if (!e.Expected.LastProtectiveResizePendingUtc.HasValue)
+            return false;
+
+        var windowMs = FeatureFlags.PostFillAlignmentWindowMs > 0 ? FeatureFlags.PostFillAlignmentWindowMs : 5000;
+        return (utcNow - e.Expected.LastProtectiveResizePendingUtc.Value).TotalMilliseconds <= windowMs;
+    }
+
     public static bool IsProtectiveResizePendingActive(string instrument, int expectedProtectiveQty, DateTimeOffset utcNow)
     {
         if (!FeatureFlags.QuantExecutionControlStoreEnabled) return false;
@@ -299,6 +518,24 @@ public static class QuantExecutionControlStore
 
         var windowMs = FeatureFlags.PostFillAlignmentWindowMs > 0 ? FeatureFlags.PostFillAlignmentWindowMs : 5000;
         return (utcNow - e.Expected.LastProtectiveResizePendingUtc.Value).TotalMilliseconds <= windowMs;
+    }
+
+    /// <summary>
+    /// True while a known protective OCO cancel/replace is in flight. This is bounded and expires
+    /// back to normal critical-audit behavior.
+    /// </summary>
+    public static bool IsProtectiveCancelReplacePendingActive(string instrument, DateTimeOffset utcNow)
+    {
+        if (!FeatureFlags.QuantExecutionControlStoreEnabled) return false;
+        var inst = Norm(instrument);
+        if (string.IsNullOrEmpty(inst) || !ByInstrument.TryGetValue(inst, out var e)) return false;
+        if (e.Phase is QuantExecutionInstrumentPhase.UnmappedExecution or QuantExecutionInstrumentPhase.ExecutionLocked)
+            return false;
+        if (!e.Expected.LastProtectiveCancelReplacePendingUtc.HasValue)
+            return false;
+
+        var windowMs = FeatureFlags.PostFillAlignmentWindowMs > 0 ? FeatureFlags.PostFillAlignmentWindowMs : 5000;
+        return (utcNow - e.Expected.LastProtectiveCancelReplacePendingUtc.Value).TotalMilliseconds <= windowMs;
     }
 
     /// <summary>

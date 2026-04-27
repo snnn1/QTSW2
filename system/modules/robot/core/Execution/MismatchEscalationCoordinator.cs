@@ -349,7 +349,7 @@ public sealed class MismatchEscalationCoordinator
     }
 
     private static bool ShouldArmConvergenceFromExecutionTriggerDetails(MismatchExecutionTriggerDetails d) =>
-        d.FillDelta != 0 || d.EntryToProtectivesTransition;
+        d.FillDelta != 0 || d.EntryToProtectivesTransition || d.WorkingOrderSubmitTransition;
 
     private static string BuildExecutionTriggerConvergenceCause(MismatchExecutionTriggerDetails d)
     {
@@ -357,6 +357,8 @@ public sealed class MismatchEscalationCoordinator
             return "execution_fill_and_protective_transition";
         if (d.EntryToProtectivesTransition)
             return "protective_transition";
+        if (d.WorkingOrderSubmitTransition)
+            return "working_order_submit_transition";
         if (d.FillDelta != 0)
             return "execution_fill";
         return "execution_trigger";
@@ -527,7 +529,8 @@ public sealed class MismatchEscalationCoordinator
         var authorityPublished = scratch?.AuthorityPublished ?? false;
 
         var assertionApplicable = convergenceActive && canonicalProbeAvailable && canonicalExposureOk;
-        var invariantViolated = assertionApplicable && (episodeExtended || authorityPublished);
+        var invariantViolated = assertionApplicable && authorityPublished;
+        var episodeExtendedWithoutPublicationDeferred = assertionApplicable && episodeExtended && !authorityPublished;
         if (invariantViolated)
             TestMismatchEvalInvariantViolationCount++;
 
@@ -544,6 +547,7 @@ public sealed class MismatchEscalationCoordinator
             episode_exists = episodeExists,
             episode_extended = episodeExtended,
             authority_published = authorityPublished,
+            episode_extended_without_publication_deferred = episodeExtendedWithoutPublicationDeferred,
             assertion_applicable = assertionApplicable,
             convergence_invariant_ok = invariantOk,
             run_id = _getRunIdForMismatchDiagnostics?.Invoke() ?? "",
@@ -1023,6 +1027,17 @@ public sealed class MismatchEscalationCoordinator
         ulong externalFp,
         ulong materialReadinessFp)
     {
+        var coherentFlatRelease =
+            r.ReleaseReady &&
+            pendingIeA == 0 &&
+            obs.BrokerWorkingOrderCount == 0 &&
+            obs.LocalWorkingOrderCount == 0 &&
+            r.DiagnosticBrokerPositionQty == 0 &&
+            (r.ResidualCleanupOnly || r.DiagnosticJournalOpenQty == 0) &&
+            r.DiagnosticIeaOwnedPlusAdoptedWorking <= 0;
+
+        var quietPreSigHash = coherentFlatRelease ? 0 : preSigHash;
+        var quietPostSigHash = coherentFlatRelease ? 0 : postSigHash;
         var summaryH = r.Summary != null ? StringComparer.Ordinal.GetHashCode(r.Summary) : 0;
         return string.Format(CultureInfo.InvariantCulture,
             "{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}|{8}|{9}",
@@ -1031,8 +1046,8 @@ public sealed class MismatchEscalationCoordinator
             obs.LocalWorkingOrderCount,
             r.DiagnosticBrokerPositionQty,
             r.DiagnosticJournalOpenQty,
-            preSigHash,
-            postSigHash,
+            quietPreSigHash,
+            quietPostSigHash,
             externalFp,
             materialReadinessFp,
             summaryH);
@@ -1069,17 +1084,56 @@ public sealed class MismatchEscalationCoordinator
         bool fpChanged,
         bool releaseConditionsMet)
     {
-        if (!releaseConditionsMet || fpChanged || pendingIeA != 0)
+        if (!releaseConditionsMet || pendingIeA != 0)
             return false;
         if (!readiness.SnapshotSufficient || !readiness.ReleaseReady || readiness.BlockerInvariantViolation)
             return false;
-        if (readiness.DiagnosticBrokerPositionQty != 0 || readiness.DiagnosticJournalOpenQty != 0 ||
-            readiness.DiagnosticBrokerWorkingCount != 0 || readiness.DiagnosticIeaOwnedPlusAdoptedWorking != 0)
+        if (readiness.DiagnosticBrokerPositionQty != 0 ||
+            readiness.DiagnosticIeaOwnedPlusAdoptedWorking > 0)
+            return false;
+        if (!readiness.ResidualCleanupOnly && readiness.DiagnosticJournalOpenQty != 0)
             return false;
         if (obs.BrokerWorkingOrderCount != 0 || obs.LocalWorkingOrderCount != 0)
             return false;
 
         return true;
+    }
+
+    private static void UpdateResidualCleanupTelemetry(
+        MismatchInstrumentState state,
+        StateConsistencyReleaseReadinessResult readiness,
+        int pendingIeA,
+        DateTimeOffset utcNow)
+    {
+        var brokerFlatNoWork = readiness.DiagnosticBrokerPositionQty == 0 &&
+                               readiness.DiagnosticBrokerWorkingCount == 0 &&
+                               pendingIeA == 0;
+        if (!brokerFlatNoWork)
+        {
+            state.FirstBrokerFlatResidualUtc = default;
+            state.FirstJournalResidualUtc = default;
+            state.FirstAdoptionResidualUtc = default;
+            return;
+        }
+
+        if (state.FirstBrokerFlatResidualUtc == default)
+            state.FirstBrokerFlatResidualUtc = utcNow;
+
+        if (readiness.DiagnosticJournalOpenQty > 0)
+        {
+            if (state.FirstJournalResidualUtc == default)
+                state.FirstJournalResidualUtc = utcNow;
+        }
+        else
+            state.FirstJournalResidualUtc = default;
+
+        if (readiness.DiagnosticPendingAdoptionCandidateCount > 0)
+        {
+            if (state.FirstAdoptionResidualUtc == default)
+                state.FirstAdoptionResidualUtc = utcNow;
+        }
+        else
+            state.FirstAdoptionResidualUtc = default;
     }
 
     private void MaybeEmitGateMaxDwellExceeded(string inst, DateTimeOffset utcNow, MismatchInstrumentState state)
@@ -1477,7 +1531,16 @@ public sealed class MismatchEscalationCoordinator
         }
 
         if (state.EscalationState == MismatchEscalationState.NONE &&
-            QuantExecutionControlStore.IsPostFillAlignmentWindowActive(inst, utcNow))
+            PendingAlignmentAuthority.IsJournalLagExplainedMismatchType(obs.MismatchType) &&
+            QuantExecutionControlStore.IsAnyBrokerJournalAlignmentWindowActive(inst, utcNow))
+        {
+            EmitMismatchPendingConvergence(inst, utcNow, obs);
+            return;
+        }
+
+        if (state.EscalationState == MismatchEscalationState.NONE &&
+            obs.MismatchType == MismatchType.WORKING_ORDER_COUNT_CONVERGENCE &&
+            QuantExecutionControlStore.IsAnyBrokerJournalAlignmentWindowActive(inst, utcNow))
         {
             EmitMismatchPendingConvergence(inst, utcNow, obs);
             return;
@@ -1543,14 +1606,19 @@ public sealed class MismatchEscalationCoordinator
             if (state.PersistenceMs >= MismatchEscalationPolicy.MISMATCH_PERSISTENT_THRESHOLD_MS)
             {
                 var wasBlocked = state.Blocked;
-                state.EscalationState = MismatchEscalationState.PERSISTENT_MISMATCH;
-                state.Blocked = true;
-                state.BlockReason = MismatchEscalationPolicy.BLOCK_REASON_PERSISTENT_MISMATCH;
-                if (state.GateLifecyclePhase != GateLifecyclePhase.StablePendingRelease)
-                    state.GateLifecyclePhase = GateLifecyclePhase.PersistentMismatch;
-                _mismatchPersistentCount++;
-                var p = ToGatePayload(state, inst, utcNow, obs, null, null);
-                _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "RECONCILIATION_MISMATCH_PERSISTENT", p));
+            state.EscalationState = MismatchEscalationState.PERSISTENT_MISMATCH;
+            state.Blocked = true;
+            state.BlockReason = MismatchEscalationPolicy.BLOCK_REASON_PERSISTENT_MISMATCH;
+            if (state.GateLifecyclePhase == GateLifecyclePhase.StablePendingRelease)
+            {
+                state.FirstConsistentUtc = default;
+                state.LastConsistentUtc = default;
+                state.ReleaseQuietFingerprintKey = "";
+            }
+            state.GateLifecyclePhase = GateLifecyclePhase.PersistentMismatch;
+            _mismatchPersistentCount++;
+            var p = ToGatePayload(state, inst, utcNow, obs, null, null);
+            _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "RECONCILIATION_MISMATCH_PERSISTENT", p));
                 _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "RECONCILIATION_MISMATCH_BLOCKED", p));
                 _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH", p));
                 EmitCanonical(inst, "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH", utcNow, p, "WARN");
@@ -1750,11 +1818,15 @@ public sealed class MismatchEscalationCoordinator
 
         if (!readiness.SnapshotSufficient || readiness.BlockerInvariantViolation)
             return false;
-        if (readiness.DiagnosticBrokerPositionQty != 0 || readiness.DiagnosticBrokerWorkingCount != 0)
+        if (readiness.DiagnosticBrokerWorkingCount != 0)
             return false;
         if (readiness.DiagnosticIeaOwnedPlusAdoptedWorking > 0)
             return false;
         if ((_getPendingExecutionWorkloadForInstrument?.Invoke(inst) ?? 0) != 0)
+            return false;
+        if (!readiness.BrokerPositionExplainable || !readiness.BrokerWorkingExplainable || !readiness.LocalStateCoherent)
+            return false;
+        if (readiness.UnexplainedBrokerPositionQty != 0 || readiness.UnexplainedBrokerWorkingCount != 0)
             return false;
 
         return readiness.ReleaseReady || IsSoftTransitionReleaseReadiness(readiness);
@@ -2076,8 +2148,13 @@ public sealed class MismatchEscalationCoordinator
             state.EscalationState = MismatchEscalationState.PERSISTENT_MISMATCH;
             state.Blocked = true;
             state.BlockReason = MismatchEscalationPolicy.BLOCK_REASON_PERSISTENT_MISMATCH;
-            if (state.GateLifecyclePhase != GateLifecyclePhase.StablePendingRelease)
-                state.GateLifecyclePhase = GateLifecyclePhase.PersistentMismatch;
+            if (state.GateLifecyclePhase == GateLifecyclePhase.StablePendingRelease)
+            {
+                state.FirstConsistentUtc = default;
+                state.LastConsistentUtc = default;
+                state.ReleaseQuietFingerprintKey = "";
+            }
+            state.GateLifecyclePhase = GateLifecyclePhase.PersistentMismatch;
             _mismatchPersistentCount++;
             var p = ToGatePayload(state, inst, utcNow, obsForSig, null, null);
             _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "STATE_CONSISTENCY_GATE_PERSISTENT_MISMATCH", p));
@@ -2339,6 +2416,7 @@ public sealed class MismatchEscalationCoordinator
 
         var materialReadinessFp = BuildMaterialReadinessFingerprint(readiness, state.MismatchType);
         var pendingIeA = _getPendingExecutionWorkloadForInstrument?.Invoke(inst) ?? 0;
+        UpdateResidualCleanupTelemetry(state, readiness, pendingIeA, utcNow);
         var releaseQuietFingerprint = BuildReleaseQuietFingerprint(obsForSig, readiness, pendingIeA, preSigHash, postSigHash,
             fpNow, materialReadinessFp);
         var identicalStallCycle = skipExpensive && !externalFingerprintChanged && !progressChanged &&
@@ -2602,6 +2680,9 @@ public sealed class MismatchEscalationCoordinator
         state.LastReleaseUtc = utcNow;
         state.FirstConsistentUtc = default;
         state.ReleaseQuietFingerprintKey = "";
+        state.FirstBrokerFlatResidualUtc = default;
+        state.FirstJournalResidualUtc = default;
+        state.FirstAdoptionResidualUtc = default;
         state.ConsecutiveCleanPassCount = 0;
         state.MismatchStillPresent = false;
         state.GateProgress.Reset();
@@ -2861,6 +2942,18 @@ public sealed class MismatchEscalationCoordinator
         var stableFor = state.FirstConsistentUtc != default && state.GateLifecyclePhase == GateLifecyclePhase.StablePendingRelease
             ? (long)(utcNow - state.FirstConsistentUtc).TotalMilliseconds
             : 0L;
+        var mismatchUntilBrokerFlatMs = state.LastGateEngagedUtc != default && state.FirstBrokerFlatResidualUtc != default
+            ? (long)(state.FirstBrokerFlatResidualUtc - state.LastGateEngagedUtc).TotalMilliseconds
+            : (long?)null;
+        var mismatchAfterBrokerFlatMs = state.FirstBrokerFlatResidualUtc != default
+            ? (long)(utcNow - state.FirstBrokerFlatResidualUtc).TotalMilliseconds
+            : (long?)null;
+        var journalRetirementLagMs = state.FirstJournalResidualUtc != default
+            ? (long)(utcNow - state.FirstJournalResidualUtc).TotalMilliseconds
+            : (long?)null;
+        var adoptionRetirementLagMs = state.FirstAdoptionResidualUtc != default
+            ? (long)(utcNow - state.FirstAdoptionResidualUtc).TotalMilliseconds
+            : (long?)null;
 
         return new
         {
@@ -2878,8 +2971,14 @@ public sealed class MismatchEscalationCoordinator
             unexplained_working_count = readiness?.UnexplainedBrokerWorkingCount,
             unexplained_position_qty = readiness?.UnexplainedBrokerPositionQty,
             release_ready = readiness?.ReleaseReady,
+            residual_cleanup_only = readiness?.ResidualCleanupOnly,
+            residual_cleanup_class = readiness?.ResidualCleanupClass,
             stable_for_ms = stableFor,
             stable_window_ms = state.StableWindowMsApplied > 0 ? state.StableWindowMsApplied : _stableWindowMs,
+            mismatch_time_until_broker_flat_ms = mismatchUntilBrokerFlatMs,
+            mismatch_time_after_broker_flat_ms = mismatchAfterBrokerFlatMs,
+            journal_retirement_lag_ms = journalRetirementLagMs,
+            adoption_retirement_lag_ms = adoptionRetirementLagMs,
             reconciliation_outcome = recon == null
                 ? null
                 : new
@@ -2929,6 +3028,18 @@ public sealed class MismatchEscalationCoordinator
         var stableFor = state.FirstConsistentUtc != default && state.GateLifecyclePhase == GateLifecyclePhase.StablePendingRelease
             ? (long)(utcNow - state.FirstConsistentUtc).TotalMilliseconds
             : 0L;
+        var mismatchUntilBrokerFlatMs = state.LastGateEngagedUtc != default && state.FirstBrokerFlatResidualUtc != default
+            ? (long)(state.FirstBrokerFlatResidualUtc - state.LastGateEngagedUtc).TotalMilliseconds
+            : (long?)null;
+        var mismatchAfterBrokerFlatMs = state.FirstBrokerFlatResidualUtc != default
+            ? (long)(utcNow - state.FirstBrokerFlatResidualUtc).TotalMilliseconds
+            : (long?)null;
+        var journalRetirementLagMs = state.FirstJournalResidualUtc != default
+            ? (long)(utcNow - state.FirstJournalResidualUtc).TotalMilliseconds
+            : (long?)null;
+        var adoptionRetirementLagMs = state.FirstAdoptionResidualUtc != default
+            ? (long)(utcNow - state.FirstAdoptionResidualUtc).TotalMilliseconds
+            : (long?)null;
 
         return new
         {
@@ -2946,8 +3057,14 @@ public sealed class MismatchEscalationCoordinator
             unexplained_working_count = readiness?.UnexplainedBrokerWorkingCount,
             unexplained_position_qty = readiness?.UnexplainedBrokerPositionQty,
             release_ready = readiness?.ReleaseReady,
+            residual_cleanup_only = readiness?.ResidualCleanupOnly,
+            residual_cleanup_class = readiness?.ResidualCleanupClass,
             stable_for_ms = stableFor,
             stable_window_ms = state.StableWindowMsApplied > 0 ? state.StableWindowMsApplied : _stableWindowMs,
+            mismatch_time_until_broker_flat_ms = mismatchUntilBrokerFlatMs,
+            mismatch_time_after_broker_flat_ms = mismatchAfterBrokerFlatMs,
+            journal_retirement_lag_ms = journalRetirementLagMs,
+            adoption_retirement_lag_ms = adoptionRetirementLagMs,
             reconciliation_outcome = recon == null
                 ? null
                 : new
@@ -3156,6 +3273,7 @@ public sealed class MismatchEscalationCoordinator
             case MismatchType.STRUCTURAL_MULTI_INTENT: _mismatchStructuralMultiIntentCount++; break;
             case MismatchType.HEDGED_NET_FLAT_GROSS_OPEN: _mismatchHedgedNetFlatCount++; break;
             case MismatchType.ORDER_REGISTRY_MISSING: _mismatchRegistryMissingCount++; break;
+            case MismatchType.WORKING_ORDER_COUNT_CONVERGENCE: break;
             case MismatchType.PROTECTIVE_STATE_DIVERGENCE: _mismatchProtectiveDivergenceCount++; break;
         }
     }

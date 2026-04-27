@@ -1,0 +1,92 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+using QTSW2.Robot.Core;
+
+namespace QTSW2.Robot.Core.Execution;
+
+/// <summary>
+/// Registry for Instrument Execution Authority (IEA) instances.
+/// Key: (accountName, executionInstrumentKey) — one IEA per instrument per account.
+/// Used when use_instrument_execution_authority is enabled to fix wrong-instance behavior.
+    ///
+/// INVARIANT: Key uses exact executionInstrumentKey (from ResolveExecutionInstrumentKey).
+/// MNQ and NQ are distinct keys — no cross-authority merge. IsSameInstrument is for matching only.
+/// </summary>
+public static class InstrumentExecutionAuthorityRegistry
+{
+    private static readonly ConcurrentDictionary<(string Account, string ExecutionInstrumentKey), InstrumentExecutionAuthority> _registry = new();
+
+    /// <summary>
+    /// Get or create IEA for the given account and execution instrument.
+    /// </summary>
+    /// <param name="accountName">Account name (e.g., Sim101).</param>
+    /// <param name="executionInstrumentKey">Execution instrument key from ResolveExecutionInstrumentKey (e.g., MNQ, MGC).</param>
+    /// <param name="factory">Factory to create new IEA when none exists.</param>
+    /// <returns>IEA instance for this (account, instrument).</returns>
+    public static InstrumentExecutionAuthority GetOrCreate(
+        string accountName,
+        string executionInstrumentKey,
+        Func<InstrumentExecutionAuthority> factory)
+    {
+        var key = (accountName ?? "", (executionInstrumentKey ?? "").Trim().ToUpperInvariant());
+        return _registry.GetOrAdd(key, _ => factory());
+    }
+
+    /// <summary>
+    /// Try get existing IEA (for diagnostics).
+    /// </summary>
+    public static bool TryGet(string accountName, string executionInstrumentKey, out InstrumentExecutionAuthority? iea)
+    {
+        var key = (accountName ?? "", (executionInstrumentKey ?? "").Trim().ToUpperInvariant());
+        var found = _registry.TryGetValue(key, out var existing);
+        iea = existing;
+        return found;
+    }
+
+    /// <summary>
+    /// Get all IEAs for the given account. Phase 4: used for per-instrument BeginReconnectRecovery.
+    /// </summary>
+    public static IReadOnlyList<InstrumentExecutionAuthority> GetAllForAccount(string accountName)
+    {
+        var account = accountName ?? "";
+        return _registry.Where(kvp => string.Equals(kvp.Key.Account, account, StringComparison.OrdinalIgnoreCase))
+            .Select(kvp => kvp.Value)
+            .ToList();
+    }
+
+    /// <summary>
+    /// Engine heartbeat: for each IEA on the account with a deferred adoption scan, try to enqueue <see cref="InstrumentExecutionAuthority.TryRetryDeferredAdoptionScanIfDeferred"/>.
+    /// Logs one structured event when any deferred IEA was considered (per-IEA enqueue outcome).
+    /// </summary>
+    public static void RetryDeferredAdoptionScansForAccount(string accountName, RobotLogger? log,
+        Func<string, bool>? executionInstrumentFilter = null)
+    {
+        var account = accountName ?? "";
+        if (string.IsNullOrWhiteSpace(account)) return;
+
+        var utcNow = DateTimeOffset.UtcNow;
+        var rows = new List<object>();
+        foreach (var iea in GetAllForAccount(account))
+        {
+            if (executionInstrumentFilter != null &&
+                !executionInstrumentFilter(iea.ExecutionInstrumentKey))
+                continue;
+            if (!iea.HasDeferredAdoptionScanPending) continue;
+            var enqueued = iea.TryRetryDeferredAdoptionScanIfDeferred();
+            iea.RecordDeferralHeartbeatRetryForProof(utcNow);
+            rows.Add(new
+            {
+                execution_instrument_key = iea.ExecutionInstrumentKey,
+                iea_instance_id = iea.InstanceId,
+                scan_enqueued = enqueued,
+                adoption_proof = iea.GetAdoptionDeferralRetryProofPayload()
+            });
+        }
+
+        if (rows.Count == 0) return;
+        log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ADOPTION_DEFERRAL_HEARTBEAT_RETRY", state: "ENGINE",
+            new { account, iea_retries = rows }));
+    }
+}

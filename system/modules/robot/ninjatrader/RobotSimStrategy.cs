@@ -110,6 +110,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         // BE path diagnostic: once per minute when in position — confirms BE check runs, shows active_intent_count.
         private readonly Dictionary<string, DateTimeOffset> _lastBePathActiveLogUtc = new Dictionary<string, DateTimeOffset>();
         private const int BE_PATH_ACTIVE_RATE_LIMIT_SECONDS = 60;
+        private readonly Dictionary<string, DateTimeOffset> _beZeroIntentExposureFirstSeenUtc = new Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase);
+        private const double BE_ZERO_INTENT_CRITICAL_AFTER_SECONDS = 2.0;
         /// <summary>Phase 4B: throttle BE_PENDING_CONVERGENCE / OWNERSHIP_PENDING_CONVERGENCE during Tier-1 alignment window.</summary>
         private readonly Dictionary<string, DateTimeOffset> _lastBePendingConvergenceLogUtc = new Dictionary<string, DateTimeOffset>();
         private const int BE_PENDING_CONVERGENCE_LOG_SECONDS = 10;
@@ -371,6 +373,95 @@ namespace NinjaTrader.NinjaScript.Strategies
             catch { /* never throw from trace */ }
         }
 
+        private static string GetInstrumentRootFromFullName(string? fullName, string? fallback)
+        {
+            var source = !string.IsNullOrWhiteSpace(fullName) ? fullName : fallback;
+            if (string.IsNullOrWhiteSpace(source))
+                return "";
+
+            var parts = source.Trim().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            return parts.Length > 0 ? parts[0].ToUpperInvariant() : "";
+        }
+
+        private static bool TryParseContractMonth(string? fullName, out int contractYear, out int contractMonth)
+        {
+            contractYear = 0;
+            contractMonth = 0;
+
+            if (string.IsNullOrWhiteSpace(fullName))
+                return false;
+
+            var parts = fullName.Trim().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 2)
+                return false;
+
+            var monthYear = parts[1].Split('-');
+            if (monthYear.Length != 2)
+                return false;
+
+            if (!int.TryParse(monthYear[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out contractMonth) ||
+                !int.TryParse(monthYear[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var twoDigitYear))
+                return false;
+
+            if (contractMonth < 1 || contractMonth > 12)
+                return false;
+
+            contractYear = twoDigitYear >= 70 ? 1900 + twoDigitYear : 2000 + twoDigitYear;
+            return true;
+        }
+
+        private void LogStrategyContractContext(string stage, string? engineInstrumentName, string? tradingDateStr)
+        {
+            if (_engine == null || Instrument == null)
+                return;
+
+            var fullName = Instrument.FullName ?? "";
+            var masterName = Instrument.MasterInstrument?.Name ?? "";
+            var root = GetInstrumentRootFromFullName(fullName, engineInstrumentName ?? masterName);
+            var eventType = "STRATEGY_CONTRACT_CONTEXT";
+            var note = "NinjaTrader strategy contract context captured for replay diagnostics.";
+            int? contractYear = null;
+            int? contractMonth = null;
+            int? contractMonthDelta = null;
+
+            if (TryParseContractMonth(fullName, out var parsedYear, out var parsedMonth))
+            {
+                contractYear = parsedYear;
+                contractMonth = parsedMonth;
+
+                if (!string.IsNullOrWhiteSpace(tradingDateStr) && DateOnly.TryParse(tradingDateStr, out var tradingDate))
+                {
+                    contractMonthDelta = (parsedYear * 12 + parsedMonth) - (tradingDate.Year * 12 + tradingDate.Month);
+
+                    var isNaturalGas = string.Equals(root, "MNG", StringComparison.OrdinalIgnoreCase) ||
+                                       string.Equals(root, "NG", StringComparison.OrdinalIgnoreCase) ||
+                                       string.Equals(masterName, "MNG", StringComparison.OrdinalIgnoreCase) ||
+                                       string.Equals(masterName, "NG", StringComparison.OrdinalIgnoreCase);
+
+                    if (isNaturalGas && contractMonthDelta > 1)
+                    {
+                        eventType = "PLAYBACK_CONTRACT_REVIEW_REQUIRED";
+                        note = "Natural Gas playback is attached to a contract more than one month beyond the replay trading date. Confirm the chart contract matches the replay date before trusting missing-trade diagnostics.";
+                    }
+                }
+            }
+
+            _engine.LogEngineEvent(DateTimeOffset.UtcNow, eventType, new Dictionary<string, object>
+            {
+                { "stage", stage },
+                { "instrument", root },
+                { "engine_instrument", engineInstrumentName ?? "" },
+                { "strategy_instrument_full_name", fullName },
+                { "strategy_instrument_root", root },
+                { "master_instrument", masterName },
+                { "trading_date", tradingDateStr ?? "" },
+                { "contract_year", contractYear?.ToString(CultureInfo.InvariantCulture) ?? "" },
+                { "contract_month", contractMonth?.ToString(CultureInfo.InvariantCulture) ?? "" },
+                { "contract_month_delta_from_trading_date", contractMonthDelta?.ToString(CultureInfo.InvariantCulture) ?? "" },
+                { "note", note }
+            });
+        }
+
         // Keep NinjaTrader's visible log focused on actionable warnings/errors by default.
         // Detailed startup and BarsRequest tracing remains available in engine events and lifecycle files.
         private const bool EmitVerboseNtStartupLogs = false;
@@ -473,10 +564,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                                          $"with execution instrument '{executionInstrumentFullName}'. " +
                                          $"INVARIANT VIOLATION: One execution instrument → one strategy instance per account. " +
                                          $"Standing down to prevent order tracking failures.";
-                            
+
                             Log(errorMsg, LogLevel.Error);
                             _initFailed = true;
-                            
+
                             // Log to engine and report critical if engine exists
                             if (_engine != null)
                             {
@@ -612,6 +703,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     LogVerboseNtStartup($"Timetable read: path={timetablePath}, trading_date={(string.IsNullOrEmpty(tradingDateFromEngine) ? "(not locked)" : tradingDateFromEngine)}, stream_count={streamCount}");
                 else
                     Log("Timetable path not set - engine may not have loaded timetable", LogLevel.Warning);
+                LogStrategyContractContext("DataLoaded_ENGINE_START_DONE", engineInstrumentName, tradingDateFromEngine);
                 TraceLifecycle("DataLoaded_AFTER_TIMETABLE_LOG", engineInstrumentName, "DataLoaded");
                 
                 // LAG FIX: Skip TradingHours access in DataLoaded - it can block UI thread causing "stuck in buffering".
@@ -681,9 +773,14 @@ namespace NinjaTrader.NinjaScript.Strategies
 
                 if (_engine != null)
                 {
+                    var strategyInstrumentFullName = Instrument?.FullName ?? "";
+                    var strategyInstrumentRoot = GetInstrumentRootFromFullName(strategyInstrumentFullName, instrumentName);
                     _engine.LogEngineEvent(DateTimeOffset.UtcNow, "DATALOADED_INITIALIZATION_COMPLETE", new Dictionary<string, object>
                     {
                         { "instrument", instrumentName },
+                        { "strategy_instrument_full_name", strategyInstrumentFullName },
+                        { "strategy_instrument_root", strategyInstrumentRoot },
+                        { "master_instrument", Instrument?.MasterInstrument?.Name ?? "" },
                         { "engine_ready", _engineReady },
                         { "init_failed", _initFailed },
                         { "note", "DataLoaded: execution context ready — BarsRequest may run; OnBarUpdate allowed" }
@@ -704,20 +801,20 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                     else
                     {
-                    var executionInstruments = _engine.GetAllExecutionInstrumentsForBarsRequest();
+                        var executionInstruments = _engine.GetAllExecutionInstrumentsForBarsRequest();
                     
-                    // NQ2 FIX: Enhanced logging for BarsRequest initiation
-                    LogVerboseNtStartup($"BARSREQUEST_INIT: Attempting to request bars. Execution instruments count: {executionInstruments.Count}");
+                        // NQ2 FIX: Enhanced logging for BarsRequest initiation
+                        LogVerboseNtStartup($"BARSREQUEST_INIT: Attempting to request bars. Execution instruments count: {executionInstruments.Count}");
                     
-                    if (_engine != null)
-                    {
-                        _engine.LogEngineEvent(barsReqEventUtcDl, "BARSREQUEST_INIT", new Dictionary<string, object>
+                        if (_engine != null)
                         {
-                            { "execution_instruments_count", executionInstruments.Count },
-                            { "execution_instruments", executionInstruments },
-                            { "note", "BarsRequest initiation - checking for enabled streams" }
-                        });
-                    }
+                            _engine.LogEngineEvent(barsReqEventUtcDl, "BARSREQUEST_INIT", new Dictionary<string, object>
+                            {
+                                { "execution_instruments_count", executionInstruments.Count },
+                                { "execution_instruments", executionInstruments },
+                                { "note", "BarsRequest initiation - checking for enabled streams" }
+                            });
+                        }
                     
                     // CRITICAL: Mark ALL instruments as pending BEFORE queuing BarsRequest
                     // This ensures streams wait even if they process ticks before BarsRequest completes
@@ -879,10 +976,14 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (_engine != null)
                 {
                     var utcNow = DateTimeOffset.UtcNow;
+                    LogStrategyContractContext("Realtime_ENTER", instrumentName, _engine.GetTradingDate());
                     _engine.LogEngineBuildSignatureIfNeeded(utcNow, instrumentName);
                     _engine.LogEngineEvent(utcNow, "REALTIME_STATE_REACHED", new Dictionary<string, object>
                     {
                         { "instrument", instrumentName },
+                        { "strategy_instrument_full_name", Instrument?.FullName ?? "" },
+                        { "strategy_instrument_root", GetInstrumentRootFromFullName(Instrument?.FullName, instrumentName) },
+                        { "master_instrument", Instrument?.MasterInstrument?.Name ?? "" },
                         { "engine_ready", _engineReady },
                         { "init_failed", _initFailed },
                         { "bars_array_length", BarsArray?.Length ?? 0 },
@@ -914,38 +1015,37 @@ namespace NinjaTrader.NinjaScript.Strategies
                         }
                         else
                         {
-                        var instrumentsNeedingBarsRequest = _engine.GetInstrumentsNeedingRestartBarsRequest();
-                        if (instrumentsNeedingBarsRequest.Count > 0)
-                        {
-                            LogVerboseNtStartup($"RESTART_BARSREQUEST: Detected {instrumentsNeedingBarsRequest.Count} instrument(s) needing BarsRequest for restart");
-                            
-                            foreach (var instrument in instrumentsNeedingBarsRequest)
+                            var instrumentsNeedingBarsRequest = _engine.GetInstrumentsNeedingRestartBarsRequest();
+                            if (instrumentsNeedingBarsRequest.Count > 0)
                             {
-                                // Check if this strategy's instrument matches
-                                var canonicalInstrument = Instrument?.MasterInstrument?.Name ?? "";
-                                if (string.Equals(instrument, canonicalInstrument, StringComparison.OrdinalIgnoreCase))
+                                LogVerboseNtStartup($"RESTART_BARSREQUEST: Detected {instrumentsNeedingBarsRequest.Count} instrument(s) needing BarsRequest for restart");
+                                foreach (var instrument in instrumentsNeedingBarsRequest)
                                 {
-                                    LogVerboseNtStartup($"RESTART_BARSREQUEST: Triggering BarsRequest for {instrument} due to restart");
-                                    _engine?.LogEngineEvent(barsReqEventUtcRt, "BARS_REQUEST_TRIGGERED_FOR_REBUILD", new Dictionary<string, object>
+                                    // Check if this strategy's instrument matches
+                                    var canonicalInstrument = Instrument?.MasterInstrument?.Name ?? "";
+                                    if (string.Equals(instrument, canonicalInstrument, StringComparison.OrdinalIgnoreCase))
                                     {
-                                        { "instrument", instrument },
-                                        { "note", "BarsRequest triggered for RANGE_BUILDING/PRE_HYDRATION/ARMED stream on restart" }
-                                    });
+                                        LogVerboseNtStartup($"RESTART_BARSREQUEST: Triggering BarsRequest for {instrument} due to restart");
+                                        _engine?.LogEngineEvent(barsReqEventUtcRt, "BARS_REQUEST_TRIGGERED_FOR_REBUILD", new Dictionary<string, object>
+                                        {
+                                            { "instrument", instrument },
+                                            { "note", "BarsRequest triggered for RANGE_BUILDING/PRE_HYDRATION/ARMED stream on restart" }
+                                        });
                                     
-                                    // Mark BarsRequest as pending BEFORE queuing (prevents premature range lock)
-                                    if (_engine != null)
-                                    {
-                                        _engine.MarkBarsRequestPending(instrument, barsReqEventUtcRt);
+                                        // Mark BarsRequest as pending BEFORE queuing (prevents premature range lock)
+                                        if (_engine != null)
+                                        {
+                                            _engine.MarkBarsRequestPending(instrument, barsReqEventUtcRt);
+                                        }
+                                    
+                                        QueueBarsRequestOnStrategyThread(
+                                            instrument,
+                                            barsReqEventUtcRt,
+                                            "BARSREQUEST_RESTART_FAILED",
+                                            "Restart BarsRequest failed after strategy-thread scheduling - strategy continues with live bars only");
                                     }
-                                    
-                                    QueueBarsRequestOnStrategyThread(
-                                        instrument,
-                                        barsReqEventUtcRt,
-                                        "BARSREQUEST_RESTART_FAILED",
-                                        "Restart BarsRequest failed after strategy-thread scheduling - strategy continues with live bars only");
                                 }
                             }
-                        }
                         }
                     }
                     catch (Exception ex)
@@ -973,6 +1073,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 _engine?.LogEngineEvent(DateTimeOffset.UtcNow, "STRATEGY_DISABLED_BY_NINJATRADER", new Dictionary<string, object>
                 {
                     { "instrument", Instrument?.MasterInstrument?.Name ?? "UNKNOWN" },
+                    { "strategy_instrument_full_name", Instrument?.FullName ?? "" },
+                    { "strategy_instrument_root", GetInstrumentRootFromFullName(Instrument?.FullName, Instrument?.MasterInstrument?.Name) },
+                    { "master_instrument", Instrument?.MasterInstrument?.Name ?? "" },
                     { "instance_id", _instanceId },
                     { "account", Account?.Name ?? "UNKNOWN" },
                     { "note", "NinjaTrader disabled strategy. Common cause: 'lost price connection more than 4 times in the past 5 minutes'." }
@@ -1292,6 +1395,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                     _engine.LogEngineEvent(barsReqEventUtc, "BARSREQUEST_REQUESTED", new Dictionary<string, object>
                     {
                         { "instrument", Instrument.MasterInstrument.Name },
+                        { "requested_instrument", instrumentName },
+                        { "strategy_instrument_full_name", Instrument.FullName ?? "" },
+                        { "strategy_instrument_root", GetInstrumentRootFromFullName(Instrument.FullName, instrumentName) },
+                        { "master_instrument", Instrument.MasterInstrument.Name },
                         { "trading_date", tradingDateStr },
                         { "current_time_utc", currentTimeUtcHhmm },
                         { "current_time_chicago", currentTimeChicagoHhmm },
@@ -1908,11 +2015,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                         _engine.LogEngineEvent(nowUtc, "BAR_TIME_INTERPRETATION_MISMATCH", new Dictionary<string, object>
                         {
                             { "instrument", instrumentName },
-                            { "severity", "CRITICAL" },
+                            { "severity", "WARN" },
                             { "locked_interpretation", _barTimeInterpretation.ToString() },
                             { "current_bar_age_minutes", Math.Round(barAge, 2) },
                             { "raw_bar_time", barExchangeTime.ToString("o") },
-                            { "warning", "Bar time interpretation would flip - this should not happen" },
+                            { "warning", "Bar time is outside the locked interpretation age guard; keeping the locked interpretation." },
                             { "rate_limited", true },
                             { "note", $"Warning rate-limited to once per {BAR_TIME_MISMATCH_RATE_LIMIT_MINUTES} minute(s) per instrument to prevent log flooding. This typically occurs after disconnect when historical bars arrive out of order." }
                         });
@@ -2451,6 +2558,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 {
                     if (openIntentCount > 0)
                     {
+                        _beZeroIntentExposureFirstSeenUtc.Remove(executionInstrument);
                         _engine.LogEngineEvent(now, "BE_FILTER_EXCLUDED_PROTECTED_EXPOSURE", new Dictionary<string, object>
                         {
                             { "chart_instrument", instrumentName },
@@ -2462,8 +2570,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                             { "note", "Exposure has open robot intent(s), but none need BE monitoring." }
                         });
                     }
-                    else if (QuantExecutionControlStore.IsPostFillAlignmentWindowActive(executionInstrument, now))
+                    else if (QuantExecutionControlStore.IsAnyBrokerJournalAlignmentWindowActive(executionInstrument, now))
                     {
+                        _beZeroIntentExposureFirstSeenUtc.Remove(executionInstrument);
                         _engine.LogEngineEvent(now, "OWNERSHIP_PENDING_CONVERGENCE", new Dictionary<string, object>
                         {
                             { "chart_instrument", instrumentName },
@@ -2475,21 +2584,39 @@ namespace NinjaTrader.NinjaScript.Strategies
                     }
                     else
                     {
-                        _engine.LogEngineEvent(now, "BE_FILTER_EXCLUDED_ACTIVE_EXPOSURE", new Dictionary<string, object>
+                        if (!_beZeroIntentExposureFirstSeenUtc.TryGetValue(executionInstrument, out var firstSeenUtc))
+                        {
+                            firstSeenUtc = now;
+                            _beZeroIntentExposureFirstSeenUtc[executionInstrument] = firstSeenUtc;
+                        }
+
+                        var elapsedSeconds = Math.Max(0.0, (now - firstSeenUtc).TotalSeconds);
+                        var eventType = elapsedSeconds >= BE_ZERO_INTENT_CRITICAL_AFTER_SECONDS
+                            ? "BE_FILTER_EXCLUDED_ACTIVE_EXPOSURE"
+                            : "BE_FILTER_TRANSIENT_NO_INTENT";
+                        _engine.LogEngineEvent(now, eventType, new Dictionary<string, object>
                         {
                             { "chart_instrument", instrumentName },
                             { "execution_instrument", executionInstrument },
                             { "resolved_active_intent_count", 0 },
+                            { "open_intent_count", openIntentCount },
                             { "tick_price", tickPrice },
+                            { "first_seen_utc", firstSeenUtc },
+                            { "elapsed_seconds", elapsedSeconds },
+                            { "critical_after_seconds", BE_ZERO_INTENT_CRITICAL_AFTER_SECONDS },
                             { "stand_down_reason", "exposure_exists_but_no_intent_found" },
-                            { "note", "CRITICAL: Account has exposure but BE filter returned 0 intents. Likely execution instrument mismatch (chart vs intent)." }
+                            { "note", eventType == "BE_FILTER_EXCLUDED_ACTIVE_EXPOSURE" ? "CRITICAL: Account has exposure but BE filter returned 0 intents beyond transient settle window." : "Exposure has no BE/open intent yet, but has not persisted long enough to classify as unowned." }
                         });
                     }
+                }
+                else
+                {
+                    _beZeroIntentExposureFirstSeenUtc.Remove(executionInstrument);
                 }
             }
 
             // Phase 4B: During Tier-1 post-fill alignment, defer BE when no intents resolved yet (transient journal lag).
-            var postFillAlignment = QuantExecutionControlStore.IsPostFillAlignmentWindowActive(executionInstrument, now);
+            var postFillAlignment = QuantExecutionControlStore.IsAnyBrokerJournalAlignmentWindowActive(executionInstrument, now);
             var skipBeForPostFillConvergence = false;
             if (postFillAlignment)
             {

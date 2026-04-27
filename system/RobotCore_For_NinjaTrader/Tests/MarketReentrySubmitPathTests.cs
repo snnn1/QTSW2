@@ -26,7 +26,7 @@ public static class MarketReentrySubmitPathTests
             var qSnap = QuantExecutionControlStore.GetSnapshot(inst);
             if (qSnap.Phase != QuantExecutionInstrumentPhase.RecoveryRequired)
                 return (false, "setup failed: expected RecoveryRequired phase");
-            if (!string.Equals(qSnap.RecoveryRequiredReason, "recovery_stabilization_window_expired_broker_gross_mismatch", StringComparison.Ordinal))
+            if (!string.Equals(qSnap.RecoveryRequiredReason, "pending_alignment_expired_broker_gross_mismatch", StringComparison.Ordinal))
                 return (false, "setup failed: wrong RecoveryRequired reason " + qSnap.RecoveryRequiredReason);
 
             var root = Path.Combine(Path.GetTempPath(), "market_reentry_submit_path_" + Guid.NewGuid().ToString("N"));

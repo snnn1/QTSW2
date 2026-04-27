@@ -32,12 +32,33 @@ public sealed class UnifiedExecutionAuthority
         var trail = new List<GateEvaluation>();
         var utcNow = request.UtcNow;
         var instrument = request.Instrument?.Trim() ?? "";
+        ExecutionAuthorityFrame? authorityFrame = request.AuthorityFrame ?? request.PrebuiltSafetyRequest?.AuthorityFrame;
 
-        InstrumentOwnershipSnapshot? ownershipSnapshot = null;
+        InstrumentOwnershipSnapshot? ownershipSnapshot = authorityFrame?.OwnershipSnapshot;
         if (FeatureFlags.CanonicalOwnershipLedgerEnabled && _ownershipLedger != null && !string.IsNullOrEmpty(instrument))
         {
             ownershipSnapshot = _ownershipLedger.GetOwnershipSnapshot(
                 request.AccountName ?? "default", instrument);
+            if (authorityFrame == null)
+            {
+                authorityFrame = new ExecutionAuthorityFrame
+                {
+                    FrameId = ExecutionAuthorityFrame.CreateFrameId(utcNow),
+                    Source = "uea_ownership_preflight",
+                    Instrument = instrument,
+                    CanonicalInstrument = request.CanonicalInstrument,
+                    IntentId = request.IntentId,
+                    SubmitPath = request.SubmitPath,
+                    DecisionUtc = utcNow,
+                    FrameCreatedUtc = DateTimeOffset.UtcNow,
+                    LedgerAccountName = request.AccountName,
+                    LedgerOwnershipVersion = ownershipSnapshot.OwnershipVersion,
+                    LedgerSignedNetQty = ownershipSnapshot.LedgerSignedNetQty,
+                    LedgerActiveSlotCount = ownershipSnapshot.ActiveSlotCount,
+                    LedgerOrphanSlotCount = ownershipSnapshot.OrphanSlotCount,
+                    OwnershipSnapshot = ownershipSnapshot
+                };
+            }
         }
 
         // Gate 1: KillSwitch + Recovery (EPA preflight)
@@ -53,7 +74,7 @@ public sealed class UnifiedExecutionAuthority
                 skipMismatchExecutionBlock: skipMismatch))
         {
             trail.Add(new GateEvaluation { GateName = "Gate1_KillSwitch_Recovery", Passed = false, DenyReason = epaDeny });
-            return AuthorityDecision.Deny("Gate1_KillSwitch_Recovery", epaDeny, ownershipSnapshot, trail, utcNow);
+            return AuthorityDecision.Deny("Gate1_KillSwitch_Recovery", epaDeny, ownershipSnapshot, authorityFrame, trail, utcNow);
         }
         trail.Add(new GateEvaluation { GateName = "Gate1_KillSwitch_Recovery", Passed = true });
 
@@ -66,7 +87,7 @@ public sealed class UnifiedExecutionAuthority
             && request.SubmitIntent != SubmitIntent.RiskCoverage)
         {
             trail.Add(new GateEvaluation { GateName = "Gate2_MismatchBlock", Passed = false, DenyReason = "MISMATCH_EXECUTION_BLOCKED" });
-            return AuthorityDecision.Deny("Gate2_MismatchBlock", "MISMATCH_EXECUTION_BLOCKED", ownershipSnapshot, trail, utcNow);
+            return AuthorityDecision.Deny("Gate2_MismatchBlock", "MISMATCH_EXECUTION_BLOCKED", ownershipSnapshot, authorityFrame, trail, utcNow);
         }
         trail.Add(new GateEvaluation { GateName = "Gate2_MismatchBlock", Passed = true });
 
@@ -80,12 +101,15 @@ public sealed class UnifiedExecutionAuthority
             ExecutionSafetyEvaluationRequest safetyReq;
             try
             {
-                safetyReq = request.BuildSafetyRequest(instrument, request.IntentId, utcNow);
+                safetyReq = request.PrebuiltSafetyRequest ??
+                            request.BuildSafetyRequest(instrument, request.IntentId, utcNow);
+                authorityFrame = safetyReq.AuthorityFrame ?? authorityFrame;
+                ownershipSnapshot = authorityFrame?.OwnershipSnapshot ?? ownershipSnapshot;
             }
             catch
             {
                 trail.Add(new GateEvaluation { GateName = "Gate3_Structural", Passed = false, DenyReason = "account_snapshot_failed" });
-                return AuthorityDecision.Deny("Gate3_Structural", "account_snapshot_failed", ownershipSnapshot, trail, utcNow);
+                return AuthorityDecision.Deny("Gate3_Structural", "account_snapshot_failed", ownershipSnapshot, authorityFrame, trail, utcNow);
             }
 
             var flattenBypass = request.SubmitIntent == SubmitIntent.Emergency;
@@ -98,7 +122,7 @@ public sealed class UnifiedExecutionAuthority
                     DenyReason = structSnap.Reason,
                     Detail = structSnap.Detail
                 });
-                return AuthorityDecision.Deny("Gate3_Structural", structSnap.Reason ?? "structural_deny", ownershipSnapshot, trail, utcNow);
+                return AuthorityDecision.Deny("Gate3_Structural", structSnap.Reason ?? "structural_deny", ownershipSnapshot, authorityFrame, trail, utcNow);
             }
             trail.Add(new GateEvaluation { GateName = "Gate3_Structural", Passed = true, Detail = structSnap.Detail });
 
@@ -112,11 +136,11 @@ public sealed class UnifiedExecutionAuthority
                     DenyReason = overlay.BlockReason.ToString(),
                     Detail = overlay.Detail
                 });
-                return AuthorityDecision.Deny("Gate4_Overlay", $"OVERLAY:{overlay.BlockReason}", ownershipSnapshot, trail, utcNow);
+                return AuthorityDecision.Deny("Gate4_Overlay", $"OVERLAY:{overlay.BlockReason}", ownershipSnapshot, authorityFrame, trail, utcNow);
             }
             trail.Add(new GateEvaluation { GateName = "Gate4_Overlay", Passed = true });
         }
 
-        return AuthorityDecision.Allow(ownershipSnapshot, trail, utcNow);
+        return AuthorityDecision.Allow(ownershipSnapshot, authorityFrame, trail, utcNow);
     }
 }

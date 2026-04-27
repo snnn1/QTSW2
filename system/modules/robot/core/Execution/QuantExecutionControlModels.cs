@@ -42,7 +42,28 @@ public sealed class QuantExpectedInstrumentState
     /// <summary>Robot-tagged working orders expected at broker for parity-style checks (optional; 0 if unknown).</summary>
     public int ExpectedWorkingOrderCount { get; set; }
 
+    /// <summary>Last time a robot working order submit was handed to the broker.</summary>
+    public DateTimeOffset? LastWorkingOrderSubmitUtc { get; set; }
+
+    /// <summary>Expected robot working-order count during the submit/register convergence window.</summary>
+    public int? PendingWorkingOrderSubmitCount { get; set; }
+
     public DateTimeOffset? LastMappedFillUtc { get; set; }
+
+    /// <summary>
+    /// Set when the broker order lifecycle has observed a fill before the execution/journal callback
+    /// may have finished mapping it. This is a bounded callback-ordering suppressor.
+    /// </summary>
+    public DateTimeOffset? LastBrokerExecutionCallbackUtc { get; set; }
+
+    /// <summary>End of the broker-callback ahead-of-journal window.</summary>
+    public DateTimeOffset? BrokerExecutionCallbackExpiresUtc { get; set; }
+
+    /// <summary>Diagnostic role for the last broker callback that armed callback alignment.</summary>
+    public string? LastBrokerExecutionCallbackRole { get; set; }
+
+    /// <summary>Diagnostic lifecycle state for the last broker callback that armed callback alignment.</summary>
+    public string? LastBrokerExecutionCallbackState { get; set; }
 
     /// <summary>End of bounded PENDING_ALIGNMENT window (wall clock).</summary>
     public DateTimeOffset? PendingAlignmentExpiresUtc { get; set; }
@@ -63,6 +84,15 @@ public sealed class QuantExpectedInstrumentState
 
     /// <summary>Absolute protective quantity expected after the pending resize completes.</summary>
     public int? PendingProtectiveResizeQty { get; set; }
+
+    /// <summary>
+    /// Set when an existing protective OCO pair is intentionally cancel/replaced, for example a BE move
+    /// where NT rejects/reverts in-place OCO stop changes.
+    /// </summary>
+    public DateTimeOffset? LastProtectiveCancelReplacePendingUtc { get; set; }
+
+    /// <summary>Expected broker working-order count while the protective cancel/replace converges.</summary>
+    public int? PendingProtectiveCancelReplaceWorkingCount { get; set; }
 
     /// <summary>True after reconnect adoption without full history.</summary>
     public bool RecoveryMode { get; set; }

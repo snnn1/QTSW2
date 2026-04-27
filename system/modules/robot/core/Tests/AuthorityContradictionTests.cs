@@ -21,6 +21,8 @@ public static class AuthorityContradictionTests
         if (e != null) return (false, e);
         e = Case_BrokerVsJournalSingleParityClassification();
         if (e != null) return (false, e);
+        e = Case_UeaCarriesSinglePrebuiltAuthorityFrame();
+        if (e != null) return (false, e);
         return (true, null);
     }
 
@@ -151,6 +153,78 @@ public static class AuthorityContradictionTests
                 return "expected single classification POSITION_MISMATCH when broker open and journal empty";
             if (r.IsOk || r.IsOkOrPendingAlignment)
                 return "did not expect OK or pending-alignment flags for raw position mismatch";
+            return null;
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(root))
+                    Directory.Delete(root, true);
+            }
+            catch { /* best effort */ }
+        }
+    }
+
+    private static string? Case_UeaCarriesSinglePrebuiltAuthorityFrame()
+    {
+        var utc = DateTimeOffset.UtcNow;
+        var root = Path.Combine(Path.GetTempPath(), "auth_frame_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var log = new RobotLogger(root);
+            var journal = new ExecutionJournal(root, log);
+            var frame = new ExecutionAuthorityFrame
+            {
+                FrameId = "frame-test",
+                Source = "test",
+                Instrument = "MES",
+                CanonicalInstrument = "MES",
+                IntentId = "intent-frame",
+                SubmitPath = "SUBMIT_TARGET",
+                DecisionUtc = utc,
+                FrameCreatedUtc = utc,
+                BrokerPositionQty = 1,
+                JournalOpenQty = 0
+            };
+            var safety = new ExecutionSafetyEvaluationRequest
+            {
+                Instrument = "MES",
+                CanonicalInstrument = "MES",
+                UtcNow = utc,
+                Journal = journal,
+                AccountSnapshot = null,
+                AuthorityFrame = frame
+            };
+            if (ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(safety, "SUBMIT_TARGET", false, out var structural) ||
+                structural.AuthorityFrameId != "frame-test")
+                return "expected structural deny snapshot to carry the prebuilt authority frame id";
+
+            var uea = new UnifiedExecutionAuthority(log);
+            var decision = uea.Evaluate(new AuthorityEvaluationRequest
+            {
+                Instrument = "MES",
+                IntentId = "intent-frame",
+                SubmitIntent = SubmitIntent.RiskCoverage,
+                SubmitPath = "SUBMIT_TARGET",
+                UtcNow = utc,
+                GlobalKillSwitchActive = () => false,
+                MismatchExecutionBlocked = _ => false,
+                MismatchExecutionBlockedForSubmit = (_, _) => false,
+                InstrumentFrozenOrEpaBlocked = (_, _) => false,
+                PrebuiltSafetyRequest = safety,
+                AuthorityFrame = frame,
+                BuildSafetyRequest = (_, _, _) => throw new InvalidOperationException("prebuilt frame was not used")
+            });
+
+            if (decision.Allowed)
+                return "expected UEA structural deny with null account snapshot";
+            if (decision.AuthorityFrame?.FrameId != "frame-test")
+                return "expected UEA decision to carry the same prebuilt authority frame id";
+            if (decision.DenyGate != "Gate3_Structural")
+                return "expected Gate3_Structural deny from prebuilt safety request";
+
             return null;
         }
         finally

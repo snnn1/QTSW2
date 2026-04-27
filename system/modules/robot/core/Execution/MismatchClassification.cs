@@ -47,6 +47,12 @@ public static class MismatchClassification
             return MismatchType.GROSS_POSITION_DIVERGENCE;
         }
 
+        if (brokerWorkingOrderCount > localWorkingOrderCount)
+            return MismatchType.ORDER_REGISTRY_MISSING;
+
+        if (localWorkingOrderCount > brokerWorkingOrderCount)
+            return MismatchType.WORKING_ORDER_COUNT_CONVERGENCE;
+
         return MismatchType.UNCLASSIFIED_CRITICAL_MISMATCH;
     }
 }

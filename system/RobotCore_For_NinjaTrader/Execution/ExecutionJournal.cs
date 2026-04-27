@@ -18,6 +18,7 @@ public static class ReleaseBlockingExclusionReasons
     public const string NO_TAG = "NO_TAG";
     public const string NOT_IN_REGISTRY = "NOT_IN_REGISTRY";
     public const string DIRECTION_MISMATCH = "DIRECTION_MISMATCH";
+    public const string LIVE_TAGGED_UNFILLED_ENTRY = "LIVE_TAGGED_UNFILLED_ENTRY";
     /// <summary>Direction matches broker but row has no open qty and is not tied to live tag/registry working state.</summary>
     public const string NON_LIVE_STALE_ADOPTION = "NON_LIVE_STALE_ADOPTION";
     public const string OTHER = "OTHER";
@@ -463,7 +464,7 @@ public sealed class ExecutionJournal
             if (TryParseJournalIsoUtc(entry.EntryFilledAtUtc, out var fillCanon) && utcNow > fillCanon)
             {
                 entry.IsReconstructedSubmission = true;
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_EVENT_ORDER_VIOLATION", "ENGINE",
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_LATE_SUBMISSION_OBSERVATION", "ENGINE",
                     new
                     {
                         intent_id = intentId,
@@ -1122,7 +1123,15 @@ public sealed class ExecutionJournal
                 if (boundedLateTerminalFill)
                 {
                     var priorExitType = entry.ExitOrderType;
-                    if (!string.IsNullOrWhiteSpace(exitOrderType) &&
+                    var terminalFillUpgraded = TryUpgradeBrokerFlatCompletionFromTerminalFill(
+                        entry,
+                        exitFillPrice,
+                        exitFillQuantity,
+                        exitOrderType,
+                        utcNow,
+                        out var terminalFillUpgradeReason);
+                    if (!terminalFillUpgraded &&
+                        !string.IsNullOrWhiteSpace(exitOrderType) &&
                         !string.Equals(priorExitType, exitOrderType, StringComparison.OrdinalIgnoreCase))
                     {
                         entry.ExitOrderType = exitOrderType;
@@ -1140,9 +1149,15 @@ public sealed class ExecutionJournal
                             prior_completion_reason = CompletionReasons.RECONCILIATION_BROKER_FLAT,
                             prior_exit_order_type = priorExitType,
                             reconciled_exit_order_type = entry.ExitOrderType,
+                            exit_avg_fill_price = entry.ExitAvgFillPrice,
+                            realized_pnl_gross = entry.RealizedPnLGross,
+                            realized_pnl_net = entry.RealizedPnLNet,
                             completion_age_ms = completionAgeMs,
-                            action = "JOURNAL_TERMINAL_FILL_SUPPRESSED",
-                            note = "ExecutionJournal suppressed bounded late terminal fill after reconciliation broker-flat completion to avoid double-count overfill."
+                            action = terminalFillUpgraded ? "JOURNAL_TERMINAL_FILL_UPGRADED" : "JOURNAL_TERMINAL_FILL_TYPE_RECONCILED",
+                            upgrade_reason = terminalFillUpgradeReason,
+                            note = terminalFillUpgraded
+                                ? "ExecutionJournal upgraded broker-flat completion with the bounded terminal fill facts without increasing exit quantity."
+                                : "ExecutionJournal reconciled bounded terminal fill type after broker-flat completion but did not infer PnL from an incomplete fill fact."
                         }));
 
                     _cache[key] = entry;
@@ -1302,6 +1317,8 @@ public sealed class ExecutionJournal
                 {
                     entry.CompletionReason = exitOrderType;
                 }
+                if (entry.Rejected && IsProtectiveOrderRejection(entry.RejectionOrderType, entry.RejectionReason))
+                    entry.Rejected = false;
                 
                 // Log trade completion with enhanced fields
                 var tradeData = new Dictionary<string, object?>
@@ -1408,6 +1425,87 @@ public sealed class ExecutionJournal
         }, () => new { cache_hit = cacheHit });
     }
 
+    private static bool TryUpgradeBrokerFlatCompletionFromTerminalFill(
+        ExecutionJournalEntry entry,
+        decimal exitFillPrice,
+        int exitFillQuantity,
+        string exitOrderType,
+        DateTimeOffset utcNow,
+        out string reason)
+    {
+        reason = "not_applicable";
+        if (!string.Equals(entry.CompletionReason, CompletionReasons.RECONCILIATION_BROKER_FLAT, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (entry.EntryFilledQuantityTotal <= 0)
+        {
+            reason = "missing_entry_quantity";
+            return false;
+        }
+
+        if (exitFillQuantity != entry.EntryFilledQuantityTotal)
+        {
+            reason = "terminal_fill_quantity_not_full_entry_quantity";
+            return false;
+        }
+
+        if (!entry.EntryAvgFillPrice.HasValue)
+        {
+            reason = "missing_entry_avg_fill_price";
+            return false;
+        }
+
+        if (!entry.ContractMultiplier.HasValue)
+        {
+            reason = "missing_contract_multiplier";
+            return false;
+        }
+
+        var normalizedDirection = entry.Direction?.Trim();
+        if (string.IsNullOrWhiteSpace(normalizedDirection))
+        {
+            reason = "missing_direction";
+            return false;
+        }
+
+        decimal points;
+        if (string.Equals(normalizedDirection, "Long", StringComparison.OrdinalIgnoreCase))
+            points = exitFillPrice - entry.EntryAvgFillPrice.Value;
+        else if (string.Equals(normalizedDirection, "Short", StringComparison.OrdinalIgnoreCase))
+            points = entry.EntryAvgFillPrice.Value - exitFillPrice;
+        else
+        {
+            reason = "invalid_direction";
+            return false;
+        }
+
+        var grossDollars = points * entry.EntryFilledQuantityTotal * entry.ContractMultiplier.Value;
+        var netDollars = grossDollars;
+        if (entry.SlippageDollars.HasValue)
+            netDollars -= entry.SlippageDollars.Value;
+        if (entry.Commission.HasValue)
+            netDollars -= entry.Commission.Value;
+        if (entry.Fees.HasValue)
+            netDollars -= entry.Fees.Value;
+
+        entry.ExitFilledQuantityTotal = entry.EntryFilledQuantityTotal;
+        entry.ExitFillNotional = exitFillPrice * entry.EntryFilledQuantityTotal;
+        entry.ExitAvgFillPrice = exitFillPrice;
+        entry.ExitFilledAtUtc = utcNow.ToString("o");
+        if (!string.IsNullOrWhiteSpace(exitOrderType))
+        {
+            entry.ExitOrderType = exitOrderType;
+            entry.CompletionReason = exitOrderType;
+        }
+        entry.CompletedAtUtc = utcNow.ToString("o");
+        entry.RealizedPnLPoints = points;
+        entry.RealizedPnLGross = grossDollars;
+        entry.RealizedPnLNet = netDollars;
+
+        reason = "full_terminal_fill_upgraded_broker_flat_completion";
+        return true;
+    }
+
     /// <summary>
     /// Record order rejection.
     /// </summary>
@@ -1464,13 +1562,30 @@ public sealed class ExecutionJournal
                 }
             }
 
-            entry.Rejected = true;
+            entry.RejectionOrderType = orderType;
+            entry.RejectedPrice = rejectedPrice;
+            entry.RejectedQuantity = rejectedQuantity;
             entry.RejectedAt = utcNow.ToString("o");
             entry.RejectionReason = reason;
+
+            var protectiveRejection = IsProtectiveOrderRejection(orderType, reason);
+            if (!protectiveRejection || !entry.EntryFilled)
+                entry.Rejected = true;
 
             _cache[key] = entry;
             SaveJournal(journalPath, entry);
         }
+    }
+
+    private static bool IsProtectiveOrderRejection(string? orderType, string? reason)
+    {
+        if (string.Equals(orderType, "STOP", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(orderType, "TARGET", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var r = reason ?? "";
+        return r.StartsWith("STOP_", StringComparison.OrdinalIgnoreCase) ||
+               r.StartsWith("TARGET_", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>
@@ -2219,6 +2334,22 @@ public sealed class ExecutionJournal
         return remaining <= 0;
     }
 
+    /// <summary>
+    /// Broker is flat, but the row is still a live robot-tagged unfilled entry submission. This is normal working-entry state,
+    /// not stale journal residue, and should not by itself hold release mismatch open.
+    /// </summary>
+    private static bool IsLiveTaggedUnfilledEntryWhileBrokerFlat(
+        ExecutionJournalEntry entry,
+        IReadOnlyCollection<string> robotTaggedIntentIdsOnInstrument,
+        string intentId)
+    {
+        if (entry == null || string.IsNullOrWhiteSpace(intentId)) return false;
+        if (!entry.EntrySubmitted || entry.TradeCompleted || entry.EntryFilled) return false;
+        var tagSet = robotTaggedIntentIdsOnInstrument as HashSet<string> ??
+                     new HashSet<string>(robotTaggedIntentIdsOnInstrument ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
+        return tagSet.Contains(intentId);
+    }
+
     /// <summary>Remaining open quantity for a journal entry (filled legs only).</summary>
     public static int GetEntryRemainingOpenQuantity(ExecutionJournalEntry entry)
     {
@@ -2291,6 +2422,12 @@ public sealed class ExecutionJournal
 
             if (brokerPositionQtyAbs == 0)
             {
+                if (IsLiveTaggedUnfilledEntryWhileBrokerFlat(entry, tagSet, intentId))
+                {
+                    decisions.Add((intentId, false, ReleaseBlockingExclusionReasons.LIVE_TAGGED_UNFILLED_ENTRY));
+                    continue;
+                }
+
                 if (IsStaleAdoptionJournalEntryForRelease(entry, brokerPositionQtyAbs, tagSet, intentId))
                     decisions.Add((intentId, false, ReleaseBlockingExclusionReasons.NO_TAG));
                 else
@@ -2720,13 +2857,15 @@ public sealed class ExecutionJournal
         IReadOnlyCollection<string>? registryMismatchTrustedIntentIds,
         DateTimeOffset utcNow,
         string? triggerSource = null,
-        bool suppressWhileFlattenPending = false)
+        bool suppressWhileFlattenPending = false,
+        bool allowTaggedResidualRetirement = false,
+        Action<string, string, string, int>? onReconciled = null)
     {
         if (brokerPositionQtyAbs != 0 || brokerWorkingCount != 0 || suppressWhileFlattenPending)
             return 0;
 
-        var candidates = GetAdoptionCandidateIntentIdsUnionForExecutionKeys(executionInstrumentPrimary, canonicalInstrument);
-        if (candidates.Count == 0)
+        var openByInstrument = GetOpenJournalEntriesByInstrument();
+        if (openByInstrument.Count == 0)
             return 0;
 
         var tagSet = robotTaggedIntentIdsOnInstrument as HashSet<string> ??
@@ -2734,38 +2873,38 @@ public sealed class ExecutionJournal
         var processed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var closed = 0;
 
-        foreach (var intentId in candidates)
+        foreach (var kv in openByInstrument)
         {
-            // Broker-flat + no working is stronger proof than stale registry trust. Keep only actively tagged intents
-            // protected here so old mismatch-trusted rows can retire instead of pinning JournalOnlyBrokerFlat forever.
-            if (tagSet.Contains(intentId))
+            if (!OpenJournalInstrumentKeyMatches(kv.Key, executionInstrumentPrimary, canonicalInstrument))
                 continue;
 
-            var located = TryGetAdoptionCandidateEntry(intentId, executionInstrumentPrimary, canonicalInstrument);
-            if (located == null)
-                continue;
-
-            var (tradingDate, stream, entry) = located.Value;
-            var rowKey = $"{tradingDate}_{stream}_{intentId}";
-            if (!processed.Add(rowKey))
-                continue;
-            if (entry == null || !entry.EntryFilled || entry.TradeCompleted || entry.EntryFilledQuantityTotal <= 0)
-                continue;
-
-            var remaining = GetEntryRemainingOpenQuantity(entry);
-            if (remaining <= 0)
-                continue;
-
-            if (RecordReconciliationComplete(
-                    tradingDate,
-                    stream,
-                    intentId,
-                    utcNow,
-                    brokerPositionQtyAbsAtDecision: 0,
-                    journalOpenQtyBeforeClose: remaining,
-                    triggerSource: triggerSource ?? "BrokerFlatReleaseReadiness"))
+            foreach (var (tradingDate, stream, intentId, entry) in kv.Value)
             {
-                closed++;
+                if (!allowTaggedResidualRetirement && tagSet.Contains(intentId))
+                    continue;
+
+                var rowKey = $"{tradingDate}_{stream}_{intentId}";
+                if (!processed.Add(rowKey))
+                    continue;
+                if (entry == null || !entry.EntryFilled || entry.TradeCompleted || entry.EntryFilledQuantityTotal <= 0)
+                    continue;
+
+                var remaining = GetEntryRemainingOpenQuantity(entry);
+                if (remaining <= 0)
+                    continue;
+
+                if (RecordReconciliationComplete(
+                        tradingDate,
+                        stream,
+                        intentId,
+                        utcNow,
+                        brokerPositionQtyAbsAtDecision: 0,
+                        journalOpenQtyBeforeClose: remaining,
+                        triggerSource: triggerSource ?? "BrokerFlatReleaseReadiness"))
+                {
+                    closed++;
+                    onReconciled?.Invoke(tradingDate, stream, intentId, remaining);
+                }
             }
         }
 
@@ -2781,7 +2920,8 @@ public sealed class ExecutionJournal
         string? canonicalInstrument,
         IReadOnlyCollection<string> interruptedIntentIds,
         DateTimeOffset utcNow,
-        string? triggerSource = null)
+        string? triggerSource = null,
+        Action<string, string, string, int>? onReconciled = null)
     {
         var executionKey = executionInstrumentPrimary?.Trim() ?? "";
         if (string.IsNullOrWhiteSpace(executionKey) || interruptedIntentIds == null || interruptedIntentIds.Count == 0)
@@ -2824,6 +2964,7 @@ public sealed class ExecutionJournal
                         triggerSource: triggerSource ?? "LateSessionCloseFlattenBrokerFlat"))
                 {
                     closed++;
+                    onReconciled?.Invoke(tradingDate, stream, intentId, openQty);
                 }
             }
         }
@@ -3782,7 +3923,7 @@ public sealed class ExecutionJournal
             if (TryParseJournalIsoUtc(entry.EntryFilledAtUtc, out var priorFillCanon) && utcNow > priorFillCanon)
             {
                 entry.IsReconstructedSubmission = true;
-                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_EVENT_ORDER_VIOLATION", "ENGINE",
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_LATE_SUBMISSION_OBSERVATION", "ENGINE",
                     new
                     {
                         intent_id = intentId,

@@ -33,6 +33,21 @@ public static class HealthMonitorDataStallTests
             var (pass4, err4) = TestDebounceWorks(CreateTestDir(baseTemp, "4"));
             if (!pass4) return (false, $"Test 4 (Debounce): {err4}");
 
+            var (pass5, err5) = TestDisconnectBurstRequestsControlledShutdown(CreateTestDir(baseTemp, "5"));
+            if (!pass5) return (false, $"Test 5 (Disconnect burst shutdown): {err5}");
+
+            var (pass6, err6) = TestRepeatedConnectionLossRequestsControlledShutdown(CreateTestDir(baseTemp, "6"));
+            if (!pass6) return (false, $"Test 6 (Repeated connection loss shutdown): {err6}");
+
+            var (pass7, err7) = TestDisconnectBurstRequestsControlledShutdownWithoutActiveStreams(CreateTestDir(baseTemp, "7"));
+            if (!pass7) return (false, $"Test 7 (Disconnect burst shutdown without active streams): {err7}");
+
+            var (pass8, err8) = TestPlaybackImmediateDisconnectShutdownSuppressedDuringStartupGrace(CreateTestDir(baseTemp, "8"));
+            if (!pass8) return (false, $"Test 8 (Playback immediate shutdown startup grace): {err8}");
+
+            var (pass9, err9) = TestPlaybackSuppressesBarTimestampDataLoss(CreateTestDir(baseTemp, "9"));
+            if (!pass9) return (false, $"Test 9 (Playback bar timestamp data loss suppression): {err9}");
+
             return (true, null);
         }
         finally
@@ -58,7 +73,7 @@ public static class HealthMonitorDataStallTests
         var config = new HealthMonitorConfig { enabled = true, default_stall_seconds = 300 };
         var log = new RobotLogger(tempDir, logDir, "MNG");
         var hm = new HealthMonitor(tempDir, config, log);
-        hm.Start();
+        // Manual-evaluation test: do not start the background evaluator.
 
         var baseTime = DateTimeOffset.UtcNow.AddHours(-1);
         // Feed sparse bars (150s apart) - MNG threshold 420, expected will be ~150
@@ -68,6 +83,7 @@ public static class HealthMonitorDataStallTests
         var evalTime = baseTime.AddSeconds(600 + 400);
         hm.Evaluate(evalTime);
         hm.Stop();
+        svc.Stop();
         System.Threading.Thread.Sleep(500); // Allow async flush
         var events = ReadLogEvents(logDir, "DATA_LOSS_DETECTED");
 
@@ -85,10 +101,10 @@ public static class HealthMonitorDataStallTests
         var config = new HealthMonitorConfig { enabled = true, default_stall_seconds = 300 };
         var log = new RobotLogger(tempDir, logDir, "MES");
         var hm = new HealthMonitor(tempDir, config, log);
-        hm.Start();
+        // Manual-evaluation test: do not start the background evaluator.
 
         var baseTime = DateTimeOffset.UtcNow.AddHours(-2);
-        hm.OnBar("MES", baseTime, close: 6000m);
+        hm.OnBar("MES", baseTime, close: 6000m, volume: 100);
 
         // No more bars for 500s - true disconnect
         var evalTime = baseTime.AddSeconds(500);
@@ -111,16 +127,17 @@ public static class HealthMonitorDataStallTests
         var config = new HealthMonitorConfig { enabled = true, default_stall_seconds = 300 };
         var log = new RobotLogger(tempDir, logDir, "MULTI");
         var hm = new HealthMonitor(tempDir, config, log);
-        hm.Start();
+        // Manual-evaluation test: do not start the background evaluator.
 
         var baseTime = DateTimeOffset.UtcNow.AddHours(-2);
-        hm.OnBar("MES", baseTime, close: 6000m);
-        hm.OnBar("NQ", baseTime, close: 21000m);
+        hm.OnBar("MES", baseTime, close: 6000m, volume: 100);
+        hm.OnBar("NQ", baseTime, close: 21000m, volume: 100);
 
         // Both stall simultaneously (no bars for 350s)
         var evalTime = baseTime.AddSeconds(350);
         hm.Evaluate(evalTime);
         hm.Stop();
+        svc.Stop();
         System.Threading.Thread.Sleep(500);
         var events = ReadLogEvents(logDir, "DATA_LOSS_DETECTED");
 
@@ -140,16 +157,16 @@ public static class HealthMonitorDataStallTests
         var config = new HealthMonitorConfig { enabled = true, default_stall_seconds = 300 };
         var log = new RobotLogger(tempDir, logDir, "MES");
         var hm = new HealthMonitor(tempDir, config, log);
-        hm.Start();
+        // Manual-evaluation test: do not start the background evaluator.
 
         var baseTime = DateTimeOffset.UtcNow.AddHours(-2);
         // Feed bars at 60s intervals to establish expected_interval ~60
         for (int i = 0; i < 10; i++)
-            hm.OnBar("MES", baseTime.AddSeconds(i * 60), close: 6000m + i);
+            hm.OnBar("MES", baseTime.AddSeconds(i * 60), close: 6000m + i, volume: 100 + i);
 
         // One delayed bar: gap 120s (2x expected) - debounce requires max(300, 180)=300, so 120 < 300, no stall
         var afterGap = baseTime.AddSeconds(9 * 60 + 120);
-        hm.OnBar("MES", afterGap, close: 6010m);
+        hm.OnBar("MES", afterGap, close: 6010m, volume: 120);
         var evalAfterOneGap = afterGap.AddSeconds(10);
         hm.Evaluate(evalAfterOneGap);
 
@@ -162,11 +179,159 @@ public static class HealthMonitorDataStallTests
         var evalSustained = afterGap.AddSeconds(350);
         hm.Evaluate(evalSustained);
         hm.Stop();
+        svc.Stop();
         System.Threading.Thread.Sleep(500);
         var events2 = ReadLogEvents(logDir, "DATA_LOSS_DETECTED");
 
         if (events2.Count == 0)
             return (false, "Sustained 350s gap should trigger stall");
+        return (true, null);
+    }
+
+    private static (bool Pass, string? Error) TestDisconnectBurstRequestsControlledShutdown((string tempDir, string logDir) paths)
+    {
+        var (tempDir, logDir) = paths;
+        var svc = RobotLoggingService.GetOrCreate(tempDir, logDir);
+        svc.Start();
+        var config = new HealthMonitorConfig { enabled = true, default_stall_seconds = 300 };
+        var log = new RobotLogger(tempDir, logDir, "MULTI");
+        var hm = new HealthMonitor(tempDir, config, log);
+        var shutdownRequests = new List<string>();
+        hm.SetActiveStreamsCallback(() => true);
+        hm.SetConnectivityShutdownCallback((reason, _, _) => shutdownRequests.Add(reason));
+        // Manual-evaluation test: do not start the background evaluator.
+
+        var baseTime = DateTimeOffset.UtcNow.AddHours(-2);
+        hm.OnConnectionStatusUpdate(ConnectionStatus.ConnectionLost, "Playback", baseTime);
+        hm.OnBar("MES", baseTime, close: 6000m, volume: 100);
+        hm.OnBar("MNQ", baseTime, close: 21000m, volume: 100);
+        hm.OnBar("MNG", baseTime, close: 2.5m, volume: 100);
+
+        hm.Evaluate(baseTime.AddSeconds(500));
+        hm.Stop();
+        svc.Stop();
+
+        if (shutdownRequests.Count != 1)
+            return (false, $"Expected exactly one connectivity shutdown request, got {shutdownRequests.Count}");
+        if (!string.Equals(shutdownRequests[0], "DISCONNECT_CLASSIFIED_DATA_LOSS_BURST", StringComparison.Ordinal))
+            return (false, $"Expected DISCONNECT_CLASSIFIED_DATA_LOSS_BURST, got {shutdownRequests[0]}");
+        return (true, null);
+    }
+
+    private static (bool Pass, string? Error) TestRepeatedConnectionLossRequestsControlledShutdown((string tempDir, string logDir) paths)
+    {
+        var (tempDir, logDir) = paths;
+        var svc = RobotLoggingService.GetOrCreate(tempDir, logDir);
+        svc.Start();
+        var config = new HealthMonitorConfig { enabled = true, default_stall_seconds = 300 };
+        var log = new RobotLogger(tempDir, logDir, "MES");
+        var hm = new HealthMonitor(tempDir, config, log);
+        var shutdownRequests = new List<string>();
+        hm.SetConnectivityShutdownCallback((reason, _, _) => shutdownRequests.Add(reason));
+        // Manual-evaluation test: do not start the background evaluator.
+
+        var baseTime = DateTimeOffset.UtcNow.AddHours(-1);
+        for (int i = 0; i < 4; i++)
+        {
+            var incidentTime = baseTime.AddSeconds(i * 70);
+            hm.OnConnectionStatusUpdate(ConnectionStatus.ConnectionLost, "Playback", incidentTime);
+            hm.OnConnectionStatusUpdate(ConnectionStatus.Connected, "Playback", incidentTime.AddSeconds(1));
+        }
+
+        hm.Stop();
+        svc.Stop();
+
+        if (shutdownRequests.Count != 1)
+            return (false, $"Expected exactly one connectivity shutdown request from repeated connection loss, got {shutdownRequests.Count}");
+        if (!string.Equals(shutdownRequests[0], "PRICE_CONNECTION_LOSS_REPEATED", StringComparison.Ordinal))
+            return (false, $"Expected PRICE_CONNECTION_LOSS_REPEATED, got {shutdownRequests[0]}");
+        return (true, null);
+    }
+
+    private static (bool Pass, string? Error) TestDisconnectBurstRequestsControlledShutdownWithoutActiveStreams((string tempDir, string logDir) paths)
+    {
+        var (tempDir, logDir) = paths;
+        var svc = RobotLoggingService.GetOrCreate(tempDir, logDir);
+        svc.Start();
+        var config = new HealthMonitorConfig { enabled = true, default_stall_seconds = 300 };
+        var log = new RobotLogger(tempDir, logDir, "MULTI");
+        var hm = new HealthMonitor(tempDir, config, log);
+        var shutdownRequests = new List<string>();
+        hm.SetActiveStreamsCallback(() => false);
+        hm.SetConnectivityShutdownCallback((reason, _, _) => shutdownRequests.Add(reason));
+        // Manual-evaluation test: do not start the background evaluator.
+
+        var baseTime = DateTimeOffset.UtcNow.AddHours(-2);
+        hm.OnConnectionStatusUpdate(ConnectionStatus.ConnectionLost, "Playback", baseTime);
+        hm.OnBar("MES", baseTime, close: 6000m, volume: 100);
+        hm.OnBar("MNQ", baseTime, close: 21000m, volume: 100);
+        hm.OnBar("MNG", baseTime, close: 2.5m, volume: 100);
+
+        hm.Evaluate(baseTime.AddSeconds(500));
+        hm.Stop();
+        svc.Stop();
+
+        if (shutdownRequests.Count != 1)
+            return (false, $"Expected exactly one connectivity shutdown request without active streams, got {shutdownRequests.Count}");
+        if (!string.Equals(shutdownRequests[0], "DISCONNECT_CLASSIFIED_DATA_LOSS_BURST", StringComparison.Ordinal))
+            return (false, $"Expected DISCONNECT_CLASSIFIED_DATA_LOSS_BURST, got {shutdownRequests[0]}");
+        return (true, null);
+    }
+
+    private static (bool Pass, string? Error) TestPlaybackImmediateDisconnectShutdownSuppressedDuringStartupGrace((string tempDir, string logDir) paths)
+    {
+        var (tempDir, logDir) = paths;
+        var svc = RobotLoggingService.GetOrCreate(tempDir, logDir);
+        svc.Start();
+        var config = new HealthMonitorConfig { enabled = true, default_stall_seconds = 300 };
+        var log = new RobotLogger(tempDir, logDir, "MNG");
+        var hm = new HealthMonitor(tempDir, config, log);
+        var shutdownRequests = new List<string>();
+        hm.SetRunId(Guid.NewGuid().ToString("N"));
+        hm.SetPlaybackTelemetryMode(true);
+        hm.SetActiveStreamsCallback(() => true);
+        hm.SetConnectivityShutdownCallback((reason, _, _) => shutdownRequests.Add(reason));
+        // Manual-evaluation test: do not start the background evaluator.
+
+        var baseTime = DateTimeOffset.UtcNow.AddSeconds(-500);
+        hm.OnConnectionStatusUpdate(ConnectionStatus.ConnectionLost, "Playback", baseTime);
+        hm.OnBar("MNG", baseTime, close: 2.5m, volume: 100);
+
+        hm.Evaluate(DateTimeOffset.UtcNow);
+        hm.Stop();
+        svc.Stop();
+
+        if (shutdownRequests.Any(r => string.Equals(r, "DISCONNECT_CLASSIFIED_DATA_LOSS_PLAYBACK_IMMEDIATE", StringComparison.Ordinal)))
+            return (false, "Playback immediate disconnect shutdown should be suppressed during startup grace");
+        return (true, null);
+    }
+
+    private static (bool Pass, string? Error) TestPlaybackSuppressesBarTimestampDataLoss((string tempDir, string logDir) paths)
+    {
+        var (tempDir, logDir) = paths;
+        var svc = RobotLoggingService.GetOrCreate(tempDir, logDir);
+        svc.Start();
+        var config = new HealthMonitorConfig { enabled = true, default_stall_seconds = 300 };
+        var log = new RobotLogger(tempDir, logDir, "MNG");
+        var hm = new HealthMonitor(tempDir, config, log);
+        var shutdownRequests = new List<string>();
+        hm.SetRunId(Guid.NewGuid().ToString("N"));
+        hm.SetPlaybackTelemetryMode(true);
+        hm.SetActiveStreamsCallback(() => true);
+        hm.SetConnectivityShutdownCallback((reason, _, _) => shutdownRequests.Add(reason));
+
+        var replayBarTime = DateTimeOffset.UtcNow.AddHours(-2);
+        hm.OnBar("MNG", replayBarTime, close: 2.5m, volume: 100);
+        hm.Evaluate(DateTimeOffset.UtcNow);
+        hm.Stop();
+        svc.Stop();
+        System.Threading.Thread.Sleep(500);
+
+        var events = ReadLogEvents(logDir, "DATA_LOSS_DETECTED");
+        if (events.Count > 0)
+            return (false, $"Playback bar time should not emit DATA_LOSS_DETECTED, got {events.Count}");
+        if (shutdownRequests.Count > 0)
+            return (false, $"Playback bar time should not request connectivity shutdown, got {string.Join(", ", shutdownRequests)}");
         return (true, null);
     }
 

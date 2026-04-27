@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections.Generic;
+using QTSW2.Robot.Contracts;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -36,7 +37,19 @@ public sealed partial class NinjaTraderSimAdapter
     private OrderModificationResult ModifyStopToBreakEvenReal(string intentId, string instrument, decimal beStopPrice, DateTimeOffset utcNow)
         => throw new NotImplementedException("NinjaTraderSimAdapter.NT.cs excluded - no real NT implementation.");
 
+    private OrderModificationResult ModifyStopToBreakEvenReal(string intentId, string instrument, decimal beStopPrice, DateTimeOffset utcNow, int retryCount)
+        => throw new NotImplementedException("NinjaTraderSimAdapter.NT.cs excluded - no real NT implementation.");
+
     private FlattenResult FlattenIntentReal(string intentId, string instrument, DateTimeOffset utcNow)
+        => throw new NotImplementedException("NinjaTraderSimAdapter.NT.cs excluded - no real NT implementation.");
+
+    private FlattenResult FlattenIntentReal(
+        string intentId,
+        string instrument,
+        DateTimeOffset utcNow,
+        NtDestructivePolicyAlreadyAppliedToken? policyPrechecked = null,
+        DestructiveActionSource? destructiveSourceOverride = null,
+        DestructiveTriggerReason? explicitTriggerOverride = null)
         => throw new NotImplementedException("NinjaTraderSimAdapter.NT.cs excluded - no real NT implementation.");
 
     private int GetCurrentPositionReal(string instrument)
@@ -46,6 +59,15 @@ public sealed partial class NinjaTraderSimAdapter
         => throw new NotImplementedException("NinjaTraderSimAdapter.NT.cs excluded - no real NT implementation.");
 
     private void CancelRobotOwnedWorkingOrdersReal(AccountSnapshot snap, DateTimeOffset utcNow)
+        => throw new NotImplementedException("NinjaTraderSimAdapter.NT.cs excluded - no real NT implementation.");
+
+    private void CancelRobotOwnedWorkingOrdersReal(
+        AccountSnapshot snap,
+        DateTimeOffset utcNow,
+        string? instrumentRootForScope,
+        IReadOnlyList<string>? explicitBrokerOrderIds,
+        bool allowAccountWideCancelFallback,
+        string? correlationId)
         => throw new NotImplementedException("NinjaTraderSimAdapter.NT.cs excluded - no real NT implementation.");
 
     private void CancelOrdersReal(List<string> orderIds, DateTimeOffset utcNow)

@@ -218,6 +218,8 @@ public sealed partial class InstrumentExecutionAuthority
         var supervisoryRequestsEmitted = 0;
         var divergenceEventsLogged = 0;
         var postFillAlign = QuantExecutionControlStore.IsPostFillAlignmentWindowActive(ExecutionInstrumentKey, utcNow);
+        var workingSubmitAlign = QuantExecutionControlStore.IsWorkingOrderSubmitWindowActive(ExecutionInstrumentKey, utcNow);
+        var pendingConvergence = postFillAlign || workingSubmitAlign;
 
         if (Log != null && (utcNow - _lastVerifyRegistryThreadAttrUtc).TotalSeconds >= 60)
         {
@@ -378,19 +380,20 @@ public sealed partial class InstrumentExecutionAuthority
             if (string.IsNullOrEmpty(brokerId) || _orderRegistry.Contains(brokerId)) continue;
 
             divergenceEventsLogged++;
-            _orderRegistry.IncrementIntegrityFailure();
-            if (postFillAlign)
+            if (pendingConvergence)
             {
                 Log?.Write(RobotEvents.ExecutionBase(utcNow, "", ExecutionInstrumentKey, "REGISTRY_PENDING_CONVERGENCE", new
                 {
                     broker_order_id = brokerId,
                     direction = "broker_has_registry_missing",
+                    convergence_source = workingSubmitAlign ? "working_order_submit" : "post_fill_alignment",
                     note = "Tier-1 PendingAlignment window — broker order not yet in registry; adopting without hard divergence escalation",
                     iea_instance_id = InstanceId
                 }));
             }
             else
             {
+                _orderRegistry.IncrementIntegrityFailure();
                 Log?.Write(RobotEvents.ExecutionBase(utcNow, "", ExecutionInstrumentKey, "REGISTRY_BROKER_DIVERGENCE", new
                 {
                     broker_order_id = brokerId,
@@ -401,13 +404,14 @@ public sealed partial class InstrumentExecutionAuthority
             }
             if (TryAdoptBrokerOrderIfNotInRegistry(o))
             {
-                if (postFillAlign)
+                if (pendingConvergence)
                 {
                     Log?.Write(RobotEvents.ExecutionBase(utcNow, "", ExecutionInstrumentKey, "REGISTRY_PENDING_CONVERGENCE", new
                     {
                         broker_order_id = brokerId,
                         direction = "broker_has_registry_missing",
                         phase = "adopted",
+                        convergence_source = workingSubmitAlign ? "working_order_submit" : "post_fill_alignment",
                         note = "Order adopted into registry during alignment window",
                         iea_instance_id = InstanceId
                     }));
@@ -423,7 +427,7 @@ public sealed partial class InstrumentExecutionAuthority
                 }
             }
 #if NINJATRADER
-            if (!postFillAlign)
+            if (!pendingConvergence)
             {
                 recoveryRequestsEmitted++;
                 supervisoryRequestsEmitted++;

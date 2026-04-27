@@ -13,6 +13,8 @@
 
 **Invariants:** NO_DUPLICATE_EXECUTION_PROCESSED, INTENT_REQUIRES_POLICY_BEFORE_SUBMISSION, BE_PRICE_CROSSED_BY_STEP, BE_TRIGGERED_BY_STEP.
 
+This pack has four processed replay steps, so the latest valid invariant assertion step is `4`.
+
 **Run:**
 ```bash
 dotnet run --project modules/robot/replay_host/Robot.ReplayHost.csproj -- \

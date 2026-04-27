@@ -309,6 +309,8 @@ public sealed partial class InstrumentExecutionAuthority
                 !simForGate.TrySessionIdentityGateForIntentBundle(bundleGateIds.ToList(), instrument, "entry_stop_aggregate", utcNow, out var bundleGateFailure))
                 return bundleGateFailure;
 
+            // Registry/adoption scans run on wall clock; arm this bounded convergence window on the same clock.
+            QuantExecutionControlStore.NotifyWorkingOrderSubmitTransition(instrument, ordersToSubmit.Count, DateTimeOffset.UtcNow);
             Executor.SubmitOrders(ordersToSubmit);
 
             foreach (var id in allIntentIds)

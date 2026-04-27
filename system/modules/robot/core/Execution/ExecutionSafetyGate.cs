@@ -205,7 +205,14 @@ public static class ExecutionSafetyGate
         if (reason.IndexOf("MANUAL", StringComparison.OrdinalIgnoreCase) >= 0)
             return ExecutionOverlayBlockReason.MANUAL_LOCK;
         if (reason.IndexOf("UNMAPPED", StringComparison.OrdinalIgnoreCase) >= 0 ||
-            reason.IndexOf("EXECUTION_FILL", StringComparison.OrdinalIgnoreCase) >= 0)
+            reason.IndexOf("EXECUTION_FILL", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            reason.Equals("NO_ACTIVE_EXPOSURES", StringComparison.OrdinalIgnoreCase) ||
+            reason.Equals("NO_ACTIVE_EXPOSURE", StringComparison.OrdinalIgnoreCase) ||
+            reason.Equals("ZERO_REMAINING_EXPOSURE", StringComparison.OrdinalIgnoreCase) ||
+            reason.Equals("UNTRACKED_TAG", StringComparison.OrdinalIgnoreCase) ||
+            reason.Equals("UNKNOWN_ORDER_AFTER_GRACE", StringComparison.OrdinalIgnoreCase) ||
+            reason.Equals("INTENT_NOT_FOUND", StringComparison.OrdinalIgnoreCase) ||
+            reason.Equals("TRADING_DATE_NULL", StringComparison.OrdinalIgnoreCase))
             return ExecutionOverlayBlockReason.UNMAPPED_FILL;
         return ExecutionOverlayBlockReason.KILL_SWITCH;
     }
@@ -278,6 +285,9 @@ public sealed class ExecutionSafetyEvaluationRequest
     /// <summary>Override <see cref="ExecutionSafetyGate.MaxBrokerSnapshotAgeMilliseconds"/> when &gt; 0.</summary>
     public int MaxBrokerSnapshotAgeMs { get; set; }
 
+    /// <summary>Single sampled authority/audit frame for this execution decision.</summary>
+    public ExecutionAuthorityFrame? AuthorityFrame { get; set; }
+
     /// <summary>
     /// Phase 8: Optional ledger ownership snapshot. When present and
     /// <see cref="FeatureFlags.StructuralLayerUseLedgerOwnership"/> is on, <see cref="ExecutionStructuralLayer"/>
@@ -302,6 +312,7 @@ public readonly struct PositionAuthorityEvaluatedArgs
 public sealed class ExecutionSafetySnapshot
 {
     public string Instrument { get; set; } = "";
+    public string AuthorityFrameId { get; set; } = "";
     public int BrokerQty { get; set; }
     public int JournalQty { get; set; }
     public int RealOpenQty { get; set; }

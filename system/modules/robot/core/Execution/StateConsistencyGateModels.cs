@@ -57,6 +57,7 @@ public sealed class StateConsistencyReleaseEvaluationInput
     public string Instrument { get; set; } = "";
     public int BrokerPositionQty { get; set; }
     public int BrokerWorkingCount { get; set; }
+    public int PendingExecutionWorkload { get; set; }
     /// <summary>Open journal remaining quantity (same semantics as mismatch assembly).</summary>
     public int JournalOpenQty { get; set; }
     /// <summary>IEA owned+adopted working count, or -1 if unavailable / fail-closed.</summary>
@@ -130,6 +131,9 @@ public sealed class StateConsistencyReleaseReadinessResult
     /// <summary>Count of blockers whose domain decision is <see cref="ReconciliationDecision.ADOPT"/>.</summary>
     public int DiagnosticAdoptDecisionCount { get; set; }
 
+    /// <summary>Pending execution workload used to distinguish active risk from residual cleanup lag.</summary>
+    public int DiagnosticPendingExecutionWorkload { get; set; }
+
     /// <summary>True when blocker list could not be fully resolved (fail-closed signal).</summary>
     public bool BlockerInvariantViolation { get; set; }
 
@@ -138,6 +142,20 @@ public sealed class StateConsistencyReleaseReadinessResult
 
     /// <summary>True when pending-adoption counts exist but classifier produced no diagnostics/blockers (modeling gap). Informational — does not by itself veto <see cref="ReleaseReady"/>.</summary>
     public bool LegacyClassifierGap { get; set; }
+
+    /// <summary>True when broker/working exposure is already flat and only journal/adoption retirement residue remains.</summary>
+    public bool ResidualCleanupOnly { get; set; }
+
+    /// <summary>Structured residual cleanup class for audits.</summary>
+    public string ResidualCleanupClass { get; set; } = ResidualCleanupMismatchClass.None.ToString();
+}
+
+public enum ResidualCleanupMismatchClass
+{
+    None = 0,
+    MISMATCH_RESIDUAL_JOURNAL_RETIREMENT = 1,
+    MISMATCH_RESIDUAL_ADOPTION_RETIREMENT = 2,
+    MISMATCH_RESIDUAL_JOURNAL_AND_ADOPTION_RETIREMENT = 3
 }
 
 /// <summary>P1.5-E: Structured result after an instrument-scoped gate reconciliation pass.</summary>
@@ -293,6 +311,14 @@ public static class StateConsistencyReleaseEvaluator
             r.IsExplainable = false;
 
         var releaseReady = r.IsExplainable && !hasStructuralBlocker && !r.BlockerInvariantViolation;
+        var residualCleanupClass = ClassifyResidualCleanup(i, r, resolved);
+        r.ResidualCleanupOnly = residualCleanupClass != ResidualCleanupMismatchClass.None;
+        r.ResidualCleanupClass = residualCleanupClass.ToString();
+        if (!releaseReady && r.ResidualCleanupOnly)
+        {
+            releaseReady = true;
+            r.Contradictions.Add($"info_residual_cleanup:{r.ResidualCleanupClass}");
+        }
         if (!releaseReady && IsBrokerFlatSoftTransitionOnlyRelease(i, r, resolved))
         {
             releaseReady = true;
@@ -301,7 +327,9 @@ public static class StateConsistencyReleaseEvaluator
 
         r.ReleaseReady = releaseReady;
         r.Summary = r.ReleaseReady
-            ? (r.Contradictions.Contains("info_soft_transition_broker_flat_release")
+            ? (r.ResidualCleanupOnly
+                ? $"release_ready_residual_cleanup:{r.ResidualCleanupClass}"
+                : r.Contradictions.Contains("info_soft_transition_broker_flat_release")
                 ? "release_ready_soft_transition_broker_flat"
                 : "release_ready")
             : string.Join(";", r.Contradictions);
@@ -313,6 +341,7 @@ public static class StateConsistencyReleaseEvaluator
         r.DiagnosticIeaOwnedPlusAdoptedWorking = i.IeaOwnedPlusAdoptedWorking;
         r.DiagnosticPendingAdoptionCandidateCount = adoptCount;
         r.DiagnosticAdoptDecisionCount = adoptCount;
+        r.DiagnosticPendingExecutionWorkload = i.PendingExecutionWorkload;
         return r;
     }
 
@@ -356,9 +385,15 @@ public static class StateConsistencyReleaseEvaluator
                 case ReconciliationDecision.RETRY:
                     if (!IsSoftTransitionBlocker(x.Blocker.ReasonCode))
                         return false;
+                    if (x.Blocker.ReasonCode == ReconciliationBlockerReasonCode.JournalOnlyBrokerFlat &&
+                        input.JournalOpenQty <= 0)
+                        return false;
                     continue;
                 case ReconciliationDecision.ALTERNATE_LANE:
                     if (x.Blocker.IsTerminal == true || !IsSoftTransitionBlocker(x.Blocker.ReasonCode))
+                        return false;
+                    if (x.Blocker.ReasonCode == ReconciliationBlockerReasonCode.JournalOnlyBrokerFlat &&
+                        input.JournalOpenQty <= 0)
                         return false;
                     continue;
                 default:
@@ -367,6 +402,65 @@ public static class StateConsistencyReleaseEvaluator
         }
 
         return true;
+    }
+
+    private static ResidualCleanupMismatchClass ClassifyResidualCleanup(
+        StateConsistencyReleaseEvaluationInput input,
+        StateConsistencyReleaseReadinessResult readiness,
+        IReadOnlyList<(ReconciliationBlocker Blocker, ReconciliationDecision Decision)> resolved)
+    {
+        if (input.PendingExecutionWorkload != 0)
+            return ResidualCleanupMismatchClass.None;
+        if (input.BrokerPositionQty != 0 || input.BrokerWorkingCount != 0)
+            return ResidualCleanupMismatchClass.None;
+        if (input.UseInstrumentExecutionAuthority && input.IeaOwnedPlusAdoptedWorking > 0)
+            return ResidualCleanupMismatchClass.None;
+        var brokerFlatJournalResidual = input.BrokerPositionQty == 0 && input.JournalOpenQty > 0;
+        if ((!readiness.BrokerPositionExplainable && !brokerFlatJournalResidual) ||
+            !readiness.BrokerWorkingExplainable ||
+            !readiness.LocalStateCoherent)
+            return ResidualCleanupMismatchClass.None;
+        if ((readiness.UnexplainedBrokerPositionQty != 0 && !brokerFlatJournalResidual) ||
+            readiness.UnexplainedBrokerWorkingCount != 0)
+            return ResidualCleanupMismatchClass.None;
+
+        var hasJournalResidual = input.JournalOpenQty > 0;
+        var hasAdoptionResidual = false;
+        foreach (var x in resolved)
+        {
+            switch (x.Decision)
+            {
+                case ReconciliationDecision.IGNORE:
+                    continue;
+                case ReconciliationDecision.ESCALATE:
+                    return ResidualCleanupMismatchClass.None;
+                case ReconciliationDecision.ADOPT:
+                case ReconciliationDecision.RETRY:
+                case ReconciliationDecision.ALTERNATE_LANE:
+                    if (!IsSoftTransitionBlocker(x.Blocker.ReasonCode))
+                        return ResidualCleanupMismatchClass.None;
+                    if (x.Blocker.ReasonCode == ReconciliationBlockerReasonCode.JournalOnlyBrokerFlat)
+                    {
+                        if (input.JournalOpenQty <= 0)
+                            return ResidualCleanupMismatchClass.None;
+                        hasJournalResidual = true;
+                    }
+                    else
+                        hasAdoptionResidual = true;
+                    continue;
+                default:
+                    return ResidualCleanupMismatchClass.None;
+            }
+        }
+
+        if (!hasJournalResidual && !hasAdoptionResidual)
+            return ResidualCleanupMismatchClass.None;
+
+        if (hasJournalResidual && hasAdoptionResidual)
+            return ResidualCleanupMismatchClass.MISMATCH_RESIDUAL_JOURNAL_AND_ADOPTION_RETIREMENT;
+        if (hasJournalResidual)
+            return ResidualCleanupMismatchClass.MISMATCH_RESIDUAL_JOURNAL_RETIREMENT;
+        return ResidualCleanupMismatchClass.MISMATCH_RESIDUAL_ADOPTION_RETIREMENT;
     }
 
     private static bool IsSoftTransitionBlocker(ReconciliationBlockerReasonCode reasonCode) =>

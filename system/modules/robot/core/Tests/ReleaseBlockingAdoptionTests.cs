@@ -19,6 +19,8 @@ public static class ReleaseBlockingAdoptionTests
         if (!b) return (false, eb);
         var (c, ec) = RobotTagStillBlocksWithZeroOpenQty();
         if (!c) return (false, ec);
+        var (d, ed) = TaggedUnfilledEntryDoesNotBlockWhileBrokerFlat();
+        if (!d) return (false, ed);
         return (true, null);
     }
 
@@ -163,6 +165,53 @@ public static class ReleaseBlockingAdoptionTests
             var n = journal.CountReleaseBlockingAdoptionCandidates("MES", "ES", 1, 1, tag, tag);
             if (n != 1)
                 return (false, $"Tagged intent should block even with 0 open journal qty; got {n}");
+            return (true, null);
+        }
+        finally
+        {
+            try { Directory.Delete(tempRoot, true); } catch { /* */ }
+        }
+    }
+
+    private static (bool Pass, string? Error) TaggedUnfilledEntryDoesNotBlockWhileBrokerFlat()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"RelBlock_{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            var journalDir = RobotRunArtifactPaths.StateExecutionJournals(tempRoot);
+            Directory.CreateDirectory(journalDir);
+
+            var tid = "taggedflatentry1";
+            WriteJournal(journalDir, tid, new ExecutionJournalEntry
+            {
+                IntentId = tid,
+                TradingDate = "2026-04-01",
+                Stream = "T",
+                Instrument = "MCL",
+                EntrySubmitted = true,
+                TradeCompleted = false,
+                EntryFilled = false,
+                Direction = "Short",
+                BrokerOrderId = "broker-flat-working"
+            });
+
+            var log = new RobotLogger(Path.Combine(tempRoot, "log"));
+            var journal = new ExecutionJournal(tempRoot, log);
+
+            var tag = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { tid };
+            var n = journal.CountReleaseBlockingAdoptionCandidates("MCL", "CL", brokerPositionQtyAbs: 0, brokerPositionQtySigned: 0, tag, null);
+            if (n != 0)
+                return (false, $"Tagged unfilled flat broker entry should not block; got {n}");
+
+            var audit = journal.BuildReleaseBlockingCandidateAudit("MCL", "CL", 0, 0, tag, null, sampleLimit: 20);
+            if (audit.BlockingCandidateCount != 0)
+                return (false, $"Audit blocking count expected 0, got {audit.BlockingCandidateCount}");
+            if (!audit.ExcludedIntentIdsSample.Contains(tid, StringComparer.OrdinalIgnoreCase))
+                return (false, "Excluded sample should include tagged unfilled broker-flat entry");
+            if (!audit.ExclusionReasonsSample.Contains(ReleaseBlockingExclusionReasons.LIVE_TAGGED_UNFILLED_ENTRY, StringComparer.OrdinalIgnoreCase))
+                return (false, "Expected LIVE_TAGGED_UNFILLED_ENTRY exclusion reason");
+
             return (true, null);
         }
         finally

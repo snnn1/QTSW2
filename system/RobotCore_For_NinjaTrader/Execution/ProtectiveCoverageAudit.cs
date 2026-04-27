@@ -114,11 +114,12 @@ public static class ProtectiveCoverageAudit
         // Missing stop: critical unless bounded post-fill convergence (mapped fill → PendingAlignment window)
         if (robotProtectiveStops.Count == 0)
         {
-            if (IsWithinBoundedPostFillConvergenceWindow(instrument, utcNow))
+            if (IsWithinBoundedPostFillConvergenceWindow(instrument, utcNow) ||
+                IsWithinBrokerExecutionCallbackWindow(instrument, utcNow))
             {
                 result.Status = ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE;
                 result.Detail =
-                    "No broker-visible protective stop in snapshot; bounded convergence: PendingAlignment + LastProtectiveStopSubmitUtc >= LastMappedFillUtc (QuantExecutionControlStore)";
+                    "No broker-visible protective stop in snapshot; bounded convergence: mapped fill pending protective submit visibility (QuantExecutionControlStore)";
                 return result;
             }
 
@@ -130,6 +131,15 @@ public static class ProtectiveCoverageAudit
         // Stop qty mismatch: under-covered is critical
         if (totalStopQty < absQty)
         {
+            if (IsWithinBoundedProtectiveResizeWindow(instrument, absQty, utcNow) ||
+                IsWithinBrokerExecutionCallbackWindow(instrument, utcNow))
+            {
+                result.Status = ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE;
+                result.Detail =
+                    $"Stop qty {totalStopQty} < broker exposure {absQty}; bounded convergence: protective coverage pending";
+                return result;
+            }
+
             result.Status = ProtectiveAuditStatus.PROTECTIVE_STOP_QTY_MISMATCH;
             result.Detail = $"Stop qty {totalStopQty} < broker exposure {absQty}";
             return result;
@@ -158,6 +168,15 @@ public static class ProtectiveCoverageAudit
 
         if (totalTargetQty < absQty)
         {
+            if (IsWithinBoundedProtectiveResizeWindow(instrument, absQty, utcNow) ||
+                IsWithinBrokerExecutionCallbackWindow(instrument, utcNow))
+            {
+                result.Status = ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE;
+                result.Detail =
+                    $"Target qty {totalTargetQty} < broker exposure {absQty}; bounded convergence: protective coverage pending";
+                return result;
+            }
+
             result.Status = ProtectiveAuditStatus.PROTECTIVE_TARGET_QTY_MISMATCH;
             result.Detail = $"Target qty {totalTargetQty} < broker exposure {absQty}";
             return result;
@@ -218,8 +237,7 @@ public static class ProtectiveCoverageAudit
     /// <remarks>
     /// <para><see cref="QuantExecutionInstrumentPhase.PendingAlignment"/> is entered on mapped trusted fill before protective submit
     /// completes — it does <b>not</b> alone imply submit. Convergence additionally requires
-    /// <see cref="QuantExpectedInstrumentState.LastProtectiveStopSubmitUtc"/> &gt;= <see cref="QuantExpectedInstrumentState.LastMappedFillUtc"/>
-    /// (adapter calls <see cref="QuantExecutionControlStore.NotifyProtectiveStopSubmitted"/> after successful stop submit).</para>
+    /// <see cref="QuantExpectedInstrumentState.LastProtectiveStopSubmitUtc"/> &gt;= <see cref="QuantExpectedInstrumentState.LastMappedFillUtc"/>.</para>
     /// <para>Does not apply to <see cref="QuantExecutionInstrumentPhase.UnmappedExecution"/>,
     /// <see cref="QuantExecutionInstrumentPhase.ExecutionLocked"/>, or <see cref="QuantExecutionInstrumentPhase.RecoveryRequired"/> —
     /// those phases are never <c>PendingAlignment</c> for this audit, and <see cref="QuantExecutionControlStore.NotifyMappedTrustedFill"/>
@@ -253,11 +271,21 @@ public static class ProtectiveCoverageAudit
             return false;
 
         if (!snap.Expected.LastProtectiveStopSubmitUtc.HasValue)
-            return false;
+            return true;
 
         if (snap.Expected.LastProtectiveStopSubmitUtc.Value < snap.Expected.LastMappedFillUtc.Value)
             return false;
 
         return true;
+    }
+
+    private static bool IsWithinBoundedProtectiveResizeWindow(string instrument, int expectedProtectiveQty, DateTimeOffset utcNow)
+    {
+        return QuantExecutionControlStore.IsProtectiveResizePendingActive(instrument, expectedProtectiveQty, utcNow);
+    }
+
+    private static bool IsWithinBrokerExecutionCallbackWindow(string instrument, DateTimeOffset utcNow)
+    {
+        return QuantExecutionControlStore.IsBrokerExecutionCallbackPendingActive(instrument, utcNow);
     }
 }

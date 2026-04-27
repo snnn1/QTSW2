@@ -117,5 +117,20 @@ public sealed class TimeService
     /// Format DateOnly as yyyy-MM-dd string (replaces .ToString("yyyy-MM-dd") pattern).
     /// </summary>
     public static string FormatDateOnly(DateOnly date) => date.ToString("yyyy-MM-dd");
-}
 
+    /// <summary>
+    /// CME futures session rules: Sun 17:00 CT to Fri 16:00 CT, excluding the daily 16:00-17:00 CT maintenance break.
+    /// </summary>
+    public static bool IsCmeMarketOpen(DateTimeOffset chicagoTime)
+    {
+        var dt = chicagoTime.DateTime;
+        var weekday = dt.DayOfWeek;
+        var minutes = dt.Hour * 60 + dt.Minute;
+
+        if (weekday == DayOfWeek.Saturday) return false;
+        if (weekday == DayOfWeek.Sunday) return minutes >= 17 * 60;
+        if (weekday == DayOfWeek.Friday) return minutes < 16 * 60;
+        if (minutes >= 16 * 60 && minutes < 17 * 60) return false;
+        return true;
+    }
+}

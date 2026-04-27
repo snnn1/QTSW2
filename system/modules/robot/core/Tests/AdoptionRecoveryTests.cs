@@ -31,6 +31,9 @@ public static class AdoptionRecoveryTests
         var (p3, e3) = TestNoAdoptableEvidenceFailClosed();
         if (!p3) return (false, e3);
 
+        var (p3b, e3b) = TestLocalWorkingAheadClassifiesAsConvergence();
+        if (!p3b) return (false, e3b);
+
         // 5. Bootstrap LIVE_ORDERS_PRESENT_NO_POSITION + SlotJournalShowsEntryStopsExpected -> ADOPT
         var (p4, e4) = TestBootstrapAdoptEntryStops();
         if (!p4) return (false, e4);
@@ -153,6 +156,21 @@ public static class AdoptionRecoveryTests
             localWorkingOrderCount: 0);
         if (mismatchType != MismatchType.ORDER_REGISTRY_MISSING)
             return (false, $"No adoptable evidence: expected ORDER_REGISTRY_MISSING, got {mismatchType}");
+        return (true, null);
+    }
+
+    private static (bool Pass, string? Error) TestLocalWorkingAheadClassifiesAsConvergence()
+    {
+        var mismatchType = MismatchClassification.Classify(
+            brokerQtyAbs: 2,
+            grossJournalQty: 2,
+            netBrokerQty: -2,
+            netJournalQty: -2,
+            opposingMultiIntentOpen: false,
+            brokerWorkingOrderCount: 2,
+            localWorkingOrderCount: 4);
+        if (mismatchType != MismatchType.WORKING_ORDER_COUNT_CONVERGENCE)
+            return (false, $"Local working ahead: expected WORKING_ORDER_COUNT_CONVERGENCE, got {mismatchType}");
         return (true, null);
     }
 

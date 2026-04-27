@@ -2343,6 +2343,7 @@ public sealed class StreamStateMachine
                     if (utcNow >= MarketCloseUtc)
                     {
                         if (TryCommitCompletedTradeAtMarketClose(utcNow)) return;
+                        if (HasEntryFillForCurrentStream()) return;
                         LogNoTradeMarketClose(utcNow);
                         if (!Commit(utcNow, "NO_TRADE_MARKET_CLOSE", "MARKET_CLOSE_NO_TRADE")) return;
                         return;
@@ -2418,9 +2419,10 @@ public sealed class StreamStateMachine
     {
         // Check for market close cutoff (all execution modes)
         // If market has closed and no entry detected, commit as NO_TRADE_MARKET_CLOSE
-        if (!_entryDetected && utcNow >= MarketCloseUtc)
+        if (utcNow >= MarketCloseUtc)
         {
             if (TryCommitCompletedTradeAtMarketClose(utcNow)) return;
+            if (HasEntryFillForCurrentStream()) return;
             LogNoTradeMarketClose(utcNow);
             if (!Commit(utcNow, "NO_TRADE_MARKET_CLOSE", "MARKET_CLOSE_NO_TRADE")) return;
             return;
@@ -2688,9 +2690,10 @@ public sealed class StreamStateMachine
         }
         
         // Check for market close cutoff (all execution modes)
-        if (!_entryDetected && utcNow >= MarketCloseUtc)
+        if (utcNow >= MarketCloseUtc)
         {
             if (TryCommitCompletedTradeAtMarketClose(utcNow)) return;
+            if (HasEntryFillForCurrentStream()) return;
             LogNoTradeMarketClose(utcNow);
             if (!Commit(utcNow, "NO_TRADE_MARKET_CLOSE", "MARKET_CLOSE_NO_TRADE")) return;
         }
@@ -6634,8 +6637,55 @@ public sealed class StreamStateMachine
         _journal.SlotStatus = r.SlotStatus;
     }
 
-    private bool HasCompletedTradeForCurrentStream() =>
-        _executionJournal?.HasCompletedTradeForStream(TradingDate, Stream) == true;
+    private bool HasCompletedTradeForCurrentStream()
+    {
+        if (_executionJournal == null)
+            return false;
+
+        // During a forced-flatten/reentry episode, the original intent completing must not make
+        // the stream look terminal while the reentry lifecycle is still unresolved.
+        if (_journal.ExecutionInterruptedByClose && !_journal.ReentryFilled)
+            return false;
+
+        if (!string.IsNullOrWhiteSpace(_journal.ReentryIntentId))
+        {
+            if (_journal.ReentryFilled)
+                return _executionJournal.IsIntentCompleted(_journal.ReentryIntentId, TradingDate, Stream);
+
+            if (_journal.ReentrySubmitted || _journal.ReentrySubmitFailureCount > 0)
+                return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(_journal.OriginalIntentId))
+            return _executionJournal.IsIntentCompleted(_journal.OriginalIntentId, TradingDate, Stream);
+
+        return _executionJournal.HasCompletedTradeForStream(TradingDate, Stream);
+    }
+
+    private bool HasEntryFillForCurrentStream()
+    {
+        if (_executionJournal == null)
+            return _entryDetected;
+
+        if (!string.IsNullOrWhiteSpace(_journal.ReentryIntentId))
+        {
+            var reentry = _executionJournal.GetEntry(_journal.ReentryIntentId, TradingDate, Stream);
+            if (reentry?.EntryFilled == true)
+                return true;
+
+            if (_journal.ReentrySubmitted || _journal.ReentrySubmitFailureCount > 0)
+                return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(_journal.OriginalIntentId))
+        {
+            var original = _executionJournal.GetEntry(_journal.OriginalIntentId, TradingDate, Stream);
+            if (original?.EntryFilled == true)
+                return true;
+        }
+
+        return _executionJournal.HasEntryFillForStream(TradingDate, Stream) || _entryDetected;
+    }
 
     private bool TryCommitCompletedTradeAtMarketClose(DateTimeOffset utcNow)
     {
@@ -6662,7 +6712,7 @@ public sealed class StreamStateMachine
         }
 
         var rollback = CaptureJournalCommitRollback();
-        var hasCompletedTradeForStream = _executionJournal?.HasCompletedTradeForStream(TradingDate, Stream) == true;
+        var hasCompletedTradeForStream = HasCompletedTradeForCurrentStream();
         if (hasCompletedTradeForStream &&
             (commitReason == "NO_TRADE_MARKET_CLOSE" || commitReason.Contains("NO_TRADE")))
         {
@@ -6778,11 +6828,7 @@ public sealed class StreamStateMachine
     private StreamTerminalState DetermineTerminalState(string commitReason, DateTimeOffset utcNow)
     {
         // Check if trade was completed (from execution journal)
-        bool tradeCompleted = false;
-        if (_executionJournal != null)
-        {
-            tradeCompleted = _executionJournal.HasCompletedTradeForStream(TradingDate, Stream);
-        }
+        var tradeCompleted = HasCompletedTradeForCurrentStream();
 
         // Classify based on commit reason and trade completion
         if (tradeCompleted)
@@ -7527,7 +7573,7 @@ public sealed class StreamStateMachine
                 _journal.OriginalIntentId = openEntry.IntentId;
                 hasOpenOriginalPosition = true;
             }
-            else if (_executionJournal.HasCompletedTradeForStream(TradingDate, Stream))
+            else if (HasCompletedTradeForCurrentStream())
             {
                 _engine?.LogEngineEvent(utcNow, "FORCED_FLATTEN_SKIPPED_COMPLETED_TRADE", new Dictionary<string, object?>
                 {
@@ -8194,6 +8240,25 @@ public sealed class StreamStateMachine
         if (!IsActiveInterruptedBySessionClose || string.IsNullOrWhiteSpace(_journal.OriginalIntentId))
             return;
 
+        var reentryEvaluationUtc = utcNow;
+        var reentryEvaluationSource = "late_confirm_callback";
+        if (_journal.NextSlotTimeUtc.HasValue && reentryEvaluationUtc >= _journal.NextSlotTimeUtc.Value)
+        {
+            // Playback order callbacks can carry wall-clock time long after the historical slot. Do not
+            // synthesize a future in-slot timestamp, because that bypasses the market-open gate and
+            // re-enters immediately after flatten. Fall back to the logical forced-flatten time and let
+            // ordinary replay ticks submit only when the configured reopen time is actually reached.
+            if (_journal.ForcedFlattenTimestamp.HasValue)
+            {
+                reentryEvaluationUtc = _journal.ForcedFlattenTimestamp.Value;
+                reentryEvaluationSource = "forced_flatten_timestamp_after_wall_clock_callback";
+            }
+            else
+            {
+                reentryEvaluationSource = "late_confirm_callback_after_slot_no_logical_fallback";
+            }
+        }
+
         _journal.LastUpdateUtc = utcNow.ToString("o");
         _journals.Save(_journal);
 
@@ -8204,9 +8269,18 @@ public sealed class StreamStateMachine
                 original_intent_id = _journal.OriginalIntentId ?? "",
                 execution_instrument = ExecutionInstrument ?? Instrument ?? "",
                 forced_flatten_timestamp_utc = _journal.ForcedFlattenTimestamp?.ToString("o") ?? "",
+                late_confirm_wall_clock_utc = utcNow.ToString("o"),
+                reentry_evaluation_utc = reentryEvaluationUtc.ToString("o"),
+                reentry_evaluation_source = reentryEvaluationSource,
+                next_slot_time_utc = _journal.NextSlotTimeUtc?.ToString("o") ?? "",
                 reentry_submitted = _journal.ReentrySubmitted,
                 note = "Late forced-flatten fill closed the original trade and broker is flat; stream remains active for market-open reentry."
             }));
+
+        // Late broker-flat proof can arrive after the last ordinary tick for the interrupted stream.
+        // Kick the normal reentry gate immediately so the stream does not stay stranded waiting for
+        // another tick that may never arrive before shutdown.
+        CheckMarketOpenReentry(reentryEvaluationUtc);
     }
 
     /// <summary>

@@ -16,6 +16,7 @@ public static class PostFillAlignmentGate
     private sealed class GateState
     {
         public int CumulativeExpectedAbs;
+        public int CumulativeExpectedSigned;
         public DateTimeOffset ExpiryUtc;
         public string Cause = "mapped_trusted_fill";
     }
@@ -29,11 +30,12 @@ public static class PostFillAlignmentGate
     /// <summary>
     /// Trusted mapped fill path only — pairs with <see cref="JournalParityPendingLedger.TryRecordTrustedFill"/>.
     /// </summary>
-    public static void ArmTrustedMappedFill(string instrument, int absSignedQuantity, string? cause, DateTimeOffset utcNow)
+    public static void ArmTrustedMappedFill(string instrument, int signedQuantity, string? cause, DateTimeOffset utcNow)
     {
-        if (!FeatureFlags.EnablePostFillAlignmentGate || absSignedQuantity <= 0) return;
+        if (!FeatureFlags.EnablePostFillAlignmentGate || signedQuantity == 0) return;
         var inst = instrument?.Trim() ?? "";
         if (string.IsNullOrEmpty(inst)) return;
+        var absSignedQuantity = Math.Abs(signedQuantity);
         var windowMs = FeatureFlags.PostFillAlignmentWindowMs > 0 ? FeatureFlags.PostFillAlignmentWindowMs : 5000;
         var expiry = utcNow.AddMilliseconds(windowMs);
         ByInstrument.AddOrUpdate(
@@ -41,12 +43,14 @@ public static class PostFillAlignmentGate
             _ => new GateState
             {
                 CumulativeExpectedAbs = absSignedQuantity,
+                CumulativeExpectedSigned = signedQuantity,
                 ExpiryUtc = expiry,
                 Cause = string.IsNullOrWhiteSpace(cause) ? "mapped_trusted_fill" : cause.Trim()
             },
             (_, st) =>
             {
                 st.CumulativeExpectedAbs += absSignedQuantity;
+                st.CumulativeExpectedSigned += signedQuantity;
                 if (expiry > st.ExpiryUtc)
                     st.ExpiryUtc = expiry;
                 if (!string.IsNullOrWhiteSpace(cause))
@@ -87,6 +91,7 @@ public static class PostFillAlignmentGate
         string instrument,
         DateTimeOffset utcNow,
         int posDiff,
+        int signedDelta,
         int absSignedDelta,
         int brokerAbs,
         int journalStructural,
@@ -109,6 +114,11 @@ public static class PostFillAlignmentGate
             return false;
 
         if (posDiff != absSignedDelta)
+            return false;
+
+        if (st.CumulativeExpectedSigned == 0 ||
+            Math.Sign(signedDelta) != Math.Sign(st.CumulativeExpectedSigned) ||
+            Math.Abs(signedDelta) > Math.Abs(st.CumulativeExpectedSigned))
             return false;
 
         result = new JournalParityResult

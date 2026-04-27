@@ -79,6 +79,49 @@ public static class ProtectiveCoverageAuditTests
         if (r.Status != ProtectiveAuditStatus.PROTECTIVE_STOP_QTY_MISMATCH)
             return (false, $"Stop qty mismatch: expected PROTECTIVE_STOP_QTY_MISMATCH, got {r.Status}");
 
+        // 3b. Resize in-flight: broker has expanded exposure before the replacement stop/target is broker-visible.
+        QuantExecutionControlStore.Clear();
+        QuantExecutionControlStore.NotifyProtectiveResizePending("MNQ", 2, utcNow);
+        r = ProtectiveCoverageAudit.Audit("MNQ", snap, null, false, false, false, utcNow.AddMilliseconds(1));
+        if (r.Status != ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE)
+            return (false, $"Resize pending stop qty handoff: expected PROTECTIVE_PENDING_CONVERGENCE, got {r.Status}");
+
+        // 3c. Same resize window also suppresses transient target under-coverage.
+        QuantExecutionControlStore.Clear();
+        QuantExecutionControlStore.NotifyProtectiveResizePending("MNQ", 2, utcNow);
+        snap = new AccountSnapshot
+        {
+            Positions = new List<PositionSnapshot> { new() { Instrument = "MNQ", Quantity = 2, AveragePrice = 21000m } },
+            WorkingOrders = new List<WorkingOrderSnapshot>
+            {
+                new() { Instrument = "MNQ", Tag = "QTSW2:intent1:STOP", StopPrice = 20950m, Quantity = 2 },
+                new() { Instrument = "MNQ", Tag = "QTSW2:intent1:TARGET", Price = 21050m, Quantity = 1 }
+            }
+        };
+        r = ProtectiveCoverageAudit.Audit("MNQ", snap, null, false, false, false, utcNow.AddMilliseconds(1));
+        if (r.Status != ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE)
+            return (false, $"Resize pending target qty handoff: expected PROTECTIVE_PENDING_CONVERGENCE, got {r.Status}");
+        QuantExecutionControlStore.Clear();
+
+        // 3d. Broker callback can expose the larger position before ExecutionUpdate submits the second stream's protection.
+        snap = new AccountSnapshot
+        {
+            Positions = new List<PositionSnapshot> { new() { Instrument = "MNG", Quantity = -4, AveragePrice = 2.635m } },
+            WorkingOrders = new List<WorkingOrderSnapshot>
+            {
+                new() { Instrument = "MNG", Tag = "QTSW2:intentA:STOP", StopPrice = 2.723m, Quantity = 2 },
+                new() { Instrument = "MNG", Tag = "QTSW2:intentA:TARGET", Price = 2.612m, Quantity = 2 }
+            }
+        };
+        QuantExecutionControlStore.NotifyBrokerExecutionCallbackPending("MNG", utcNow, "ENTRY", "FILLED");
+        r = ProtectiveCoverageAudit.Audit("MNG", snap, null, false, false, false, utcNow.AddMilliseconds(1));
+        if (r.Status != ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE)
+            return (false, $"Broker callback pending stop qty handoff: expected PROTECTIVE_PENDING_CONVERGENCE, got {r.Status}");
+        r = ProtectiveCoverageAudit.Audit("MNG", snap, null, false, false, false, utcNow.AddMilliseconds(6000));
+        if (r.Status != ProtectiveAuditStatus.PROTECTIVE_STOP_QTY_MISMATCH)
+            return (false, $"Expired broker callback pending stop qty handoff: expected PROTECTIVE_STOP_QTY_MISMATCH, got {r.Status}");
+        QuantExecutionControlStore.Clear();
+
         // 4. Long position, target missing but stop present -> PROTECTIVE_MISSING_TARGET
         snap = new AccountSnapshot
         {
@@ -130,8 +173,8 @@ public static class ProtectiveCoverageAuditTests
             WorkingOrders = new List<WorkingOrderSnapshot>()
         };
         r = ProtectiveCoverageAudit.Audit("MNQ", snap, null, false, false, false, t0);
-        if (r.Status != ProtectiveAuditStatus.PROTECTIVE_MISSING_STOP)
-            return (false, $"Mapped fill without protective submit notify: expected PROTECTIVE_MISSING_STOP, got {r.Status}");
+        if (r.Status != ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE)
+            return (false, $"Mapped fill first-submit handoff: expected PROTECTIVE_PENDING_CONVERGENCE, got {r.Status}");
 
         // 8b. PendingAlignment + NotifyProtectiveStopSubmit + no broker-visible stop -> PROTECTIVE_PENDING_CONVERGENCE
         QuantExecutionControlStore.Clear();

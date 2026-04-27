@@ -69,7 +69,9 @@ public static class TryExecutionSafetyGateProtectiveIntegrationTests
 
                 if (!adapter.TryExecutionSafetyStructuralEvaluationFromAdapterRequest(
                         "intent-x", inst, "SUBMIT_PROTECTIVE_STOP", utc, out var structSnap))
-                    return (false, "structural-only evaluation unexpectedly failed");
+                    return (false, "structural-only evaluation unexpectedly failed: " +
+                                   $"{structSnap.Reason} detail={structSnap.Detail} parity={structSnap.ParityStatus} " +
+                                   $"broker={structSnap.BrokerQty} journal={structSnap.JournalQty} authority={structSnap.AuthorityState}");
 
                 if (!structSnap.NoActiveExposuresWithBrokerPosition)
                     return (false, "expected NoActiveExposuresWithBrokerPosition (no coordinator + broker open)");

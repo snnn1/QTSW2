@@ -16,14 +16,16 @@ using System.IO;
 using QTSW2.Robot.Core;
 using QTSW2.Robot.Core.Execution;
 using QTSW2.Robot.Core.Tests;
+using QTSW2.Robot.Contracts;
 
 namespace QTSW2.Robot.SiblingProtectiveCancelQueue.Test;
 
 internal static class Program
 {
-    private sealed class RecordingExecutor : INtActionExecutor
+    private sealed class RecordingExecutor : INtActionExecutor, INtMarketReentryExecutionGate
     {
         private readonly List<string> _trace;
+        private readonly Dictionary<string, string> _activeReentryByInstrument = new(StringComparer.OrdinalIgnoreCase);
         public RecordingExecutor(List<string> trace) => _trace = trace;
 
         public void ExecuteCancelOrders(NtCancelOrdersCommand cmd) =>
@@ -32,8 +34,66 @@ internal static class Program
         public void ExecuteSubmitProtectives(NtSubmitProtectivesCommand cmd) => _trace.Add("SUBMIT_PROTECTIVES");
         public void ExecuteFlattenInstrument(NtFlattenInstrumentCommand cmd) => _trace.Add("FLATTEN");
         public void ExecuteSubmitEntryIntent(NtSubmitEntryIntentCommand cmd) => _trace.Add("ENTRY");
-        public void ExecuteSubmitMarketReentry(NtSubmitMarketReentryCommand cmd) => _trace.Add("REENTRY");
+        public void ExecuteSubmitMarketReentry(NtSubmitMarketReentryCommand cmd) => _trace.Add($"REENTRY:{cmd.CorrelationId}");
+
+        public bool TryBeginMarketReentryExecution(
+            NtSubmitMarketReentryCommand cmd,
+            DateTimeOffset utcNow,
+            out string deferReason,
+            out string? activeIntentId)
+        {
+            deferReason = "";
+            activeIntentId = null;
+
+            var instrument = NormalizeInstrument(cmd);
+            var intentId = cmd.IntentId ?? cmd.Command.ReentryIntentId ?? "";
+            if (string.IsNullOrEmpty(instrument) || string.IsNullOrEmpty(intentId))
+                return true;
+
+            if (_activeReentryByInstrument.TryGetValue(instrument, out var active) &&
+                !string.Equals(active, intentId, StringComparison.OrdinalIgnoreCase))
+            {
+                deferReason = "active_reentry_waiting_for_protection";
+                activeIntentId = active;
+                return false;
+            }
+
+            _activeReentryByInstrument[instrument] = intentId;
+            return true;
+        }
+
+        public void ReleaseMarketReentryExecution(NtSubmitMarketReentryCommand cmd, DateTimeOffset utcNow, string reason)
+        {
+            var instrument = NormalizeInstrument(cmd);
+            var intentId = cmd.IntentId ?? cmd.Command.ReentryIntentId ?? "";
+            if (!string.IsNullOrEmpty(instrument) &&
+                _activeReentryByInstrument.TryGetValue(instrument, out var active) &&
+                string.Equals(active, intentId, StringComparison.OrdinalIgnoreCase))
+            {
+                _activeReentryByInstrument.Remove(instrument);
+            }
+        }
+
+        public void MarkReentryProtectionAccepted(NtSubmitMarketReentryCommand cmd, DateTimeOffset utcNow) =>
+            ReleaseMarketReentryExecution(cmd, utcNow, "REENTRY_PROTECTION_ACCEPTED");
+
+        private static string NormalizeInstrument(NtSubmitMarketReentryCommand cmd) =>
+            (cmd.InstrumentKey ?? cmd.Command.ExecutionInstrument ?? cmd.Command.Instrument ?? "").Trim().ToUpperInvariant();
     }
+
+    private static NtSubmitMarketReentryCommand ReentryAction(string correlationId, string intentId, DateTimeOffset utc) =>
+        new(correlationId, new SubmitMarketReentryCommand
+        {
+            Instrument = "MNG",
+            ExecutionInstrument = "MNG",
+            ReentryIntentId = intentId,
+            OriginalIntentId = "original-" + intentId,
+            Stream = intentId.EndsWith("1", StringComparison.Ordinal) ? "NG1" : "NG2",
+            Direction = "short",
+            Quantity = 2,
+            Reason = "SESSION_REENTRY_ATTEMPT",
+            TimestampUtc = utc
+        });
 
     private static int Main(string[] args)
     {
@@ -124,6 +184,19 @@ internal static class Program
             if (pass)
             {
                 Console.WriteLine("PASS: AUTHORITY_CONTRADICTIONS");
+                return 0;
+            }
+
+            Console.Error.WriteLine("FAIL: " + err);
+            return 1;
+        }
+
+        if (args.Length > 0 && args[0].Equals("RUN_SUMMARY_BUILDER", StringComparison.OrdinalIgnoreCase))
+        {
+            var (pass, err) = RunSummaryBuilderTests.RunAll();
+            if (pass)
+            {
+                Console.WriteLine("PASS: RUN_SUMMARY_BUILDER");
                 return 0;
             }
 
@@ -227,7 +300,48 @@ internal static class Program
                 return 1;
             }
 
-            if (exec.PendingCount != 0 || exec2.PendingCount != 0 || exec3.PendingCount != 0)
+            var trace4 = new List<string>();
+            var exec4 = new StrategyThreadExecutor(log, () => utc);
+            var reentry1 = ReentryAction("r1", "intent-1", utc);
+            var reentry2 = ReentryAction("r2", "intent-2", utc);
+            if (!exec4.EnqueueNtAction(reentry1, out _))
+            {
+                Console.Error.WriteLine("FAIL: r1 enqueue");
+                return 1;
+            }
+            if (!exec4.EnqueueNtAction(reentry2, out _))
+            {
+                Console.Error.WriteLine("FAIL: r2 enqueue");
+                return 1;
+            }
+            var recorder4 = new RecordingExecutor(trace4);
+            exec4.DrainNtActions(recorder4);
+            if (trace4.Count != 1 || trace4[0] != "REENTRY:r1")
+            {
+                Console.Error.WriteLine("FAIL: first reentry drain must execute exactly one market reentry: " + string.Join(" | ", trace4));
+                return 1;
+            }
+            if (exec4.PendingCount != 1 || exec4.NormalPendingCount != 1)
+            {
+                Console.Error.WriteLine($"FAIL: second reentry must remain queued after pause, pending={exec4.PendingCount}, normal={exec4.NormalPendingCount}");
+                return 1;
+            }
+            exec4.DrainNtActions(recorder4);
+            if (trace4.Count != 1 || exec4.PendingCount != 1 || exec4.NormalPendingCount != 1)
+            {
+                Console.Error.WriteLine($"FAIL: second reentry must remain queued before protection accepted: trace={string.Join(" | ", trace4)}, pending={exec4.PendingCount}, normal={exec4.NormalPendingCount}");
+                return 1;
+            }
+
+            recorder4.MarkReentryProtectionAccepted(reentry1, utc);
+            exec4.DrainNtActions(recorder4);
+            if (trace4.Count != 2 || trace4[1] != "REENTRY:r2")
+            {
+                Console.Error.WriteLine("FAIL: second reentry must execute after first protection accepted: " + string.Join(" | ", trace4));
+                return 1;
+            }
+
+            if (exec.PendingCount != 0 || exec2.PendingCount != 0 || exec3.PendingCount != 0 || exec4.PendingCount != 0)
             {
                 Console.Error.WriteLine("FAIL: queues must be empty after drain");
                 return 1;

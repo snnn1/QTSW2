@@ -9,6 +9,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using Microsoft.CSharp.RuntimeBinder;
@@ -58,6 +59,66 @@ public sealed partial class NinjaTraderSimAdapter
         {
             dynOrder.Name = tag;
         }
+    }
+
+    private static List<Order> SnapshotAccountOrders(Account? account)
+    {
+        var snapshot = new List<Order>();
+        if (account?.Orders == null) return snapshot;
+
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            snapshot.Clear();
+            try
+            {
+                foreach (Order order in account.Orders)
+                {
+                    if (order != null) snapshot.Add(order);
+                }
+                return snapshot;
+            }
+            catch (InvalidOperationException) when (attempt == 0)
+            {
+                // NinjaTrader mutates Account.Orders while order/execution callbacks are active.
+            }
+            catch (InvalidOperationException)
+            {
+                snapshot.Clear();
+                return snapshot;
+            }
+        }
+
+        return snapshot;
+    }
+
+    private static List<Position> SnapshotAccountPositions(Account? account)
+    {
+        var snapshot = new List<Position>();
+        if (account?.Positions == null) return snapshot;
+
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            snapshot.Clear();
+            try
+            {
+                foreach (Position position in account.Positions)
+                {
+                    if (position != null) snapshot.Add(position);
+                }
+                return snapshot;
+            }
+            catch (InvalidOperationException) when (attempt == 0)
+            {
+                // NinjaTrader mutates Account.Positions while order/execution callbacks are active.
+            }
+            catch (InvalidOperationException)
+            {
+                snapshot.Clear();
+                return snapshot;
+            }
+        }
+
+        return snapshot;
     }
 
     /// <summary>
@@ -848,6 +909,8 @@ public sealed partial class NinjaTraderSimAdapter
             }
             
             _orderMap[intentId] = orderInfo;
+            // Registry/adoption scans run on wall clock; arm this bounded convergence window on the same clock.
+            QuantExecutionControlStore.NotifyWorkingOrderSubmitTransition(instrument, 1, DateTimeOffset.UtcNow);
 
             // Real NT API: Submit order
             // Submit may return Order[] or void - use dynamic to handle both
@@ -941,6 +1004,12 @@ public sealed partial class NinjaTraderSimAdapter
                 quantity,
                 account = "SIM"
             }));
+
+            _onMismatchExecutionTrigger?.Invoke(instrument.Trim(), acknowledgedAt, new MismatchExecutionTriggerDetails
+            {
+                IntentId = intentId,
+                WorkingOrderSubmitTransition = true
+            });
 
             return OrderSubmissionResult.SuccessResult(order.OrderId, utcNow, acknowledgedAt);
         }
@@ -2265,6 +2334,16 @@ public sealed partial class NinjaTraderSimAdapter
 
                 if (boundedLateTerminalFill)
                 {
+                    _executionJournal.RecordExitFill(
+                        context.IntentId,
+                        context.TradingDate,
+                        context.Stream,
+                        fillPrice,
+                        fillQuantity,
+                        orderTypeForContext,
+                        utcNow);
+                    var reconciledEntry = _executionJournal.GetEntry(intentId, tradingDate, stream);
+
                     _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "COMPLETED_INTENT_LATE_TERMINAL_FILL_RECONCILED", "ENGINE",
                         new
                         {
@@ -2281,8 +2360,13 @@ public sealed partial class NinjaTraderSimAdapter
                             completed_at_utc = completedEntry.CompletedAtUtc,
                             completion_age_ms = completionAgeMs,
                             mapped = true,
-                            action = "BOUNDED_LATE_TERMINAL_FILL_IGNORED",
-                            note = "Late terminal fill arrived shortly after reconciliation broker-flat completion; ignored to avoid false critical under playback timing compression."
+                            journal_completion_reason = reconciledEntry?.CompletionReason,
+                            journal_exit_avg_fill_price = reconciledEntry?.ExitAvgFillPrice,
+                            journal_realized_pnl_gross = reconciledEntry?.RealizedPnLGross,
+                            action = reconciledEntry?.RealizedPnLGross.HasValue == true
+                                ? "BOUNDED_LATE_TERMINAL_FILL_JOURNAL_UPGRADED"
+                                : "BOUNDED_LATE_TERMINAL_FILL_TYPE_RECONCILED",
+                            note = "Late terminal fill arrived shortly after reconciliation broker-flat completion; journal upgrade path was invoked without replaying ownership/coordinator side effects."
                         }));
                     return;
                 }
@@ -3449,6 +3533,7 @@ public sealed partial class NinjaTraderSimAdapter
     /// </summary>
     private AccountSnapshot GetAccountSnapshotReal(DateTimeOffset utcNow)
     {
+        var swSnapshot = Stopwatch.StartNew();
         if (_ntAccount == null)
         {
             return new AccountSnapshot
@@ -3476,7 +3561,7 @@ public sealed partial class NinjaTraderSimAdapter
         try
         {
             // Get positions
-            foreach (var position in account.Positions)
+            foreach (var position in SnapshotAccountPositions(account))
             {
                 if (position.Quantity != 0)
                 {
@@ -3493,7 +3578,7 @@ public sealed partial class NinjaTraderSimAdapter
             }
             
             // Get working orders
-            foreach (var order in account.Orders)
+            foreach (var order in SnapshotAccountOrders(account))
             {
                 if (order.OrderState == OrderState.Working || order.OrderState == OrderState.Accepted)
                 {
@@ -3521,7 +3606,20 @@ public sealed partial class NinjaTraderSimAdapter
                     note = "Failed to snapshot account - returning partial snapshot"
                 }));
         }
-        
+
+        swSnapshot.Stop();
+        if (swSnapshot.ElapsedMilliseconds > 500)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ACCOUNT_SNAPSHOT_SLOW", state: "ENGINE",
+                new
+                {
+                    elapsed_ms = swSnapshot.ElapsedMilliseconds,
+                    position_count = positions.Count,
+                    working_order_count = workingOrders.Count,
+                    note = "NT account snapshot enumeration exceeded 500ms"
+                }));
+        }
+
         return new AccountSnapshot
         {
             Positions = positions,
@@ -3537,10 +3635,45 @@ public sealed partial class NinjaTraderSimAdapter
     /// </summary>
     private void TerminalizeIntent(string intentId, string tradingDate, string stream, string completionReason, DateTimeOffset utcNow)
     {
-        // 1. Cancel all remaining protective orders
-        CancelProtectiveOrdersForIntent(intentId, utcNow);
+        if (!IsStrategyThreadContext() && _ntActionQueue != null)
+        {
+            EnqueueTerminalProtectiveCleanup(intentId, tradingDate, stream, completionReason, utcNow);
+            return;
+        }
 
-        // 2. Verify terminal invariant: no working stop/target orders remain
+        CancelProtectiveOrdersForIntent(intentId, utcNow);
+        VerifyTerminalProtectiveCleanup(intentId, tradingDate, stream, completionReason, utcNow);
+    }
+
+    private void EnqueueTerminalProtectiveCleanup(string intentId, string tradingDate, string stream, string completionReason, DateTimeOffset utcNow)
+    {
+        var cmd = new NtCancelOrdersCommand(
+            $"TERMINAL_CANCEL_PROTECTIVE:{intentId}",
+            intentId,
+            null,
+            protectiveOrdersOnly: true,
+            reason: "TERMINAL_INTENT_PROTECTIVE_CLEANUP",
+            utcNow,
+            preferUrgentDrain: true,
+            verifyWorkingProtectivesClearedAfter: true,
+            postCancelTradingDate: tradingDate,
+            postCancelStream: stream,
+            postCancelCompletionReason: completionReason);
+
+        EnqueueNtActionInternal(cmd);
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "TERMINAL_INTENT_PROTECTIVE_CLEANUP_ENQUEUED", "ENGINE",
+            new
+            {
+                intent_id = intentId,
+                stream = stream,
+                completion_reason = completionReason,
+                correlation_id = cmd.CorrelationId,
+                note = "Terminal protective cleanup routed onto strategy thread before touching NT account/orders."
+            }));
+    }
+
+    private void VerifyTerminalProtectiveCleanup(string intentId, string tradingDate, string stream, string completionReason, DateTimeOffset utcNow)
+    {
         var workingOrders = GetWorkingProtectiveOrdersForIntent(intentId);
         if (workingOrders.Count > 0)
         {
@@ -3556,12 +3689,10 @@ public sealed partial class NinjaTraderSimAdapter
                     action = "CANCEL_PENDING",
                     note = "Terminal intent cancel submitted; protective order state can remain accepted/working until NT emits cancel updates."
                 }));
-            // Attempt cancel again (defense in depth)
-            CancelProtectiveOrdersForIntent(intentId, utcNow);
         }
         else
         {
-            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, "", "TERMINAL_INTENT_VERIFIED",
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "TERMINAL_INTENT_VERIFIED", "ENGINE",
                 new { intent_id = intentId, stream = stream, completion_reason = completionReason }));
         }
     }
@@ -4948,6 +5079,8 @@ public sealed partial class NinjaTraderSimAdapter
             }
             
             _orderMap[intentId] = orderInfo;
+            // Registry/adoption scans run on wall clock; arm this bounded convergence window on the same clock.
+            QuantExecutionControlStore.NotifyWorkingOrderSubmitTransition(instrument, 1, DateTimeOffset.UtcNow);
 
             // Real NT API: Submit order
             // Submit may return Order[] or void - use dynamic to handle both
@@ -5070,6 +5203,12 @@ public sealed partial class NinjaTraderSimAdapter
                 oco_group = ocoGroup,
                 account = "SIM"
             }));
+
+            _onMismatchExecutionTrigger?.Invoke(instrument.Trim(), acknowledgedAt, new MismatchExecutionTriggerDetails
+            {
+                IntentId = intentId,
+                WorkingOrderSubmitTransition = true
+            });
 
             return OrderSubmissionResult.SuccessResult(order.OrderId, utcNow, acknowledgedAt);
         }

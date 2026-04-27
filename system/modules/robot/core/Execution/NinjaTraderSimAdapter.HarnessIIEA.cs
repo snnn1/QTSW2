@@ -11,6 +11,32 @@ public sealed partial class NinjaTraderSimAdapter
 {
     private readonly ReplayExecutor _harnessIiea = new();
 
+    private void OnRecoveryRequested(string instrument, string reason, object context, DateTimeOffset utcNow)
+    {
+    }
+
+    private void OnRecoveryFlattenRequestedFromIeCallback(string instrument, string reason, string callerContext, DateTimeOffset utcNow)
+    {
+    }
+
+    private void OnBootstrapSnapshotRequested(string instrument, BootstrapReason reason, DateTimeOffset utcNow)
+    {
+    }
+
+    private void HandleOrderIngressFromNt(object orderObj, object orderUpdateObj)
+    {
+        ((IIEAOrderExecutor)this).ProcessOrderUpdate(orderObj, orderUpdateObj);
+    }
+
+    private void HandleExecutionIngressFromNt(object executionObj, object orderObj)
+    {
+        ((IIEAOrderExecutor)this).ProcessExecutionUpdate(executionObj, orderObj);
+    }
+
+    private void ProcessUnresolvedRetry(UnresolvedExecutionRecord record)
+    {
+    }
+
     /// <summary>No-op: full ingress draining is NT-only (<c>CallbackIngress</c> partial).</summary>
     public void DrainCallbackIngress(DateTimeOffset utcNow)
     {

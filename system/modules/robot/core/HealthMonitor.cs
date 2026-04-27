@@ -142,6 +142,12 @@ public sealed class HealthMonitor
     private static DateTimeOffset _lastPriceConnectionLossRepeatedLogUtc = DateTimeOffset.MinValue;
     private const int PRICE_CONNECTION_LOSS_WINDOW_SECONDS = 300; // 5 minutes
     private const int PRICE_CONNECTION_LOSS_THRESHOLD = 4;
+    private readonly Dictionary<string, DateTimeOffset> _disconnectClassifiedDataLossUtcByInstrument = new(StringComparer.OrdinalIgnoreCase);
+    private DateTimeOffset _lastConnectivityShutdownSignalUtc = DateTimeOffset.MinValue;
+    private const int CONNECTIVITY_SHUTDOWN_DATA_LOSS_WINDOW_SECONDS = 15;
+    private const int CONNECTIVITY_SHUTDOWN_DATA_LOSS_THRESHOLD = 3;
+    private const int CONNECTIVITY_SHUTDOWN_SIGNAL_COOLDOWN_SECONDS = 60;
+    private Action<string, DateTimeOffset, Dictionary<string, object>>? _connectivityShutdownCallback;
     
     /// <param name="persistenceBaseRoot">Run artifact root (engine <c>_persistenceBase</c>) for notification-sidecar logs.</param>
     public HealthMonitor(string persistenceBaseRoot, HealthMonitorConfig config, RobotLogger log)
@@ -234,6 +240,15 @@ public sealed class HealthMonitor
         _playbackTelemetryMode = enabled;
     }
 
+    public void SetConnectivityShutdownCallback(Action<string, DateTimeOffset, Dictionary<string, object>>? callback)
+    {
+        _connectivityShutdownCallback = callback;
+    }
+
+    public bool IsEngineTickStallActive => _engineTickStallActive;
+
+    public bool IsPlaybackEngineTickStallActive => _playbackTelemetryMode && _engineTickStallActive;
+
     /// <summary>
     /// Check if any streams are in active trading state (ARMED, RANGE_BUILDING, or RANGE_LOCKED).
     /// </summary>
@@ -288,6 +303,16 @@ public sealed class HealthMonitor
                                 window_seconds = PRICE_CONNECTION_LOSS_WINDOW_SECONDS,
                                 note = "Connection lost 4+ times in 5 minutes. NinjaTrader may disable strategy with 'lost price connection more than 4 times in the past 5 minutes'."
                             }));
+
+                        TrySignalConnectivityShutdown("PRICE_CONNECTION_LOSS_REPEATED", utcNow,
+                            new Dictionary<string, object>
+                            {
+                                ["connection_name"] = connectionName,
+                                ["loss_count_in_window"] = _connectionLossTimestamps.Count,
+                                ["window_seconds"] = PRICE_CONNECTION_LOSS_WINDOW_SECONDS,
+                                ["trading_date"] = _currentTradingDate ?? "",
+                                ["note"] = "Repeated connection loss crossed the NinjaTrader disable threshold. Prefer controlled engine stop before platform-side strategy disable cascade."
+                            });
                     }
                 }
             }
@@ -755,6 +780,16 @@ public sealed class HealthMonitor
     /// </summary>
     private void EvaluateDataStalls(DateTimeOffset utcNow)
     {
+        if (_playbackTelemetryMode)
+        {
+            // Playback bars are replay/chart time while utcNow is wall time. Engine tick stall
+            // detection owns playback quiescence; per-instrument data loss would be false-positive.
+            _dataStallActive.Clear();
+            _stallDetectedAtUtc.Clear();
+            _disconnectClassifiedDataLossUtcByInstrument.Clear();
+            return;
+        }
+
         var instrumentsToCheck = new List<string>(_lastBarUtcByInstrument.Keys);
 
         foreach (var instrument in instrumentsToCheck)
@@ -806,9 +841,76 @@ public sealed class HealthMonitor
                                 note = "Notification suppressed - handled by gap tolerance + range invalidation (log only, rate-limited)"
                             }));
                     }
+
+                    if (string.Equals(classification, "DISCONNECT", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _disconnectClassifiedDataLossUtcByInstrument[instrument] = utcNow;
+
+                        if (_playbackTelemetryMode && !IsInStartupGrace(utcNow))
+                        {
+                            TrySignalConnectivityShutdown("DISCONNECT_CLASSIFIED_DATA_LOSS_PLAYBACK_IMMEDIATE", utcNow,
+                                new Dictionary<string, object>
+                                {
+                                    ["instrument"] = instrument,
+                                    ["instrument_count"] = 1,
+                                    ["window_seconds"] = CONNECTIVITY_SHUTDOWN_DATA_LOSS_WINDOW_SECONDS,
+                                    ["active_streams"] = HasActiveStreams(),
+                                    ["trading_date"] = _currentTradingDate ?? "",
+                                    ["note"] = "Playback-mode disconnect-classified data loss detected. Prefer immediate controlled engine stop before NinjaTrader enters the disable/freeze cascade."
+                                });
+                        }
+
+                        var cutoff = utcNow.AddSeconds(-CONNECTIVITY_SHUTDOWN_DATA_LOSS_WINDOW_SECONDS);
+                        foreach (var staleInstrument in _disconnectClassifiedDataLossUtcByInstrument
+                                     .Where(kvp => kvp.Value < cutoff)
+                                     .Select(kvp => kvp.Key)
+                                     .ToArray())
+                        {
+                            _disconnectClassifiedDataLossUtcByInstrument.Remove(staleInstrument);
+                        }
+
+                        var disconnectBurstInstruments = _disconnectClassifiedDataLossUtcByInstrument.Keys
+                            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                            .ToArray();
+
+                        if (disconnectBurstInstruments.Length >= CONNECTIVITY_SHUTDOWN_DATA_LOSS_THRESHOLD)
+                        {
+                            var hasActiveStreams = HasActiveStreams();
+                            TrySignalConnectivityShutdown("DISCONNECT_CLASSIFIED_DATA_LOSS_BURST", utcNow,
+                                new Dictionary<string, object>
+                                {
+                                    ["instrument_count"] = disconnectBurstInstruments.Length,
+                                    ["instruments"] = disconnectBurstInstruments,
+                                    ["window_seconds"] = CONNECTIVITY_SHUTDOWN_DATA_LOSS_WINDOW_SECONDS,
+                                    ["active_streams"] = hasActiveStreams,
+                                    ["trading_date"] = _currentTradingDate ?? "",
+                                    ["note"] = hasActiveStreams
+                                        ? "Multiple instruments entered disconnect-classified data loss while streams were still active. Prefer controlled engine stop before NinjaTrader mass-disables strategies."
+                                        : "Multiple instruments entered disconnect-classified data loss in a short burst. Prefer controlled engine stop before NinjaTrader mass-disables strategies."
+                                });
+                        }
+                    }
                 }
             }
         }
+    }
+
+    private void TrySignalConnectivityShutdown(string reason, DateTimeOffset utcNow, Dictionary<string, object> payload)
+    {
+        if (_connectivityShutdownCallback == null)
+            return;
+
+        if ((utcNow - _lastConnectivityShutdownSignalUtc).TotalSeconds < CONNECTIVITY_SHUTDOWN_SIGNAL_COOLDOWN_SECONDS)
+            return;
+
+        _lastConnectivityShutdownSignalUtc = utcNow;
+        _connectivityShutdownCallback.Invoke(reason, utcNow, payload);
+    }
+
+    private bool IsInStartupGrace(DateTimeOffset utcNow)
+    {
+        return _engineStartUtc != DateTimeOffset.MinValue &&
+               (utcNow - _engineStartUtc).TotalSeconds < ENGINE_START_GRACE_PERIOD_SECONDS;
     }
 
     private bool IsLowActivity(string instrument)
@@ -827,7 +929,11 @@ public sealed class HealthMonitor
         if (_currentIncident != null && _currentIncident.FirstDetectedUtc.HasValue)
         {
             var incidentAge = (utcNow - _currentIncident.FirstDetectedUtc.Value).TotalSeconds;
-            if (incidentAge < 300)
+            var incidentStillDisconnected =
+                _currentIncident.LastStatus == ConnectionStatus.ConnectionLost ||
+                _currentIncident.LastStatus == ConnectionStatus.Disconnected ||
+                _currentIncident.LastStatus == ConnectionStatus.ConnectionError;
+            if (incidentStillDisconnected || incidentAge < 300)
                 return "DISCONNECT";
         }
 

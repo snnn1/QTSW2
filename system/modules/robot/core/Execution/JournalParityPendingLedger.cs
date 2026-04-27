@@ -50,7 +50,7 @@ public static class JournalParityPendingLedger
             }))
             return;
 
-        PostFillAlignmentGate.ArmTrustedMappedFill(inst, Math.Abs(signedQuantity), "mapped_trusted_fill", utcNow);
+        PostFillAlignmentGate.ArmTrustedMappedFill(inst, signedQuantity, "mapped_trusted_fill", utcNow);
         QuantExecutionControlStore.NotifyMappedTrustedFill(inst, signedQuantity, utcNow);
     }
 

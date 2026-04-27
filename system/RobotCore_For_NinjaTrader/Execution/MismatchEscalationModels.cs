@@ -49,6 +49,12 @@ public enum MismatchType
     /// <summary>Broker working order exists but local registry/order map does not reliably own or classify it.</summary>
     ORDER_REGISTRY_MISSING,
 
+    /// <summary>
+    /// Local/IEA working count is temporarily ahead of the broker snapshot while an order submit is converging.
+    /// This is not an unexplained broker exposure by itself.
+    /// </summary>
+    WORKING_ORDER_COUNT_CONVERGENCE,
+
     /// <summary>Lifecycle or local state says protectives exist or are active, but broker-side protection is missing or contradictory.</summary>
     PROTECTIVE_STATE_DIVERGENCE,
 
@@ -140,6 +146,9 @@ public sealed class MismatchInstrumentState
     public DateTimeOffset LastReleaseUtc { get; set; }
     public DateTimeOffset LastGateEngagedUtc { get; set; }
     public int StableWindowMsApplied { get; set; }
+    public DateTimeOffset FirstBrokerFlatResidualUtc { get; set; }
+    public DateTimeOffset FirstJournalResidualUtc { get; set; }
+    public DateTimeOffset FirstAdoptionResidualUtc { get; set; }
 
     /// <summary>Progress-aware throttling for expensive gate reconciliation (local to coordinator).</summary>
     public GateReconciliationProgressState GateProgress { get; } = new GateReconciliationProgressState();
@@ -378,6 +387,8 @@ public readonly struct MismatchExecutionTriggerDetails : IEquatable<MismatchExec
     public int? InstrumentPositionQty { get; init; }
     /// <summary>True once when protective stop+target are successfully submitted after an entry fill.</summary>
     public bool EntryToProtectivesTransition { get; init; }
+    /// <summary>True once when an entry or entry-stop submit has been accepted locally and broker callbacks may lag.</summary>
+    public bool WorkingOrderSubmitTransition { get; init; }
 
     /// <summary>
     /// When true, <c>TryEnsureJournalIntegrityAfterExecutionActivity</c> performs parity telemetry only and skips
@@ -392,6 +403,7 @@ public readonly struct MismatchExecutionTriggerDetails : IEquatable<MismatchExec
         FillDelta == other.FillDelta &&
         InstrumentPositionQty == other.InstrumentPositionQty &&
         EntryToProtectivesTransition == other.EntryToProtectivesTransition &&
+        WorkingOrderSubmitTransition == other.WorkingOrderSubmitTransition &&
         SuppressHardJournalIntegrityActions == other.SuppressHardJournalIntegrityActions;
 
     public override bool Equals(object? obj) => obj is MismatchExecutionTriggerDetails o && Equals(o);
@@ -575,6 +587,7 @@ public static class GateProgressEvaluator
         MismatchType.GROSS_POSITION_DIVERGENCE => 28,
         MismatchType.STRUCTURAL_MULTI_INTENT => 27,
         MismatchType.HEDGED_NET_FLAT_GROSS_OPEN => 26,
+        MismatchType.WORKING_ORDER_COUNT_CONVERGENCE => 24,
         MismatchType.ORDER_REGISTRY_MISSING => 40,
         MismatchType.PROTECTIVE_STATE_DIVERGENCE => 35,
         MismatchType.UNKNOWN_EXECUTION_PERSISTENT => 50,

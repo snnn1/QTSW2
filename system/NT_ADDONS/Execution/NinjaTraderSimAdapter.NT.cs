@@ -97,6 +97,66 @@ public sealed partial class NinjaTraderSimAdapter
         }
     }
 
+    private static List<Order> SnapshotAccountOrders(Account? account)
+    {
+        var snapshot = new List<Order>();
+        if (account?.Orders == null) return snapshot;
+
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            snapshot.Clear();
+            try
+            {
+                foreach (Order order in account.Orders)
+                {
+                    if (order != null) snapshot.Add(order);
+                }
+                return snapshot;
+            }
+            catch (InvalidOperationException) when (attempt == 0)
+            {
+                // NinjaTrader mutates Account.Orders while order/execution callbacks are active.
+            }
+            catch (InvalidOperationException)
+            {
+                snapshot.Clear();
+                return snapshot;
+            }
+        }
+
+        return snapshot;
+    }
+
+    private static List<Position> SnapshotAccountPositions(Account? account)
+    {
+        var snapshot = new List<Position>();
+        if (account?.Positions == null) return snapshot;
+
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            snapshot.Clear();
+            try
+            {
+                foreach (Position position in account.Positions)
+                {
+                    if (position != null) snapshot.Add(position);
+                }
+                return snapshot;
+            }
+            catch (InvalidOperationException) when (attempt == 0)
+            {
+                // NinjaTrader mutates Account.Positions while order/execution callbacks are active.
+            }
+            catch (InvalidOperationException)
+            {
+                snapshot.Clear();
+                return snapshot;
+            }
+        }
+
+        return snapshot;
+    }
+
     private void SetPendingEntryTerminationReason(string intentId, string reason)
     {
         if (string.IsNullOrWhiteSpace(intentId) || string.IsNullOrWhiteSpace(reason)) return;
@@ -841,9 +901,22 @@ public sealed partial class NinjaTraderSimAdapter
         if (!string.IsNullOrEmpty(cmd.IntentId))
         {
             if (cmd.ProtectiveOrdersOnly)
+            {
                 CancelProtectiveOrdersForIntent(cmd.IntentId, cmd.UtcNow);
+                if (cmd.VerifyWorkingProtectivesClearedAfter)
+                {
+                    VerifyTerminalProtectiveCleanup(
+                        cmd.IntentId,
+                        cmd.PostCancelTradingDate ?? "",
+                        cmd.PostCancelStream ?? "",
+                        cmd.PostCancelCompletionReason ?? cmd.Reason,
+                        cmd.UtcNow);
+                }
+            }
             else
+            {
                 CancelIntentOrdersReal(cmd.IntentId, cmd.UtcNow);
+            }
         }
     }
 
@@ -892,7 +965,8 @@ public sealed partial class NinjaTraderSimAdapter
         }
         catch (Exception ex)
         {
-            _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_RECONSTRUCTION_ERROR", new { error = ex.Message, iea_instance_id = _iea.InstanceId }));
+            _log.Write(RobotEvents.EngineBase(utcNow, "", "RECOVERY_RECONSTRUCTION_ERROR", "ENGINE",
+                new { instrument, error = ex.Message, iea_instance_id = _iea.InstanceId }));
             _iea.ProcessBootstrapResult(new BootstrapSnapshot { Instrument = instrument, UnownedLiveOrderCount = 999 }, utcNow);
             return;
         }
@@ -916,7 +990,7 @@ public sealed partial class NinjaTraderSimAdapter
             ProtectiveStatus = protectiveStatus,
             SlotJournalShowsEntryStopsExpected = slotJournalShowsEntryStops
         };
-        _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "BOOTSTRAP_SNAPSHOT_CAPTURED", new
+        _log.Write(RobotEvents.EngineBase(utcNow, "", "BOOTSTRAP_SNAPSHOT_CAPTURED", "ENGINE", new
         {
             instrument,
             broker_position_qty = brokerQty,
@@ -1156,7 +1230,8 @@ public sealed partial class NinjaTraderSimAdapter
         }
         catch (Exception ex)
         {
-            _log.Write(RobotEvents.EngineBase(utcNow, "", instrument, "RECOVERY_RECONSTRUCTION_ERROR", new { error = ex.Message, iea_instance_id = _iea.InstanceId }));
+            _log.Write(RobotEvents.EngineBase(utcNow, "", "RECOVERY_RECONSTRUCTION_ERROR", "ENGINE",
+                new { instrument, error = ex.Message, iea_instance_id = _iea.InstanceId }));
             _iea.ProcessReconstructionResult(new ReconstructionResult { Instrument = instrument, Classification = ReconstructionClassification.UNSAFE_AMBIGUOUS_STATE }, utcNow);
             return;
         }
@@ -1581,6 +1656,7 @@ public sealed partial class NinjaTraderSimAdapter
         {
             _log.Write(RobotEvents.ExecutionBase(utcNow, cmd.ReentryIntentId ?? "", execInst, "SUBMIT_MARKET_REENTRY_SKIPPED",
                 new { reason = "Missing required fields", reentryIntentId = cmd.ReentryIntentId, execInst, direction, quantity }));
+            ReleaseMarketReentryExecutionLatch(cmd.ReentryIntentId ?? "", execInst, utcNow, "SUBMIT_MARKET_REENTRY_INVALID", ntCmd.CorrelationId);
             _onReentrySubmitCompletedCallback?.Invoke(cmd.ReentryIntentId ?? "", utcNow, false, "Missing required fields");
             return;
         }
@@ -1616,6 +1692,8 @@ public sealed partial class NinjaTraderSimAdapter
         RegisterIntentPolicy(canonicalIntentId, quantity, quantity, instrument, execInst, "EXECUTION_COMMAND");
 
         var result = SubmitMarketReentryOrder(canonicalIntentId, execInst, direction, quantity, utcNow);
+        if (!result.Success)
+            ReleaseMarketReentryExecutionLatch(canonicalIntentId, execInst, utcNow, "SUBMIT_MARKET_REENTRY_FAILED", ntCmd.CorrelationId);
         _log.Write(RobotEvents.ExecutionBase(utcNow, canonicalIntentId, execInst, "SUBMIT_MARKET_REENTRY_COMPLETED",
             new { success = result.Success, error = result.ErrorMessage }));
         _onReentrySubmitCompletedCallback?.Invoke(canonicalIntentId, utcNow, result.Success, result.ErrorMessage);
@@ -2567,6 +2645,8 @@ public sealed partial class NinjaTraderSimAdapter
             }
             
             OrderMap[intentId] = orderInfo;
+            // Registry/adoption scans run on wall clock; arm this bounded convergence window on the same clock.
+            QuantExecutionControlStore.NotifyWorkingOrderSubmitTransition(instrument, 1, DateTimeOffset.UtcNow);
 
             // Real NT API: Submit order
             // Submit may return Order[] or void - use dynamic to handle both
@@ -2666,6 +2746,12 @@ public sealed partial class NinjaTraderSimAdapter
                     ["trading_date"] = string.IsNullOrEmpty(tradingDate) ? null : tradingDate,
                     ["direction"] = finalDirection
                 });
+
+            _onMismatchExecutionTrigger?.Invoke(instrument.Trim(), acknowledgedAt, new MismatchExecutionTriggerDetails
+            {
+                IntentId = intentId,
+                WorkingOrderSubmitTransition = true
+            });
 
             return OrderSubmissionResult.SuccessResult(order.OrderId, utcNow, acknowledgedAt);
         }
@@ -3139,6 +3225,7 @@ public sealed partial class NinjaTraderSimAdapter
             if (((IIEAOrderExecutor)this).HasWorkingProtectivesForIntent(intentId))
             {
                 _reentryProtectionAcceptedNotified.Add(intentId);
+                ReleaseMarketReentryExecutionLatch(intentId, orderInfo.Instrument, utcNow, "REENTRY_PROTECTION_ACCEPTED");
                 _onReentryProtectionAcceptedCallback?.Invoke(intentId, utcNow);
                 _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "REENTRY_PROTECTION_ACCEPTED_CALLBACK",
                     new { reentry_intent_id = intentId, note = "Both reentry protective orders Working - HandleReentryProtectionAccepted invoked" }));
@@ -4421,21 +4508,35 @@ public sealed partial class NinjaTraderSimAdapter
         string? brokerExecId = null;
         try { dynamic d = execution; brokerExecId = d.ExecutionId as string; } catch { }
         var fillGroupId = ComputeFillGroupId(brokerExecId, orderIdInternal, brokerOrderId, utcNow.ToString("o"), fillPrice, fillQuantity);
+        var deferEntryFillFollowUp = _iea != null && !isProtectiveOrder && orderInfo.IsEntryOrder == true;
+        var followUpEnqueueUtc = DateTimeOffset.MinValue;
+        var syncPathSw = Stopwatch.StartNew();
+        long syncJournalMs = 0;
+        var deferredCoordinatorActions = new List<Action>();
+        var deferredProtectiveActions = new List<Action>();
+        var deferredRepairActions = new List<Action>();
 
         var instFill = orderInfo.Instrument.Trim();
         var ordStateFill = order?.OrderState.ToString() ?? "";
         _executionTrace?.WriteExecutionTrace(utcNow, "Fill", "raw_callback", instFill, intentId, brokerOrderId,
             brokerExecId ?? "", fillQuantity, ordStateFill);
-        _executionTrace?.WriteExecutionTrace(utcNow, "NotifyExecutionTrigger", "before_notify", instFill, intentId,
-            brokerOrderId, brokerExecId ?? "", fillQuantity, ordStateFill);
-        _onMismatchExecutionTrigger?.Invoke(instFill, utcNow, new MismatchExecutionTriggerDetails
+
+        void InvokeMismatchExecutionTrigger()
         {
-            IntentId = intentId,
-            FillDelta = fillQuantity,
-            SuppressHardJournalIntegrityActions = true
-        });
-        _executionTrace?.WriteExecutionTrace(utcNow, "NotifyExecutionTrigger", "after_notify", instFill, intentId,
-            brokerOrderId, brokerExecId ?? "", fillQuantity, ordStateFill);
+            _executionTrace?.WriteExecutionTrace(utcNow, "NotifyExecutionTrigger", "before_notify", instFill, intentId,
+                brokerOrderId, brokerExecId ?? "", fillQuantity, ordStateFill);
+            _onMismatchExecutionTrigger?.Invoke(instFill, utcNow, new MismatchExecutionTriggerDetails
+            {
+                IntentId = intentId,
+                FillDelta = fillQuantity,
+                SuppressHardJournalIntegrityActions = true
+            });
+            _executionTrace?.WriteExecutionTrace(utcNow, "NotifyExecutionTrigger", "after_notify", instFill, intentId,
+                brokerOrderId, brokerExecId ?? "", fillQuantity, ordStateFill);
+        }
+
+        if (!deferEntryFillFollowUp)
+            InvokeMismatchExecutionTrigger();
 
         var orderTypeForContext = orderTypeFromTag ?? orderInfo.OrderType;
 
@@ -4454,6 +4555,8 @@ public sealed partial class NinjaTraderSimAdapter
         {
             // Context resolution failed - orphan fill logged and execution blocked
             // Do NOT call journal with empty strings
+            if (deferEntryFillFollowUp)
+                InvokeMismatchExecutionTrigger();
             return; // Fail-closed
         }
 
@@ -4472,6 +4575,8 @@ public sealed partial class NinjaTraderSimAdapter
                     action = "BLOCKED",
                     note = "Fail-closed: emit ERROR and block trading until trading_date is set"
                 });
+            if (deferEntryFillFollowUp)
+                InvokeMismatchExecutionTrigger();
             return; // Fail-closed
         }
 
@@ -4563,6 +4668,7 @@ public sealed partial class NinjaTraderSimAdapter
                 var entrySignAlloc = string.Equals(allocContext.Direction, "Short", StringComparison.OrdinalIgnoreCase) ? -1 : 1;
                 JournalParityPendingLedger.TryRecordTrustedFill(allocContext.ExecutionInstrument.Trim(), parityKeyAlloc,
                     entrySignAlloc * allocQty, allocIntentId, utcNow);
+                var journalSw = Stopwatch.StartNew();
                 _executionJournal.RecordEntryFill(
                     allocContext.IntentId,
                     allocContext.TradingDate,
@@ -4576,32 +4682,64 @@ public sealed partial class NinjaTraderSimAdapter
                     allocContext.CanonicalInstrument,
                     brokerOrderInstrumentKey: orderInfo.Instrument,
                     parityPendingDedupeKey: parityKeyAlloc);
+                syncJournalMs += journalSw.ElapsedMilliseconds;
                 entryFillJournalRecordedQty += allocQty;
                 var exposureInstrument = !string.IsNullOrWhiteSpace(allocContext.ExecutionInstrument)
                     ? allocContext.ExecutionInstrument
                     : (allocIntent.ExecutionInstrument ?? allocIntent.Instrument ?? allocContext.CanonicalInstrument);
-                _coordinator?.OnEntryFill(allocContext.IntentId, allocQty, allocContext.Stream, exposureInstrument, allocContext.Direction ?? "", utcNow);
+                if (deferEntryFillFollowUp)
+                    deferredCoordinatorActions.Add(() => _coordinator?.OnEntryFill(allocContext.IntentId, allocQty, allocContext.Stream, exposureInstrument, allocContext.Direction ?? "", utcNow));
+                else
+                    _coordinator?.OnEntryFill(allocContext.IntentId, allocQty, allocContext.Stream, exposureInstrument, allocContext.Direction ?? "", utcNow);
             }
 
             if (isEntryFill && fillQuantity > 0 && entryFillJournalRecordedQty == 0 && allocations.Count > 0)
             {
-                var posAbs = 0;
-                try { posAbs = Math.Abs(GetCurrentPositionReal(orderInfo.Instrument.Trim())); } catch { }
-                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument,
-                    "TAGGED_ENTRY_FILL_JOURNAL_RECORDED_ZERO", new
-                    {
-                        reason = "ALL_ALLOCATION_PATHS_SKIPPED_OR_EMPTY",
-                        intent_id = intentId,
-                        fill_qty = fillQuantity,
-                        allocation_count = allocations.Count,
-                        broker_position_abs_hint = posAbs,
-                        iea_active = _iea != null,
-                        note = "Downstream TAGGED_BROKER_WITHOUT_JOURNAL repair may run from reconciliation / protective"
-                    }));
-                if (posAbs > 0 &&
-                    SumOpenJournalForInstrument(orderInfo.Instrument.Trim(), _iea?.ExecutionInstrumentKey ?? orderInfo.Instrument.Trim()) == 0)
+                if (deferEntryFillFollowUp)
                 {
-                    _ = TryRepairTaggedBrokerWithoutJournalCore(orderInfo.Instrument.Trim(), posAbs, 0, utcNow, out _, out _);
+                    deferredRepairActions.Add(() =>
+                    {
+                        var posAbs = 0;
+                        try { posAbs = Math.Abs(GetCurrentPositionReal(orderInfo.Instrument.Trim())); } catch { }
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument,
+                            "TAGGED_ENTRY_FILL_JOURNAL_RECORDED_ZERO", new
+                            {
+                                reason = "ALL_ALLOCATION_PATHS_SKIPPED_OR_EMPTY",
+                                intent_id = intentId,
+                                fill_qty = fillQuantity,
+                                allocation_count = allocations.Count,
+                                broker_position_abs_hint = posAbs,
+                                iea_active = _iea != null,
+                                deferred_stage = "repair",
+                                note = "Tagged broker-without-journal repair deferred into its own post-fill stage."
+                            }));
+                        if (posAbs > 0 &&
+                            SumOpenJournalForInstrument(orderInfo.Instrument.Trim(), _iea?.ExecutionInstrumentKey ?? orderInfo.Instrument.Trim()) == 0)
+                        {
+                            _ = TryRepairTaggedBrokerWithoutJournalCore(orderInfo.Instrument.Trim(), posAbs, 0, utcNow, out _, out _);
+                        }
+                    });
+                }
+                else
+                {
+                    var posAbs = 0;
+                    try { posAbs = Math.Abs(GetCurrentPositionReal(orderInfo.Instrument.Trim())); } catch { }
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument,
+                        "TAGGED_ENTRY_FILL_JOURNAL_RECORDED_ZERO", new
+                        {
+                            reason = "ALL_ALLOCATION_PATHS_SKIPPED_OR_EMPTY",
+                            intent_id = intentId,
+                            fill_qty = fillQuantity,
+                            allocation_count = allocations.Count,
+                            broker_position_abs_hint = posAbs,
+                            iea_active = _iea != null,
+                            note = "Downstream TAGGED_BROKER_WITHOUT_JOURNAL repair may run from reconciliation / protective"
+                        }));
+                    if (posAbs > 0 &&
+                        SumOpenJournalForInstrument(orderInfo.Instrument.Trim(), _iea?.ExecutionInstrumentKey ?? orderInfo.Instrument.Trim()) == 0)
+                    {
+                        _ = TryRepairTaggedBrokerWithoutJournalCore(orderInfo.Instrument.Trim(), posAbs, 0, utcNow, out _, out _);
+                    }
                 }
             }
 
@@ -4627,6 +4765,44 @@ public sealed partial class NinjaTraderSimAdapter
             // P1: Emit one EXECUTION_FILLED/PARTIAL per intent when aggregated; single when not
             var isPartial = filledTotal < orderInfo.Quantity;
             var eventType = isPartial ? "EXECUTION_PARTIAL_FILL" : "EXECUTION_FILLED";
+            int ResolveReentryExpectedQuantity(string reentryIntentId, int cumulativeForIntent)
+            {
+                if (!string.IsNullOrWhiteSpace(reentryIntentId) &&
+                    IntentPolicy.TryGetValue(reentryIntentId, out var policy) &&
+                    policy.ExpectedQuantity > 0)
+                    return policy.ExpectedQuantity;
+
+                var aggregateCount = orderInfo.AggregatedIntentIds?.Count ?? 0;
+                if (aggregateCount > 1 && orderInfo.ExpectedQuantity > 0)
+                    return Math.Max(1, orderInfo.ExpectedQuantity / aggregateCount);
+
+                if (orderInfo.ExpectedQuantity > 0)
+                    return orderInfo.ExpectedQuantity;
+                if (orderInfo.Quantity > 0)
+                    return orderInfo.Quantity;
+                return Math.Max(1, cumulativeForIntent);
+            }
+
+            void InvokeReentryFillCallbackAfterFullFill(string reentryIntentId, int cumulativeForIntent, int lastFillQty)
+            {
+                var expectedForIntent = ResolveReentryExpectedQuantity(reentryIntentId, cumulativeForIntent);
+                if (ShouldDeferReentryProtectionForPartialFill(cumulativeForIntent, expectedForIntent))
+                {
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, reentryIntentId, orderInfo.Instrument, "REENTRY_PROTECTION_DEFERRED_PARTIAL_FILL",
+                        new
+                        {
+                            intent_id = reentryIntentId,
+                            last_fill_qty = lastFillQty,
+                            cumulative_filled_qty = cumulativeForIntent,
+                            expected_qty = expectedForIntent,
+                            reason = "partial_reentry_fill_waiting_for_full_quantity",
+                            protection_action = "defer"
+                        }));
+                    return;
+                }
+
+                _onReentryFillCallback?.Invoke(reentryIntentId, utcNow);
+            }
             if (!isPartial)
             {
                 orderInfo.State = "FILLED";
@@ -4716,7 +4892,7 @@ public sealed partial class NinjaTraderSimAdapter
             // never submitted, BE had no stop to modify, BE_STOP_VISIBILITY_TIMEOUT → flatten.
             if (isAggregated && allocations.Count > 0)
             {
-                CheckAndCancelEntryStopsOnPositionFlat(orderInfo.Instrument, utcNow);
+                var didImmediateFlatCheck = false;
                 foreach (var alloc in allocations)
                 {
                     var allocIntentId = alloc.Item1;
@@ -4728,28 +4904,50 @@ public sealed partial class NinjaTraderSimAdapter
                         : allocQty;
                     if (string.Equals(allocIntent.TriggerReason, "SUBMIT_MARKET_REENTRY", StringComparison.OrdinalIgnoreCase))
                     {
-                        _onReentryFillCallback?.Invoke(allocIntentId, utcNow);
+                        InvokeReentryFillCallbackAfterFullFill(allocIntentId, cumulativeForIntent, allocQty);
                     }
+                    else if (deferEntryFillFollowUp && _iea != null)
+                        deferredProtectiveActions.Add(() => _iea.HandleEntryFill(allocIntentId, allocIntent, fillPrice, allocQty, cumulativeForIntent, utcNow));
                     else if (_useInstrumentExecutionAuthority && _iea != null)
+                    {
+                        if (!didImmediateFlatCheck)
+                        {
+                            CheckAndCancelEntryStopsOnPositionFlat(orderInfo.Instrument, utcNow);
+                            didImmediateFlatCheck = true;
+                        }
                         _iea.HandleEntryFill(allocIntentId, allocIntent, fillPrice, allocQty, cumulativeForIntent, utcNow);
+                    }
                     else
+                    {
+                        if (!didImmediateFlatCheck)
+                        {
+                            CheckAndCancelEntryStopsOnPositionFlat(orderInfo.Instrument, utcNow);
+                            didImmediateFlatCheck = true;
+                        }
                         HandleEntryFill(allocIntentId, allocIntent, fillPrice, allocQty, cumulativeForIntent, utcNow);
+                    }
                 }
             }
             else if (IntentMap.TryGetValue(intentId, out var entryIntent))
             {
                 // Non-aggregated: coordinator OnEntryFill is already invoked once per allocation in the loop above (canonical instrument).
 
-                CheckAndCancelEntryStopsOnPositionFlat(orderInfo.Instrument, utcNow);
-
                 if (string.Equals(entryIntent.TriggerReason, "SUBMIT_MARKET_REENTRY", StringComparison.OrdinalIgnoreCase))
                 {
-                    _onReentryFillCallback?.Invoke(intentId, utcNow);
+                    InvokeReentryFillCallbackAfterFullFill(intentId, filledTotal, fillQuantity);
                 }
+                else if (deferEntryFillFollowUp && _iea != null)
+                    deferredProtectiveActions.Add(() => _iea.HandleEntryFill(intentId, entryIntent, fillPrice, fillQuantity, filledTotal, utcNow));
                 else if (_useInstrumentExecutionAuthority && _iea != null)
+                {
+                    CheckAndCancelEntryStopsOnPositionFlat(orderInfo.Instrument, utcNow);
                     _iea.HandleEntryFill(intentId, entryIntent, fillPrice, fillQuantity, filledTotal, utcNow);
+                }
                 else
+                {
+                    CheckAndCancelEntryStopsOnPositionFlat(orderInfo.Instrument, utcNow);
                     HandleEntryFill(intentId, entryIntent, fillPrice, fillQuantity, filledTotal, utcNow);
+                }
             }
             else
             {
@@ -4813,6 +5011,104 @@ public sealed partial class NinjaTraderSimAdapter
                 }
                 }
             }
+
+            var syncTotalMs = syncPathSw.ElapsedMilliseconds;
+            if (syncTotalMs >= 25 || syncJournalMs >= 10)
+            {
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "EXECUTION_UPDATE_SYNC_PATH_TIMING", new
+                {
+                    intent_id = intentId,
+                    fill_quantity = fillQuantity,
+                    allocations_count = allocations.Count,
+                    total_ms = syncTotalMs,
+                    journal_ms = syncJournalMs,
+                    ownership_ms = 0,
+                    coordinator_ms = 0,
+                    deferred_follow_up = deferEntryFillFollowUp,
+                    note = "Synchronous ExecutionUpdate work kept to fill mapping, journal write, and lightweight fill accounting. Coordination, mismatch, and protective work are deferred."
+                }));
+            }
+
+            if (deferEntryFillFollowUp && _iea != null)
+            {
+                followUpEnqueueUtc = DateTimeOffset.UtcNow;
+                var deferredCoordinator = deferredCoordinatorActions.ToArray();
+                var deferredProtective = deferredProtectiveActions.ToArray();
+                var deferredRepair = deferredRepairActions.ToArray();
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "EXECUTION_UPDATE_FOLLOWUP_ENQUEUED", new
+                {
+                    intent_id = intentId,
+                    fill_quantity = fillQuantity,
+                    deferred_action_count = deferredCoordinator.Length + deferredProtective.Length + deferredRepair.Length + 2,
+                    coordinator_action_count = deferredCoordinator.Length,
+                    protective_action_count = deferredProtective.Length,
+                    repair_action_count = deferredRepair.Length,
+                    mismatch_trigger_deferred = true,
+                    flat_check_deferred = true,
+                    queued_via = "IEA_WORKER",
+                    note = "Post-fill work split into staged queue items so coordination, protective handling, repair, flat-check, and mismatch trigger are timed independently."
+                }));
+                void EnqueuePostFillStage(string stageName, string workKind, Action action, int actionCount)
+                {
+                    var stageEnqueueUtc = DateTimeOffset.UtcNow;
+                    _iea.EnqueueRecoveryEssential(() =>
+                    {
+                        var stageStartUtc = DateTimeOffset.UtcNow;
+                        var stageSw = Stopwatch.StartNew();
+                        action();
+                        var stageTotalMs = stageSw.ElapsedMilliseconds;
+                        _log.Write(RobotEvents.ExecutionBase(stageStartUtc, intentId, orderInfo.Instrument, "EXECUTION_UPDATE_POSTFILL_STAGE_TIMING", new
+                        {
+                            intent_id = intentId,
+                            fill_quantity = fillQuantity,
+                            stage = stageName,
+                            work_kind = workKind,
+                            action_count = actionCount,
+                            queue_delay_ms = Math.Max(0L, (long)(stageStartUtc - followUpEnqueueUtc).TotalMilliseconds),
+                            stage_enqueue_delay_ms = Math.Max(0L, (long)(stageStartUtc - stageEnqueueUtc).TotalMilliseconds),
+                            total_ms = stageTotalMs,
+                            note = "Deferred post-fill stage timing on the serialized IEA worker. NT-touching and repair-ish work now runs in its own queue stage."
+                        }));
+                    }, workKind);
+                }
+
+                if (deferredCoordinator.Length > 0)
+                {
+                    EnqueuePostFillStage("coordinator", "ExecutionUpdatePostFillCoordinator", () =>
+                    {
+                        foreach (var deferredAction in deferredCoordinator)
+                            deferredAction();
+                    }, deferredCoordinator.Length);
+                }
+
+                if (deferredProtective.Length > 0)
+                {
+                    EnqueuePostFillStage("protective", "ExecutionUpdatePostFillProtective", () =>
+                    {
+                        foreach (var deferredAction in deferredProtective)
+                            deferredAction();
+                    }, deferredProtective.Length);
+                }
+
+                if (deferredRepair.Length > 0)
+                {
+                    EnqueuePostFillStage("repair", "ExecutionUpdatePostFillRepair", () =>
+                    {
+                        foreach (var deferredAction in deferredRepair)
+                            deferredAction();
+                    }, deferredRepair.Length);
+                }
+
+                EnqueuePostFillStage("flat_check", "ExecutionUpdatePostFillFlatCheck", () =>
+                {
+                    CheckAndCancelEntryStopsOnPositionFlat(orderInfo.Instrument, utcNow);
+                }, 1);
+
+                EnqueuePostFillStage("mismatch_trigger", "ExecutionUpdatePostFillMismatch", () =>
+                {
+                    InvokeMismatchExecutionTrigger();
+                }, 1);
+            }
         }
         else if (orderTypeForContext == "STOP" || orderTypeForContext == "TARGET")
         {
@@ -4837,6 +5133,16 @@ public sealed partial class NinjaTraderSimAdapter
 
                 if (boundedLateTerminalFill)
                 {
+                    _executionJournal.RecordExitFill(
+                        context.IntentId,
+                        context.TradingDate,
+                        context.Stream,
+                        fillPrice,
+                        fillQuantity,
+                        orderTypeForContext,
+                        utcNow);
+                    var reconciledEntry = _executionJournal.GetEntry(intentId, tradingDate, stream);
+
                     _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "COMPLETED_INTENT_LATE_TERMINAL_FILL_RECONCILED", "ENGINE",
                         new
                         {
@@ -4853,8 +5159,13 @@ public sealed partial class NinjaTraderSimAdapter
                             completed_at_utc = completedEntry.CompletedAtUtc,
                             completion_age_ms = completionAgeMs,
                             mapped = true,
-                            action = "BOUNDED_LATE_TERMINAL_FILL_IGNORED",
-                            note = "Late terminal fill arrived shortly after reconciliation broker-flat completion; ignored to avoid false critical under playback timing compression."
+                            journal_completion_reason = reconciledEntry?.CompletionReason,
+                            journal_exit_avg_fill_price = reconciledEntry?.ExitAvgFillPrice,
+                            journal_realized_pnl_gross = reconciledEntry?.RealizedPnLGross,
+                            action = reconciledEntry?.RealizedPnLGross.HasValue == true
+                                ? "BOUNDED_LATE_TERMINAL_FILL_JOURNAL_UPGRADED"
+                                : "BOUNDED_LATE_TERMINAL_FILL_TYPE_RECONCILED",
+                            note = "Late terminal fill arrived shortly after reconciliation broker-flat completion; journal upgrade path was invoked without replaying ownership/coordinator side effects."
                         }));
                     return;
                 }
@@ -6676,8 +6987,22 @@ public sealed partial class NinjaTraderSimAdapter
                 quantity,
                 old_oco_id = ocoId,
                 new_oco_id = newOcoGroup,
+                execution_instrument_key = executionInstrumentKey,
                 note = "OCO Change() reverts - using cancel+replace for BE"
             }));
+
+            var beReplaceExecutionKey = (executionInstrumentKey ?? "").Trim();
+            if (!string.IsNullOrWhiteSpace(beReplaceExecutionKey) &&
+                !string.Equals(beReplaceExecutionKey, "UNKNOWN", StringComparison.OrdinalIgnoreCase))
+            {
+                QuantExecutionControlStore.NotifyProtectiveCancelReplacePending(beReplaceExecutionKey, 2, utcNow);
+            }
+            var beReplaceLogicalInstrument = (instrument ?? "").Trim();
+            if (!string.IsNullOrWhiteSpace(beReplaceLogicalInstrument) &&
+                !string.Equals(beReplaceLogicalInstrument, beReplaceExecutionKey, StringComparison.OrdinalIgnoreCase))
+            {
+                QuantExecutionControlStore.NotifyProtectiveCancelReplacePending(beReplaceLogicalInstrument, 2, utcNow);
+            }
 
             // 1. Cancel both OCO orders
             CancelProtectiveOrdersForIntent(intentId, utcNow);
@@ -6773,6 +7098,7 @@ public sealed partial class NinjaTraderSimAdapter
     /// </summary>
     private AccountSnapshot GetAccountSnapshotReal(DateTimeOffset utcNow)
     {
+        var swSnapshot = Stopwatch.StartNew();
         if (_ntAccount == null)
         {
             return new AccountSnapshot
@@ -6800,7 +7126,7 @@ public sealed partial class NinjaTraderSimAdapter
         try
         {
             // Get positions
-            foreach (var position in account.Positions)
+            foreach (var position in SnapshotAccountPositions(account))
             {
                 if (position.Quantity != 0)
                 {
@@ -6817,7 +7143,7 @@ public sealed partial class NinjaTraderSimAdapter
             }
             
             // Get working orders
-            foreach (var order in account.Orders)
+            foreach (var order in SnapshotAccountOrders(account))
             {
                 if (order.OrderState == OrderState.Working || order.OrderState == OrderState.Accepted)
                 {
@@ -6845,7 +7171,20 @@ public sealed partial class NinjaTraderSimAdapter
                     note = "Failed to snapshot account - returning partial snapshot"
                 }));
         }
-        
+
+        swSnapshot.Stop();
+        if (swSnapshot.ElapsedMilliseconds > 500)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ACCOUNT_SNAPSHOT_SLOW", state: "ENGINE",
+                new
+                {
+                    elapsed_ms = swSnapshot.ElapsedMilliseconds,
+                    position_count = positions.Count,
+                    working_order_count = workingOrders.Count,
+                    note = "NT account snapshot enumeration exceeded 500ms"
+                }));
+        }
+
         return new AccountSnapshot
         {
             Positions = positions,
@@ -6862,7 +7201,45 @@ public sealed partial class NinjaTraderSimAdapter
     /// </summary>
     private void TerminalizeIntent(string intentId, string tradingDate, string stream, string completionReason, DateTimeOffset utcNow)
     {
+        if (!IsStrategyThreadContext() && _ntActionQueue != null)
+        {
+            EnqueueTerminalProtectiveCleanup(intentId, tradingDate, stream, completionReason, utcNow);
+            return;
+        }
+
         CancelProtectiveOrdersForIntent(intentId, utcNow);
+        VerifyTerminalProtectiveCleanup(intentId, tradingDate, stream, completionReason, utcNow);
+    }
+
+    private void EnqueueTerminalProtectiveCleanup(string intentId, string tradingDate, string stream, string completionReason, DateTimeOffset utcNow)
+    {
+        var cmd = new NtCancelOrdersCommand(
+            $"TERMINAL_CANCEL_PROTECTIVE:{intentId}",
+            intentId,
+            null,
+            protectiveOrdersOnly: true,
+            reason: "TERMINAL_INTENT_PROTECTIVE_CLEANUP",
+            utcNow,
+            preferUrgentDrain: true,
+            verifyWorkingProtectivesClearedAfter: true,
+            postCancelTradingDate: tradingDate,
+            postCancelStream: stream,
+            postCancelCompletionReason: completionReason);
+
+        EnqueueNtActionInternal(cmd);
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "TERMINAL_INTENT_PROTECTIVE_CLEANUP_ENQUEUED", "ENGINE",
+            new
+            {
+                intent_id = intentId,
+                stream = stream,
+                completion_reason = completionReason,
+                correlation_id = cmd.CorrelationId,
+                note = "Terminal protective cleanup routed onto strategy thread before touching NT account/orders."
+            }));
+    }
+
+    private void VerifyTerminalProtectiveCleanup(string intentId, string tradingDate, string stream, string completionReason, DateTimeOffset utcNow)
+    {
         var workingOrders = GetWorkingProtectiveOrdersForIntent(intentId);
         if (workingOrders.Count > 0)
         {
@@ -6878,11 +7255,10 @@ public sealed partial class NinjaTraderSimAdapter
                     action = "CANCEL_PENDING",
                     note = "Terminal intent cancel submitted; protective order state can remain accepted/working until NT emits cancel updates."
                 }));
-            CancelProtectiveOrdersForIntent(intentId, utcNow);
         }
         else
         {
-            _log.Write(RobotEvents.EngineBase(utcNow, intentId, "", "TERMINAL_INTENT_VERIFIED",
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "TERMINAL_INTENT_VERIFIED", "ENGINE",
                 new { intent_id = intentId, stream = stream, completion_reason = completionReason }));
         }
     }
@@ -8785,6 +9161,8 @@ public sealed partial class NinjaTraderSimAdapter
             }
             
             OrderMap[intentId] = orderInfo;
+            // Registry/adoption scans run on wall clock; arm this bounded convergence window on the same clock.
+            QuantExecutionControlStore.NotifyWorkingOrderSubmitTransition(instrument, 1, DateTimeOffset.UtcNow);
 
             // Real NT API: Submit order
             // Submit may return Order[] or void - use dynamic to handle both
@@ -8901,6 +9279,12 @@ public sealed partial class NinjaTraderSimAdapter
                 order_state = submitResult.OrderState.ToString()
             }));
 
+            _onMismatchExecutionTrigger?.Invoke(instrument.Trim(), acknowledgedAt, new MismatchExecutionTriggerDetails
+            {
+                IntentId = intentId,
+                WorkingOrderSubmitTransition = true
+            });
+
             return OrderSubmissionResult.SuccessResult(order.OrderId, utcNow, acknowledgedAt);
         }
         catch (Exception ex)
@@ -9011,6 +9395,8 @@ public sealed partial class NinjaTraderSimAdapter
         }
 
         OrderMap[intentId] = orderInfo;
+        // Registry/adoption scans run on wall clock; arm this bounded convergence window on the same clock.
+        QuantExecutionControlStore.NotifyWorkingOrderSubmitTransition(instrument, 1, DateTimeOffset.UtcNow);
 
         dynamic dynAccountSubmit = account;
         Order submitResult;
@@ -9080,6 +9466,12 @@ public sealed partial class NinjaTraderSimAdapter
             broker_order_id = order.OrderId, order_type = "ENTRY_STOP", direction, stop_price = stopPrice,
             quantity, oco_group = ocoGroup, account = "SIM", order_action = orderAction.ToString()
         }));
+
+        _onMismatchExecutionTrigger?.Invoke(instrument.Trim(), acknowledgedAt, new MismatchExecutionTriggerDetails
+        {
+            IntentId = intentId,
+            WorkingOrderSubmitTransition = true
+        });
 
         return OrderSubmissionResult.SuccessResult(order.OrderId, utcNow, acknowledgedAt);
     }

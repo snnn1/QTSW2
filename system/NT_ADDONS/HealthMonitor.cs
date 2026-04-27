@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using QTSW2.Robot.Core.Notifications;
@@ -131,6 +132,12 @@ public sealed class HealthMonitor
     private static DateTimeOffset _lastPriceConnectionLossRepeatedLogUtc = DateTimeOffset.MinValue;
     private const int PRICE_CONNECTION_LOSS_WINDOW_SECONDS = 300; // 5 minutes
     private const int PRICE_CONNECTION_LOSS_THRESHOLD = 4;
+    private readonly Dictionary<string, DateTimeOffset> _disconnectClassifiedDataLossUtcByInstrument = new(StringComparer.OrdinalIgnoreCase);
+    private DateTimeOffset _lastConnectivityShutdownSignalUtc = DateTimeOffset.MinValue;
+    private const int CONNECTIVITY_SHUTDOWN_DATA_LOSS_WINDOW_SECONDS = 15;
+    private const int CONNECTIVITY_SHUTDOWN_DATA_LOSS_THRESHOLD = 3;
+    private const int CONNECTIVITY_SHUTDOWN_SIGNAL_COOLDOWN_SECONDS = 60;
+    private Action<string, DateTimeOffset, Dictionary<string, object>>? _connectivityShutdownCallback;
     
     /// <param name="persistenceBaseRoot">Run artifact root (engine <c>_persistenceBase</c>) for notification-sidecar logs.</param>
     public HealthMonitor(string persistenceBaseRoot, HealthMonitorConfig config, RobotLogger log)
@@ -173,6 +180,15 @@ public sealed class HealthMonitor
     {
         _playbackTelemetryMode = enabled;
     }
+
+    public void SetConnectivityShutdownCallback(Action<string, DateTimeOffset, Dictionary<string, object>>? callback)
+    {
+        _connectivityShutdownCallback = callback;
+    }
+
+    public bool IsEngineTickStallActive => _engineTickStallActive;
+
+    public bool IsPlaybackEngineTickStallActive => _playbackTelemetryMode && _engineTickStallActive;
     
     /// <summary>
     /// Set current trading date. Normalizes empty/whitespace to null, validates format.
@@ -289,6 +305,16 @@ public sealed class HealthMonitor
                                 window_seconds = PRICE_CONNECTION_LOSS_WINDOW_SECONDS,
                                 note = "Connection lost 4+ times in 5 minutes. NinjaTrader may disable strategy with 'lost price connection more than 4 times in the past 5 minutes'."
                             }));
+
+                        TrySignalConnectivityShutdown("PRICE_CONNECTION_LOSS_REPEATED", utcNow,
+                            new Dictionary<string, object>
+                            {
+                                ["connection_name"] = connectionName,
+                                ["loss_count_in_window"] = _connectionLossTimestamps.Count,
+                                ["window_seconds"] = PRICE_CONNECTION_LOSS_WINDOW_SECONDS,
+                                ["trading_date"] = _currentTradingDate ?? "",
+                                ["note"] = "Repeated connection loss crossed the NinjaTrader disable threshold. Prefer controlled engine stop before platform-side strategy disable cascade."
+                            });
                     }
                     
                     _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _currentTradingDate ?? "", eventType: "CONNECTION_LOST", state: "ENGINE",
@@ -723,6 +749,15 @@ public sealed class HealthMonitor
     /// </summary>
     private void EvaluateDataStalls(DateTimeOffset utcNow)
     {
+        if (_playbackTelemetryMode)
+        {
+            // Playback bars are replay/chart time while utcNow is wall time. Engine tick stall
+            // detection owns playback quiescence; per-instrument data loss would be false-positive.
+            _dataStallActive.Clear();
+            _disconnectClassifiedDataLossUtcByInstrument.Clear();
+            return;
+        }
+
         // Check each instrument that has received bars
         var instrumentsToCheck = new List<string>(_lastBarUtcByInstrument.Keys);
         
@@ -763,12 +798,55 @@ public sealed class HealthMonitor
                                 note = "Notification suppressed - handled by gap tolerance + range invalidation (log only, rate-limited)"
                             }));
                     }
+
+                    _disconnectClassifiedDataLossUtcByInstrument[instrument] = utcNow;
+                    var cutoff = utcNow.AddSeconds(-CONNECTIVITY_SHUTDOWN_DATA_LOSS_WINDOW_SECONDS);
+                    foreach (var staleInstrument in _disconnectClassifiedDataLossUtcByInstrument
+                                 .Where(kvp => kvp.Value < cutoff)
+                                 .Select(kvp => kvp.Key)
+                                 .ToArray())
+                    {
+                        _disconnectClassifiedDataLossUtcByInstrument.Remove(staleInstrument);
+                    }
+
+                    var disconnectBurstInstruments = _disconnectClassifiedDataLossUtcByInstrument.Keys
+                        .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+                        .ToArray();
+
+                    if (disconnectBurstInstruments.Length >= CONNECTIVITY_SHUTDOWN_DATA_LOSS_THRESHOLD)
+                    {
+                        var hasActiveStreams = HasActiveStreams();
+                        TrySignalConnectivityShutdown("DISCONNECT_CLASSIFIED_DATA_LOSS_BURST", utcNow,
+                            new Dictionary<string, object>
+                            {
+                                ["instrument_count"] = disconnectBurstInstruments.Length,
+                                ["instruments"] = disconnectBurstInstruments,
+                                ["window_seconds"] = CONNECTIVITY_SHUTDOWN_DATA_LOSS_WINDOW_SECONDS,
+                                ["active_streams"] = hasActiveStreams,
+                                ["trading_date"] = _currentTradingDate ?? "",
+                                ["note"] = hasActiveStreams
+                                    ? "Multiple instruments entered data-loss while streams were still active. Prefer controlled engine stop before NinjaTrader mass-disables strategies."
+                                    : "Multiple instruments entered data-loss in a short burst. Prefer controlled engine stop before NinjaTrader mass-disables strategies."
+                            });
+                    }
                     
                     // NOTIFICATION DISABLED: Data loss is handled by gap tolerance + range invalidation
                     // SendNotification($"DATA_LOSS:{instrument}", title, message, priority: 1);
                 }
             }
         }
+    }
+
+    private void TrySignalConnectivityShutdown(string reason, DateTimeOffset utcNow, Dictionary<string, object> payload)
+    {
+        if (_connectivityShutdownCallback == null)
+            return;
+
+        if ((utcNow - _lastConnectivityShutdownSignalUtc).TotalSeconds < CONNECTIVITY_SHUTDOWN_SIGNAL_COOLDOWN_SECONDS)
+            return;
+
+        _lastConnectivityShutdownSignalUtc = utcNow;
+        _connectivityShutdownCallback.Invoke(reason, utcNow, payload);
     }
     
     /// <summary>

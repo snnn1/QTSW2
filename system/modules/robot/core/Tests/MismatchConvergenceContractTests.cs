@@ -16,6 +16,10 @@ public static class MismatchConvergenceContractTests
         if (!c) return (false, ec);
         var (d, ed) = ExpiryRestoresNormalEscalation();
         if (!d) return (false, ed);
+        var (e, ee) = WorkingOrderSubmitTriggerArmsAndSuppressesConvergence();
+        if (!e) return (false, ee);
+        var (f, ef) = WorkingOrderSubmitWindowSuppressesFirstGateWithoutConvergenceArm();
+        if (!f) return (false, ef);
         return (true, null);
     }
 
@@ -134,5 +138,85 @@ public static class MismatchConvergenceContractTests
         if (st == null || st.EscalationState != MismatchEscalationState.DETECTED)
             return (false, "Convergence4: expected normal escalation after expiry");
         return (true, null);
+    }
+
+    private static (bool, string?) WorkingOrderSubmitTriggerArmsAndSuppressesConvergence()
+    {
+        var coord = CreateCoordinator(false);
+        coord.ResetConvergenceTestCountersForTest();
+        var t0 = DateTimeOffset.UtcNow;
+        coord.NotifyExecutionTrigger("ES", t0, new MismatchExecutionTriggerDetails
+        {
+            IntentId = "submit-ahead",
+            WorkingOrderSubmitTransition = true
+        });
+        if (!coord.HasActiveConvergenceForTest("ES", t0))
+            return (false, "Convergence5: working-order submit should arm convergence");
+
+        coord.ProcessObservationForTest(new MismatchObservation
+        {
+            Instrument = "ES",
+            MismatchType = MismatchType.WORKING_ORDER_COUNT_CONVERGENCE,
+            Present = true,
+            ObservedUtc = t0
+        });
+        if (coord.TestConvergenceFirstEscalationSuppressedCount != 1)
+            return (false, "Convergence5: expected working-order convergence suppression count 1");
+        var st = coord.GetStateForTest("ES");
+        if (st == null || st.EscalationState != MismatchEscalationState.NONE)
+            return (false, "Convergence5: escalation should not start for local-working-ahead convergence");
+        return (true, null);
+    }
+
+    private static (bool, string?) WorkingOrderSubmitWindowSuppressesFirstGateWithoutConvergenceArm()
+    {
+        var prevStore = FeatureFlags.QuantExecutionControlStoreEnabled;
+        var prevWindow = FeatureFlags.PostFillAlignmentWindowMs;
+        QuantExecutionControlStore.Clear();
+        try
+        {
+            FeatureFlags.QuantExecutionControlStoreEnabled = true;
+            FeatureFlags.PostFillAlignmentWindowMs = 5000;
+
+            var coord = CreateCoordinator(false);
+            var t0 = DateTimeOffset.UtcNow;
+            QuantExecutionControlStore.NotifyWorkingOrderSubmitTransition("MES", 2, t0);
+
+            coord.ProcessObservationForTest(new MismatchObservation
+            {
+                Instrument = "MES",
+                MismatchType = MismatchType.WORKING_ORDER_COUNT_CONVERGENCE,
+                Present = true,
+                BrokerWorkingOrderCount = 1,
+                LocalWorkingOrderCount = 2,
+                ObservedUtc = t0.AddMilliseconds(100)
+            });
+
+            var st = coord.GetStateForTest("MES");
+            if (st == null || st.EscalationState != MismatchEscalationState.NONE)
+                return (false, "Convergence6: QEC working-order window should defer first WOC gate engagement");
+
+            coord.ProcessObservationForTest(new MismatchObservation
+            {
+                Instrument = "MES",
+                MismatchType = MismatchType.WORKING_ORDER_COUNT_CONVERGENCE,
+                Present = true,
+                BrokerWorkingOrderCount = 1,
+                LocalWorkingOrderCount = 2,
+                ObservedUtc = t0.AddMilliseconds(FeatureFlags.PostFillAlignmentWindowMs + 500)
+            });
+
+            st = coord.GetStateForTest("MES");
+            if (st == null || st.EscalationState != MismatchEscalationState.DETECTED)
+                return (false, "Convergence6: WOC gate should engage after bounded working-order window expires");
+
+            return (true, null);
+        }
+        finally
+        {
+            QuantExecutionControlStore.Clear();
+            FeatureFlags.QuantExecutionControlStoreEnabled = prevStore;
+            FeatureFlags.PostFillAlignmentWindowMs = prevWindow;
+        }
     }
 }

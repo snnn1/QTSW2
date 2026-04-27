@@ -90,6 +90,7 @@
     <Compile Include="..\modules\robot\core\Execution\Qtsw2OrderUpdateHydrationPolicy.cs" Link="Execution\Qtsw2OrderUpdateHydrationPolicy.cs" />
     <Compile Include="..\modules\robot\core\Execution\ReconciliationDeferPolicy.cs" Link="Execution\ReconciliationDeferPolicy.cs" />
     <Compile Include="..\modules\robot\core\Execution\FlattenCoordinationTracker.cs" Link="Execution\FlattenCoordinationTracker.cs" />
+    <Compile Include="..\modules\robot\core\Execution\FlattenFillAllocationPolicy.cs" Link="Execution\FlattenFillAllocationPolicy.cs" />
     <Compile Include="..\modules\robot\core\Execution\ReleaseReconciliationRedundancySuppression.cs" Link="Execution\ReleaseReconciliationRedundancySuppression.cs" />
     <Compile Include="..\modules\robot\core\Execution\NtNonLiveAccountValidation.cs" Link="Execution\NtNonLiveAccountValidation.cs" />
     <Compile Include="..\modules\robot\core\reconciliation\ReconciliationStateTracker.cs" Link="reconciliation\ReconciliationStateTracker.cs" />
@@ -108,5 +109,6 @@
     <Compile Include="..\modules\robot\core\Tests\TryExecutionSafetyGateProtectiveIntegrationTests.cs" Link="Tests\TryExecutionSafetyGateProtectiveIntegrationTests.cs" />
     <Compile Include="..\modules\robot\core\Tests\QuantExecutionControlStoreTests.cs" Link="Tests\QuantExecutionControlStoreTests.cs" />
     <Compile Include="..\modules\robot\core\Tests\StructuralPhase3DemotionTests.cs" Link="Tests\StructuralPhase3DemotionTests.cs" />
+    <Compile Include="..\modules\robot\core\Tests\RunSummaryBuilderTests.cs" Link="Tests\RunSummaryBuilderTests.cs" />
   </ItemGroup>
 </Project>

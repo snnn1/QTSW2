@@ -72,7 +72,7 @@ public static class TerminalIntentHardeningTests
             if (entry3.BETriggerPrice != 2.6025m)
                 return (false, $"Expected BETriggerPrice 2.6025 for test_intent_3, got {entry3.BETriggerPrice?.ToString() ?? "null"}");
 
-            // 6. Unfilled canceled entry becomes terminal immediately and stops blocking release adoption.
+            // 6. Live tagged unfilled entries do not block broker-flat release, and cancel keeps them terminal.
             var cancelRoot = Path.Combine(Path.GetTempPath(), "TerminalIntentCancel_" + Guid.NewGuid().ToString("N")[..8]);
             Directory.CreateDirectory(cancelRoot);
             try
@@ -81,8 +81,8 @@ public static class TerminalIntentHardeningTests
                 var cancelIntent = "test_intent_cancel";
                 cancelJournal.RecordSubmission(cancelIntent, tradingDate, stream, "MNG", "ENTRY_STOP", "broker_4", utcNow, direction: "Long");
                 var beforeCancelBlockers = cancelJournal.CountReleaseBlockingAdoptionCandidates("MNG", "NG", 0, 0, Array.Empty<string>(), null);
-                if (beforeCancelBlockers != 1)
-                    return (false, $"Expected exactly 1 release blocker before cancel, got {beforeCancelBlockers}");
+                if (beforeCancelBlockers != 0)
+                    return (false, $"Live tagged unfilled entry should not block broker-flat release before cancel, got {beforeCancelBlockers} blocker(s)");
                 if (!cancelJournal.RecordCancelledUnfilledEntry(cancelIntent, tradingDate, stream, utcNow))
                     return (false, "Expected RecordCancelledUnfilledEntry to terminalize unfilled canceled entry");
                 var canceledEntry = cancelJournal.GetEntry(cancelIntent, tradingDate, stream);
@@ -115,6 +115,12 @@ public static class TerminalIntentHardeningTests
                 return (false, "Late terminal fill should preserve completed state");
             if (lateFillEntry.CompletionReason != "STOP")
                 return (false, $"Late terminal fill should reconcile completion reason to STOP, got {lateFillEntry.CompletionReason ?? "null"}");
+            if (lateFillEntry.ExitAvgFillPrice != 4501m)
+                return (false, $"Late terminal fill should upgrade exit avg price to 4501, got {lateFillEntry.ExitAvgFillPrice?.ToString() ?? "null"}");
+            if (lateFillEntry.RealizedPnLGross != 10m)
+                return (false, $"Late terminal fill should upgrade realized gross PnL to 10, got {lateFillEntry.RealizedPnLGross?.ToString() ?? "null"}");
+            if (lateFillEntry.RealizedPnLNet != 10m)
+                return (false, $"Late terminal fill should upgrade realized net PnL to 10, got {lateFillEntry.RealizedPnLNet?.ToString() ?? "null"}");
 
             return (true, null);
         }
