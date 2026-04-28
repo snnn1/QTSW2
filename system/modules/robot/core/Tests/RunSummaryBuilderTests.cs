@@ -73,6 +73,8 @@ public static class RunSummaryBuilderTests
                 return (false, $"expected STOP/HIGH for open shutdown exposure, got {openDoc.recommended_action}/{openDoc.confidence}");
             if (!openDoc.flags.had_open_exposure_at_shutdown)
                 return (false, "expected had_open_exposure_at_shutdown flag");
+            if (openDoc.verdict_class != "UNSAFE_EXPOSURE")
+                return (false, $"expected unsafe exposure verdict class, got {openDoc.verdict_class}");
             if (openDoc.errors != 1)
                 return (false, $"expected one summary error for open shutdown exposure, got {openDoc.errors}");
             if (openDoc.key_counts.open_position_at_shutdown != 1 ||
@@ -84,6 +86,43 @@ public static class RunSummaryBuilderTests
             {
                 return (false, "expected open shutdown exposure counts from journal and ownership snapshot");
             }
+
+            var staleRoot = Path.Combine(root, "stale_ownership_summary");
+            Directory.CreateDirectory(staleRoot);
+            File.WriteAllText(Path.Combine(staleRoot, RunRootArtifacts.KeyEventsFileName), "");
+            var staleSnapshotDir = RobotRunArtifactPaths.EventsOwnershipSnapshotsTradingDate(staleRoot, "2026-04-14");
+            Directory.CreateDirectory(staleSnapshotDir);
+            File.WriteAllText(Path.Combine(staleSnapshotDir, "ownership_snapshots.jsonl"),
+                "{\"EmittedUtc\":\"2026-04-28T20:01:08.0000000+00:00\",\"Instruments\":[{\"Instrument\":\"M2K\",\"BrokerPositionQty\":0,\"BrokerWorkingOrderCount\":2,\"JournalOpenQty\":0,\"ActiveSlotCount\":0,\"OrphanSlotCount\":0,\"SnapshotSequence\":23,\"SnapshotUtc\":\"2026-04-28T20:01:08.0000000+00:00\"}]}" + Environment.NewLine);
+            var staleLogDir = Path.Combine(staleRoot, "logs", "robot");
+            Directory.CreateDirectory(staleLogDir);
+            File.WriteAllText(Path.Combine(staleLogDir, "robot_M2K.jsonl"),
+                "{\"ts_utc\":\"2026-04-28T20:01:37.0409618+00:00\",\"level\":\"INFO\",\"instrument\":\"M2K\",\"event\":\"ORDER_REGISTRY_METRICS\",\"data\":{\"owned_orders_active\":\"0\",\"adopted_orders_active\":\"0\",\"terminal_orders_recent\":\"2\"}}" + Environment.NewLine);
+
+            var staleDoc = RunSummaryBuilder.Build(
+                staleRoot,
+                "stale-ownership-summary-test",
+                DateTimeOffset.Parse("2026-04-12T22:01:00+00:00"),
+                ExecutionMode.SIM,
+                new[] { "M2K" },
+                new ExecutionSummarySnapshot());
+
+            if (staleDoc.status != "WARN" ||
+                staleDoc.status_reason != "DIAGNOSTIC_CONTRADICTION" ||
+                staleDoc.verdict_class != "DIAGNOSTIC_CONTRADICTION")
+            {
+                return (false, $"expected stale ownership to be WARN/DIAGNOSTIC_CONTRADICTION, got {staleDoc.status}/{staleDoc.status_reason}/{staleDoc.verdict_class}");
+            }
+            if (staleDoc.key_counts.broker_working_orders_at_shutdown != 0 ||
+                staleDoc.key_counts.stale_ownership_working_orders_suppressed != 2 ||
+                staleDoc.key_counts.diagnostic_contradictions == 0)
+            {
+                return (false, "expected stale ownership working orders to be suppressed and counted as diagnostic contradiction");
+            }
+            if (staleDoc.flags.had_open_exposure_at_shutdown || !staleDoc.flags.had_diagnostic_contradiction)
+                return (false, "expected stale ownership to avoid unsafe exposure while flagging diagnostic contradiction");
+            if (staleDoc.errors != 0)
+                return (false, $"expected stale diagnostic contradiction to keep hard error count zero, got {staleDoc.errors}");
 
             var incompleteRoot = Path.Combine(root, "incomplete_stream_summary");
             Directory.CreateDirectory(incompleteRoot);

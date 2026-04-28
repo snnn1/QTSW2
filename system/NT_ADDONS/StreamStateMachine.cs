@@ -157,6 +157,9 @@ public sealed class StreamStateMachine
     private readonly Func<string, bool>? _isInstrumentBlockedForReentry;
     private readonly Func<string, DateTimeOffset, FlattenResult>? _emergencyFlatten;
     private readonly Func<string, bool>? _isIeaQueueHealthyForInstrument;
+    private DateTimeOffset? _lastActiveReentryForcedFlattenSkipLogUtc;
+    private string? _lastActiveReentryForcedFlattenSkipLogKey;
+    private const double ActiveReentryForcedFlattenSkipLogIntervalMinutes = 60.0;
 
     // Canonical event writer for replay reconstruction (forced flatten, slot expiry)
     private readonly ExecutionEventWriter? _eventWriter;
@@ -6844,6 +6847,44 @@ public sealed class StreamStateMachine
         return _executionJournal.IsIntentCompleted(_journal.ReentryIntentId, TradingDate, Stream);
     }
 
+    private void LogActiveReentryForcedFlattenSkipIfNeeded(DateTimeOffset utcNow)
+    {
+        var key = string.Join("|",
+            TradingDate,
+            Stream,
+            _journal.OriginalIntentId ?? "",
+            _journal.ReentryIntentId ?? "",
+            _journal.ReentrySubmitted,
+            _journal.ReentryFilled,
+            _journal.ProtectionSubmitted,
+            _journal.ProtectionAccepted);
+
+        var shouldLog = !string.Equals(_lastActiveReentryForcedFlattenSkipLogKey, key, StringComparison.Ordinal) ||
+                        !_lastActiveReentryForcedFlattenSkipLogUtc.HasValue ||
+                        (utcNow - _lastActiveReentryForcedFlattenSkipLogUtc.Value).TotalMinutes >=
+                        ActiveReentryForcedFlattenSkipLogIntervalMinutes;
+        if (!shouldLog)
+            return;
+
+        _lastActiveReentryForcedFlattenSkipLogKey = key;
+        _lastActiveReentryForcedFlattenSkipLogUtc = utcNow;
+        _engine?.LogEngineEvent(utcNow, "FORCED_FLATTEN_SKIPPED_ACTIVE_REENTRY", new Dictionary<string, object?>
+        {
+            ["trading_date"] = TradingDate,
+            ["session_class"] = Session,
+            ["stream"] = Stream,
+            ["instrument"] = ExecutionInstrument,
+            ["original_intent_id"] = _journal.OriginalIntentId ?? "",
+            ["reentry_intent_id"] = _journal.ReentryIntentId ?? "",
+            ["reentry_submitted"] = _journal.ReentrySubmitted,
+            ["reentry_filled"] = _journal.ReentryFilled,
+            ["protection_submitted"] = _journal.ProtectionSubmitted,
+            ["protection_accepted"] = _journal.ProtectionAccepted,
+            ["detail_log_interval_minutes"] = ActiveReentryForcedFlattenSkipLogIntervalMinutes,
+            ["note"] = "Original intent is complete, but the stream has an unresolved reentry lifecycle; leaving stream ACTIVE for next-slot expiry."
+        });
+    }
+
     /// <summary>
     /// Terminal commit: persists <see cref="StreamJournal"/> with Committed=true, then sets <see cref="State"/> to DONE.
     /// Option A: if <see cref="JournalStore.Save"/> fails, in-memory journal is rolled back and state is not DONE.
@@ -7789,6 +7830,11 @@ public sealed class StreamStateMachine
         return true;
     }
 
+    private static bool ShouldDeferSessionCloseBrokerFlatConfirmation()
+    {
+        return true;
+    }
+
     private bool TryWaitBrokerFlatForExecutionInstrument(
         string executionInstrument,
         DateTimeOffset wallPollDeadlineUtc,
@@ -7950,20 +7996,7 @@ public sealed class StreamStateMachine
                             return;
                         }
 
-                        _engine?.LogEngineEvent(utcNow, "FORCED_FLATTEN_SKIPPED_ACTIVE_REENTRY", new Dictionary<string, object?>
-                        {
-                            ["trading_date"] = TradingDate,
-                            ["session_class"] = Session,
-                            ["stream"] = Stream,
-                            ["instrument"] = ExecutionInstrument,
-                            ["original_intent_id"] = _journal.OriginalIntentId ?? "",
-                            ["reentry_intent_id"] = _journal.ReentryIntentId ?? "",
-                            ["reentry_submitted"] = _journal.ReentrySubmitted,
-                            ["reentry_filled"] = _journal.ReentryFilled,
-                            ["protection_submitted"] = _journal.ProtectionSubmitted,
-                            ["protection_accepted"] = _journal.ProtectionAccepted,
-                            ["note"] = "Original intent is complete, but the stream has an unresolved reentry lifecycle; leaving stream ACTIVE for next-slot expiry."
-                        });
+                        LogActiveReentryForcedFlattenSkipIfNeeded(utcNow);
                         return;
                     }
 
@@ -8061,7 +8094,9 @@ public sealed class StreamStateMachine
             return;
         }
         
-        // Phase 1: Request flatten (session-close queue when supported), then wait for broker flat — do not advance state on enqueue alone.
+        // Phase 1: Request flatten (session-close queue when supported). Broker-flat confirmation
+        // is handled asynchronously by the flatten fill/reconciliation path so the engine tick
+        // thread never blocks playback waiting for NinjaTrader callbacks.
         const int SESSION_FORCED_FLATTEN_BROKER_WAIT_SECONDS = 90;
         const int SESSION_FORCED_FLATTEN_RETRY_WAIT_SECONDS = 30;
         if (_executionAdapter == null)
@@ -8100,9 +8135,11 @@ public sealed class StreamStateMachine
             }
         }
 
+        var flattenRequestPath = sessionCloseRequest != null ? "session_close_enqueue" : "flatten_delegate";
+
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
             "FORCED_FLATTEN_REQUEST_SUBMITTED", State.ToString(),
-            new { original_intent_id = _journal.OriginalIntentId, path = sessionCloseRequest != null ? "session_close_enqueue" : "flatten_delegate" }));
+            new { original_intent_id = _journal.OriginalIntentId, path = flattenRequestPath }));
 
         _engine?.LogEngineEvent(utcNow, "FORCED_FLATTEN_REQUEST_SUBMITTED", new Dictionary<string, object?>
         {
@@ -8111,7 +8148,7 @@ public sealed class StreamStateMachine
             ["stream"] = Stream,
             ["instrument"] = ExecutionInstrument,
             ["original_intent_id"] = _journal.OriginalIntentId ?? "",
-            ["path"] = sessionCloseRequest != null ? "session_close_enqueue" : "flatten_delegate",
+            ["path"] = flattenRequestPath,
             ["session_close_forced_flatten"] = true
         });
 
@@ -8121,6 +8158,32 @@ public sealed class StreamStateMachine
         _journal.ExecutionInterruptedByClose = true;
         _journal.ForcedFlattenTimestamp = utcNow;
         _journals.Save(_journal);
+
+        if (ShouldDeferSessionCloseBrokerFlatConfirmation())
+        {
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "FORCED_FLATTEN_BROKER_CONFIRM_DEFERRED", State.ToString(),
+                new
+                {
+                    original_intent_id = _journal.OriginalIntentId,
+                    instrument = ExecutionInstrument,
+                    path = flattenRequestPath,
+                    note = "Session-close flatten queued; broker-flat confirmation will be handled by the flatten fill/reconciliation path."
+                }));
+
+            _engine?.LogEngineEvent(utcNow, "FORCED_FLATTEN_BROKER_CONFIRM_DEFERRED", new Dictionary<string, object?>
+            {
+                ["trading_date"] = TradingDate,
+                ["session_class"] = Session,
+                ["stream"] = Stream,
+                ["instrument"] = ExecutionInstrument,
+                ["original_intent_id"] = _journal.OriginalIntentId ?? "",
+                ["path"] = flattenRequestPath,
+                ["session_close_forced_flatten"] = true,
+                ["note"] = "Session-close flatten queued; broker-flat confirmation will be handled by the flatten fill/reconciliation path."
+            });
+            return;
+        }
 
         var wallPollDeadlineUtc = DateTimeOffset.UtcNow.AddSeconds(SESSION_FORCED_FLATTEN_BROKER_WAIT_SECONDS);
         var brokerFlat = TryWaitBrokerFlatForExecutionInstrument(ExecutionInstrument, wallPollDeadlineUtc, utcNow, out var remainingQty);

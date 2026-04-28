@@ -1895,7 +1895,9 @@ public sealed class ExecutionJournal
                     {
                         var json = File.ReadAllText(file);
                         var entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
-                        if (entry != null && entry.TradeCompleted)
+                        if (entry != null &&
+                            entry.TradeCompleted &&
+                            (entry.EntryFilled || entry.EntryFilledQuantityTotal > 0))
                         {
                             return true; // Found at least one completed trade
                         }

@@ -46,6 +46,11 @@ public sealed class ExecutionAuthorityFrame
     public int IeaOwnedPlusAdoptedWorking { get; init; }
     public bool RecoveryExecutionDisallowed { get; init; }
     public bool JournalIntegrityOrReconciliationRepairActive { get; init; }
+    public bool PreflightAuthoritySampled { get; init; }
+    public bool PreflightGlobalKillSwitchActive { get; init; }
+    public bool PreflightMismatchExecutionBlocked { get; init; }
+    public bool? PreflightMismatchExecutionBlockedForSubmit { get; init; }
+    public bool PreflightInstrumentFrozenOrEpaBlocked { get; init; }
 
     public string? LedgerAccountName { get; init; }
     public long? LedgerOwnershipVersion { get; init; }
@@ -111,6 +116,10 @@ public sealed class AuthorityEvaluationRequest
     public Func<string, bool>? MismatchExecutionBlocked { get; init; }
     public Func<string, string?, bool>? MismatchExecutionBlockedForSubmit { get; init; }
     public Func<string, string?, bool>? InstrumentFrozenOrEpaBlocked { get; init; }
+    public bool? PreflightGlobalKillSwitchActive { get; init; }
+    public bool? PreflightMismatchExecutionBlocked { get; init; }
+    public bool? PreflightMismatchExecutionBlockedForSubmit { get; init; }
+    public bool? PreflightInstrumentFrozenOrEpaBlocked { get; init; }
     public ExecutionSafetyEvaluationRequest? PrebuiltSafetyRequest { get; init; }
     public ExecutionAuthorityFrame? AuthorityFrame { get; init; }
     public Func<string, string?, DateTimeOffset, ExecutionSafetyEvaluationRequest>? BuildSafetyRequest { get; init; }

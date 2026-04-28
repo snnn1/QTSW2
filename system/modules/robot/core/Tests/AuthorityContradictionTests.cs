@@ -23,6 +23,8 @@ public static class AuthorityContradictionTests
         if (e != null) return (false, e);
         e = Case_UeaCarriesSinglePrebuiltAuthorityFrame();
         if (e != null) return (false, e);
+        e = Case_UeaTrustsSinglePreflightAuthoritySample();
+        if (e != null) return (false, e);
         return (true, null);
     }
 
@@ -224,6 +226,66 @@ public static class AuthorityContradictionTests
                 return "expected UEA decision to carry the same prebuilt authority frame id";
             if (decision.DenyGate != "Gate3_Structural")
                 return "expected Gate3_Structural deny from prebuilt safety request";
+
+            return null;
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(root))
+                    Directory.Delete(root, true);
+            }
+            catch { /* best effort */ }
+        }
+    }
+
+    private static string? Case_UeaTrustsSinglePreflightAuthoritySample()
+    {
+        var utc = DateTimeOffset.UtcNow;
+        var root = Path.Combine(Path.GetTempPath(), "auth_preflight_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var log = new RobotLogger(root);
+            var uea = new UnifiedExecutionAuthority(log);
+
+            var sampledAllow = uea.Evaluate(new AuthorityEvaluationRequest
+            {
+                Instrument = "MES",
+                IntentId = "intent-sampled-allow",
+                SubmitIntent = SubmitIntent.OpeningEntry,
+                SubmitPath = "SUBMIT_ENTRY_STOP",
+                UtcNow = utc,
+                GlobalKillSwitchActive = () => false,
+                MismatchExecutionBlocked = _ => true,
+                MismatchExecutionBlockedForSubmit = (_, _) => true,
+                InstrumentFrozenOrEpaBlocked = (_, _) => false,
+                PreflightGlobalKillSwitchActive = false,
+                PreflightMismatchExecutionBlocked = false,
+                PreflightMismatchExecutionBlockedForSubmit = false,
+                PreflightInstrumentFrozenOrEpaBlocked = false
+            });
+            if (!sampledAllow.Allowed)
+                return "expected UEA to trust the sampled preflight allow instead of re-reading later mismatch callbacks";
+
+            var sampledDeny = uea.Evaluate(new AuthorityEvaluationRequest
+            {
+                Instrument = "MES",
+                IntentId = "intent-sampled-deny",
+                SubmitIntent = SubmitIntent.OpeningEntry,
+                SubmitPath = "SUBMIT_ENTRY_STOP",
+                UtcNow = utc,
+                GlobalKillSwitchActive = () => false,
+                MismatchExecutionBlocked = _ => false,
+                MismatchExecutionBlockedForSubmit = (_, _) => false,
+                InstrumentFrozenOrEpaBlocked = (_, _) => false,
+                PreflightGlobalKillSwitchActive = false,
+                PreflightMismatchExecutionBlocked = true,
+                PreflightInstrumentFrozenOrEpaBlocked = false
+            });
+            if (sampledDeny.Allowed || sampledDeny.DenyReason != "MISMATCH_EXECUTION_BLOCK")
+                return "expected UEA to trust the sampled preflight mismatch deny";
 
             return null;
         }

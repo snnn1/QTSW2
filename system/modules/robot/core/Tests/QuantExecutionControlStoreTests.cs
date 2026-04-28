@@ -592,8 +592,10 @@ public static class QuantExecutionControlStoreTests
 
                 if (!ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_MARKET_REENTRY", false, out var ok))
                     return "market reentry bypass: expected allow, got " + ok.Reason;
-                if (ok.Detail == null || ok.Detail.IndexOf("market_reentry_quant_recovery_gross_mismatch_bypass", StringComparison.Ordinal) < 0)
-                    return "market reentry bypass: missing bypass detail, got " + ok.Detail;
+                if (ok.Detail == null ||
+                    (ok.Detail.IndexOf("market_reentry_quant_recovery_gross_mismatch_bypass", StringComparison.Ordinal) < 0 &&
+                     ok.Detail.IndexOf("quant_recovery_required_cleared_authoritative_flat", StringComparison.Ordinal) < 0))
+                    return "market reentry bypass: missing bypass/clear detail, got " + ok.Detail;
                 return null;
             }
             finally

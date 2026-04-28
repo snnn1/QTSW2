@@ -23,6 +23,27 @@ public sealed class UnifiedExecutionAuthority
         _ownershipLedger = ownershipLedger;
     }
 
+    private static bool ResolveGlobalKillSwitchActive(AuthorityEvaluationRequest request) =>
+        request.PreflightGlobalKillSwitchActive ?? (request.GlobalKillSwitchActive?.Invoke() == true);
+
+    private static bool ResolveMismatchExecutionBlocked(AuthorityEvaluationRequest request, string instrument)
+    {
+        if (string.IsNullOrEmpty(instrument))
+            return false;
+        if (request.PreflightMismatchExecutionBlockedForSubmit.HasValue)
+            return request.PreflightMismatchExecutionBlockedForSubmit.Value;
+        if (request.PreflightMismatchExecutionBlocked.HasValue)
+            return request.PreflightMismatchExecutionBlocked.Value;
+        if (request.MismatchExecutionBlockedForSubmit != null)
+            return request.MismatchExecutionBlockedForSubmit(instrument, request.SubmitPath);
+        return request.MismatchExecutionBlocked?.Invoke(instrument) == true;
+    }
+
+    private static bool ResolveInstrumentFrozenOrEpaBlocked(AuthorityEvaluationRequest request, string instrument) =>
+        !string.IsNullOrEmpty(instrument) &&
+        (request.PreflightInstrumentFrozenOrEpaBlocked ??
+         (request.InstrumentFrozenOrEpaBlocked?.Invoke(instrument, request.SubmitPath) == true));
+
     /// <summary>
     /// Evaluate all four gates in order. Short-circuits on first deny.
     /// A single <see cref="InstrumentOwnershipSnapshot"/> is captured once and passed to all gates.
@@ -61,17 +82,21 @@ public sealed class UnifiedExecutionAuthority
             }
         }
 
+        var globalKillSwitchActive = ResolveGlobalKillSwitchActive(request);
+        var mismatchBlocked = ResolveMismatchExecutionBlocked(request, instrument);
+        var instrumentFrozenOrEpaBlocked = ResolveInstrumentFrozenOrEpaBlocked(request, instrument);
+
         // Gate 1: KillSwitch + Recovery (EPA preflight)
         var skipMismatch = request.SubmitIntent == SubmitIntent.RiskCoverage;
-        if (!ExecutionPermissionAuthority.TryAdapterOrderSubmitPreflight(
-                request.GlobalKillSwitchActive,
-                request.MismatchExecutionBlocked,
-                request.MismatchExecutionBlockedForSubmit,
-                request.InstrumentFrozenOrEpaBlocked,
-                instrument,
-                request.SubmitPath,
-                out var epaDeny,
-                skipMismatchExecutionBlock: skipMismatch))
+        string? epaDeny = null;
+        if (globalKillSwitchActive)
+            epaDeny = "GLOBAL_KILL_SWITCH_ACTIVE";
+        else if (!skipMismatch && mismatchBlocked)
+            epaDeny = "MISMATCH_EXECUTION_BLOCK";
+        else if (instrumentFrozenOrEpaBlocked)
+            epaDeny = "INSTRUMENT_FROZEN_OR_EPA_BLOCKED";
+
+        if (!string.IsNullOrEmpty(epaDeny))
         {
             trail.Add(new GateEvaluation { GateName = "Gate1_KillSwitch_Recovery", Passed = false, DenyReason = epaDeny });
             return AuthorityDecision.Deny("Gate1_KillSwitch_Recovery", epaDeny, ownershipSnapshot, authorityFrame, trail, utcNow);
@@ -81,8 +106,6 @@ public sealed class UnifiedExecutionAuthority
         // Gate 2: Explicit Mismatch Block (first-class authority input)
         // Gate1 checks mismatch via EPA preflight, but this gate is the explicit mismatch authority
         // for non-coverage submits. When Gate1+Gate2 merge in Phase 2, this becomes the single check.
-        var mismatchBlocked = request.MismatchExecutionBlockedForSubmit?.Invoke(instrument, request.SubmitPath) ??
-                              (request.MismatchExecutionBlocked?.Invoke(instrument) == true);
         if (mismatchBlocked
             && request.SubmitIntent != SubmitIntent.RiskCoverage)
         {
