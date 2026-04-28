@@ -1562,14 +1562,32 @@ public sealed class ExecutionJournal
                 }
             }
 
-            entry.RejectionOrderType = orderType;
-            entry.RejectedPrice = rejectedPrice;
-            entry.RejectedQuantity = rejectedQuantity;
-            entry.RejectedAt = utcNow.ToString("o");
-            entry.RejectionReason = reason;
-
             var protectiveRejection = IsProtectiveOrderRejection(orderType, reason);
-            if (!protectiveRejection || !entry.EntryFilled)
+            var activeFilledIntent = protectiveRejection && entry.EntryFilled;
+            if (activeFilledIntent)
+            {
+                entry.ProtectiveRejectionOrderType = orderType;
+                entry.ProtectiveRejectedPrice = rejectedPrice;
+                entry.ProtectiveRejectedQuantity = rejectedQuantity;
+                entry.ProtectiveRejectedAt = utcNow.ToString("o");
+                entry.ProtectiveRejectionReason = reason;
+            }
+            else
+            {
+                entry.RejectionOrderType = orderType;
+                entry.RejectedPrice = rejectedPrice;
+                entry.RejectedQuantity = rejectedQuantity;
+                entry.RejectedAt = utcNow.ToString("o");
+                entry.RejectionReason = reason;
+            }
+            if (string.IsNullOrWhiteSpace(entry.IntentId))
+                entry.IntentId = intentId;
+            if (string.IsNullOrWhiteSpace(entry.TradingDate) && !string.IsNullOrWhiteSpace(tradingDate))
+                entry.TradingDate = tradingDate;
+            if (string.IsNullOrWhiteSpace(entry.Stream) && !string.IsNullOrWhiteSpace(stream))
+                entry.Stream = stream;
+
+            if (!activeFilledIntent)
                 entry.Rejected = true;
 
             _cache[key] = entry;
@@ -4783,6 +4801,16 @@ public class ExecutionJournalEntry
     public string? RejectedAt { get; set; }
 
     public string? RejectionReason { get; set; }
+
+    public string? ProtectiveRejectedAt { get; set; }
+
+    public string? ProtectiveRejectionReason { get; set; }
+
+    public string? ProtectiveRejectionOrderType { get; set; }
+
+    public decimal? ProtectiveRejectedPrice { get; set; }
+
+    public int? ProtectiveRejectedQuantity { get; set; }
 
     public bool BEModified { get; set; }
 

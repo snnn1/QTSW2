@@ -36,6 +36,11 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         cumulativeFilledQuantity > 0 &&
         cumulativeFilledQuantity < expectedQuantity;
 
+    internal static bool ShouldTerminalizeAfterExitFill(ExecutionJournalEntry? entry) =>
+        entry != null &&
+        entry.EntryFilledQuantityTotal > 0 &&
+        entry.ExitFilledQuantityTotal >= entry.EntryFilledQuantityTotal;
+
     /// <summary>At most one delayed critical flatten re-enqueue per (account, canonical) until the retry fires (stale-owner takeover window).</summary>
     private readonly ConcurrentDictionary<string, byte> _criticalFlattenCoordinationRetryInflight = new(StringComparer.OrdinalIgnoreCase);
 
@@ -160,6 +165,47 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     private object? _ntInstrument; // NinjaTrader.Cbi.Instrument
     private bool _simAccountVerified = false;
     private bool _ntContextSet = false;
+
+    private sealed class LatestMarketDataLast
+    {
+        public decimal Price;
+        public DateTimeOffset Utc;
+    }
+
+    private static readonly TimeSpan LatestMarketDataLastFreshWindow = TimeSpan.FromSeconds(10);
+    private readonly ConcurrentDictionary<string, LatestMarketDataLast> _latestMarketDataLastByInstrument =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private static string NormalizeMarketDataInstrumentKey(string? instrument)
+    {
+        var trimmed = (instrument ?? "").Trim();
+        if (trimmed.Length == 0) return "";
+        return trimmed.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? trimmed;
+    }
+
+    public void RecordLatestMarketDataLast(string instrument, decimal price, DateTimeOffset utcNow)
+    {
+        if (price <= 0) return;
+        var key = NormalizeMarketDataInstrumentKey(instrument);
+        if (key.Length == 0) return;
+        _latestMarketDataLastByInstrument[key] = new LatestMarketDataLast { Price = price, Utc = utcNow };
+    }
+
+    private bool TryGetLatestMarketDataLast(string instrument, DateTimeOffset utcNow, out decimal price, out DateTimeOffset lastUtc)
+    {
+        price = 0m;
+        lastUtc = default;
+        var key = NormalizeMarketDataInstrumentKey(instrument);
+        if (key.Length == 0) return false;
+        if (!_latestMarketDataLastByInstrument.TryGetValue(key, out var latest)) return false;
+        if (latest.Price <= 0) return false;
+        var age = DateTimeOffset.UtcNow - latest.Utc;
+        if (age < TimeSpan.Zero) age = TimeSpan.Zero;
+        if (age > LatestMarketDataLastFreshWindow) return false;
+        price = latest.Price;
+        lastUtc = latest.Utc;
+        return true;
+    }
 
     /// <inheritdoc />
     public bool IsExecutionContextReady => _simAccountVerified && _ntContextSet;
@@ -898,8 +944,30 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         {
             SetProtectionState(action.IntentId, ProtectionState.Enqueued);
             _firstEnqueuedUtcByIntent.TryAdd(action.IntentId, DateTimeOffset.UtcNow);
+            if (action is NtSubmitProtectivesCommand protectives)
+                NotifyProtectiveSubmitPendingForAction(protectives);
         }
         return _ntActionQueue.EnqueueNtAction(action, out _);
+    }
+
+    private void NotifyProtectiveSubmitPendingForAction(NtSubmitProtectivesCommand cmd)
+    {
+        var utcNow = cmd.UtcNow == default ? DateTimeOffset.UtcNow : cmd.UtcNow;
+        var candidates = new[]
+        {
+            cmd.Instrument,
+            cmd.InstrumentKey,
+            _iea?.ExecutionInstrumentKey,
+            _ieaEngineExecutionInstrument
+        };
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var candidate in candidates)
+        {
+            var inst = candidate?.Trim();
+            if (string.IsNullOrEmpty(inst) || !seen.Add(inst))
+                continue;
+            QuantExecutionControlStore.NotifyProtectiveSubmitPending(inst, 2, utcNow);
+        }
     }
 
     private void SetProtectionState(string intentId, ProtectionState state, string? reason = null)
@@ -1078,6 +1146,8 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             return;
         if (action is NtFlattenInstrumentCommand fCmd && !TryCoordinationGateFlattenEnqueue(fCmd, out _))
             return;
+        if (action is NtSubmitProtectivesCommand protectives)
+            NotifyProtectiveSubmitPendingForAction(protectives);
         if (_ntActionQueue != null)
             _ntActionQueue.EnqueueNtAction(action, out _);
     }
@@ -4130,6 +4200,19 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
 
     public int GetCurrentPosition(string instrument)
     {
+        if (_isPlaybackStallNtCallBlockedCallback != null && _isPlaybackStallNtCallBlockedCallback())
+        {
+            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "EXECUTION_BLOCKED", state: "ENGINE",
+                new
+                {
+                    reason = "PLAYBACK_STALL_QUIESCENCE",
+                    operation = "GetCurrentPosition",
+                    instrument,
+                    note = "Playback stall quiescence is armed; returning flat without touching NT account state."
+                }));
+            return 0;
+        }
+
 #if !NINJATRADER
 {
         var error = "CRITICAL: NINJATRADER preprocessor directive is NOT defined. " +
@@ -4292,7 +4375,37 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             new { reason = "NINJATRADER_NOT_DEFINED", error }));
         throw new InvalidOperationException(error);
 #else
-        CancelOrdersReal(orderIds?.ToList() ?? new List<string>(), utcNow);
+        var ids = orderIds?.ToList() ?? new List<string>();
+        if (!IsStrategyThreadContext())
+        {
+            if (_ntActionQueue != null)
+            {
+                var cid = $"CANCEL_ORDERS:{utcNow:yyyyMMddHHmmssfff}:{ids.Count}";
+                _ntActionQueue.EnqueueNtAction(
+                    new NtDeferredAction(cid, null, null, "PUBLIC_CANCEL_ORDERS", () => CancelOrdersReal(ids, utcNow)),
+                    out _);
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ENTRY_ORDER_SET_CANCEL_ENQUEUED", state: "ENGINE",
+                    new
+                    {
+                        order_count = ids.Count,
+                        order_ids = ids,
+                        correlation_id = cid,
+                        note = "CancelOrders requested off strategy thread; queued onto strategy thread before touching NT account/orders."
+                    }));
+                return;
+            }
+
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ORDER_CANCEL_BLOCKED", state: "ENGINE",
+                new
+                {
+                    reason = "NT_ACTION_QUEUE_UNAVAILABLE",
+                    order_count = ids.Count,
+                    note = "CancelOrders requested off strategy thread but NT action queue is unavailable."
+                }));
+            return;
+        }
+
+        CancelOrdersReal(ids, utcNow);
 #endif
     }
 
@@ -4633,6 +4746,36 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
                 new { intent_id = intentId, reason = "NT_CONTEXT_NOT_SET", error }));
             return false;
         }
+
+#if NINJATRADER
+        if (!IsStrategyThreadContext())
+        {
+            if (_ntActionQueue != null)
+            {
+                var cid = $"CANCEL_INTENT:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
+                _ntActionQueue.EnqueueNtAction(
+                    new NtDeferredAction(cid, intentId, null, "PUBLIC_CANCEL_INTENT_ORDERS", () => CancelIntentOrdersReal(intentId, utcNow)),
+                    out _);
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_INTENT_ORDERS_ENQUEUED", state: "ENGINE",
+                    new
+                    {
+                        intent_id = intentId,
+                        correlation_id = cid,
+                        note = "CancelIntentOrders requested off strategy thread; queued onto strategy thread before touching NT account/orders."
+                    }));
+                return true;
+            }
+
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "CANCEL_INTENT_ORDERS_BLOCKED", state: "ENGINE",
+                new
+                {
+                    intent_id = intentId,
+                    reason = "NT_ACTION_QUEUE_UNAVAILABLE",
+                    note = "CancelIntentOrders requested off strategy thread but NT action queue is unavailable."
+                }));
+            return false;
+        }
+#endif
 
         try
         {

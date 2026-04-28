@@ -165,10 +165,10 @@ public sealed class ExecutionJournal
             root = root.Replace(c, '-');
         return "RECOVERED-" + root;
     }
-    
+
     // Callback for stream stand-down on journal corruption
     private Action<string, string, string, DateTimeOffset>? _onJournalCorruptionCallback;
-    
+
     // Callback for recording execution costs in ExecutionSummary
     private Action<string, decimal, decimal?, decimal?>? _onExecutionCostCallback;
 
@@ -203,7 +203,7 @@ public sealed class ExecutionJournal
             // Intentionally no _log.Write — constructor runs before logger rebind; adoption lookups fall back to full scan until a later rebuild path succeeds.
         }
     }
-    
+
     /// <summary>
     /// Phase 3.2: Startup self-check. Verifies journal dir exists and is writable.
     /// Uses unique temp file per instance to avoid race when multiple strategies start concurrently.
@@ -212,7 +212,7 @@ public sealed class ExecutionJournal
     {
         if (!Directory.Exists(_journalDir))
             throw new InvalidOperationException($"ExecutionJournal: journal directory does not exist: {_journalDir}");
-        
+
         var checkPath = Path.Combine(_journalDir, $".startup_check_{Guid.NewGuid():N}");
         try
         {
@@ -228,7 +228,7 @@ public sealed class ExecutionJournal
             throw new InvalidOperationException($"ExecutionJournal: journal directory not writable: {_journalDir}", ex);
         }
     }
-    
+
     /// <summary>Journal directory path (for diagnostics).</summary>
     public string JournalDirectory => _journalDir;
 
@@ -257,7 +257,7 @@ public sealed class ExecutionJournal
     {
         _onJournalCorruptionCallback = callback;
     }
-    
+
     /// <summary>
     /// Set callback for recording execution costs (slippage, commission, fees).
     /// </summary>
@@ -320,7 +320,7 @@ public sealed class ExecutionJournal
         lock (_lock)
         {
             var key = $"{tradingDate}_{stream}_{intentId}";
-            
+
             if (_cache.TryGetValue(key, out var entry))
             {
                 return entry.EntrySubmitted || entry.EntryFilled;
@@ -359,10 +359,10 @@ public sealed class ExecutionJournal
                             action = "STREAM_STAND_DOWN",
                             note = "Journal corruption - standing down stream to prevent duplicate submissions (fail-closed)"
                         }));
-                    
+
                     // Stand down stream
                     _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
-                    
+
                     // Return true (treat as submitted) to prevent duplicate submission
                     return true; // Fail-closed: assume submitted to prevent duplicates
                 }
@@ -423,10 +423,10 @@ public sealed class ExecutionJournal
                             action = "STREAM_STAND_DOWN",
                             note = "Journal corruption during RecordSubmission - standing down stream (fail-closed)"
                         }));
-                    
+
                     // Stand down stream
                     _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
-                    
+
                     // Return early - don't record submission to prevent duplicates
                     return;
                 }
@@ -572,10 +572,10 @@ public sealed class ExecutionJournal
                                 action = "STREAM_STAND_DOWN",
                                 note = "Journal corruption during RecordFill - standing down stream (fail-closed)"
                             }));
-                        
+
                         // Stand down stream
                         _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
-                        
+
                         // Return early - don't record fill to prevent duplicates
                         return;
                     }
@@ -616,13 +616,13 @@ public sealed class ExecutionJournal
             if (entry.ExpectedEntryPrice.HasValue)
             {
                 entry.SlippagePoints = fillPrice - entry.ExpectedEntryPrice.Value;
-                
+
                 // Calculate slippage in dollars if contract multiplier is provided
                 if (contractMultiplier.HasValue && fillQuantity > 0)
                 {
                     entry.SlippageDollars = entry.SlippagePoints.Value * contractMultiplier.Value * fillQuantity;
                 }
-                
+
                 // Log slippage event
                 _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_SLIPPAGE_DETECTED", "ENGINE",
                     new
@@ -637,7 +637,7 @@ public sealed class ExecutionJournal
                         fill_quantity = fillQuantity,
                         contract_multiplier = contractMultiplier
                     }));
-                
+
                 // Record cost in ExecutionSummary via callback
                 if (entry.SlippageDollars.HasValue)
                 {
@@ -712,7 +712,7 @@ public sealed class ExecutionJournal
                     }));
                 return; // Fail-closed: do not persist
             }
-            
+
             if (string.IsNullOrWhiteSpace(stream))
             {
                 _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_VALIDATION_FAILED", "ENGINE",
@@ -726,10 +726,10 @@ public sealed class ExecutionJournal
                     }));
                 return; // Fail-closed: do not persist
             }
-            
+
             var key = $"{tradingDate}_{stream}_{intentId}";
             var journalPath = GetJournalPath(tradingDate, stream, intentId);
-            
+
             ExecutionJournalEntry entry;
             if (_cache.TryGetValue(key, out var existing))
             {
@@ -767,10 +767,10 @@ public sealed class ExecutionJournal
                             action = "STREAM_STAND_DOWN",
                             note = "Journal corruption during RecordEntryFill - standing down stream (fail-closed)"
                         }));
-                    
+
                     // Stand down stream
                     _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
-                    
+
                     // Return early - don't record fill to prevent duplicates
                     return;
                 }
@@ -785,16 +785,16 @@ public sealed class ExecutionJournal
                     Instrument = executionInstrument
                 };
             }
-            
+
             // Normalize direction (ensure consistent casing: "Long" or "Short")
             var normalizedDirection = direction?.Trim();
             if (!string.IsNullOrEmpty(normalizedDirection))
             {
                 normalizedDirection = char.ToUpperInvariant(normalizedDirection[0]) + normalizedDirection.Substring(1).ToLowerInvariant();
             }
-            
+
             // Validate direction consistency (if already set)
-            if (!string.IsNullOrEmpty(entry.Direction) && 
+            if (!string.IsNullOrEmpty(entry.Direction) &&
                 !string.Equals(entry.Direction, normalizedDirection, StringComparison.OrdinalIgnoreCase))
             {
                 // CRITICAL: Direction mismatch - invariant violation
@@ -811,7 +811,7 @@ public sealed class ExecutionJournal
                     }));
                 return; // Fail-closed
             }
-            
+
             // Validate contract multiplier consistency (if already set)
             if (entry.ContractMultiplier.HasValue && entry.ContractMultiplier.Value != contractMultiplier)
             {
@@ -831,7 +831,7 @@ public sealed class ExecutionJournal
             }
 
             HydrateCanonicalTimestampsFromLegacy(entry);
-            
+
             // Update cumulative entry quantities (delta-based accumulation)
             entry.EntryFilledQuantityTotal += fillQuantity;
             entry.EntryFillNotional = (entry.EntryFillNotional ?? 0) + (fillPrice * fillQuantity);
@@ -853,11 +853,11 @@ public sealed class ExecutionJournal
                         note = "Fill observation precedes canonical submit timestamp — check clock or ordering."
                     }));
             }
-            
+
             // Timestamp policy: Store first entry fill time only (canonical event time)
             if (string.IsNullOrEmpty(entry.EntryFilledAtUtc))
                 entry.EntryFilledAtUtc = utcNow.ToString("o");
-            
+
             // Persist direction + multiplier on first entry fill (use normalized direction)
             if (string.IsNullOrEmpty(entry.Direction))
             {
@@ -867,29 +867,29 @@ public sealed class ExecutionJournal
             {
                 entry.ContractMultiplier = contractMultiplier;
             }
-            
+
             // Store intent prices if not already set (preserve existing values)
             // These may have been set by RecordSubmission, but if not, preserve null
             // Note: Intent prices should ideally be set at submission time, but we don't block here
-            
+
             // Legacy fields for backwards compatibility (mirror canonical fill time)
             entry.EntryFilled = true;
             entry.EntryFilledAt = entry.EntryFilledAtUtc;
             entry.FillPrice = fillPrice;
             entry.FillQuantity = entry.EntryFilledQuantityTotal; // Store cumulative for legacy compatibility
             entry.ActualFillPrice = fillPrice;
-            
+
             // Calculate slippage if expected price is available
             if (entry.ExpectedEntryPrice.HasValue)
             {
                 entry.SlippagePoints = fillPrice - entry.ExpectedEntryPrice.Value;
-                
+
                 // Calculate slippage in dollars
                 if (fillQuantity > 0)
                 {
                     entry.SlippageDollars = (entry.SlippageDollars ?? 0) + (entry.SlippagePoints.Value * contractMultiplier * fillQuantity);
                 }
-                
+
                 // Log slippage event
                 _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_SLIPPAGE_DETECTED", "ENGINE",
                     new
@@ -905,14 +905,14 @@ public sealed class ExecutionJournal
                         cumulative_entry_qty = entry.EntryFilledQuantityTotal,
                         contract_multiplier = contractMultiplier
                     }));
-                
+
                 // Record cost in ExecutionSummary via callback
                 if (entry.SlippageDollars.HasValue)
                 {
                     _onExecutionCostCallback?.Invoke(intentId, entry.SlippageDollars.Value, entry.Commission, entry.Fees);
                 }
             }
-            
+
             _cache[key] = entry;
             SaveJournal(journalPath, entry);
             _entryFillByStream[$"{tradingDate}_{stream}"] = true;
@@ -956,7 +956,7 @@ public sealed class ExecutionJournal
                     }));
                 return; // Fail-closed: do not persist
             }
-            
+
             if (string.IsNullOrWhiteSpace(stream))
             {
                 _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_VALIDATION_FAILED", "ENGINE",
@@ -970,10 +970,10 @@ public sealed class ExecutionJournal
                     }));
                 return; // Fail-closed: do not persist
             }
-            
+
             var key = $"{tradingDate}_{stream}_{intentId}";
             var journalPath = GetJournalPath(tradingDate, stream, intentId);
-            
+
             ExecutionJournalEntry entry;
             if (_cache.TryGetValue(key, out var existing))
             {
@@ -1002,7 +1002,7 @@ public sealed class ExecutionJournal
                                 action = "STREAM_STAND_DOWN",
                                 note = "Entry fill missing when exit occurs - cannot calculate P&L deterministically"
                             }));
-                        
+
                         // Stand down stream
                         _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
                         return; // Fail-closed
@@ -1023,10 +1023,10 @@ public sealed class ExecutionJournal
                             action = "STREAM_STAND_DOWN",
                             note = "Journal corruption during RecordExitFill - standing down stream (fail-closed)"
                         }));
-                    
+
                     // Stand down stream
                     _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
-                    
+
                     // Return early - don't record fill to prevent duplicates
                     return;
                 }
@@ -1047,12 +1047,12 @@ public sealed class ExecutionJournal
                         action = "STREAM_STAND_DOWN",
                         note = "Entry fill missing when exit occurs - cannot calculate P&L deterministically"
                     }));
-                
+
                 // Stand down stream
                 _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
                 return; // Fail-closed
             }
-            
+
             // Validate entry prerequisites
             if (entry.EntryFilledQuantityTotal <= 0)
             {
@@ -1066,12 +1066,12 @@ public sealed class ExecutionJournal
                         action = "STREAM_STAND_DOWN",
                         note = "Cannot calculate P&L - entry quantity invalid"
                     }));
-                
+
                 // Stand down stream
                 _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
                 return; // Fail-closed
             }
-            
+
             if (string.IsNullOrEmpty(entry.Direction))
             {
                 _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_INVALID_STATE", "ENGINE",
@@ -1083,12 +1083,12 @@ public sealed class ExecutionJournal
                         action = "STREAM_STAND_DOWN",
                         note = "Cannot calculate P&L deterministically - direction missing"
                     }));
-                
+
                 // Stand down stream
                 _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
                 return; // Fail-closed
             }
-            
+
             if (!entry.ContractMultiplier.HasValue)
             {
                 _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_INVALID_STATE", "ENGINE",
@@ -1100,7 +1100,7 @@ public sealed class ExecutionJournal
                         action = "STREAM_STAND_DOWN",
                         note = "Cannot calculate P&L deterministically - contract multiplier missing"
                     }));
-                
+
                 // Stand down stream
                 _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
                 return; // Fail-closed
@@ -1183,7 +1183,7 @@ public sealed class ExecutionJournal
                 SaveJournal(journalPath, entry);
                 return;
             }
-            
+
             // Update exit cumulatives (delta-based accumulation)
             entry.ExitFilledQuantityTotal += exitFillQuantity;
             entry.ExitFillNotional = (entry.ExitFillNotional ?? 0) + (exitFillPrice * exitFillQuantity);
@@ -1204,11 +1204,11 @@ public sealed class ExecutionJournal
                         note = "Exit fill observation precedes canonical entry fill — check clock or ordering."
                     }));
             }
-            
+
             // Timestamp policy: Store first exit fill time only (canonical)
             if (string.IsNullOrEmpty(entry.ExitFilledAtUtc))
                 entry.ExitFilledAtUtc = utcNow.ToString("o");
-            
+
             // ExitOrderType: Store first exit order type
             if (string.IsNullOrEmpty(entry.ExitOrderType))
             {
@@ -1228,7 +1228,7 @@ public sealed class ExecutionJournal
                         note = "Exit order type changed - setting CompletionReason to EMERGENCY_OVERRIDE"
                     }));
             }
-            
+
             // Completion logic
             if (entry.ExitFilledQuantityTotal < entry.EntryFilledQuantityTotal)
             {
@@ -1247,20 +1247,20 @@ public sealed class ExecutionJournal
                     SaveJournal(journalPath, entry);
                     return;
                 }
-                
+
                 // Complete - compute P&L
                 var direction = entry.Direction;
                 var contractMultiplier = entry.ContractMultiplier.Value;
                 var entryAvg = entry.EntryAvgFillPrice.Value;
                 var exitAvg = entry.ExitAvgFillPrice.Value;
-                
+
                 // Normalize direction for comparison (case-insensitive)
                 var normalizedDirection = direction?.Trim();
                 if (!string.IsNullOrEmpty(normalizedDirection))
                 {
                     normalizedDirection = char.ToUpperInvariant(normalizedDirection[0]) + normalizedDirection.Substring(1).ToLowerInvariant();
                 }
-                
+
                 // Calculate points (sign by direction)
                 decimal points;
                 if (string.Equals(normalizedDirection, "Long", StringComparison.OrdinalIgnoreCase))
@@ -1283,15 +1283,15 @@ public sealed class ExecutionJournal
                             action = "STREAM_STAND_DOWN",
                             note = "Cannot calculate P&L - invalid direction"
                         }));
-                    
+
                     // Stand down stream
                     _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
                     return; // Fail-closed
                 }
-                
+
                 // Calculate gross dollars
                 var grossDollars = points * entry.EntryFilledQuantityTotal * contractMultiplier;
-                
+
                 // Calculate net dollars (only subtract populated values)
                 decimal netDollars = grossDollars;
                 if (entry.SlippageDollars.HasValue)
@@ -1306,7 +1306,7 @@ public sealed class ExecutionJournal
                 {
                     netDollars -= entry.Fees.Value;
                 }
-                
+
                 // Store P&L
                 entry.RealizedPnLPoints = points;
                 entry.RealizedPnLGross = grossDollars;
@@ -1319,7 +1319,7 @@ public sealed class ExecutionJournal
                 }
                 if (entry.Rejected && IsProtectiveOrderRejection(entry.RejectionOrderType, entry.RejectionReason))
                     entry.Rejected = false;
-                
+
                 // Log trade completion with enhanced fields
                 var tradeData = new Dictionary<string, object?>
                 {
@@ -1338,7 +1338,7 @@ public sealed class ExecutionJournal
                     ["exit_reason"] = entry.CompletionReason, // Alias for consistency
                     ["contract_multiplier"] = contractMultiplier
                 };
-                
+
                 // Add entry/exit times if available (canonical fill time, not observation)
                 var entryCanonForLog = !string.IsNullOrWhiteSpace(entry.EntryFilledAtUtc)
                     ? entry.EntryFilledAtUtc
@@ -1351,7 +1351,7 @@ public sealed class ExecutionJournal
                         tradeData["entry_time_chicago"] = TimeService.ConvertUtcToChicagoStatic(entryTime).ToString("o");
                     }
                 }
-                
+
                 // Use ExitFilledAtUtc (the field name in ExecutionJournalEntry)
                 var exitTimeStr = entry.ExitFilledAtUtc;
                 if (!string.IsNullOrWhiteSpace(exitTimeStr))
@@ -1362,18 +1362,18 @@ public sealed class ExecutionJournal
                         tradeData["exit_time_chicago"] = TimeService.ConvertUtcToChicagoStatic(exitTime).ToString("o");
                     }
                 }
-                
+
                 // Add commission and fees if available
                 if (entry.Commission.HasValue)
                 {
                     tradeData["commission"] = entry.Commission.Value;
                 }
-                
+
                 if (entry.Fees.HasValue)
                 {
                     tradeData["fees"] = entry.Fees.Value;
                 }
-                
+
                 // Calculate time in trade if both times available
                 var entryTimeStr = entry.EntryFilledAt;
                 if (!string.IsNullOrWhiteSpace(entryTimeStr) && !string.IsNullOrWhiteSpace(exitTimeStr))
@@ -1386,13 +1386,13 @@ public sealed class ExecutionJournal
                         tradeData["time_in_trade_seconds"] = (int)timeInTrade.TotalSeconds;
                     }
                 }
-                
+
                 // Include slot_instance_key if provided (for health sink path granularity)
                 if (!string.IsNullOrWhiteSpace(slotInstanceKey))
                 {
                     tradeData["slot_instance_key"] = slotInstanceKey;
                 }
-                
+
                 // Use RobotEvents.Base instead of EngineBase for proper stream context
                 // RobotEvents.Base signature: (TimeService?, DateTimeOffset, string?, string?, string?, string?, string?, DateTimeOffset?, string, string, Dictionary<string, object?>?)
                 // Note: TimeService is required, but ExecutionJournal doesn't have access to it. Use a temporary instance.
@@ -1414,12 +1414,12 @@ public sealed class ExecutionJournal
                         action = "STREAM_STAND_DOWN",
                         note = "Overfill detected - exit quantity > entry quantity"
                     }));
-                
+
                 // Stand down stream
                 _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
                 return; // Fail-closed
             }
-            
+
             _cache[key] = entry;
             SaveJournal(journalPath, entry);
         }, () => new { cache_hit = cacheHit });
@@ -1548,10 +1548,10 @@ public sealed class ExecutionJournal
                                 action = "STREAM_STAND_DOWN",
                                 note = "Journal corruption during RecordRejection - standing down stream (fail-closed)"
                             }));
-                        
+
                         // Stand down stream
                         _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
-                        
+
                         // Return early - don't record rejection to prevent duplicates
                         return;
                     }
@@ -1562,14 +1562,32 @@ public sealed class ExecutionJournal
                 }
             }
 
-            entry.RejectionOrderType = orderType;
-            entry.RejectedPrice = rejectedPrice;
-            entry.RejectedQuantity = rejectedQuantity;
-            entry.RejectedAt = utcNow.ToString("o");
-            entry.RejectionReason = reason;
-
             var protectiveRejection = IsProtectiveOrderRejection(orderType, reason);
-            if (!protectiveRejection || !entry.EntryFilled)
+            var activeFilledIntent = protectiveRejection && entry.EntryFilled;
+            if (activeFilledIntent)
+            {
+                entry.ProtectiveRejectionOrderType = orderType;
+                entry.ProtectiveRejectedPrice = rejectedPrice;
+                entry.ProtectiveRejectedQuantity = rejectedQuantity;
+                entry.ProtectiveRejectedAt = utcNow.ToString("o");
+                entry.ProtectiveRejectionReason = reason;
+            }
+            else
+            {
+                entry.RejectionOrderType = orderType;
+                entry.RejectedPrice = rejectedPrice;
+                entry.RejectedQuantity = rejectedQuantity;
+                entry.RejectedAt = utcNow.ToString("o");
+                entry.RejectionReason = reason;
+            }
+            if (string.IsNullOrWhiteSpace(entry.IntentId))
+                entry.IntentId = intentId;
+            if (string.IsNullOrWhiteSpace(entry.TradingDate) && !string.IsNullOrWhiteSpace(tradingDate))
+                entry.TradingDate = tradingDate;
+            if (string.IsNullOrWhiteSpace(entry.Stream) && !string.IsNullOrWhiteSpace(stream))
+                entry.Stream = stream;
+
+            if (!activeFilledIntent)
                 entry.Rejected = true;
 
             _cache[key] = entry;
@@ -1700,10 +1718,10 @@ public sealed class ExecutionJournal
                                 action = "STREAM_STAND_DOWN",
                                 note = "Journal corruption during RecordBEModification - standing down stream (fail-closed)"
                             }));
-                        
+
                         // Stand down stream
                         _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
-                        
+
                         // Return early - don't record BE modification to prevent duplicates
                         return;
                     }
@@ -1727,7 +1745,7 @@ public sealed class ExecutionJournal
             entry.BEModified = true;
             entry.BEModifiedAt = utcNow.ToString("o");
             entry.BEStopPrice = beStopPrice;
-            
+
             // Store BE modification context (only if not already set)
             if (previousStopPrice.HasValue && !entry.PreviousStopPrice.HasValue)
             {
@@ -1755,7 +1773,7 @@ public sealed class ExecutionJournal
         lock (_lock)
         {
             var key = $"{tradingDate}_{stream}_{intentId}";
-            
+
             if (_cache.TryGetValue(key, out var entry))
             {
                 return entry.BEModified;
@@ -1790,10 +1808,10 @@ public sealed class ExecutionJournal
                             action = "STREAM_STAND_DOWN",
                             note = "Journal corruption during IsBEModified check - standing down stream (fail-closed)"
                         }));
-                    
+
                     // Stand down stream
                     _onJournalCorruptionCallback?.Invoke(stream, tradingDate, intentId, utcNow);
-                    
+
                     // Return true (treat as modified) to prevent duplicate BE modification
                     return true; // Fail-closed: assume modified to prevent duplicates
                 }
@@ -1865,11 +1883,11 @@ public sealed class ExecutionJournal
         {
             // Scan journal directory for entries matching tradingDate_stream_*
             var pattern = $"{tradingDate}_{stream}_*.json";
-            
+
             try
             {
                 if (!Directory.Exists(_journalDir)) return false;
-                
+
                 var files = Directory.GetFiles(_journalDir, pattern);
                 foreach (var file in files)
                 {
@@ -1893,7 +1911,7 @@ public sealed class ExecutionJournal
                 // Fail-safe: return false on error (assume no completed trade)
                 return false;
             }
-            
+
             return false;
         }
     }
@@ -1917,13 +1935,13 @@ public sealed class ExecutionJournal
         lock (_lock)
         {
             var key = $"{tradingDate}_{stream}_{intentId}";
-            
+
             // Check cache first
             if (_cache.TryGetValue(key, out var cachedEntry))
             {
                 return cachedEntry;
             }
-            
+
             // Check disk
             var journalPath = GetJournalPath(tradingDate, stream, intentId);
             if (File.Exists(journalPath))
@@ -1945,11 +1963,11 @@ public sealed class ExecutionJournal
                     // If read fails, return null
                 }
             }
-            
+
             return null;
         }
     }
-    
+
     private string GetJournalPath(string tradingDate, string stream, string intentId)
         => Path.Combine(_journalDir, $"{tradingDate}_{stream}_{intentId}.json");
 
@@ -2880,6 +2898,8 @@ public sealed class ExecutionJournal
 
             foreach (var (tradingDate, stream, intentId, entry) in kv.Value)
             {
+                // Broker-flat + no working is stronger proof than stale registry trust. Keep actively tagged intents
+                // protected unless the caller is running the final residual-cleanup pulse.
                 if (!allowTaggedResidualRetirement && tagSet.Contains(intentId))
                     continue;
 
@@ -4782,32 +4802,42 @@ public class ExecutionJournalEntry
 
     public string? RejectionReason { get; set; }
 
+    public string? ProtectiveRejectedAt { get; set; }
+
+    public string? ProtectiveRejectionReason { get; set; }
+
+    public string? ProtectiveRejectionOrderType { get; set; }
+
+    public decimal? ProtectiveRejectedPrice { get; set; }
+
+    public int? ProtectiveRejectedQuantity { get; set; }
+
     public bool BEModified { get; set; }
 
     public string? BEModifiedAt { get; set; }
 
     public decimal? BEStopPrice { get; set; }
-    
+
     // BE modification context
     public decimal? PreviousStopPrice { get; set; } // Stop price before BE modification
     public decimal? BETriggerPrice { get; set; } // BE trigger price (65% of target)
-    
+
     // Minimal extension for recovery: deterministic rebuild fields
     public string? Direction { get; set; }
-    
+
     public decimal? EntryPrice { get; set; }
-    
+
     public decimal? StopPrice { get; set; }
-    
+
     public decimal? TargetPrice { get; set; }
-    
+
     public string? OcoGroup { get; set; }
-    
+
     // Rejection context
     public string? RejectionOrderType { get; set; } // Order type that was rejected (ENTRY, STOP, TARGET)
     public decimal? RejectedPrice { get; set; } // Price that was rejected
     public int? RejectedQuantity { get; set; } // Quantity that was rejected
-    
+
     // Slippage and cost tracking
     public decimal? ExpectedEntryPrice { get; set; } // Price we intended to fill at
     public decimal? ActualFillPrice { get; set; } // Price we actually filled at (same as FillPrice, kept for clarity)
@@ -4816,21 +4846,21 @@ public class ExecutionJournalEntry
     public decimal? Commission { get; set; } // Broker commission (if available)
     public decimal? Fees { get; set; } // Exchange fees (if available)
     public decimal? TotalCost { get; set; } // SlippageDollars + Commission + Fees
-    
+
     // Core identity (for journal-alone determinism)
     // NOTE: TradingDate and Stream may be nullable for backwards compatibility,
     // but persistence MUST reject empty/whitespace values
     // TradingDate and Stream already exist above - ensure they are populated
-    
+
     public decimal? ContractMultiplier { get; set; } // Contract multiplier (required for P&L calculation)
-    
+
     // Entry fill tracking (cumulative, weighted average)
     public int EntryFilledQuantityTotal { get; set; } // Cumulative total entry quantity
     public decimal? EntryAvgFillPrice { get; set; } // Weighted average entry fill price
     public decimal? EntryFillNotional { get; set; } // Sum(price * qty) for weighted avg calculation
     /// <summary>Canonical first entry fill event time (ISO-8601 UTC).</summary>
     public string? EntryFilledAtUtc { get; set; }
-    
+
     // Exit fill tracking (cumulative, weighted average)
     public int ExitFilledQuantityTotal { get; set; } // Cumulative total exit quantity
     public decimal? ExitAvgFillPrice { get; set; } // Weighted average exit fill price
@@ -4856,7 +4886,7 @@ public class ExecutionJournalEntry
 
     /// <summary>Null for integrity-recovered rows (no upstream intent).</summary>
     public string? OriginalIntentId { get; set; }
-    
+
     // Trade completion
     public bool TradeCompleted { get; set; } // True when exit qty == entry qty
     public decimal? RealizedPnLGross { get; set; } // Gross realized P&L in dollars
@@ -4901,7 +4931,10 @@ public static class CompletionReasons
     /// <summary>Virtual alignment trimmed exit qty but row cannot be marked complete (broker exposure, tags, or clock).</summary>
     public const string RECONCILIATION_ALIGNMENT_PENDING = "RECONCILIATION_ALIGNMENT_PENDING";
 
-    /// <summary>Integrity recovered row closed: non-recovered journal open qty fully explains broker; synthetic row superseded.</summary>
+    /// <summary>
+    /// Integrity-layer recovered row closed because non-recovered journal open qty equals broker abs exposure
+    /// (real strategy rows fully explain the position; recovered remainder is redundant).
+    /// </summary>
     public const string RECONCILIATION_RECOVERED_SUPERSEDED_BY_REAL = "RECONCILIATION_RECOVERED_SUPERSEDED_BY_REAL";
 
     /// <summary>Journal row requires recovery path; do not treat as flat-completed.</summary>

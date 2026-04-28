@@ -70,6 +70,12 @@ public sealed class LoggingConfig
     /// ERROR and CRITICAL events always bypass this flag.
     /// </summary>
     public bool diagnostics_enabled { get; set; } = false;
+
+    /// <summary>
+    /// Maximum DEBUG events per minute when diagnostics enabled (default: 600).
+    /// Prevents DEBUG volume from starving INFO. 0 = no cap.
+    /// </summary>
+    public int debug_volume_cap_per_minute { get; set; } = 600;
     
     /// <summary>
     /// Event rate limits: max occurrences per minute per event type.
@@ -88,9 +94,9 @@ public sealed class LoggingConfig
     /// <summary>
     /// When true, do not let a NinjaTrader TradingHours-only HOLIDAY result suppress trading if timetable indicates
     /// the session is active. The engine logs conflict telemetry and overrides HOLIDAY using internal close/reopen times.
-    /// Default false preserves legacy behavior.
+    /// Default true is fail-closed for playback/timetable days: an NT holiday cache must not suppress flatten on active rows.
     /// </summary>
-    public bool prefer_internal_calendar_over_nt_holiday { get; set; } = false;
+    public bool prefer_internal_calendar_over_nt_holiday { get; set; } = true;
 
     /// <summary>
     /// True when diagnostics logging is on (matches RobotCore: log_profile DIAGNOSTIC, or legacy flags).

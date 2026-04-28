@@ -25,6 +25,9 @@ public static class Phase5HardeningTests
         err = RunSupervisoryPolicyHysteresisTests();
         if (err != null) return (false, err);
 
+        err = RunLocalPlaybackStopDoesNotBroadcastRunWideShutdownSignal();
+        if (err != null) return (false, err);
+
         return (true, null);
     }
 
@@ -152,6 +155,90 @@ public static class Phase5HardeningTests
         }
         finally
         {
+            try
+            {
+                if (Directory.Exists(tempRoot))
+                    Directory.Delete(tempRoot, recursive: true);
+            }
+            catch { /* best effort */ }
+        }
+
+        return null;
+    }
+
+    /// <summary>Test: a normal local playback engine stop must not broadcast a run-wide shutdown signal.</summary>
+    private static string? RunLocalPlaybackStopDoesNotBroadcastRunWideShutdownSignal()
+    {
+        var root = ProjectRootResolver.ResolveProjectRoot();
+        var tempRoot = Path.Combine(Path.GetTempPath(), "QTSW2_LocalStopNoBroadcast_" + Guid.NewGuid().ToString("N")[..8]);
+        var priorRunId = Environment.GetEnvironmentVariable("QTSW2_RUN_ID");
+        var runId = "local_stop_no_broadcast_" + Guid.NewGuid().ToString("N")[..8];
+
+        try
+        {
+            Environment.SetEnvironmentVariable("QTSW2_RUN_ID", runId);
+
+            var configsRobot = Path.Combine(tempRoot, "configs", "robot");
+            var configsDir = Path.Combine(tempRoot, "configs");
+            var dataTimetable = Path.Combine(tempRoot, "data", "timetable");
+            var logsRobot = Path.Combine(tempRoot, "logs", "robot");
+            Directory.CreateDirectory(configsRobot);
+            Directory.CreateDirectory(configsDir);
+            Directory.CreateDirectory(dataTimetable);
+            Directory.CreateDirectory(logsRobot);
+
+            File.Copy(Path.Combine(root, "configs", "analyzer_robot_parity.json"),
+                Path.Combine(configsDir, "analyzer_robot_parity.json"));
+
+            var policySrc = Path.Combine(root, "configs", "execution_policy.json");
+            if (File.Exists(policySrc))
+                File.Copy(policySrc, Path.Combine(configsDir, "execution_policy.json"));
+
+            var loggingSrc = Path.Combine(root, "configs", "robot", "logging.json");
+            if (File.Exists(loggingSrc))
+                File.Copy(loggingSrc, Path.Combine(configsRobot, "logging.json"));
+
+            var sessionCalendarSrc = Path.Combine(root, "configs", "robot", "session_calendar.json");
+            if (File.Exists(sessionCalendarSrc))
+                File.Copy(sessionCalendarSrc, Path.Combine(configsRobot, "session_calendar.json"));
+
+            var timetableJson = JsonSerializer.Serialize(new
+            {
+                as_of = DateTimeOffset.UtcNow.ToString("o"),
+                trading_date = "2026-04-14",
+                timezone = "America/Chicago",
+                source = "local_stop_no_broadcast_test",
+                is_replay = true,
+                streams = new[]
+                {
+                    new { stream = "ES1", instrument = "MES", session = "S1", slot_time = "07:30", enabled = true }
+                }
+            });
+
+            var timetablePath = Path.Combine(dataTimetable, "timetable_replay_current.json");
+            File.WriteAllText(timetablePath, timetableJson);
+
+            var engine = new RobotEngine(
+                tempRoot,
+                TimeSpan.FromSeconds(60),
+                ExecutionMode.SIM,
+                customTimetablePath: timetablePath,
+                instrument: "MES",
+                masterInstrumentName: "MES",
+                ignoreExistingStreamJournals: true,
+                playbackAccountDetected: true,
+                useAsyncLogging: false);
+
+            engine.Start();
+            engine.Stop();
+
+            var shutdownSignalPath = Path.Combine(tempRoot, "runs", runId, RunRootArtifacts.RunShutdownSignalFileName);
+            if (File.Exists(shutdownSignalPath))
+                return "Local playback Stop() wrote RUN_SHUTDOWN.json; expected only explicit global shutdown paths to broadcast.";
+        }
+        finally
+        {
+            try { Environment.SetEnvironmentVariable("QTSW2_RUN_ID", priorRunId); } catch { /* best effort */ }
             try
             {
                 if (Directory.Exists(tempRoot))

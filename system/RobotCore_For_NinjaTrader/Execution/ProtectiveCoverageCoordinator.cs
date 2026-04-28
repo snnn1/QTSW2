@@ -21,7 +21,6 @@ public sealed class ProtectiveCoverageCoordinator
 {
     private readonly Func<AccountSnapshot> _getSnapshot;
     private readonly Func<IReadOnlyList<string>> _getActiveInstruments;
-    private readonly Func<string, IReadOnlyCollection<string>>? _getActiveIntentIdsForInstrument;
     private readonly Func<string, bool> _isFlattenInProgress;
     private readonly Func<string, bool> _isRecoveryInProgress;
     private readonly Func<string, bool> _isInstrumentBlockedExternal;
@@ -56,7 +55,6 @@ public sealed class ProtectiveCoverageCoordinator
         Func<ProtectiveCorrectiveRequest, ProtectiveCorrectiveResult>? submitCorrective = null,
         Func<string, DateTimeOffset, FlattenResult>? emergencyFlatten = null,
         ExecutionEventWriter? eventWriter = null,
-        Func<string, IReadOnlyCollection<string>>? getActiveIntentIdsForInstrument = null,
         RuntimeAuditHub? runtimeAudit = null,
         Func<string, bool>? isInstrumentInEngineScope = null,
         Func<string, int>? getPendingExecutionWorkloadForInstrument = null,
@@ -64,7 +62,6 @@ public sealed class ProtectiveCoverageCoordinator
     {
         _getSnapshot = getSnapshot ?? throw new ArgumentNullException(nameof(getSnapshot));
         _getActiveInstruments = getActiveInstruments ?? (() => Array.Empty<string>());
-        _getActiveIntentIdsForInstrument = getActiveIntentIdsForInstrument;
         _isFlattenInProgress = isFlattenInProgress ?? (_ => false);
         _isRecoveryInProgress = isRecoveryInProgress ?? (_ => false);
         _isInstrumentBlockedExternal = isInstrumentBlocked ?? (_ => false);
@@ -104,6 +101,8 @@ public sealed class ProtectiveCoverageCoordinator
             var snapshot = _getSnapshot();
             var instruments = _getActiveInstruments();
 
+            // Without engine scope: legacy behavior — expand to all account positions when the active list is empty.
+            // With engine scope: never fall back to the whole account; empty list means this engine has nothing to audit.
             if (instruments.Count == 0 && snapshot.Positions != null && _isInstrumentInEngineScope == null)
             {
                 var fromPositions = snapshot.Positions
@@ -137,18 +136,17 @@ public sealed class ProtectiveCoverageCoordinator
                 }
 
                 var blockedForAudit = _isInstrumentBlockedExternal(inst) || IsInstrumentBlockedByProtective(inst);
-                var activeIntentIds = _getActiveIntentIdsForInstrument?.Invoke(inst);
 
                 var result = ProtectiveCoverageAudit.Audit(
                     inst,
                     snapshot,
-                    activeIntentIds,
+                    activeIntentIds: null,
                     flattenInProgress: _isFlattenInProgress(inst),
                     recoveryInProgress: _isRecoveryInProgress(inst),
                     instrumentBlocked: blockedForAudit,
                     utcNow);
 
-                ProcessResult(result, activeIntentIds, utcNow);
+                ProcessResult(result);
             }
 
             _lastAuditUtc = utcNow;
@@ -187,10 +185,12 @@ public sealed class ProtectiveCoverageCoordinator
         });
     }
 
-    private void ProcessResult(ProtectiveAuditResult result, IReadOnlyCollection<string>? activeIntentIds, DateTimeOffset utcNow)
+    private void ProcessResult(ProtectiveAuditResult result)
     {
         var inst = result.Instrument;
         if (string.IsNullOrWhiteSpace(inst)) return;
+
+        var state = GetOrAddState(inst);
 
         // Phase 4A: pending broker visibility — diagnostic only; no block, no recovery, no failure metrics
         if (result.Status == ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE)
@@ -199,25 +199,6 @@ public sealed class ProtectiveCoverageCoordinator
             EmitCanonical(inst, ExecutionEventTypes.PROTECTIVE_PENDING_CONVERGENCE, result.AuditUtc, ToPayload(result), "INFO");
             return;
         }
-
-        // Diagnostic: log audit context for protective_missing_stop and critical failures
-        if (ProtectiveCoverageAudit.IsCritical(result.Status) || result.Status == ProtectiveAuditStatus.PROTECTIVE_MISSING_STOP)
-        {
-            var expectedCount = activeIntentIds?.Count ?? -1;
-            var foundStopQty = result.StopQty;
-            var reason = activeIntentIds == null ? "expected_intent_set_null" : (activeIntentIds.Count == 0 ? "expected_intent_set_empty" : null);
-            _log?.Write(RobotEvents.ExecutionBase(utcNow, "", inst, "PROTECTIVE_AUDIT_CONTEXT", new
-            {
-                instrument = inst,
-                audit_status = result.Status.ToString(),
-                expected_active_intent_ids_count = expectedCount,
-                found_protective_stop_qty = foundStopQty,
-                broker_position_qty = result.BrokerPositionQty,
-                context_wiring_reason = reason ?? "ok"
-            }));
-        }
-
-        var state = GetOrAddState(inst);
 
         // Clean or suppress (flatten/recovery in progress)
         if (result.Status == ProtectiveAuditStatus.PROTECTIVE_OK ||
@@ -253,7 +234,6 @@ public sealed class ProtectiveCoverageCoordinator
                     state.Blocked = false;
                     state.BlockReason = "";
                     state.ConsecutiveCleanPassCount = 0;
-                    state.AwaitingConfirmationUntilUtc = default;
                     _log?.Write(RobotEvents.ExecutionBase(result.AuditUtc, "", inst, "PROTECTIVE_RECOVERY_CONFIRMED", ToPayload(result)));
                     EmitCanonical(inst, ExecutionEventTypes.PROTECTIVE_RECOVERY_CONFIRMED, result.AuditUtc, ToPayload(result));
                 }
@@ -267,7 +247,39 @@ public sealed class ProtectiveCoverageCoordinator
             _auditFailureCount++;
             var eventType = GetEventTypeForStatus(result.Status);
             _log?.Write(RobotEvents.ExecutionBase(result.AuditUtc, "", inst, eventType, ToPayload(result)));
-            EmitCanonical(inst, ExecutionEventTypes.PROTECTIVE_AUDIT_RESULT, result.AuditUtc, ToPayload(result), "WARN");
+
+            if (state.RecoveryState != ProtectiveRecoveryState.CORRECTIVE_SUBMITTING &&
+                state.RecoveryState != ProtectiveRecoveryState.AWAITING_CONFIRMATION &&
+                state.AttemptCount < ProtectiveAuditPolicy.PROTECTIVE_MAX_CORRECTIVE_ATTEMPTS &&
+                IsCorrectiveEligible(result.Status) &&
+                _submitCorrective != null)
+            {
+                state.RecoveryState = ProtectiveRecoveryState.CORRECTIVE_SUBMITTING;
+                state.FirstDetectedUtc = state.FirstDetectedUtc == default ? result.AuditUtc : state.FirstDetectedUtc;
+                state.LastDetectedUtc = result.AuditUtc;
+                state.LastAuditStatus = result.Status;
+
+                var req = new ProtectiveCorrectiveRequest
+                {
+                    Instrument = inst,
+                    BrokerPositionQty = result.BrokerPositionQty,
+                    BrokerDirection = result.BrokerDirection,
+                    StopQty = result.StopQty,
+                    TargetQty = result.TargetQty,
+                    Status = result.Status,
+                    AuditUtc = result.AuditUtc
+                };
+                var correctiveResult = _submitCorrective(req);
+                state.AttemptCount++;
+                var submittedPayload = new { instrument = inst, intent_id = correctiveResult.IntentId, submitted = correctiveResult.Submitted, failure_reason = correctiveResult.FailureReason, attempt_count = state.AttemptCount };
+                _log?.Write(RobotEvents.ExecutionBase(result.AuditUtc, "", inst, "PROTECTIVE_RECOVERY_SUBMITTED", submittedPayload));
+                EmitCanonical(inst, ExecutionEventTypes.PROTECTIVE_RECOVERY_SUBMITTED, result.AuditUtc, submittedPayload);
+
+                state.AwaitingConfirmationUntilUtc = result.AuditUtc.AddMilliseconds(ProtectiveAuditPolicy.PROTECTIVE_AWAITING_CONFIRMATION_MS);
+                state.RecoveryState = correctiveResult.Submitted
+                    ? ProtectiveRecoveryState.AWAITING_CONFIRMATION
+                    : ProtectiveRecoveryState.DETECTED;
+            }
             return;
         }
 
@@ -279,12 +291,9 @@ public sealed class ProtectiveCoverageCoordinator
                 state.EmergencyFlattenTriggered = true;
                 var flattenResult = _emergencyFlatten(inst, result.AuditUtc);
                 state.RecoveryState = ProtectiveRecoveryState.FLATTEN_IN_PROGRESS;
-                _log?.Write(RobotEvents.ExecutionBase(result.AuditUtc, "", inst, "PROTECTIVE_EMERGENCY_FLATTEN_TRIGGERED", new
-                {
-                    instrument = inst,
-                    success = flattenResult.Success,
-                    error = flattenResult.ErrorMessage
-                }));
+                var flattenPayload = new { instrument = inst, success = flattenResult.Success, error = flattenResult.ErrorMessage };
+                _log?.Write(RobotEvents.ExecutionBase(result.AuditUtc, "", inst, "PROTECTIVE_EMERGENCY_FLATTEN_TRIGGERED", flattenPayload));
+                EmitCanonical(inst, ExecutionEventTypes.PROTECTIVE_EMERGENCY_FLATTEN_TRIGGERED, result.AuditUtc, flattenPayload);
             }
             else if (!state.EmergencyFlattenTriggered && _emergencyFlatten == null)
             {
@@ -350,7 +359,6 @@ public sealed class ProtectiveCoverageCoordinator
             state.Blocked = true;
             state.BlockReason = ProtectiveAuditPolicy.BLOCK_REASON_PROTECTIVE_FAILURE;
             _log?.Write(RobotEvents.ExecutionBase(result.AuditUtc, "", inst, "PROTECTIVE_INSTRUMENT_BLOCKED", ToPayload(result)));
-            EmitCanonical(inst, ExecutionEventTypes.PROTECTIVE_INSTRUMENT_BLOCKED, result.AuditUtc, ToPayload(result), "ERROR");
         }
 
         // Phase 4: Bounded corrective — one attempt for missing stop, stop qty mismatch, invalid price
@@ -372,14 +380,9 @@ public sealed class ProtectiveCoverageCoordinator
             };
             var correctiveResult = _submitCorrective(req);
             state.AttemptCount++;
-            _log?.Write(RobotEvents.ExecutionBase(result.AuditUtc, "", inst, "PROTECTIVE_RECOVERY_SUBMITTED", new
-            {
-                instrument = inst,
-                intent_id = correctiveResult.IntentId,
-                submitted = correctiveResult.Submitted,
-                failure_reason = correctiveResult.FailureReason,
-                attempt_count = state.AttemptCount
-            }));
+            var submittedPayload = new { instrument = inst, intent_id = correctiveResult.IntentId, submitted = correctiveResult.Submitted, failure_reason = correctiveResult.FailureReason, attempt_count = state.AttemptCount };
+            _log?.Write(RobotEvents.ExecutionBase(result.AuditUtc, "", inst, "PROTECTIVE_RECOVERY_SUBMITTED", submittedPayload));
+            EmitCanonical(inst, ExecutionEventTypes.PROTECTIVE_RECOVERY_SUBMITTED, result.AuditUtc, submittedPayload);
 
             // Phase 5: NO_SAFE_STOP_PRICE → escalate to flatten immediately (non-flat + no safe stop = flatten problem)
             if (!correctiveResult.Submitted && string.Equals(correctiveResult.FailureReason, "NO_SAFE_STOP_PRICE", StringComparison.OrdinalIgnoreCase))
@@ -417,14 +420,15 @@ public sealed class ProtectiveCoverageCoordinator
     {
         return status == ProtectiveAuditStatus.PROTECTIVE_MISSING_STOP ||
                status == ProtectiveAuditStatus.PROTECTIVE_STOP_QTY_MISMATCH ||
-               status == ProtectiveAuditStatus.PROTECTIVE_STOP_PRICE_INVALID;
+               status == ProtectiveAuditStatus.PROTECTIVE_STOP_PRICE_INVALID ||
+               status == ProtectiveAuditStatus.PROTECTIVE_MISSING_TARGET ||
+               status == ProtectiveAuditStatus.PROTECTIVE_TARGET_QTY_MISMATCH;
     }
 
     private static string GetEventTypeForStatus(ProtectiveAuditStatus status)
     {
         return status switch
         {
-            ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE => "PROTECTIVE_PENDING_CONVERGENCE",
             ProtectiveAuditStatus.PROTECTIVE_MISSING_STOP => "PROTECTIVE_MISSING_STOP",
             ProtectiveAuditStatus.PROTECTIVE_STOP_QTY_MISMATCH => "PROTECTIVE_STOP_QTY_MISMATCH",
             ProtectiveAuditStatus.PROTECTIVE_STOP_PRICE_INVALID => "PROTECTIVE_STOP_PRICE_INVALID",
@@ -432,6 +436,7 @@ public sealed class ProtectiveCoverageCoordinator
             ProtectiveAuditStatus.PROTECTIVE_TARGET_QTY_MISMATCH => "PROTECTIVE_TARGET_QTY_MISMATCH",
             ProtectiveAuditStatus.PROTECTIVE_CONFLICTING_ORDERS => "PROTECTIVE_CONFLICTING_ORDERS",
             ProtectiveAuditStatus.PROTECTIVE_UNRESOLVED_POSITION => "PROTECTIVE_AUDIT_FAILED",
+            ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE => "PROTECTIVE_PENDING_CONVERGENCE",
             _ => "PROTECTIVE_AUDIT_FAILED"
         };
     }
@@ -462,7 +467,7 @@ public sealed class ProtectiveCoverageCoordinator
     /// <summary>For tests: process a result directly (bypasses timer).</summary>
     internal void ProcessResultForTest(ProtectiveAuditResult result)
     {
-        ProcessResult(result, null, result.AuditUtc);
+        ProcessResult(result);
     }
 
     /// <summary>For tests: get current state (read-only).</summary>

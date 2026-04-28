@@ -114,12 +114,13 @@ public static class ProtectiveCoverageAudit
         // Missing stop: critical unless bounded post-fill convergence (mapped fill → PendingAlignment window)
         if (robotProtectiveStops.Count == 0)
         {
-            if (IsWithinBoundedPostFillConvergenceWindow(instrument, utcNow) ||
+            if (IsWithinBoundedProtectiveSubmitWindow(instrument, utcNow) ||
+                IsWithinBoundedPostFillConvergenceWindow(instrument, utcNow) ||
                 IsWithinBrokerExecutionCallbackWindow(instrument, utcNow))
             {
                 result.Status = ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE;
                 result.Detail =
-                    "No broker-visible protective stop in snapshot; bounded convergence: mapped fill pending protective submit visibility (QuantExecutionControlStore)";
+                    "No broker-visible protective stop in snapshot; bounded convergence: protective submit/fill handoff pending broker visibility (QuantExecutionControlStore)";
                 return result;
             }
 
@@ -131,7 +132,8 @@ public static class ProtectiveCoverageAudit
         // Stop qty mismatch: under-covered is critical
         if (totalStopQty < absQty)
         {
-            if (IsWithinBoundedProtectiveResizeWindow(instrument, absQty, utcNow) ||
+            if (IsWithinBoundedProtectiveSubmitWindow(instrument, utcNow) ||
+                IsWithinBoundedProtectiveResizeWindow(instrument, absQty, utcNow) ||
                 IsWithinBrokerExecutionCallbackWindow(instrument, utcNow))
             {
                 result.Status = ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE;
@@ -168,7 +170,8 @@ public static class ProtectiveCoverageAudit
 
         if (totalTargetQty < absQty)
         {
-            if (IsWithinBoundedProtectiveResizeWindow(instrument, absQty, utcNow) ||
+            if (IsWithinBoundedProtectiveSubmitWindow(instrument, utcNow) ||
+                IsWithinBoundedProtectiveResizeWindow(instrument, absQty, utcNow) ||
                 IsWithinBrokerExecutionCallbackWindow(instrument, utcNow))
             {
                 result.Status = ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE;
@@ -282,6 +285,11 @@ public static class ProtectiveCoverageAudit
     private static bool IsWithinBoundedProtectiveResizeWindow(string instrument, int expectedProtectiveQty, DateTimeOffset utcNow)
     {
         return QuantExecutionControlStore.IsProtectiveResizePendingActive(instrument, expectedProtectiveQty, utcNow);
+    }
+
+    private static bool IsWithinBoundedProtectiveSubmitWindow(string instrument, DateTimeOffset utcNow)
+    {
+        return QuantExecutionControlStore.IsProtectiveSubmitPendingActive(instrument, utcNow);
     }
 
     private static bool IsWithinBrokerExecutionCallbackWindow(string instrument, DateTimeOffset utcNow)

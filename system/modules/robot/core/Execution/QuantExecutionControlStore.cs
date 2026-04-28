@@ -30,6 +30,54 @@ public static class QuantExecutionControlStore
     }
 
     /// <summary>
+    /// Records that a protective submit has been handed to the strategy thread but may not yet be visible
+    /// in broker working-order snapshots. This is an audit-only bounded convergence window.
+    /// </summary>
+    public static void NotifyProtectiveSubmitPending(string instrument, int expectedWorkingOrderCount, DateTimeOffset utcNow)
+    {
+        if (!FeatureFlags.QuantExecutionControlStoreEnabled) return;
+        var inst = Norm(instrument);
+        if (string.IsNullOrEmpty(inst) || expectedWorkingOrderCount <= 0) return;
+
+        var windowMs = FeatureFlags.PostFillAlignmentWindowMs > 0 ? FeatureFlags.PostFillAlignmentWindowMs : 5000;
+        var expiry = utcNow.AddMilliseconds(windowMs);
+        var expectedCount = Math.Abs(expectedWorkingOrderCount);
+
+        ByInstrument.AddOrUpdate(
+            inst,
+            _ => new Entry
+            {
+                Phase = QuantExecutionInstrumentPhase.PendingAlignment,
+                Expected =
+                {
+                    ExpectedWorkingOrderCount = expectedCount,
+                    LastProtectiveSubmitPendingUtc = utcNow,
+                    PendingProtectiveSubmitWorkingCount = expectedCount,
+                    PendingAlignmentExpiresUtc = expiry
+                },
+                LockOrUnmappedReason = null
+            },
+            (_, e) =>
+            {
+                if (e.Phase is QuantExecutionInstrumentPhase.UnmappedExecution
+                    or QuantExecutionInstrumentPhase.ExecutionLocked
+                    or QuantExecutionInstrumentPhase.RecoveryRequired)
+                    return e;
+                e.Phase = QuantExecutionInstrumentPhase.PendingAlignment;
+                e.Expected.ExpectedWorkingOrderCount = Math.Max(e.Expected.ExpectedWorkingOrderCount, expectedCount);
+                e.Expected.LastProtectiveSubmitPendingUtc = utcNow;
+                e.Expected.PendingProtectiveSubmitWorkingCount =
+                    Math.Max(e.Expected.PendingProtectiveSubmitWorkingCount ?? 0, expectedCount);
+                e.Expected.PendingAlignmentExpiresUtc =
+                    !e.Expected.PendingAlignmentExpiresUtc.HasValue || expiry > e.Expected.PendingAlignmentExpiresUtc.Value
+                        ? expiry
+                        : e.Expected.PendingAlignmentExpiresUtc;
+                e.LockOrUnmappedReason = null;
+                return e;
+            });
+    }
+
+    /// <summary>
     /// Phase 4A / Tier 1: record successful protective stop submission (new or idempotent). Not implied by
     /// <see cref="NotifyMappedTrustedFill"/> — that runs earlier on the fill path before submit completes.
     /// </summary>
@@ -38,8 +86,11 @@ public static class QuantExecutionControlStore
         if (!FeatureFlags.QuantExecutionControlStoreEnabled) return;
         var inst = Norm(instrument);
         if (string.IsNullOrEmpty(inst)) return;
+        NotifyProtectiveSubmitPending(inst, 1, utcNow);
         if (!ByInstrument.TryGetValue(inst, out var e)) return;
-        if (e.Phase is QuantExecutionInstrumentPhase.UnmappedExecution or QuantExecutionInstrumentPhase.ExecutionLocked)
+        if (e.Phase is QuantExecutionInstrumentPhase.UnmappedExecution
+            or QuantExecutionInstrumentPhase.ExecutionLocked
+            or QuantExecutionInstrumentPhase.RecoveryRequired)
             return;
         e.Expected.LastProtectiveStopSubmitUtc = utcNow;
     }
@@ -366,6 +417,50 @@ public static class QuantExecutionControlStore
         e.LockOrUnmappedReason = null;
     }
 
+    /// <summary>
+    /// Explicit release valve for stale <see cref="QuantExecutionInstrumentPhase.RecoveryRequired"/> when a single
+    /// sampled authority frame proves the instrument is broker/journal/ledger/IEA flat before a fresh opening submit.
+    /// </summary>
+    public static bool TryClearRecoveryRequiredOnAuthoritativeFlat(
+        string instrument,
+        DateTimeOffset utcNow,
+        int brokerAbsPositionQty,
+        int journalRealOpenQty,
+        int journalRecoveredOpenQty,
+        int brokerWorkingOrderCount,
+        int ieaOwnedPlusAdoptedWorking,
+        int? ledgerSignedNetQty,
+        int? ledgerActiveSlotCount,
+        int? ledgerOrphanSlotCount,
+        out string detail)
+    {
+        detail = "";
+        if (!FeatureFlags.QuantExecutionControlStoreEnabled) return false;
+        var inst = Norm(instrument);
+        if (string.IsNullOrEmpty(inst)) return false;
+        if (!ByInstrument.TryGetValue(inst, out var e)) return false;
+        if (e.Phase != QuantExecutionInstrumentPhase.RecoveryRequired) return false;
+
+        if (brokerAbsPositionQty != 0 ||
+            journalRealOpenQty + journalRecoveredOpenQty != 0 ||
+            brokerWorkingOrderCount != 0 ||
+            ieaOwnedPlusAdoptedWorking != 0)
+            return false;
+
+        if ((ledgerSignedNetQty.HasValue && ledgerSignedNetQty.Value != 0) ||
+            (ledgerActiveSlotCount.HasValue && ledgerActiveSlotCount.Value != 0) ||
+            (ledgerOrphanSlotCount.HasValue && ledgerOrphanSlotCount.Value != 0))
+            return false;
+
+        var reason = e.RecoveryRequiredReason ?? "";
+        e.Phase = QuantExecutionInstrumentPhase.Normal;
+        e.Expected = new QuantExpectedInstrumentState();
+        e.LockOrUnmappedReason = null;
+        e.RecoveryRequiredReason = null;
+        detail = "quant_recovery_required_cleared_authoritative_flat:reason=" + reason;
+        return true;
+    }
+
     public static QuantExecutionControlSnapshot GetSnapshot(string instrument)
     {
         var inst = Norm(instrument);
@@ -403,6 +498,8 @@ public static class QuantExecutionControlStore
             LastBrokerExecutionCallbackState = s.LastBrokerExecutionCallbackState,
             PendingAlignmentExpiresUtc = s.PendingAlignmentExpiresUtc,
             LastProtectiveStopSubmitUtc = s.LastProtectiveStopSubmitUtc,
+            LastProtectiveSubmitPendingUtc = s.LastProtectiveSubmitPendingUtc,
+            PendingProtectiveSubmitWorkingCount = s.PendingProtectiveSubmitWorkingCount,
             LastProtectiveResizePendingUtc = s.LastProtectiveResizePendingUtc,
             PendingProtectiveResizeQty = s.PendingProtectiveResizeQty,
             LastProtectiveCancelReplacePendingUtc = s.LastProtectiveCancelReplacePendingUtc,
@@ -478,8 +575,55 @@ public static class QuantExecutionControlStore
         IsPostFillAlignmentWindowActive(instrument, utcNow) ||
         IsWorkingOrderSubmitWindowActive(instrument, utcNow) ||
         IsBrokerExecutionCallbackPendingActive(instrument, utcNow) ||
+        IsProtectiveSubmitPendingActive(instrument, utcNow) ||
         IsProtectiveResizePendingActive(instrument, utcNow) ||
         IsProtectiveCancelReplacePendingActive(instrument, utcNow);
+
+    /// <summary>
+    /// True while a first protective submit command is in flight between enqueue/submit and broker snapshot visibility.
+    /// </summary>
+    public static bool IsProtectiveSubmitPendingActive(string instrument, DateTimeOffset utcNow)
+    {
+        if (!FeatureFlags.QuantExecutionControlStoreEnabled) return false;
+        var inst = Norm(instrument);
+        if (string.IsNullOrEmpty(inst) || !ByInstrument.TryGetValue(inst, out var e)) return false;
+        if (e.Phase is QuantExecutionInstrumentPhase.UnmappedExecution
+            or QuantExecutionInstrumentPhase.ExecutionLocked
+            or QuantExecutionInstrumentPhase.RecoveryRequired)
+            return false;
+        if (!e.Expected.LastProtectiveSubmitPendingUtc.HasValue)
+            return false;
+
+        var expiry = e.Expected.PendingAlignmentExpiresUtc;
+        if (expiry.HasValue)
+            return utcNow <= expiry.Value;
+
+        var windowMs = FeatureFlags.PostFillAlignmentWindowMs > 0 ? FeatureFlags.PostFillAlignmentWindowMs : 5000;
+        return (utcNow - e.Expected.LastProtectiveSubmitPendingUtc.Value).TotalMilliseconds <= windowMs;
+    }
+
+    public static bool IsProtectiveSubmitPendingActive(string instrument, int expectedWorkingOrderCount, DateTimeOffset utcNow)
+    {
+        if (!FeatureFlags.QuantExecutionControlStoreEnabled) return false;
+        var inst = Norm(instrument);
+        if (string.IsNullOrEmpty(inst) || expectedWorkingOrderCount <= 0 || !ByInstrument.TryGetValue(inst, out var e)) return false;
+        if (e.Phase is QuantExecutionInstrumentPhase.UnmappedExecution
+            or QuantExecutionInstrumentPhase.ExecutionLocked
+            or QuantExecutionInstrumentPhase.RecoveryRequired)
+            return false;
+        if (!e.Expected.LastProtectiveSubmitPendingUtc.HasValue)
+            return false;
+        if (e.Expected.PendingProtectiveSubmitWorkingCount.HasValue &&
+            e.Expected.PendingProtectiveSubmitWorkingCount.Value < Math.Abs(expectedWorkingOrderCount))
+            return false;
+
+        var expiry = e.Expected.PendingAlignmentExpiresUtc;
+        if (expiry.HasValue)
+            return utcNow <= expiry.Value;
+
+        var windowMs = FeatureFlags.PostFillAlignmentWindowMs > 0 ? FeatureFlags.PostFillAlignmentWindowMs : 5000;
+        return (utcNow - e.Expected.LastProtectiveSubmitPendingUtc.Value).TotalMilliseconds <= windowMs;
+    }
 
     /// <summary>
     /// True while a known protective cancel/recreate resize is legitimately in flight.

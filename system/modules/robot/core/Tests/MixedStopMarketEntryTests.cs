@@ -108,6 +108,9 @@ public static class MixedStopMarketEntryTests
         var (p2, e2) = TestShortMarketLongStop();
         if (!p2) return (false, e2);
 
+        var (p3, e3) = TestHeavyCrossRejectsWithoutSubmission();
+        if (!p3) return (false, e3);
+
         return (true, null);
     }
 
@@ -206,6 +209,41 @@ public static class MixedStopMarketEntryTests
                 return (false, "Short MARKET + long STOP: Short ocoGroup should be non-empty");
             if (longSub.OcoGroup != ocoGroup)
                 return (false, $"Short MARKET + long STOP: both must share same ocoGroup, got Short={ocoGroup}, Long={longSub.OcoGroup}");
+
+            return (true, null);
+        }
+        finally
+        {
+            try { Directory.Delete(tempRoot, recursive: true); } catch { }
+        }
+    }
+
+    /// <summary>Beyond tolerance: no market chase and no sibling stop submitted.</summary>
+    private static (bool Pass, string? Error) TestHeavyCrossRejectsWithoutSubmission()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"MixedEntry_{Guid.NewGuid():N}");
+        try
+        {
+            var (sm, adapter) = CreateStreamWithRiskGate(tempRoot);
+            if (sm == null) return (false, "CreateStreamWithRiskGate returned null");
+
+            // brkLong=4501; 2 tick tolerance at 0.25 = 4501.50 max for MARKET conversion.
+            adapter.TestBid = 4494.25m;
+            adapter.TestAsk = 4501.75m;
+
+            var snap = new AccountSnapshot
+            {
+                Positions = new List<PositionSnapshot> { new() { Instrument = "ES", Quantity = 0 } },
+                WorkingOrders = new List<WorkingOrderSnapshot>()
+            };
+
+            var executed = sm.ExecutePendingRecoveryAction(snap, DateTimeOffset.UtcNow);
+            if (!executed)
+                return (false, "Heavy cross rejection: expected ExecutePendingRecoveryAction=true");
+
+            var recorded = adapter.GetRecorded();
+            if (recorded.Count != 0)
+                return (false, $"Heavy cross rejection: expected no submissions, got {recorded.Count}");
 
             return (true, null);
         }

@@ -2369,6 +2369,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
             _lastTickUpdateUtcForBE = DateTimeOffset.UtcNow;
+            var tickPrice = (decimal)e.Price;
+            _adapter?.RecordLatestMarketDataLast(executionInstrument, tickPrice, _lastTickUpdateUtcForBE);
+            _adapter?.RecordLatestMarketDataLast(instrumentName, tickPrice, _lastTickUpdateUtcForBE);
 
             if (_initFailed)
             {
@@ -2427,7 +2430,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            var tickPrice = (decimal)e.Price;
             var strategyPosition = Position.MarketPosition.ToString();
 
             // DIAGNOSTIC: Log when OnMarketData(Last) fires in Realtime — proves callback runs, shows position + tick

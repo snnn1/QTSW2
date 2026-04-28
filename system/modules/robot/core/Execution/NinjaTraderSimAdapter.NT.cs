@@ -180,35 +180,159 @@ public sealed partial class NinjaTraderSimAdapter
     /// </summary>
     private (decimal? Bid, decimal? Ask) GetCurrentMarketPriceReal(string instrument, DateTimeOffset utcNow)
     {
+        decimal? bid = null;
+        decimal? ask = null;
+
         if (_ntInstrument == null)
-            return (null, null);
+            return ApplyLastPriceEnvelope(instrument, utcNow, bid, ask);
+
         try
         {
             dynamic dynInstrument = _ntInstrument;
             var marketData = dynInstrument.MarketData;
             if (marketData == null)
-                return (null, null);
-            double? bid = null;
-            double? ask = null;
+                return ApplyLastPriceEnvelope(instrument, utcNow, bid, ask);
+            double? ntBid = null;
+            double? ntAsk = null;
             try
             {
-                bid = (double?)marketData.GetBid(0);
-                ask = (double?)marketData.GetAsk(0);
+                ntBid = (double?)marketData.GetBid(0);
+                ntAsk = (double?)marketData.GetAsk(0);
             }
             catch
             {
                 try
                 {
-                    bid = (double?)marketData.Bid;
-                    ask = (double?)marketData.Ask;
+                    ntBid = (double?)marketData.Bid;
+                    ntAsk = (double?)marketData.Ask;
                 }
-                catch { return (null, null); }
+                catch { return ApplyLastPriceEnvelope(instrument, utcNow, bid, ask); }
             }
-            if (bid.HasValue && ask.HasValue && !double.IsNaN(bid.Value) && !double.IsNaN(ask.Value))
-                return ((decimal)bid.Value, (decimal)ask.Value);
+            if (ntBid.HasValue && !double.IsNaN(ntBid.Value) && ntBid.Value > 0)
+                bid = (decimal)ntBid.Value;
+            if (ntAsk.HasValue && !double.IsNaN(ntAsk.Value) && ntAsk.Value > 0)
+                ask = (decimal)ntAsk.Value;
         }
         catch { }
-        return (null, null);
+
+        return ApplyLastPriceEnvelope(instrument, utcNow, bid, ask);
+    }
+
+    private (decimal? Bid, decimal? Ask) ApplyLastPriceEnvelope(string instrument, DateTimeOffset utcNow, decimal? bid, decimal? ask)
+    {
+        if (TryGetLatestMarketDataLast(instrument, utcNow, out var lastPrice, out _))
+        {
+            bid = bid.HasValue ? Math.Min(bid.Value, lastPrice) : lastPrice;
+            ask = ask.HasValue ? Math.Max(ask.Value, lastPrice) : lastPrice;
+        }
+        return (bid, ask);
+    }
+
+    private const int EntryStopMarketConversionToleranceTicks = 2;
+
+    private OrderSubmissionResult? TryBlockInvalidStopMarketRelationship(
+        string intentId,
+        string instrument,
+        string direction,
+        decimal stopPrice,
+        int? quantity,
+        string orderRole,
+        DateTimeOffset utcNow,
+        out bool convertEntryToMarket,
+        bool allowEntryMarketConversion = true)
+    {
+        convertEntryToMarket = false;
+        var isEntryStop = orderRole.IndexOf("ENTRY", StringComparison.OrdinalIgnoreCase) >= 0;
+        var isBuyStop = isEntryStop
+            ? string.Equals(direction, "Long", StringComparison.OrdinalIgnoreCase)
+            : string.Equals(direction, "Short", StringComparison.OrdinalIgnoreCase);
+        var (bid, ask) = GetCurrentMarketPriceReal(instrument, utcNow);
+        var marketPrice = isBuyStop ? ask : bid;
+        var marketPriceSource = isBuyStop ? "Ask" : "Bid";
+
+        if (!marketPrice.HasValue)
+        {
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument,
+                "STOP_MARKET_RELATIONSHIP_VALIDATION_UNAVAILABLE", new
+                {
+                    intent_id = intentId,
+                    order_role = orderRole,
+                    stop_price = stopPrice,
+                    direction,
+                    note = "Market bid/ask unavailable; proceeding with existing submit path."
+                }));
+            return null;
+        }
+
+        var invalidRelationship = isBuyStop
+            ? stopPrice <= marketPrice.Value
+            : stopPrice >= marketPrice.Value;
+        if (!invalidRelationship)
+            return null;
+
+        var crossedDistance = isBuyStop
+            ? marketPrice.Value - stopPrice
+            : stopPrice - marketPrice.Value;
+        var tickSize = GetTickSizeForInstrument(instrument);
+        var crossedTicks = tickSize > 0 ? crossedDistance / tickSize : (decimal?)null;
+        if (isEntryStop && allowEntryMarketConversion && crossedTicks.HasValue &&
+            crossedTicks.Value <= EntryStopMarketConversionToleranceTicks)
+        {
+            convertEntryToMarket = true;
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument,
+                "ENTRY_STOP_CROSSED_CONVERTED_TO_MARKET", new
+                {
+                    intent_id = intentId,
+                    order_role = orderRole,
+                    stop_price = stopPrice,
+                    market_price = marketPrice.Value,
+                    market_price_source = marketPriceSource,
+                    direction,
+                    quantity,
+                    crossed_distance_points = crossedDistance,
+                    crossed_distance_ticks = crossedTicks,
+                    tolerance_ticks = EntryStopMarketConversionToleranceTicks,
+                    note = "Entry stop is already marketable but still within tolerance; converting to MARKET before NT CreateOrder/Submit."
+                }));
+            return null;
+        }
+
+        var side = isBuyStop ? "Buy stop" : "Sell stop";
+        var relation = isBuyStop ? "at/below current ask" : "at/above current bid";
+        var reason = $"{side} can't be placed: stop price {stopPrice} is {relation} {marketPrice.Value}. Stop-market order is already crossed beyond market-conversion tolerance before submission.";
+        var eventType = isEntryStop ? "ENTRY_STOP_ALREADY_CROSSED_BLOCKED" : "STOP_MARKET_RELATIONSHIP_BLOCKED";
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, eventType, new
+        {
+            intent_id = intentId,
+            order_role = orderRole,
+            stop_price = stopPrice,
+            market_price = marketPrice.Value,
+            market_price_source = marketPriceSource,
+            direction,
+            quantity,
+            crossed_distance_points = crossedDistance,
+            crossed_distance_ticks = crossedTicks,
+            tolerance_ticks = isEntryStop ? EntryStopMarketConversionToleranceTicks : (int?)null,
+            reason,
+            note = "Blocked before NT CreateOrder/Submit to avoid synchronous NinjaTrader stop rejection."
+        }));
+
+        var (tradingDate, stream, _, _, _, _, _) = GetIntentInfo(intentId);
+        _executionJournal.RecordRejection(intentId, tradingDate, stream, $"STOP_PRICE_VALIDATION_FAILED: {reason}", utcNow,
+            orderType: isEntryStop ? "ENTRY_STOP" : "STOP", rejectedPrice: stopPrice, rejectedQuantity: quantity);
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument,
+            "STOP_PRICE_VALIDATION_FAILED", new
+            {
+                intent_id = intentId,
+                order_role = orderRole,
+                stop_price = stopPrice,
+                current_market_price = marketPrice.Value,
+                market_price_source = marketPriceSource,
+                direction,
+                quantity,
+                reason
+            }));
+        return OrderSubmissionResult.FailureResult($"Stop price validation failed: {reason}", utcNow);
     }
 
     /// <summary>
@@ -593,6 +717,15 @@ public sealed partial class NinjaTraderSimAdapter
                     }));
                     return OrderSubmissionResult.FailureResult(error, utcNow);
                 }
+
+                var relationshipFailure = TryBlockInvalidStopMarketRelationship(
+                    intentId, instrument, direction, (decimal)ntEntryPrice, quantity, "ENTRY_STOP", utcNow,
+                    out var convertStopEntryToMarket);
+                if (relationshipFailure != null)
+                    return relationshipFailure;
+                if (convertStopEntryToMarket)
+                    return SubmitEntryOrderCore(intentId, instrument, direction, null, quantity, "MARKET", ocoGroup, utcNow,
+                        "SUBMIT_ENTRY_STOP");
                 
                 // Create order using official NT8 CreateOrder factory method
                 try
@@ -2520,9 +2653,30 @@ public sealed partial class NinjaTraderSimAdapter
                     }
                 }
                 
-                // TERMINALIZATION: Cancel remaining protective orders and verify invariant.
-                // Single canonical path for making intent terminal - prevents zombie stops.
-                TerminalizeIntent(intentId, filledIntent.TradingDate ?? "", filledIntent.Stream ?? "", orderTypeForContext, utcNow);
+                var postExitEntry = _executionJournal.GetEntry(intentId, filledIntent.TradingDate ?? "", filledIntent.Stream ?? "");
+                if (ShouldTerminalizeAfterExitFill(postExitEntry))
+                {
+                    // TERMINALIZATION: Cancel remaining protective orders and verify invariant.
+                    // Single canonical path for making intent terminal - prevents zombie stops.
+                    TerminalizeIntent(intentId, filledIntent.TradingDate ?? "", filledIntent.Stream ?? "", orderTypeForContext, utcNow);
+                }
+                else
+                {
+                    var remainingQty = postExitEntry == null
+                        ? (int?)null
+                        : Math.Max(0, postExitEntry.EntryFilledQuantityTotal - postExitEntry.ExitFilledQuantityTotal);
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "PROTECTIVE_PARTIAL_EXIT_RETAINED",
+                        new
+                        {
+                            intent_id = intentId,
+                            stream = context.Stream,
+                            exit_order_type = orderTypeForContext,
+                            exit_filled_qty = postExitEntry?.ExitFilledQuantityTotal,
+                            entry_filled_qty = postExitEntry?.EntryFilledQuantityTotal,
+                            remaining_qty = remainingQty,
+                            note = "Partial protective exit observed; remaining protection stays managed and intent is not terminalized."
+                        }));
+                }
             }
         }
         else
@@ -2598,6 +2752,12 @@ public sealed partial class NinjaTraderSimAdapter
         {
             // Compute stop price once for use throughout method
             var stopPriceD = (double)stopPrice;
+
+            var relationshipFailure = TryBlockInvalidStopMarketRelationship(
+                intentId, instrument, direction, stopPrice, quantity, "PROTECTIVE_STOP", utcNow,
+                out var protectiveConvertToMarket);
+            if (relationshipFailure != null)
+                return relationshipFailure;
             
             // Idempotent: if stop already exists, ensure it matches desired stop/qty
             var stopTag = RobotOrderIds.EncodeStopTag(intentId);
@@ -4734,6 +4894,15 @@ public sealed partial class NinjaTraderSimAdapter
                 warning = warn ? warnReason : null
             }));
 
+            var relationshipFailure = TryBlockInvalidStopMarketRelationship(
+                intentId, instrument, direction, stopPrice, quantity, "ENTRY_STOP", utcNow,
+                out var convertStopEntryToMarket);
+            if (relationshipFailure != null)
+                return relationshipFailure;
+            if (convertStopEntryToMarket)
+                return SubmitEntryOrderCore(intentId, instrument, direction, null, quantity, "MARKET", ocoGroup, utcNow,
+                    "SUBMIT_ENTRY_STOP");
+
             // PRICE LIMIT VALIDATION: Check stop price distance from current market price
             // Prevents NinjaTrader rejections due to stale breakout levels or market gaps
             decimal? currentMarketPrice = null;
@@ -4786,6 +4955,53 @@ public sealed partial class NinjaTraderSimAdapter
                 {
                     // Calculate distance from stop price to current market price
                     stopDistance = Math.Abs(stopPrice - currentMarketPrice.Value);
+
+                    // Stop-market entries must not be submitted after price has already crossed the stop.
+                    // NinjaTrader rejects marketable stop entries synchronously, and in playback that rejection
+                    // can re-enter OCO cancellation deeply enough to crash the process.
+                    bool stopAlreadyCrossed = (direction == "Long" && currentMarketPrice.Value >= stopPrice) ||
+                                              (direction == "Short" && currentMarketPrice.Value <= stopPrice);
+
+                    if (stopAlreadyCrossed)
+                    {
+                        var tickSize = GetTickSizeForInstrument(instrument);
+                        var crossedTicks = tickSize > 0 ? stopDistance / tickSize : (decimal?)null;
+                        if (crossedTicks.HasValue && crossedTicks.Value <= EntryStopMarketConversionToleranceTicks)
+                        {
+                            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ENTRY_STOP_CROSSED_CONVERTED_TO_MARKET", new
+                            {
+                                intent_id = intentId,
+                                stop_price = stopPrice,
+                                market_price = currentMarketPrice.Value,
+                                market_price_source = direction == "Long" ? "Ask" : "Bid",
+                                direction,
+                                crossed_distance_points = stopDistance,
+                                crossed_distance_ticks = crossedTicks,
+                                tolerance_ticks = EntryStopMarketConversionToleranceTicks,
+                                note = "Entry stop is already marketable but still within tolerance; converting to MARKET before NT CreateOrder/Submit."
+                            }));
+                            return SubmitEntryOrderCore(intentId, instrument, direction, null, quantity, "MARKET", ocoGroup, utcNow,
+                                "SUBMIT_ENTRY_STOP");
+                        }
+
+                        priceValidationFailed = true;
+                        var side = direction == "Long" ? "Buy stop" : "Sell stop";
+                        var relation = direction == "Long" ? "at/below current ask" : "at/above current bid";
+                        priceValidationReason = $"{side} can't be placed: stop price {stopPrice} is {relation} {currentMarketPrice.Value}. Market moved through the breakout beyond market-conversion tolerance before stop-entry submission.";
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ENTRY_STOP_ALREADY_CROSSED_BLOCKED", new
+                        {
+                            intent_id = intentId,
+                            stop_price = stopPrice,
+                            market_price = currentMarketPrice.Value,
+                            market_price_source = direction == "Long" ? "Ask" : "Bid",
+                            direction,
+                            stop_distance_points = stopDistance,
+                            stop_distance_ticks = crossedTicks,
+                            tolerance_ticks = EntryStopMarketConversionToleranceTicks,
+                            reason = priceValidationReason,
+                            note = "Blocked before NT CreateOrder/Submit to avoid rejected marketable stop entry."
+                        }));
+                    }
                     
                     // Configurable threshold: Maximum allowed stop distance in points
                     // M2K: ~100 points (10.0) is reasonable limit
@@ -4806,7 +5022,7 @@ public sealed partial class NinjaTraderSimAdapter
                         maxStopDistancePoints = 200.0m; // 200 points for minis
                     }
                     
-                    if (stopDistance > maxStopDistancePoints)
+                    if (!priceValidationFailed && stopDistance > maxStopDistancePoints)
                     {
                         priceValidationFailed = true;
                         priceValidationReason = $"Stop price {stopPrice} is {stopDistance:F2} points from current market {currentMarketPrice.Value:F2}, exceeding limit of {maxStopDistancePoints} points. This indicates a stale breakout level or market gap.";

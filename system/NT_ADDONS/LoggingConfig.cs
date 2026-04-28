@@ -17,19 +17,13 @@ public sealed class LoggingConfig
     public int max_file_size_mb { get; set; } = 50;
     public int max_rotated_files { get; set; } = 5;
     public string min_log_level { get; set; } = "INFO";
-    
+
     /// <summary>
-    /// Log profile: "PRODUCTION" (default) or "DIAGNOSTIC".
-    /// When PRODUCTION: DEBUG events dropped, stream/bar diagnostics disabled.
-    /// When DIAGNOSTIC: DEBUG events permitted, stream status snapshots, bar diagnostics, risk gate logs.
-    /// If not set, falls back to enable_diagnostic_logs || diagnostics_enabled for backward compatibility.
+    /// Optional: "PRODUCTION" or "DIAGNOSTIC". When DIAGNOSTIC, verbose engine events (e.g. TIMETABLE_DERIVED) are allowed.
+    /// If unset, <see cref="DiagnosticsEnabled"/> uses enable_diagnostic_logs || diagnostics_enabled.
     /// </summary>
     public string? log_profile { get; set; }
-    
-    /// <summary>
-    /// [DEPRECATED] Use log_profile = "DIAGNOSTIC" instead.
-    /// Kept for backward compatibility; ignored when log_profile is set.
-    /// </summary>
+
     public bool enable_diagnostic_logs { get; set; } = false;
     public DiagnosticRateLimits? diagnostic_rate_limits { get; set; }
     public int archive_days { get; set; } = 7;
@@ -71,11 +65,12 @@ public sealed class LoggingConfig
     public int archive_cleanup_days { get; set; } = 30;
     
     /// <summary>
-    /// [DEPRECATED] Use log_profile = "DIAGNOSTIC" instead.
-    /// Kept for backward compatibility; ignored when log_profile is set.
+    /// Enable diagnostics logging (default: false).
+    /// When false, DEBUG events are dropped immediately.
+    /// ERROR and CRITICAL events always bypass this flag.
     /// </summary>
     public bool diagnostics_enabled { get; set; } = false;
-    
+
     /// <summary>
     /// Maximum DEBUG events per minute when diagnostics enabled (default: 600).
     /// Prevents DEBUG volume from starving INFO. 0 = no cap.
@@ -97,8 +92,14 @@ public sealed class LoggingConfig
     public bool enable_health_sink { get; set; } = true;
 
     /// <summary>
-    /// True when diagnostics are enabled (stream/bar diagnostics, DEBUG events, risk gate logs).
-    /// Uses log_profile if set; otherwise enable_diagnostic_logs || diagnostics_enabled.
+    /// When true, do not let a NinjaTrader TradingHours-only HOLIDAY result suppress trading if timetable indicates
+    /// the session is active. The engine logs conflict telemetry and overrides HOLIDAY using internal close/reopen times.
+    /// Default true is fail-closed for playback/timetable days: an NT holiday cache must not suppress flatten on active rows.
+    /// </summary>
+    public bool prefer_internal_calendar_over_nt_holiday { get; set; } = true;
+
+    /// <summary>
+    /// True when diagnostics logging is on (matches RobotCore: log_profile DIAGNOSTIC, or legacy flags).
     /// </summary>
     public bool DiagnosticsEnabled =>
         !string.IsNullOrWhiteSpace(log_profile)
@@ -113,6 +114,7 @@ public sealed class LoggingConfig
         var configPath = Path.Combine(configRoot, "configs", "robot", "logging.json");
         if (!File.Exists(configPath))
         {
+            // Return defaults if config doesn't exist
             return new LoggingConfig();
         }
 

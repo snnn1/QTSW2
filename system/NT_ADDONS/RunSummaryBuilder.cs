@@ -76,6 +76,7 @@ public static class RunSummaryBuilder
             pnl = null,
             errors = execSnap.OrdersRejected +
                      execSnap.OrdersBlocked +
+                     agg.ProtectiveFailed +
                      agg.RobotLogErrorCount +
                      agg.RobotLogCriticalCount +
                      agg.IncompleteStreamJournalCount +
@@ -530,7 +531,14 @@ public static class RunSummaryBuilder
                     var json = File.ReadAllText(path);
                     if (string.IsNullOrWhiteSpace(json)) continue;
                     var entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
-                    if (entry == null || entry.TradeCompleted || entry.Rejected) continue;
+                    if (entry == null) continue;
+
+                    if (HasProtectiveFailure(entry))
+                    {
+                        agg.ProtectiveFailed++;
+                    }
+
+                    if (entry.TradeCompleted || entry.Rejected) continue;
 
                     if (entry.EntryFilled)
                     {
@@ -671,6 +679,27 @@ public static class RunSummaryBuilder
 
     private static string NormInst(string? s) =>
         string.IsNullOrWhiteSpace(s) ? "" : s.Trim().ToUpperInvariant();
+
+    private static bool HasProtectiveFailure(ExecutionJournalEntry entry)
+    {
+        if (entry.TradeCompleted)
+            return false;
+
+        if (!string.IsNullOrWhiteSpace(entry.ProtectiveRejectedAt) ||
+            !string.IsNullOrWhiteSpace(entry.ProtectiveRejectionReason))
+            return true;
+
+        if (!entry.EntryFilled || string.IsNullOrWhiteSpace(entry.RejectionReason))
+            return false;
+
+        var orderType = entry.RejectionOrderType ?? "";
+        var reason = entry.RejectionReason ?? "";
+        return string.Equals(orderType, "STOP", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(orderType, "TARGET", StringComparison.OrdinalIgnoreCase) ||
+               reason.IndexOf("STOP_SUBMIT_FAILED", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               reason.IndexOf("TARGET_SUBMIT_FAILED", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               reason.IndexOf("STOP_PRICE_VALIDATION_FAILED", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
 
     private static DateTimeOffset? TryGetTimestampUtc(Dictionary<string, object> d)
     {

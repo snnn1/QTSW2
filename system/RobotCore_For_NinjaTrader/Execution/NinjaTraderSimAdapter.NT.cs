@@ -2490,6 +2490,15 @@ public sealed partial class NinjaTraderSimAdapter
                     }));
                     return OrderSubmissionResult.FailureResult(error, utcNow);
                 }
+
+                var relationshipFailure = TryBlockInvalidStopMarketRelationship(
+                    intentId, instrument, direction, (decimal)ntEntryPrice, quantity, "ENTRY_STOP", utcNow,
+                    out var convertStopEntryToMarket);
+                if (relationshipFailure != null)
+                    return relationshipFailure;
+                if (convertStopEntryToMarket)
+                    return SubmitEntryOrderCore(intentId, instrument, direction, null, quantity, "MARKET", ocoGroup, utcNow,
+                        "SUBMIT_ENTRY_STOP");
                 
                 // Create order using official NT8 CreateOrder factory method
                 try
@@ -4149,9 +4158,8 @@ public sealed partial class NinjaTraderSimAdapter
                 execution_id = execIdRec,
                 reason = "registry_miss_but_tag_matched"
             }));
-            ProcessBrokerFlattenFill(record.Execution, instrument, record.FillPrice, record.FillQuantity, utcNow, order.OrderId, order,
-                TryResolveFlattenRegistryEntry(order.OrderId));
-            CheckAllInstrumentsForFlatPositions(utcNow);
+            EnqueueBrokerFlattenFillPostFill(record.Execution, instrument, record.FillPrice, record.FillQuantity, utcNow, order.OrderId, order,
+                TryResolveFlattenRegistryEntry(order.OrderId), runFlatCheck: true);
             return;
         }
 
@@ -4303,9 +4311,8 @@ public sealed partial class NinjaTraderSimAdapter
                 execution_id = execIdRec,
                 reason = "registry_miss_but_tag_matched"
             }));
-            ProcessBrokerFlattenFill(execution, instrumentFlatten, fillPrice, fillQuantity, utcNow, order.OrderId, order,
-                TryResolveFlattenRegistryEntry(order.OrderId));
-            CheckAllInstrumentsForFlatPositions(utcNow);
+            EnqueueBrokerFlattenFillPostFill(execution, instrumentFlatten, fillPrice, fillQuantity, utcNow, order.OrderId, order,
+                TryResolveFlattenRegistryEntry(order.OrderId), runFlatCheck: true);
             return;
         }
         
@@ -4320,9 +4327,8 @@ public sealed partial class NinjaTraderSimAdapter
 
             if (TryRecognizeSelfInitiatedFlattenCloseFill(instrument, utcNow))
             {
-                ProcessBrokerFlattenFill(execution, instrument, fillPrice, fillQuantity, utcNow, order.OrderId, order,
-                    TryResolveFlattenRegistryEntry(order.OrderId));
-                CheckAllInstrumentsForFlatPositions(utcNow);
+                EnqueueBrokerFlattenFillPostFill(execution, instrument, fillPrice, fillQuantity, utcNow, order.OrderId, order,
+                    TryResolveFlattenRegistryEntry(order.OrderId), runFlatCheck: true);
                 return;
             }
 
@@ -4772,8 +4778,8 @@ public sealed partial class NinjaTraderSimAdapter
         if (IsRobotOwnedFlattenOrder(encodedTag, orderInfo) && order != null)
         {
             var flattenInst = order.Instrument?.MasterInstrument?.Name ?? orderInfo.Instrument?.Trim() ?? "UNKNOWN";
-            ProcessBrokerFlattenFill(execution, flattenInst, fillPrice, fillQuantity, utcNow, order.OrderId, order,
-                TryResolveFlattenRegistryEntry(order.OrderId));
+            EnqueueBrokerFlattenFillPostFill(execution, flattenInst, fillPrice, fillQuantity, utcNow, order.OrderId, order,
+                TryResolveFlattenRegistryEntry(order.OrderId), runFlatCheck: true);
             return;
         }
 
@@ -5631,8 +5637,29 @@ public sealed partial class NinjaTraderSimAdapter
                     }
                 }
                 
-                // TERMINALIZATION: Cancel remaining protective orders and verify invariant.
-                TerminalizeIntent(intentId, filledIntent.TradingDate ?? "", filledIntent.Stream ?? "", orderTypeForContext, utcNow);
+                var postExitEntry = _executionJournal.GetEntry(intentId, filledIntent.TradingDate ?? "", filledIntent.Stream ?? "");
+                if (ShouldTerminalizeAfterExitFill(postExitEntry))
+                {
+                    // TERMINALIZATION: Cancel remaining protective orders and verify invariant.
+                    TerminalizeIntent(intentId, filledIntent.TradingDate ?? "", filledIntent.Stream ?? "", orderTypeForContext, utcNow);
+                }
+                else
+                {
+                    var remainingQty = postExitEntry == null
+                        ? (int?)null
+                        : Math.Max(0, postExitEntry.EntryFilledQuantityTotal - postExitEntry.ExitFilledQuantityTotal);
+                    _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument, "PROTECTIVE_PARTIAL_EXIT_RETAINED",
+                        new
+                        {
+                            intent_id = intentId,
+                            stream = context.Stream,
+                            exit_order_type = orderTypeForContext,
+                            exit_filled_qty = postExitEntry?.ExitFilledQuantityTotal,
+                            entry_filled_qty = postExitEntry?.EntryFilledQuantityTotal,
+                            remaining_qty = remainingQty,
+                            note = "Partial protective exit observed; remaining protection stays managed and intent is not terminalized."
+                        }));
+                }
             }
         }
         else
@@ -5671,8 +5698,122 @@ public sealed partial class NinjaTraderSimAdapter
     /// Emits EXECUTION_FILLED per intent, RecordExitFill, OnExitFill.
     /// If no intents can be mapped, emits EXECUTION_FILL_UNMAPPED (CRITICAL).
     /// </summary>
+    private void EnqueueBrokerFlattenFillPostFill(
+        object execution,
+        string instrument,
+        decimal fillPrice,
+        int fillQuantity,
+        DateTimeOffset utcNow,
+        object orderId,
+        Order order,
+        OrderRegistryEntry? flattenRegistryEntry,
+        bool runFlatCheck)
+    {
+        if (!_useInstrumentExecutionAuthority || _iea == null)
+        {
+            ProcessBrokerFlattenFill(execution, instrument, fillPrice, fillQuantity, utcNow, orderId, order, flattenRegistryEntry);
+            if (runFlatCheck)
+                CheckAllInstrumentsForFlatPositions(utcNow);
+            return;
+        }
+
+        var brokerOrderId = orderId?.ToString() ?? "";
+        var followUpEnqueueUtc = DateTimeOffset.UtcNow;
+        _log.Write(RobotEvents.ExecutionBase(utcNow, "FLATTEN", instrument, "EXECUTION_UPDATE_FLATTEN_FOLLOWUP_ENQUEUED", new
+        {
+            instrument,
+            broker_order_id = brokerOrderId,
+            fill_quantity = fillQuantity,
+            run_flat_check = runFlatCheck,
+            queued_via = "IEA_WORKER",
+            note = "Robot-owned flatten fill acknowledged on ExecutionUpdate; journal/ownership/coordinator work is deferred to bounded post-fill stages."
+        }));
+
+        void LogFlattenStage(string stageName, string workKind, DateTimeOffset stageStartUtc, long totalMs, int actionCount)
+        {
+            _log.Write(RobotEvents.ExecutionBase(stageStartUtc, "FLATTEN", instrument, "EXECUTION_UPDATE_POSTFILL_STAGE_TIMING", new
+            {
+                intent_id = "FLATTEN",
+                fill_quantity = fillQuantity,
+                broker_order_id = brokerOrderId,
+                stage = stageName,
+                work_kind = workKind,
+                action_count = actionCount,
+                queue_delay_ms = Math.Max(0L, (long)(stageStartUtc - followUpEnqueueUtc).TotalMilliseconds),
+                total_ms = totalMs,
+                note = "Deferred flatten post-fill stage timing; forced-flatten ExecutionUpdate is kept bounded."
+            }));
+        }
+
+        _iea.EnqueueRecoveryEssential(() =>
+        {
+            var stageStartUtc = DateTimeOffset.UtcNow;
+            var sw = Stopwatch.StartNew();
+            ProcessBrokerFlattenFill(execution, instrument, fillPrice, fillQuantity, utcNow, orderId, order, flattenRegistryEntry);
+            LogFlattenStage("flatten_fill_mapping_journal", "ExecutionUpdatePostFillFlatten", stageStartUtc, sw.ElapsedMilliseconds, 1);
+            if (runFlatCheck)
+            {
+                var flatCheckEnqueueUtc = DateTimeOffset.UtcNow;
+                EnqueueStrategyThreadDeferredAction(
+                    $"FLATTEN_FLAT_CHECK:{brokerOrderId}:{flatCheckEnqueueUtc:yyyyMMddHHmmssfff}",
+                    "FLATTEN",
+                    instrument,
+                    "EXECUTION_UPDATE_POSTFILL_FLAT_CHECK",
+                    flatCheckEnqueueUtc,
+                    () =>
+                    {
+                        var flatCheckStartUtc = DateTimeOffset.UtcNow;
+                        var flatCheckSw = Stopwatch.StartNew();
+                        CheckAllInstrumentsForFlatPositions(flatCheckStartUtc);
+                        LogFlattenStage("flat_check", "ExecutionUpdatePostFillFlattenFlatCheck", flatCheckStartUtc, flatCheckSw.ElapsedMilliseconds, 1);
+                    });
+            }
+        }, "ExecutionUpdatePostFillFlatten");
+    }
+
     private void ProcessBrokerFlattenFill(object execution, string instrument, decimal fillPrice, int fillQuantity, DateTimeOffset utcNow, object orderId, Order order, OrderRegistryEntry? flattenRegistryEntry = null)
     {
+        var flattenTimingSw = Stopwatch.StartNew();
+        var allocationTimingSw = Stopwatch.StartNew();
+        long allocationMs = 0;
+        long ownershipRestoreMs = 0;
+        long journalMs = 0;
+        long ownershipMs = 0;
+        long lifecycleMs = 0;
+        long coordinatorMs = 0;
+        long executionLogMs = 0;
+        long lateConfirmEnqueueMs = 0;
+        var emittedTiming = false;
+
+        void EmitFlattenFillTiming(string outcome)
+        {
+            if (emittedTiming)
+                return;
+            emittedTiming = true;
+            _log.Write(RobotEvents.ExecutionBase(utcNow, "FLATTEN", instrument, "EXECUTION_UPDATE_POSTFILL_STAGE_TIMING", new
+            {
+                intent_id = "FLATTEN",
+                fill_quantity = fillQuantity,
+                broker_order_id = orderId?.ToString() ?? "",
+                stage = "flatten_fill_breakdown",
+                work_kind = "ExecutionUpdatePostFillFlatten",
+                action_count = 1,
+                total_ms = flattenTimingSw.ElapsedMilliseconds,
+                allocation_ms = allocationMs,
+                ownership_restore_ms = ownershipRestoreMs,
+                journal_ms = journalMs,
+                ownership_ms = ownershipMs,
+                lifecycle_ms = lifecycleMs,
+                coordinator_ms = coordinatorMs,
+                execution_log_ms = executionLogMs,
+                late_confirm_enqueue_ms = lateConfirmEnqueueMs,
+                outcome,
+                note = "Breakdown of robot-owned flatten fill processing after ExecutionUpdate was bounded."
+            }));
+        }
+
+        try
+        {
         var accountName = _iea?.AccountName ?? ExecutionUpdateRouter.GetAccountNameFromOrder(order);
         var execInstKey = _iea?.ExecutionInstrumentKey ?? ExecutionUpdateRouter.GetExecutionInstrumentKeyFromOrder(order.Instrument);
         var brokerOrderId = orderId?.ToString() ?? "";
@@ -5737,6 +5878,8 @@ public sealed partial class NinjaTraderSimAdapter
                             timestamp_utc = utcNow.ToString("o"),
                             note = "No registry link, active exposures, or open journal rows for instrument - PnL gap"
                         });
+                    allocationMs = allocationTimingSw.ElapsedMilliseconds;
+                    EmitFlattenFillTiming("unmapped_no_active_exposures");
                     return;
                 }
 
@@ -5773,6 +5916,8 @@ public sealed partial class NinjaTraderSimAdapter
                                 fill_quantity = fillQuantity,
                                 note = "Coordinator state inconsistent and no registry/open journal fallback was available"
                             });
+                        allocationMs = allocationTimingSw.ElapsedMilliseconds;
+                        EmitFlattenFillTiming("unmapped_zero_remaining_exposure");
                         return;
                     }
 
@@ -5796,9 +5941,14 @@ public sealed partial class NinjaTraderSimAdapter
                 }
             }
         }
+        allocationMs = allocationTimingSw.ElapsedMilliseconds;
 
         if (allocatedFromOpenJournal)
+        {
+            var restoreSw = Stopwatch.StartNew();
             TryRestoreOwnershipLedgerForFlattenOpenJournalAllocation(instrument, execInstKey, utcNow);
+            ownershipRestoreMs += restoreSw.ElapsedMilliseconds;
+        }
 
         var lateSessionCloseFlattenCompletionCandidates =
             new List<(string IntentId, string TradingDate, string Stream, bool AllowAllocatedIntent)>();
@@ -5838,11 +5988,15 @@ public sealed partial class NinjaTraderSimAdapter
             var side = direction.Equals("Long", StringComparison.OrdinalIgnoreCase) ? "SELL" : "BUY";
             var sessionClass = DeriveSessionClass(stream);
 
+            var journalSw = Stopwatch.StartNew();
             _executionJournal.RecordExitFill(intentId, tradingDate, stream, fillPrice, allocQty, "FLATTEN", utcNow);
+            journalMs += journalSw.ElapsedMilliseconds;
             if (FeatureFlags.CanonicalOwnershipLedgerEnabled && _ownershipLedger != null)
             {
+                var ownershipSw = Stopwatch.StartNew();
                 var result = _ownershipLedger.RecordMappedExitFill(
                     GetLedgerAccountName(), instrument.Trim(), intentId, allocQty, utcNow, executionSeq);
+                ownershipMs += ownershipSw.ElapsedMilliseconds;
                 if (!result.Success)
                 {
                     LogCriticalWithIeaContext(utcNow, intentId, instrument, "OWNERSHIP_FLATTEN_EXIT_CLOSE_FAILED",
@@ -5854,12 +6008,17 @@ public sealed partial class NinjaTraderSimAdapter
                             fill_quantity = allocQty,
                             error = result.ErrorReason ?? "",
                             note = "Broker flatten fill closed legacy journal exposure but ownership ledger close failed"
-                        });
+                    });
                 }
             }
+            var lifecycleSw = Stopwatch.StartNew();
             _iea?.TryTransitionIntentLifecycle(intentId, IntentLifecycleTransition.INTENT_COMPLETED, null, utcNow);
+            lifecycleMs += lifecycleSw.ElapsedMilliseconds;
+            var coordinatorSw = Stopwatch.StartNew();
             _coordinator?.OnExitFill(intentId, allocQty, utcNow);
+            coordinatorMs += coordinatorSw.ElapsedMilliseconds;
 
+            var executionLogSw = Stopwatch.StartNew();
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "EXECUTION_FILLED",
                 new
                 {
@@ -5887,6 +6046,7 @@ public sealed partial class NinjaTraderSimAdapter
                     mapped_from_flatten_registry = allocatedFromFlattenRegistry,
                     mapped_from_open_journal = allocatedFromOpenJournal
                 }));
+            executionLogMs += executionLogSw.ElapsedMilliseconds;
 
             lateSessionCloseFlattenCompletionCandidates.Add((
                 intentId,
@@ -5909,7 +6069,8 @@ public sealed partial class NinjaTraderSimAdapter
             if (string.IsNullOrWhiteSpace(completionCandidate.IntentId))
                 completionCandidate = lateSessionCloseFlattenCompletionCandidates[0];
 
-            TryNotifyLateSessionCloseFlattenComplete(
+            var lateConfirmSw = Stopwatch.StartNew();
+            EnqueueLateSessionCloseFlattenCompleteCheck(
                 flattenRegistryEntry,
                 completionCandidate.IntentId,
                 instrument,
@@ -5920,6 +6081,16 @@ public sealed partial class NinjaTraderSimAdapter
                 accountName,
                 brokerOrderId,
                 completionCandidate.AllowAllocatedIntent);
+            lateConfirmEnqueueMs += lateConfirmSw.ElapsedMilliseconds;
+        }
+        EmitFlattenFillTiming(allocated.Count > 0 ? "mapped" : "no_allocations");
+        }
+        catch
+        {
+            if (allocationMs == 0)
+                allocationMs = allocationTimingSw.ElapsedMilliseconds;
+            EmitFlattenFillTiming("exception");
+            throw;
         }
     }
 
@@ -6001,6 +6172,72 @@ public sealed partial class NinjaTraderSimAdapter
                     note = "Could not restore ownership ledger before open-journal flatten allocation."
                 });
         }
+    }
+
+    private void EnqueueLateSessionCloseFlattenCompleteCheck(
+        OrderRegistryEntry? flattenRegistryEntry,
+        string intentId,
+        string instrument,
+        string? executionInstrumentKey,
+        string tradingDate,
+        string stream,
+        DateTimeOffset utcNow,
+        string accountName,
+        string brokerOrderId,
+        bool allowAllocatedIntent)
+    {
+        if (flattenRegistryEntry == null ||
+            !string.Equals(flattenRegistryEntry.FlattenReason?.Trim(), "SESSION_FORCED_FLATTEN", StringComparison.OrdinalIgnoreCase))
+        {
+            TryNotifyLateSessionCloseFlattenComplete(
+                flattenRegistryEntry,
+                intentId,
+                instrument,
+                executionInstrumentKey,
+                tradingDate,
+                stream,
+                utcNow,
+                accountName,
+                brokerOrderId,
+                allowAllocatedIntent);
+            return;
+        }
+
+        var enqueuedAt = DateTimeOffset.UtcNow;
+        EnqueueStrategyThreadDeferredAction(
+            $"SESSION_CLOSE_FLATTEN_LATE_CONFIRM:{intentId}:{brokerOrderId}:{enqueuedAt:yyyyMMddHHmmssfff}",
+            intentId,
+            executionInstrumentKey ?? instrument,
+            "SESSION_CLOSE_FLATTEN_LATE_CONFIRM",
+            enqueuedAt,
+            () =>
+            {
+                var stageStartUtc = DateTimeOffset.UtcNow;
+                var sw = Stopwatch.StartNew();
+                TryNotifyLateSessionCloseFlattenComplete(
+                    flattenRegistryEntry,
+                    intentId,
+                    instrument,
+                    executionInstrumentKey,
+                    tradingDate,
+                    stream,
+                    stageStartUtc,
+                    accountName,
+                    brokerOrderId,
+                    allowAllocatedIntent);
+                _log.Write(RobotEvents.ExecutionBase(stageStartUtc, intentId, instrument, "EXECUTION_UPDATE_POSTFILL_STAGE_TIMING", new
+                {
+                    intent_id = intentId,
+                    broker_order_id = brokerOrderId,
+                    fill_quantity = 0,
+                    stage = "late_session_close_flatten_confirm",
+                    work_kind = "ExecutionUpdatePostFillFlattenConfirm",
+                    action_count = 1,
+                    queue_delay_ms = Math.Max(0L, (long)(stageStartUtc - enqueuedAt).TotalMilliseconds),
+                    total_ms = sw.ElapsedMilliseconds,
+                    note = "Late broker-flat confirmation runs on the strategy thread because it reads NT account position state."
+                }));
+            });
     }
 
     private void TryNotifyLateSessionCloseFlattenComplete(
@@ -6417,6 +6654,12 @@ public sealed partial class NinjaTraderSimAdapter
         {
             // Compute stop price once for use throughout method
             var stopPriceD = (double)stopPrice;
+
+            var relationshipFailure = TryBlockInvalidStopMarketRelationship(
+                intentId, instrument, direction, stopPrice, quantity, "PROTECTIVE_STOP", utcNow,
+                out var protectiveConvertToMarket);
+            if (relationshipFailure != null)
+                return relationshipFailure;
             
             // Idempotent: if stop already exists, ensure it matches desired stop/qty
             var stopTag = RobotOrderIds.EncodeStopTag(intentId);
@@ -7778,35 +8021,159 @@ public sealed partial class NinjaTraderSimAdapter
     /// </summary>
     private (decimal? Bid, decimal? Ask) GetCurrentMarketPriceReal(string instrument, DateTimeOffset utcNow)
     {
+        decimal? bid = null;
+        decimal? ask = null;
+
         if (_ntInstrument == null)
-            return (null, null);
+            return ApplyLastPriceEnvelope(instrument, utcNow, bid, ask);
+
         try
         {
             dynamic dynInstrument = _ntInstrument;
             var marketData = dynInstrument.MarketData;
             if (marketData == null)
-                return (null, null);
-            double? bid = null;
-            double? ask = null;
+                return ApplyLastPriceEnvelope(instrument, utcNow, bid, ask);
+            double? ntBid = null;
+            double? ntAsk = null;
             try
             {
-                bid = (double?)marketData.GetBid(0);
-                ask = (double?)marketData.GetAsk(0);
+                ntBid = (double?)marketData.GetBid(0);
+                ntAsk = (double?)marketData.GetAsk(0);
             }
             catch
             {
                 try
                 {
-                    bid = (double?)marketData.Bid;
-                    ask = (double?)marketData.Ask;
+                    ntBid = (double?)marketData.Bid;
+                    ntAsk = (double?)marketData.Ask;
                 }
-                catch { return (null, null); }
+                catch { return ApplyLastPriceEnvelope(instrument, utcNow, bid, ask); }
             }
-            if (bid.HasValue && ask.HasValue && !double.IsNaN(bid.Value) && !double.IsNaN(ask.Value))
-                return ((decimal)bid.Value, (decimal)ask.Value);
+            if (ntBid.HasValue && !double.IsNaN(ntBid.Value) && ntBid.Value > 0)
+                bid = (decimal)ntBid.Value;
+            if (ntAsk.HasValue && !double.IsNaN(ntAsk.Value) && ntAsk.Value > 0)
+                ask = (decimal)ntAsk.Value;
         }
         catch { }
-        return (null, null);
+
+        return ApplyLastPriceEnvelope(instrument, utcNow, bid, ask);
+    }
+
+    private (decimal? Bid, decimal? Ask) ApplyLastPriceEnvelope(string instrument, DateTimeOffset utcNow, decimal? bid, decimal? ask)
+    {
+        if (TryGetLatestMarketDataLast(instrument, utcNow, out var lastPrice, out _))
+        {
+            bid = bid.HasValue ? Math.Min(bid.Value, lastPrice) : lastPrice;
+            ask = ask.HasValue ? Math.Max(ask.Value, lastPrice) : lastPrice;
+        }
+        return (bid, ask);
+    }
+
+    private const int EntryStopMarketConversionToleranceTicks = 2;
+
+    private OrderSubmissionResult? TryBlockInvalidStopMarketRelationship(
+        string intentId,
+        string instrument,
+        string direction,
+        decimal stopPrice,
+        int? quantity,
+        string orderRole,
+        DateTimeOffset utcNow,
+        out bool convertEntryToMarket,
+        bool allowEntryMarketConversion = true)
+    {
+        convertEntryToMarket = false;
+        var isEntryStop = orderRole.IndexOf("ENTRY", StringComparison.OrdinalIgnoreCase) >= 0;
+        var isBuyStop = isEntryStop
+            ? string.Equals(direction, "Long", StringComparison.OrdinalIgnoreCase)
+            : string.Equals(direction, "Short", StringComparison.OrdinalIgnoreCase);
+        var (bid, ask) = GetCurrentMarketPriceReal(instrument, utcNow);
+        var marketPrice = isBuyStop ? ask : bid;
+        var marketPriceSource = isBuyStop ? "Ask" : "Bid";
+
+        if (!marketPrice.HasValue)
+        {
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument,
+                "STOP_MARKET_RELATIONSHIP_VALIDATION_UNAVAILABLE", new
+                {
+                    intent_id = intentId,
+                    order_role = orderRole,
+                    stop_price = stopPrice,
+                    direction,
+                    note = "Market bid/ask unavailable; proceeding with existing submit path."
+                }));
+            return null;
+        }
+
+        var invalidRelationship = isBuyStop
+            ? stopPrice <= marketPrice.Value
+            : stopPrice >= marketPrice.Value;
+        if (!invalidRelationship)
+            return null;
+
+        var crossedDistance = isBuyStop
+            ? marketPrice.Value - stopPrice
+            : stopPrice - marketPrice.Value;
+        var tickSize = GetTickSizeForInstrument(instrument);
+        var crossedTicks = tickSize > 0 ? crossedDistance / tickSize : (decimal?)null;
+        if (isEntryStop && allowEntryMarketConversion && crossedTicks.HasValue &&
+            crossedTicks.Value <= EntryStopMarketConversionToleranceTicks)
+        {
+            convertEntryToMarket = true;
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument,
+                "ENTRY_STOP_CROSSED_CONVERTED_TO_MARKET", new
+                {
+                    intent_id = intentId,
+                    order_role = orderRole,
+                    stop_price = stopPrice,
+                    market_price = marketPrice.Value,
+                    market_price_source = marketPriceSource,
+                    direction,
+                    quantity,
+                    crossed_distance_points = crossedDistance,
+                    crossed_distance_ticks = crossedTicks,
+                    tolerance_ticks = EntryStopMarketConversionToleranceTicks,
+                    note = "Entry stop is already marketable but still within tolerance; converting to MARKET before NT CreateOrder/Submit."
+                }));
+            return null;
+        }
+
+        var side = isBuyStop ? "Buy stop" : "Sell stop";
+        var relation = isBuyStop ? "at/below current ask" : "at/above current bid";
+        var reason = $"{side} can't be placed: stop price {stopPrice} is {relation} {marketPrice.Value}. Stop-market order is already crossed beyond market-conversion tolerance before submission.";
+        var eventType = isEntryStop ? "ENTRY_STOP_ALREADY_CROSSED_BLOCKED" : "STOP_MARKET_RELATIONSHIP_BLOCKED";
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, eventType, new
+        {
+            intent_id = intentId,
+            order_role = orderRole,
+            stop_price = stopPrice,
+            market_price = marketPrice.Value,
+            market_price_source = marketPriceSource,
+            direction,
+            quantity,
+            crossed_distance_points = crossedDistance,
+            crossed_distance_ticks = crossedTicks,
+            tolerance_ticks = isEntryStop ? EntryStopMarketConversionToleranceTicks : (int?)null,
+            reason,
+            note = "Blocked before NT CreateOrder/Submit to avoid synchronous NinjaTrader stop rejection."
+        }));
+
+        var (tradingDate, stream, _, _, _, _, _) = GetIntentInfo(intentId);
+        _executionJournal.RecordRejection(intentId, tradingDate, stream, $"STOP_PRICE_VALIDATION_FAILED: {reason}", utcNow,
+            orderType: isEntryStop ? "ENTRY_STOP" : "STOP", rejectedPrice: stopPrice, rejectedQuantity: quantity);
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument,
+            "STOP_PRICE_VALIDATION_FAILED", new
+            {
+                intent_id = intentId,
+                order_role = orderRole,
+                stop_price = stopPrice,
+                current_market_price = marketPrice.Value,
+                market_price_source = marketPriceSource,
+                direction,
+                quantity,
+                reason
+            }));
+        return OrderSubmissionResult.FailureResult($"Stop price validation failed: {reason}", utcNow);
     }
 
     /// <summary>
@@ -9095,6 +9462,28 @@ public sealed partial class NinjaTraderSimAdapter
         foreach (var (id, _, q, _) in toAggregate)
             qtyPerIntent.Add(new { id, qty = q });
 
+        var aggregateRelationshipFailure = TryBlockInvalidStopMarketRelationship(
+            intentId, instrument, direction, stopPrice, totalQty, "ENTRY_STOP_AGGREGATE", utcNow,
+            out var aggregateConvertToMarket, allowEntryMarketConversion: false);
+        if (aggregateRelationshipFailure != null)
+            return aggregateRelationshipFailure;
+
+        var aggregateOppositeDirection = direction == "Long" ? "Short" : "Long";
+        foreach (var id in allIntentIds)
+        {
+            var oppId = FindOppositeEntryIntentId(id);
+            if (oppId == null || !IntentMap.TryGetValue(oppId, out var oppIntent))
+                continue;
+
+            var oppPrice = oppIntent.EntryPrice ?? 0;
+            var oppQty = IntentPolicy.TryGetValue(oppId, out var oppPol) ? oppPol.ExpectedQuantity : 1;
+            var oppositeRelationshipFailure = TryBlockInvalidStopMarketRelationship(
+                oppId, instrument, aggregateOppositeDirection, oppPrice, oppQty, "ENTRY_STOP_AGGREGATE_OPPOSITE", utcNow,
+                out var oppositeConvertToMarket, allowEntryMarketConversion: false);
+            if (oppositeRelationshipFailure != null)
+                return oppositeRelationshipFailure;
+        }
+
         string? failedStep = null;
         var replacedOrderIds = new List<string>();
         var resubmittedOrderIds = new List<string>();
@@ -9466,6 +9855,15 @@ public sealed partial class NinjaTraderSimAdapter
                 warning = warn ? warnReason : null
             }));
 
+            var relationshipFailure = TryBlockInvalidStopMarketRelationship(
+                intentId, instrument, direction, stopPrice, quantity, "ENTRY_STOP", utcNow,
+                out var convertStopEntryToMarket);
+            if (relationshipFailure != null)
+                return relationshipFailure;
+            if (convertStopEntryToMarket)
+                return SubmitEntryOrderCore(intentId, instrument, direction, null, quantity, "MARKET", ocoGroup, utcNow,
+                    "SUBMIT_ENTRY_STOP");
+
             // PRICE LIMIT VALIDATION: Check stop price distance from current market price
             // Prevents NinjaTrader rejections due to stale breakout levels or market gaps
             decimal? currentMarketPrice = null;
@@ -9519,23 +9917,50 @@ public sealed partial class NinjaTraderSimAdapter
                     // Calculate distance from stop price to current market price
                     stopDistance = Math.Abs(stopPrice - currentMarketPrice.Value);
                     
-                    // QUICK BREAKOUT: If price has already passed through the stop, allow the order.
-                    // Long stop: triggers when price >= stopPrice. If current ask >= stopPrice, we're in the money.
-                    // Short stop: triggers when price <= stopPrice. If current bid <= stopPrice, we're in the money.
-                    // In these cases, the stop will fill immediately — exactly what we want for a fast breakout.
+                    // Stop-market entries must not be submitted after price has already crossed the stop.
+                    // NinjaTrader rejects marketable stop entries synchronously, and in playback that rejection
+                    // can re-enter OCO cancellation deeply enough to crash the process.
                     bool stopInTheMoney = (direction == "Long" && currentMarketPrice.Value >= stopPrice) ||
-                                         (direction == "Short" && currentMarketPrice.Value <= stopPrice);
+                                          (direction == "Short" && currentMarketPrice.Value <= stopPrice);
                     
                     if (stopInTheMoney)
                     {
-                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "STOP_PRICE_VALIDATION_SKIPPED_ITM", new
+                        var tickSize = GetTickSizeForInstrument(instrument);
+                        var crossedTicks = tickSize > 0 ? stopDistance / tickSize : (decimal?)null;
+                        if (crossedTicks.HasValue && crossedTicks.Value <= EntryStopMarketConversionToleranceTicks)
                         {
+                            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ENTRY_STOP_CROSSED_CONVERTED_TO_MARKET", new
+                            {
+                                intent_id = intentId,
+                                stop_price = stopPrice,
+                                market_price = currentMarketPrice.Value,
+                                market_price_source = direction == "Long" ? "Ask" : "Bid",
+                                direction,
+                                crossed_distance_points = stopDistance,
+                                crossed_distance_ticks = crossedTicks,
+                                tolerance_ticks = EntryStopMarketConversionToleranceTicks,
+                                note = "Entry stop is already marketable but still within tolerance; converting to MARKET before NT CreateOrder/Submit."
+                            }));
+                            return SubmitEntryOrderCore(intentId, instrument, direction, null, quantity, "MARKET", ocoGroup, utcNow,
+                                "SUBMIT_ENTRY_STOP");
+                        }
+
+                        priceValidationFailed = true;
+                        var side = direction == "Long" ? "Buy stop" : "Sell stop";
+                        var relation = direction == "Long" ? "at/below current ask" : "at/above current bid";
+                        priceValidationReason = $"{side} can't be placed: stop price {stopPrice} is {relation} {currentMarketPrice.Value}. Market moved through the breakout beyond market-conversion tolerance before stop-entry submission.";
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ENTRY_STOP_ALREADY_CROSSED_BLOCKED", new
+                        {
+                            intent_id = intentId,
                             stop_price = stopPrice,
                             market_price = currentMarketPrice.Value,
                             market_price_source = direction == "Long" ? "Ask" : "Bid",
                             direction,
                             stop_distance_points = stopDistance,
-                            note = "Stop in the money (quick breakout) — skipping distance validation, allowing order"
+                            stop_distance_ticks = crossedTicks,
+                            tolerance_ticks = EntryStopMarketConversionToleranceTicks,
+                            reason = priceValidationReason,
+                            note = "Blocked before NT CreateOrder/Submit to avoid rejected marketable stop entry."
                         }));
                     }
                     else
@@ -10023,6 +10448,15 @@ public sealed partial class NinjaTraderSimAdapter
         var stopPriceD = (double)stopPrice;
         if (stopPriceD <= 0)
             return OrderSubmissionResult.FailureResult($"Invalid stop price: {stopPriceD} (must be > 0)", utcNow);
+
+        var relationshipFailure = TryBlockInvalidStopMarketRelationship(
+            intentId, instrument, direction, stopPrice, quantity, "ENTRY_STOP", utcNow,
+            out var convertStopEntryToMarket);
+        if (relationshipFailure != null)
+            return relationshipFailure;
+        if (convertStopEntryToMarket)
+            return SubmitEntryOrderCore(intentId, instrument, direction, null, quantity, "MARKET", ocoGroup, utcNow,
+                "SUBMIT_ENTRY_STOP");
 
         Order order;
         try

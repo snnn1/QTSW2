@@ -110,6 +110,44 @@ public static class RunSummaryBuilderTests
             if (incompleteDoc.errors != 2)
                 return (false, $"expected two summary errors for incomplete streams, got {incompleteDoc.errors}");
 
+            var protectiveRoot = Path.Combine(root, "protective_failure_summary");
+            Directory.CreateDirectory(protectiveRoot);
+            File.WriteAllText(Path.Combine(protectiveRoot, RunRootArtifacts.KeyEventsFileName), "");
+            var protectiveJournalDir = RobotRunArtifactPaths.StateExecutionJournals(protectiveRoot);
+            Directory.CreateDirectory(protectiveJournalDir);
+            File.WriteAllText(Path.Combine(protectiveJournalDir, "2026-04-13_GC2_protective-fail.json"), JsonUtil.Serialize(new ExecutionJournalEntry
+            {
+                IntentId = "protective-fail",
+                TradingDate = "2026-04-13",
+                Stream = "GC2",
+                Instrument = "MGC",
+                EntrySubmitted = true,
+                EntryFilled = true,
+                EntryFilledQuantityTotal = 2,
+                ExitFilledQuantityTotal = 1,
+                TradeCompleted = false,
+                Rejected = false,
+                ProtectiveRejectedAt = "2026-04-26T21:00:04.0000000+00:00",
+                ProtectiveRejectionReason = "STOP_SUBMIT_FAILED: Object reference not set to an instance of an object.",
+                ProtectiveRejectionOrderType = "STOP",
+                Direction = "Long"
+            }));
+
+            var protectiveDoc = RunSummaryBuilder.Build(
+                protectiveRoot,
+                "protective-summary-test",
+                DateTimeOffset.Parse("2026-04-26T18:00:00+00:00"),
+                ExecutionMode.SIM,
+                new[] { "MGC" },
+                new ExecutionSummarySnapshot());
+
+            if (protectiveDoc.status != "FAIL" || protectiveDoc.status_reason != "PROTECTIVE_FAILED")
+                return (false, $"expected active protective journal failure to fail summary, got {protectiveDoc.status}/{protectiveDoc.status_reason}");
+            if (protectiveDoc.key_counts.protective_failed != 1 || !protectiveDoc.flags.had_protective_failure)
+                return (false, "expected protective failure count and flag from active journal");
+            if (protectiveDoc.errors != 2)
+                return (false, $"expected two summary errors for protective failure plus open exposure, got {protectiveDoc.errors}");
+
             var badRoot = Path.Combine(root, "bad_summary");
             Directory.CreateDirectory(badRoot);
             File.WriteAllLines(Path.Combine(badRoot, RunRootArtifacts.KeyEventsFileName), new[]

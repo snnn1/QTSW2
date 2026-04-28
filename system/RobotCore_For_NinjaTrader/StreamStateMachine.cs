@@ -271,6 +271,7 @@ public sealed class StreamStateMachine
 
     /// <summary>Once per (trading_date|stream|reason) SESSION_REENTRY_BLOCKED engine events (avoids tick spam).</summary>
     private readonly HashSet<string> _sessionReentryBlockedLogKeys = new(StringComparer.Ordinal);
+    private DateTimeOffset? _lastForcedFlattenPreEntryCancelUtc = null;
 
     private decimal? _lastCloseBeforeLock;
 
@@ -2597,8 +2598,9 @@ public sealed class StreamStateMachine
                 }
             }
             
-            // Legacy check: If range is locked but state is not RANGE_LOCKED, log critical error
-            if (_rangeLocked && State != StreamState.RANGE_LOCKED)
+            // Legacy check: If range is locked but state is not RANGE_LOCKED, log critical error.
+            // A durable terminal commit intentionally moves RANGE_LOCKED -> DONE and is not a partial lock failure.
+            if (_rangeLocked && State != StreamState.RANGE_LOCKED && !(State == StreamState.DONE && _journal.Committed))
             {
                 LogHealth("CRITICAL", "RANGE_LOCK_TRANSITION_FAILED", 
                     "Range lock flag is true but state is not RANGE_LOCKED - partial failure detected",
@@ -2974,6 +2976,40 @@ public sealed class StreamStateMachine
         var longInvalid = ask.HasValue && ask.Value >= brkLong + tolerance;
         var shortInvalid = bid.HasValue && bid.Value <= brkShort - tolerance;
         return !(longInvalid || shortInvalid);
+    }
+
+    private enum BreakoutEntrySubmitAction
+    {
+        Stop,
+        Market,
+        Reject
+    }
+
+    private (BreakoutEntrySubmitAction Action, decimal? DistanceTicks, string? Reason) ResolveBreakoutEntrySubmitAction(
+        string direction,
+        decimal breakoutPrice,
+        decimal? bid,
+        decimal? ask,
+        int toleranceTicks)
+    {
+        decimal? marketPrice = string.Equals(direction, "Long", StringComparison.OrdinalIgnoreCase) ? ask : bid;
+        if (!marketPrice.HasValue || _tickSize <= 0)
+            return (BreakoutEntrySubmitAction.Stop, null, null);
+
+        var crossed = string.Equals(direction, "Long", StringComparison.OrdinalIgnoreCase)
+            ? marketPrice.Value >= breakoutPrice
+            : marketPrice.Value <= breakoutPrice;
+        if (!crossed)
+            return (BreakoutEntrySubmitAction.Stop, null, null);
+
+        var distanceTicks = string.Equals(direction, "Long", StringComparison.OrdinalIgnoreCase)
+            ? (marketPrice.Value - breakoutPrice) / _tickSize
+            : (breakoutPrice - marketPrice.Value) / _tickSize;
+
+        if (distanceTicks <= toleranceTicks)
+            return (BreakoutEntrySubmitAction.Market, distanceTicks, "crossed_within_tolerance");
+
+        return (BreakoutEntrySubmitAction.Reject, distanceTicks, "crossed_beyond_tolerance");
     }
 
     /// <summary>
@@ -4029,6 +4065,21 @@ public sealed class StreamStateMachine
         _journals.Save(_journal);
     }
 
+    private static bool IsEntryStopMarketMovedRejection(string? error)
+    {
+        if (string.IsNullOrWhiteSpace(error)) return false;
+        return error.IndexOf("can't be placed", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               error.IndexOf("cannot be placed", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               error.IndexOf("price outside limits", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private void MarkPostLockBreakoutFromRejectedSide(bool longRejected, bool shortRejected)
+    {
+        if (longRejected) _journal.PostLockLongBreakoutTouched = true;
+        if (shortRejected) _journal.PostLockShortBreakoutTouched = true;
+        _journals.Save(_journal);
+    }
+
     /// <summary>
     /// Deterministic post-lock excursion: bar must be strictly after slot end; uses bar high/low vs rounded breakout stops.
     /// On first touch, persists journal flags, emits audit event, and commits NO_TRADE_BREAKOUT_ALREADY_OCCURRED.
@@ -4486,29 +4537,56 @@ public sealed class StreamStateMachine
                     }));
             }
 
-            // Pre-submit: if breakout already crossed, submit MARKET instead of STOP (prevents "price outside limits" rejection)
+            // Pre-submit: a crossed breakout stop is either converted to MARKET within tolerance or rejected as missed.
             var (bid, ask) = _executionAdapter.GetCurrentMarketPrice(ExecutionInstrument, utcNow);
-            var longCrossed = ask.HasValue && ask.Value >= brkLong;
-            var shortCrossed = bid.HasValue && bid.Value <= brkShort;
-            var longDecision = longCrossed ? "MARKET" : "STOP";
-            var shortDecision = shortCrossed ? "MARKET" : "STOP";
-            var longPriceDistTicks = (ask.HasValue && _tickSize > 0) ? (int)Math.Round((ask.Value - brkLong) / _tickSize) : (int?)null;
-            var shortPriceDistTicks = (bid.HasValue && _tickSize > 0) ? (int)Math.Round((brkShort - bid.Value) / _tickSize) : (int?)null;
+            var toleranceTicks = GetBreakoutValidityToleranceTicks();
+            var longSubmit = ResolveBreakoutEntrySubmitAction("Long", brkLong, bid, ask, toleranceTicks);
+            var shortSubmit = ResolveBreakoutEntrySubmitAction("Short", brkShort, bid, ask, toleranceTicks);
+            var longDecision = longSubmit.Action.ToString().ToUpperInvariant();
+            var shortDecision = shortSubmit.Action.ToString().ToUpperInvariant();
 
             _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                 "ENTRY_ORDER_TYPE_DECISION", State.ToString(),
-                new { stream = Stream, side = "LONG", decision = longDecision, bid, ask, brk_long = brkLong, brk_short = brkShort, price_distance_ticks = longPriceDistTicks }));
+                new { stream = Stream, side = "LONG", decision = longDecision, bid, ask, brk_long = brkLong, brk_short = brkShort, crossed_distance_ticks = longSubmit.DistanceTicks, tolerance_ticks = toleranceTicks, reason = longSubmit.Reason }));
             _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                 "ENTRY_ORDER_TYPE_DECISION", State.ToString(),
-                new { stream = Stream, side = "SHORT", decision = shortDecision, bid, ask, brk_long = brkLong, brk_short = brkShort, price_distance_ticks = shortPriceDistTicks }));
+                new { stream = Stream, side = "SHORT", decision = shortDecision, bid, ask, brk_long = brkLong, brk_short = brkShort, crossed_distance_ticks = shortSubmit.DistanceTicks, tolerance_ticks = toleranceTicks, reason = shortSubmit.Reason }));
+
+            if (longSubmit.Action == BreakoutEntrySubmitAction.Reject ||
+                shortSubmit.Action == BreakoutEntrySubmitAction.Reject)
+            {
+                MarkPostLockBreakoutFromRejectedSide(
+                    longSubmit.Action == BreakoutEntrySubmitAction.Reject,
+                    shortSubmit.Action == BreakoutEntrySubmitAction.Reject);
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "ENTRY_BREAKOUT_TOO_FAR_REJECTED", State.ToString(),
+                    new
+                    {
+                        stream = Stream,
+                        bid,
+                        ask,
+                        brk_long = brkLong,
+                        brk_short = brkShort,
+                        long_decision = longDecision,
+                        short_decision = shortDecision,
+                        long_crossed_distance_ticks = longSubmit.DistanceTicks,
+                        short_crossed_distance_ticks = shortSubmit.DistanceTicks,
+                        tolerance_ticks = toleranceTicks,
+                        note = "Breakout price was crossed beyond tolerance before bracket submission; treating as missed opportunity."
+                    }));
+                LogSlotEndSummary(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", false, false,
+                    "Range locked; breakout crossed beyond tolerance before entry could be submitted");
+                _ = Commit(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", "NO_TRADE_BREAKOUT_ALREADY_OCCURRED");
+                return;
+            }
 
             OrderSubmissionResult longRes;
             OrderSubmissionResult shortRes;
-            if (longCrossed)
+            if (longSubmit.Action == BreakoutEntrySubmitAction.Market)
                 longRes = _executionAdapter.SubmitEntryOrder(longIntentId, ExecutionInstrument, "Long", null, _orderQuantity, "MARKET", ocoGroup, utcNow);
             else
                 longRes = _executionAdapter.SubmitStopEntryOrder(longIntentId, ExecutionInstrument, "Long", brkLong, _orderQuantity, ocoGroup, utcNow);
-            if (shortCrossed)
+            if (shortSubmit.Action == BreakoutEntrySubmitAction.Market)
                 shortRes = _executionAdapter.SubmitEntryOrder(shortIntentId, ExecutionInstrument, "Short", null, _orderQuantity, "MARKET", ocoGroup, utcNow);
             else
                 shortRes = _executionAdapter.SubmitStopEntryOrder(shortIntentId, ExecutionInstrument, "Short", brkShort, _orderQuantity, ocoGroup, utcNow);
@@ -4650,7 +4728,59 @@ public sealed class StreamStateMachine
                     bothRejected
                         ? "Range locked; stop bracket submission failed (both sides) — no working entry orders"
                         : "Range locked; stop bracket submission incomplete (one side) — review adapter errors");
-                if (bothRejected)
+                var partialRejected = longRes.Success != shortRes.Success;
+                if (partialRejected && _executionAdapter is NinjaTraderSimAdapter partialCancelAdapter)
+                {
+                    try
+                    {
+                        if (longRes.Success) partialCancelAdapter.CancelIntentOrders(longIntentId, utcNow);
+                        if (shortRes.Success) partialCancelAdapter.CancelIntentOrders(shortIntentId, utcNow);
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, $"BRACKETS_AT_LOCK:{TradingDate}:{Stream}", Instrument, "STOP_BRACKETS_PARTIAL_CANCELLED", new
+                        {
+                            stream_id = Stream,
+                            trading_date = TradingDate,
+                            long_intent_id = longIntentId,
+                            short_intent_id = shortIntentId,
+                            long_success = longRes.Success,
+                            short_success = shortRes.Success,
+                            note = "Paired entry brackets are all-or-none; accepted side was cancelled after sibling rejection."
+                        }));
+                    }
+                    catch (Exception cancelEx)
+                    {
+                        _log.Write(RobotEvents.ExecutionBase(utcNow, $"BRACKETS_AT_LOCK:{TradingDate}:{Stream}", Instrument, "STOP_BRACKETS_PARTIAL_CANCEL_FAILED", new
+                        {
+                            stream_id = Stream,
+                            trading_date = TradingDate,
+                            error = cancelEx.Message,
+                            note = "Failed to cancel accepted side after partial entry-bracket rejection."
+                        }));
+                    }
+                }
+
+                var marketMovedLong = !longRes.Success && IsEntryStopMarketMovedRejection(longRes.ErrorMessage);
+                var marketMovedShort = !shortRes.Success && IsEntryStopMarketMovedRejection(shortRes.ErrorMessage);
+                if (marketMovedLong || marketMovedShort)
+                {
+                    MarkPostLockBreakoutFromRejectedSide(marketMovedLong, marketMovedShort);
+                    _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                        "ENTRY_INVALIDATED_POST_LOCK_EXCURSION", State.ToString(),
+                        new
+                        {
+                            stream_id = Stream,
+                            trading_date = TradingDate,
+                            breakout_long = brkLong,
+                            breakout_short = brkShort,
+                            long_touched = _journal.PostLockLongBreakoutTouched,
+                            short_touched = _journal.PostLockShortBreakoutTouched,
+                            long_error = longRes.ErrorMessage,
+                            short_error = shortRes.ErrorMessage,
+                            source = "BROKER_REJECTED_MARKET_MOVED",
+                            note = "Broker rejected one stop-entry side as already marketable; strict setup expired."
+                        }));
+                    _ = Commit(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", "NO_TRADE_BREAKOUT_ALREADY_OCCURRED");
+                }
+                else if (bothRejected || partialRejected)
                 {
                     // Terminal NO_TRADE: avoid substring FAILED in commit reason (classified as FAILED_RUNTIME elsewhere)
                     _ = Commit(utcNow, "NO_TRADE_ENTRY_BRACKETS_AT_LOCK_REJECTED", "NO_TRADE_ENTRY_BRACKETS_AT_LOCK_REJECTED");
@@ -6698,6 +6828,22 @@ public sealed class StreamStateMachine
         return Commit(utcNow, reason, "TRADE_COMPLETED");
     }
 
+    private bool HasAnyReentryLifecycle()
+        => !string.IsNullOrWhiteSpace(_journal.ReentryIntentId) ||
+           _journal.ReentrySubmitPending ||
+           _journal.ReentrySubmitted ||
+           _journal.ReentryFilled ||
+           _journal.ProtectionSubmitted ||
+           _journal.ProtectionAccepted;
+
+    private bool IsReentryLifecycleCompleted()
+    {
+        if (_executionJournal == null || string.IsNullOrWhiteSpace(_journal.ReentryIntentId))
+            return false;
+
+        return _executionJournal.IsIntentCompleted(_journal.ReentryIntentId, TradingDate, Stream);
+    }
+
     /// <summary>
     /// Terminal commit: persists <see cref="StreamJournal"/> with Committed=true, then sets <see cref="State"/> to DONE.
     /// Option A: if <see cref="JournalStore.Save"/> fails, in-memory journal is rolled back and state is not DONE.
@@ -7350,6 +7496,41 @@ public sealed class StreamStateMachine
         return null;
     }
 
+    private List<ExecutionJournalEntry> LoadExecutionJournalEntriesForStream(string tradingDate, string stream)
+    {
+        var entries = new List<ExecutionJournalEntry>();
+        if (string.IsNullOrWhiteSpace(tradingDate) || string.IsNullOrWhiteSpace(stream))
+            return entries;
+
+        var journalDir = RobotRunArtifactPaths.StateExecutionJournals(_robotStateRoot);
+        var pattern = $"{tradingDate}_{stream}_*.json";
+
+        try
+        {
+            if (!Directory.Exists(journalDir)) return entries;
+
+            foreach (var file in Directory.GetFiles(journalDir, pattern))
+            {
+                try
+                {
+                    var entry = JsonUtil.Deserialize<ExecutionJournalEntry>(File.ReadAllText(file));
+                    if (entry != null)
+                        entries.Add(entry);
+                }
+                catch
+                {
+                    // Skip corrupted files
+                }
+            }
+        }
+        catch
+        {
+            // Fail-safe: return any entries loaded before the error
+        }
+
+        return entries;
+    }
+
     private bool TryFindOpenExecutionJournalEntryForStream(string tradingDate, string stream, out ExecutionJournalEntry? openEntry)
     {
         openEntry = null;
@@ -7394,6 +7575,218 @@ public sealed class StreamStateMachine
         var msg = r.ErrorMessage ?? "";
         return msg.IndexOf("Enqueued", StringComparison.OrdinalIgnoreCase) >= 0
                || string.Equals(msg, "SESSION_CLOSE_FLATTEN_ENQUEUED", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsPendingUnfilledEntryJournal(ExecutionJournalEntry? entry)
+        => entry != null &&
+           entry.EntrySubmitted &&
+           !entry.TradeCompleted &&
+           !entry.EntryFilled &&
+           entry.EntryFilledQuantityTotal <= 0 &&
+           !entry.Rejected;
+
+    private int CountWorkingOrdersForStreamInstrument(AccountSnapshot snap)
+    {
+        var working = snap.WorkingOrders ?? new List<WorkingOrderSnapshot>();
+        var count = 0;
+        foreach (var order in working)
+        {
+            if (IsSameInstrument(order.Instrument))
+                count++;
+        }
+        return count;
+    }
+
+    private bool TryDeferForcedFlattenForLivePreEntryBrackets(DateTimeOffset utcNow)
+    {
+        if (!_stopBracketsSubmittedAtLock && !(_journal.StopBracketsSubmittedAtLock))
+            return false;
+
+        if (_executionAdapter == null)
+            return false;
+
+        if (!_brkLongRounded.HasValue || !_brkShortRounded.HasValue)
+        {
+            _engine?.LogEngineEvent(utcNow, "FORCED_FLATTEN_PRE_ENTRY_BRACKET_AUDIT_DEFERRED", new Dictionary<string, object?>
+            {
+                ["trading_date"] = TradingDate,
+                ["session_class"] = Session,
+                ["stream"] = Stream,
+                ["instrument"] = ExecutionInstrument,
+                ["reason"] = "BREAKOUT_LEVELS_UNAVAILABLE",
+                ["note"] = "Pre-entry stream had submitted brackets but breakout levels were unavailable; refusing terminal no-trade commit until order state is known."
+            });
+            return true;
+        }
+
+        AccountSnapshot snap;
+        try
+        {
+            snap = _executionAdapter.GetAccountSnapshot(utcNow);
+        }
+        catch (Exception ex)
+        {
+            _engine?.LogEngineEvent(utcNow, "FORCED_FLATTEN_PRE_ENTRY_BRACKET_AUDIT_DEFERRED", new Dictionary<string, object?>
+            {
+                ["trading_date"] = TradingDate,
+                ["session_class"] = Session,
+                ["stream"] = Stream,
+                ["instrument"] = ExecutionInstrument,
+                ["reason"] = "ACCOUNT_SNAPSHOT_FAILED",
+                ["error"] = ex.Message,
+                ["note"] = "Cannot prove entry brackets are gone; refusing terminal no-trade commit."
+            });
+            return true;
+        }
+
+        var longIntentId = ComputeIntentId("Long", _brkLongRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_LONG");
+        var shortIntentId = ComputeIntentId("Short", _brkShortRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_SHORT");
+        var longEntry = LoadExecutionJournalEntryForIntentId(longIntentId, TradingDate);
+        var shortEntry = LoadExecutionJournalEntryForIntentId(shortIntentId, TradingDate);
+        var pendingJournalEntries = new List<ExecutionJournalEntry>();
+        var pendingIntentIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        void AddPendingEntry(ExecutionJournalEntry? entry)
+        {
+            if (!IsPendingUnfilledEntryJournal(entry) || string.IsNullOrWhiteSpace(entry.IntentId))
+                return;
+            if (pendingIntentIds.Add(entry.IntentId))
+                pendingJournalEntries.Add(entry);
+        }
+
+        AddPendingEntry(longEntry);
+        AddPendingEntry(shortEntry);
+        foreach (var streamEntry in LoadExecutionJournalEntriesForStream(TradingDate, Stream))
+            AddPendingEntry(streamEntry);
+
+        var journalPendingCount = pendingJournalEntries.Count;
+        var instrumentWorkingCount = CountWorkingOrdersForStreamInstrument(snap);
+        var (longCount, shortCount, orderIdsRaw) = GetMatchingEntryOrderCounts(snap, longIntentId, shortIntentId);
+        var liveEntryOrderCount = longCount + shortCount;
+        if (liveEntryOrderCount <= 0 && journalPendingCount <= 0 && instrumentWorkingCount <= 0)
+        {
+            _engine?.LogEngineEvent(utcNow, "FORCED_FLATTEN_PRE_ENTRY_BRACKET_AUDIT_EMPTY", new Dictionary<string, object?>
+            {
+                ["trading_date"] = TradingDate,
+                ["session_class"] = Session,
+                ["stream"] = Stream,
+                ["instrument"] = ExecutionInstrument,
+                ["long_intent_id"] = longIntentId,
+                ["short_intent_id"] = shortIntentId,
+                ["note"] = "Pre-entry forced flatten found no live same-instrument working orders and no pending stream entry journals; terminal no-trade commit can proceed."
+            });
+            return false;
+        }
+
+        if (liveEntryOrderCount <= 0 && journalPendingCount > 0 && instrumentWorkingCount <= 0)
+        {
+            var terminalized = 0;
+            foreach (var pendingEntry in pendingJournalEntries)
+            {
+                if (!string.IsNullOrWhiteSpace(pendingEntry.IntentId) &&
+                    _executionJournal?.RecordCancelledUnfilledEntry(pendingEntry.IntentId, TradingDate, Stream, utcNow) == true)
+                    terminalized++;
+            }
+
+            _engine?.LogEngineEvent(utcNow, "FORCED_FLATTEN_PRE_ENTRY_BRACKETS_TERMINALIZED", new Dictionary<string, object?>
+            {
+                ["trading_date"] = TradingDate,
+                ["session_class"] = Session,
+                ["stream"] = Stream,
+                ["instrument"] = ExecutionInstrument,
+                ["journal_pending_count"] = journalPendingCount,
+                ["pending_intent_ids"] = pendingJournalEntries.Select(e => e.IntentId).ToList(),
+                ["terminalized_count"] = terminalized,
+                ["note"] = "Pre-entry journals were pending but broker snapshot showed no same-instrument working orders; marked unfilled entries terminal before no-trade commit."
+            });
+            return false;
+        }
+
+        var orderIds = orderIdsRaw
+            .Concat(new[] { longEntry?.BrokerOrderId, shortEntry?.BrokerOrderId })
+            .Concat(pendingJournalEntries.Select(e => e.BrokerOrderId))
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var shouldCancelNow = !_lastForcedFlattenPreEntryCancelUtc.HasValue ||
+                              (utcNow - _lastForcedFlattenPreEntryCancelUtc.Value).TotalSeconds >= 5.0;
+        if (shouldCancelNow)
+        {
+            var cancelAccepted = false;
+            try
+            {
+                if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
+                {
+                    if (orderIds.Count > 0)
+                    {
+                        _executionAdapter.CancelOrders(orderIds, utcNow);
+                        cancelAccepted = true;
+                    }
+                    cancelAccepted = simAdapter.CancelIntentOrders(longIntentId, utcNow);
+                    cancelAccepted = simAdapter.CancelIntentOrders(shortIntentId, utcNow) || cancelAccepted;
+                    foreach (var pendingEntry in pendingJournalEntries)
+                    {
+                        if (string.IsNullOrWhiteSpace(pendingEntry.IntentId) ||
+                            string.Equals(pendingEntry.IntentId, longIntentId, StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(pendingEntry.IntentId, shortIntentId, StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        cancelAccepted = simAdapter.CancelIntentOrders(pendingEntry.IntentId, utcNow) || cancelAccepted;
+                    }
+                }
+                else if (orderIds.Count > 0)
+                {
+                    _executionAdapter.CancelOrders(orderIds, utcNow);
+                    cancelAccepted = true;
+                }
+            }
+            catch (Exception ex)
+            {
+                _engine?.LogEngineEvent(utcNow, "FORCED_FLATTEN_PRE_ENTRY_BRACKET_CANCEL_ERROR", new Dictionary<string, object?>
+                {
+                    ["trading_date"] = TradingDate,
+                    ["session_class"] = Session,
+                    ["stream"] = Stream,
+                    ["instrument"] = ExecutionInstrument,
+                    ["error"] = ex.Message,
+                    ["live_entry_order_count"] = liveEntryOrderCount
+                });
+            }
+
+            _lastForcedFlattenPreEntryCancelUtc = utcNow;
+            _engine?.LogEngineEvent(utcNow, "FORCED_FLATTEN_PRE_ENTRY_BRACKETS_CANCEL_REQUESTED", new Dictionary<string, object?>
+            {
+                ["trading_date"] = TradingDate,
+                ["session_class"] = Session,
+                ["stream"] = Stream,
+                ["instrument"] = ExecutionInstrument,
+                ["long_intent_id"] = longIntentId,
+                ["short_intent_id"] = shortIntentId,
+                ["long_order_count"] = longCount,
+                ["short_order_count"] = shortCount,
+                ["journal_pending_count"] = journalPendingCount,
+                ["pending_intent_ids"] = pendingJournalEntries.Select(e => e.IntentId).ToList(),
+                ["instrument_working_count"] = instrumentWorkingCount,
+                ["broker_order_ids"] = orderIds,
+                ["cancel_accepted"] = cancelAccepted,
+                ["note"] = "Pre-entry forced flatten found live entry brackets; terminal no-trade commit deferred until broker working orders are gone."
+            });
+        }
+        else
+        {
+            _engine?.LogEngineEvent(utcNow, "FORCED_FLATTEN_PRE_ENTRY_BRACKETS_CANCEL_PENDING", new Dictionary<string, object?>
+            {
+                ["trading_date"] = TradingDate,
+                ["session_class"] = Session,
+                ["stream"] = Stream,
+                ["instrument"] = ExecutionInstrument,
+                ["live_entry_order_count"] = liveEntryOrderCount,
+                ["journal_pending_count"] = journalPendingCount,
+                ["instrument_working_count"] = instrumentWorkingCount,
+                ["note"] = "Waiting for broker to acknowledge pre-entry bracket cancellation before terminal no-trade commit."
+            });
+        }
+
+        return true;
     }
 
     private bool TryWaitBrokerFlatForExecutionInstrument(
@@ -7549,6 +7942,31 @@ public sealed class StreamStateMachine
 
                 if (!hasOpenOriginalPosition)
                 {
+                    if (HasAnyReentryLifecycle())
+                    {
+                        if (IsReentryLifecycleCompleted())
+                        {
+                            _ = Commit(utcNow, "REENTRY_TRADE_COMPLETED_MARKET_CLOSE", "TRADE_COMPLETED");
+                            return;
+                        }
+
+                        _engine?.LogEngineEvent(utcNow, "FORCED_FLATTEN_SKIPPED_ACTIVE_REENTRY", new Dictionary<string, object?>
+                        {
+                            ["trading_date"] = TradingDate,
+                            ["session_class"] = Session,
+                            ["stream"] = Stream,
+                            ["instrument"] = ExecutionInstrument,
+                            ["original_intent_id"] = _journal.OriginalIntentId ?? "",
+                            ["reentry_intent_id"] = _journal.ReentryIntentId ?? "",
+                            ["reentry_submitted"] = _journal.ReentrySubmitted,
+                            ["reentry_filled"] = _journal.ReentryFilled,
+                            ["protection_submitted"] = _journal.ProtectionSubmitted,
+                            ["protection_accepted"] = _journal.ProtectionAccepted,
+                            ["note"] = "Original intent is complete, but the stream has an unresolved reentry lifecycle; leaving stream ACTIVE for next-slot expiry."
+                        });
+                        return;
+                    }
+
                     _engine?.LogEngineEvent(utcNow, "FORCED_FLATTEN_SKIPPED_COMPLETED_TRADE", new Dictionary<string, object?>
                     {
                         ["trading_date"] = TradingDate,
@@ -7591,7 +8009,10 @@ public sealed class StreamStateMachine
         
         if (!hasOpenOriginalPosition)
         {
-            // Pre-entry forced flatten - this shouldn't happen, but if it does, mark as NO_TRADE (durable commit first)
+            if (TryDeferForcedFlattenForLivePreEntryBrackets(utcNow))
+                return;
+
+            // Pre-entry forced flatten: only terminal once live entry brackets are proven gone.
             if (!Commit(utcNow, "NO_TRADE_FORCED_FLATTEN_PRE_ENTRY", "FORCED_FLATTEN_MARKET_CLOSE"))
                 return;
             return;
@@ -8982,9 +9403,9 @@ public sealed class StreamStateMachine
         _journal.LastUpdateUtc = utcNow.ToString("o");
         _journals.Save(_journal);
         
-        // Inverted check: If _rangeLocked == true and state is not RANGE_LOCKED after slot time, log CRITICAL
-        // This detects the partial failure scenario where lock was committed but transition failed
-        if (_rangeLocked && State != StreamState.RANGE_LOCKED && utcNow >= SlotTimeUtc)
+        // Inverted check: If _rangeLocked == true and state is not RANGE_LOCKED after slot time, log CRITICAL.
+        // A durable terminal commit intentionally moves RANGE_LOCKED -> DONE and is not a partial lock failure.
+        if (_rangeLocked && State != StreamState.RANGE_LOCKED && !(State == StreamState.DONE && _journal.Committed) && utcNow >= SlotTimeUtc)
         {
             LogHealth("CRITICAL", "RANGE_LOCK_TRANSITION_FAILED", 
                 "Range lock flag is true but state is not RANGE_LOCKED - partial failure detected",

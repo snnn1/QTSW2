@@ -10,6 +10,10 @@ public static class ForcedFlattenPolicyTests
         var spec = BuildSpec();
         spec.ValidateOrThrow();
 
+        var loggingConfig = new LoggingConfig();
+        if (!loggingConfig.prefer_internal_calendar_over_nt_holiday)
+            return (false, "Expected NT holiday conflict override to default on for active timetable days");
+
         var defaultBuffer = SessionTimingPolicy.ResolveForcedFlattenBufferSeconds(spec);
         if (defaultBuffer != SessionTimingPolicy.DefaultForcedFlattenBufferSeconds)
             return (false, $"Expected default forced flatten buffer {SessionTimingPolicy.DefaultForcedFlattenBufferSeconds}, got {defaultBuffer}");

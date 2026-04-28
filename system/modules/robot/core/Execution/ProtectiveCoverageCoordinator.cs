@@ -247,6 +247,39 @@ public sealed class ProtectiveCoverageCoordinator
             _auditFailureCount++;
             var eventType = GetEventTypeForStatus(result.Status);
             _log?.Write(RobotEvents.ExecutionBase(result.AuditUtc, "", inst, eventType, ToPayload(result)));
+
+            if (state.RecoveryState != ProtectiveRecoveryState.CORRECTIVE_SUBMITTING &&
+                state.RecoveryState != ProtectiveRecoveryState.AWAITING_CONFIRMATION &&
+                state.AttemptCount < ProtectiveAuditPolicy.PROTECTIVE_MAX_CORRECTIVE_ATTEMPTS &&
+                IsCorrectiveEligible(result.Status) &&
+                _submitCorrective != null)
+            {
+                state.RecoveryState = ProtectiveRecoveryState.CORRECTIVE_SUBMITTING;
+                state.FirstDetectedUtc = state.FirstDetectedUtc == default ? result.AuditUtc : state.FirstDetectedUtc;
+                state.LastDetectedUtc = result.AuditUtc;
+                state.LastAuditStatus = result.Status;
+
+                var req = new ProtectiveCorrectiveRequest
+                {
+                    Instrument = inst,
+                    BrokerPositionQty = result.BrokerPositionQty,
+                    BrokerDirection = result.BrokerDirection,
+                    StopQty = result.StopQty,
+                    TargetQty = result.TargetQty,
+                    Status = result.Status,
+                    AuditUtc = result.AuditUtc
+                };
+                var correctiveResult = _submitCorrective(req);
+                state.AttemptCount++;
+                var submittedPayload = new { instrument = inst, intent_id = correctiveResult.IntentId, submitted = correctiveResult.Submitted, failure_reason = correctiveResult.FailureReason, attempt_count = state.AttemptCount };
+                _log?.Write(RobotEvents.ExecutionBase(result.AuditUtc, "", inst, "PROTECTIVE_RECOVERY_SUBMITTED", submittedPayload));
+                EmitCanonical(inst, ExecutionEventTypes.PROTECTIVE_RECOVERY_SUBMITTED, result.AuditUtc, submittedPayload);
+
+                state.AwaitingConfirmationUntilUtc = result.AuditUtc.AddMilliseconds(ProtectiveAuditPolicy.PROTECTIVE_AWAITING_CONFIRMATION_MS);
+                state.RecoveryState = correctiveResult.Submitted
+                    ? ProtectiveRecoveryState.AWAITING_CONFIRMATION
+                    : ProtectiveRecoveryState.DETECTED;
+            }
             return;
         }
 
@@ -387,7 +420,9 @@ public sealed class ProtectiveCoverageCoordinator
     {
         return status == ProtectiveAuditStatus.PROTECTIVE_MISSING_STOP ||
                status == ProtectiveAuditStatus.PROTECTIVE_STOP_QTY_MISMATCH ||
-               status == ProtectiveAuditStatus.PROTECTIVE_STOP_PRICE_INVALID;
+               status == ProtectiveAuditStatus.PROTECTIVE_STOP_PRICE_INVALID ||
+               status == ProtectiveAuditStatus.PROTECTIVE_MISSING_TARGET ||
+               status == ProtectiveAuditStatus.PROTECTIVE_TARGET_QTY_MISMATCH;
     }
 
     private static string GetEventTypeForStatus(ProtectiveAuditStatus status)

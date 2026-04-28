@@ -147,6 +147,14 @@ internal sealed class CapturingExecutionAdapter : IExecutionAdapter
     private readonly List<ExecutionCommandBase> _commands = new();
     private readonly object _lock = new();
 
+    public AccountSnapshot Snapshot { get; } = new AccountSnapshot
+    {
+        Positions = new List<PositionSnapshot>(),
+        WorkingOrders = new List<WorkingOrderSnapshot>()
+    };
+
+    public List<string> CancelledOrderIds { get; } = new();
+
     public CapturingExecutionAdapter(RobotLogger log)
     {
         _log = log;
@@ -203,11 +211,18 @@ internal sealed class CapturingExecutionAdapter : IExecutionAdapter
     public FlattenResult FlattenEmergency(string instrument, DateTimeOffset utcNow)
         => FlattenResult.SuccessResult(utcNow);
     public AccountSnapshot GetAccountSnapshot(DateTimeOffset utcNow)
-        => new AccountSnapshot { Positions = new List<PositionSnapshot>(), WorkingOrders = new List<WorkingOrderSnapshot>() };
+        => Snapshot;
     public (decimal? Bid, decimal? Ask) GetCurrentMarketPrice(string instrument, DateTimeOffset utcNow)
         => (null, null);
     public void CancelRobotOwnedWorkingOrders(AccountSnapshot snap, DateTimeOffset utcNow) { }
-    public void CancelOrders(IEnumerable<string> orderIds, DateTimeOffset utcNow) { }
+    public void CancelOrders(IEnumerable<string> orderIds, DateTimeOffset utcNow)
+    {
+        foreach (var id in orderIds ?? Array.Empty<string>())
+        {
+            if (!string.IsNullOrWhiteSpace(id))
+                CancelledOrderIds.Add(id);
+        }
+    }
     public FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow)
         => FlattenResult.SuccessResult(utcNow);
     public bool TryEnqueueEmergencyFlattenProtective(string instrument, DateTimeOffset utcNow) => true;

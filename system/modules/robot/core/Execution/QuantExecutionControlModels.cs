@@ -76,6 +76,15 @@ public sealed class QuantExpectedInstrumentState
     public DateTimeOffset? LastProtectiveStopSubmitUtc { get; set; }
 
     /// <summary>
+    /// Set when a protective submit command has been handed to the NT strategy-thread queue, before the
+    /// broker order snapshot is guaranteed to show the stop/target.
+    /// </summary>
+    public DateTimeOffset? LastProtectiveSubmitPendingUtc { get; set; }
+
+    /// <summary>Expected broker working-order count while a first protective submit handoff converges.</summary>
+    public int? PendingProtectiveSubmitWorkingCount { get; set; }
+
+    /// <summary>
     /// Set when an already-working protective set must be resized after another mapped fill.
     /// The protective audit uses this as a bounded suppressor while the strategy-thread resize
     /// command cancels/recreates the broker orders.

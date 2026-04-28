@@ -65,6 +65,23 @@ public static class ProtectiveCoverageAuditTests
         if (r.Status != ProtectiveAuditStatus.PROTECTIVE_MISSING_STOP)
             return (false, $"No stop: expected PROTECTIVE_MISSING_STOP, got {r.Status}");
 
+        // 2b. Just-enqueued protectives may not be broker-visible yet; this is bounded pending convergence, not critical.
+        QuantExecutionControlStore.Clear();
+        var submitPendingUtc = utcNow.AddMilliseconds(10);
+        QuantExecutionControlStore.NotifyProtectiveSubmitPending("MES", 2, submitPendingUtc);
+        snap = new AccountSnapshot
+        {
+            Positions = new List<PositionSnapshot> { new() { Instrument = "MES", Quantity = 2, AveragePrice = 5200m } },
+            WorkingOrders = new List<WorkingOrderSnapshot>()
+        };
+        r = ProtectiveCoverageAudit.Audit("MES", snap, null, false, false, false, submitPendingUtc.AddMilliseconds(1));
+        if (r.Status != ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE)
+            return (false, $"Protective submit handoff: expected PROTECTIVE_PENDING_CONVERGENCE, got {r.Status}");
+        r = ProtectiveCoverageAudit.Audit("MES", snap, null, false, false, false, submitPendingUtc.AddMilliseconds(FeatureFlags.PostFillAlignmentWindowMs + 500));
+        if (r.Status != ProtectiveAuditStatus.PROTECTIVE_MISSING_STOP)
+            return (false, $"Expired protective submit handoff: expected PROTECTIVE_MISSING_STOP, got {r.Status}");
+        QuantExecutionControlStore.Clear();
+
         // 3. Long position, stop qty less than broker qty -> PROTECTIVE_STOP_QTY_MISMATCH
         snap = new AccountSnapshot
         {
@@ -437,7 +454,7 @@ public static class ProtectiveCoverageAuditTests
         if (state?.RecoveryState != ProtectiveRecoveryState.ESCALATE_TO_FLATTEN)
             return (false, $"After timeout: expected ESCALATE_TO_FLATTEN, got {state?.RecoveryState}");
 
-        // 5. Non-critical target-only issues never enter corrective submission
+        // 5. Non-critical target-only issues request target recovery without blocking entries
         submitCount = 0;
         var coord3 = new ProtectiveCoverageCoordinator(
             getSnapshot: () => emptySnap,
@@ -455,8 +472,10 @@ public static class ProtectiveCoverageAuditTests
             BrokerDirection = "Long",
             AuditUtc = utcNow
         });
-        if (submitCount != 0)
-            return (false, $"PROTECTIVE_MISSING_TARGET: should NOT call corrective, got {submitCount} calls");
+        if (submitCount != 1)
+            return (false, $"PROTECTIVE_MISSING_TARGET: should call corrective target recovery once, got {submitCount} calls");
+        if (coord3.IsInstrumentBlockedByProtective("RTY"))
+            return (false, "PROTECTIVE_MISSING_TARGET recovery should not block instrument");
 
         return (true, null);
     }

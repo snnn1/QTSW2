@@ -31,11 +31,18 @@ public static class TerminalIntentHardeningTests
             journal.RecordEntryFill(intentId, tradingDate, stream, 3.14m, 2, utcNow, 1000m, "Short", "MNG", "NG");
             if (journal.IsIntentCompleted(intentId, tradingDate, stream))
                 return (false, "IsIntentCompleted should be false when trade not completed");
+            journal.RecordExitFill(intentId, tradingDate, stream, 3.15m, 1, "TARGET", utcNow);
+            var partialEntry = journal.GetEntry(intentId, tradingDate, stream);
+            if (NinjaTraderSimAdapter.ShouldTerminalizeAfterExitFill(partialEntry))
+                return (false, "Partial exit must not terminalize remaining protective orders");
 
             // 2. IsIntentCompleted returns true when trade completed (target fill)
-            journal.RecordExitFill(intentId, tradingDate, stream, 3.15m, 2, "TARGET", utcNow);
+            journal.RecordExitFill(intentId, tradingDate, stream, 3.15m, 1, "TARGET", utcNow);
             if (!journal.IsIntentCompleted(intentId, tradingDate, stream))
                 return (false, "IsIntentCompleted should be true after RecordExitFill completes trade");
+            var completedEntry = journal.GetEntry(intentId, tradingDate, stream);
+            if (!NinjaTraderSimAdapter.ShouldTerminalizeAfterExitFill(completedEntry))
+                return (false, "Full exit should terminalize protective orders");
 
             // 3. IsIntentCompleted returns false when entry does not exist
             if (journal.IsIntentCompleted("nonexistent", tradingDate, stream))

@@ -469,6 +469,25 @@ public sealed class ReconciliationRunner
                 if (gateMode && MatchesGateInstrument(inst, gateInst!))
                     continue;
 
+                var alignmentWindowActive =
+                    PendingAlignmentAuthority.IsPendingAlignment(inst, utcNow) ||
+                    QuantExecutionControlStore.IsAnyBrokerJournalAlignmentWindowActive(inst, utcNow);
+                if (alignmentWindowActive)
+                {
+                    _log.Write(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_DEFERRED_BROKER_JOURNAL_ALIGNMENT", "ENGINE",
+                        new
+                        {
+                            account = _reconciliationAccountName?.Invoke() ?? "",
+                            instrument = inst,
+                            account_qty = accountQty,
+                            journal_qty = journalQty,
+                            pending_alignment = PendingAlignmentAuthority.IsPendingAlignment(inst, utcNow),
+                            quant_alignment_window = QuantExecutionControlStore.IsAnyBrokerJournalAlignmentWindowActive(inst, utcNow),
+                            note = "Broker/journal mismatch observed inside bounded execution callback alignment window; deferring critical reconciliation."
+                        }));
+                    continue;
+                }
+
                 ReconciliationMismatchGateResult gateResult = new(ReconciliationMismatchGateOutcome.EmitFullAndInvokeCallback, null);
                 if (_reconciliationTracker != null)
                 {

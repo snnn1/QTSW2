@@ -53,6 +53,8 @@ public static class ExecutionStructuralLayer
 
     private static bool TryBypassQuantRecoveryRequiredForMarketReentry(
         string? orderSubmitBlockedWhat,
+        ExecutionSafetyEvaluationRequest req,
+        string inst,
         QuantExecutionControlSnapshot qSnap,
         out string detail)
     {
@@ -61,11 +63,32 @@ public static class ExecutionStructuralLayer
             return false;
         if (qSnap.Phase != QuantExecutionInstrumentPhase.RecoveryRequired)
             return false;
-        if (!string.Equals(qSnap.RecoveryRequiredReason, "recovery_stabilization_window_expired_broker_gross_mismatch", StringComparison.Ordinal) &&
-            !string.Equals(qSnap.RecoveryRequiredReason, "pending_alignment_expired_broker_gross_mismatch", StringComparison.Ordinal))
+
+        var recoveryReason = qSnap.RecoveryRequiredReason ?? "";
+        if (string.Equals(recoveryReason, "recovery_stabilization_window_expired_broker_gross_mismatch", StringComparison.Ordinal) ||
+            string.Equals(recoveryReason, "pending_alignment_expired_broker_gross_mismatch", StringComparison.Ordinal))
+        {
+            detail = "market_reentry_quant_recovery_gross_mismatch_bypass";
+            return true;
+        }
+
+        if (req.AccountSnapshot == null)
             return false;
 
-        detail = "market_reentry_quant_recovery_gross_mismatch_bypass";
+        var canonical = string.IsNullOrWhiteSpace(req.CanonicalInstrument) ? inst : req.CanonicalInstrument.Trim();
+        var brokerAbs = ExecutionJournal.SumAbsBrokerPositionForInstrument(req.AccountSnapshot, inst);
+        var working = CountInstrumentWorkingOrders(req.AccountSnapshot, inst);
+        var (journalRealOpen, journalRecoveredOpen, _) =
+            req.Journal.GetPositionAuthorityOpenQuantitiesForInstrument(inst, canonical);
+        var ledgerFlat = req.LedgerOwnershipSnapshot == null ||
+                         (req.LedgerOwnershipSnapshot.LedgerSignedNetQty == 0 &&
+                          req.LedgerOwnershipSnapshot.ActiveSlotCount == 0 &&
+                          req.LedgerOwnershipSnapshot.OrphanSlotCount == 0);
+
+        if (brokerAbs != 0 || working != 0 || journalRealOpen + journalRecoveredOpen != 0 || !ledgerFlat)
+            return false;
+
+        detail = "market_reentry_quant_recovery_flat_authority_bypass:reason=" + recoveryReason;
         return true;
     }
 
@@ -95,11 +118,58 @@ public static class ExecutionStructuralLayer
             req.Journal.GetPositionAuthorityOpenQuantitiesForInstrument(inst, canonical);
         var trustedWorking = Math.Max(req.IeaOwnedPlusAdoptedWorking, CountInstrumentWorkingOrders(req.AccountSnapshot, inst));
 
-        if (brokerAbs != 0 || journalRealOpen + journalRecoveredOpen != 0 || trustedWorking <= 0)
+        if (brokerAbs != 0 || journalRealOpen + journalRecoveredOpen != 0 || trustedWorking < 0)
             return false;
 
-        detail = "opening_entry_stop_quant_recovery_bypass_flat_working_order_transition";
+        detail = trustedWorking == 0
+            ? "opening_entry_stop_quant_recovery_bypass_flat_first_order_transition"
+            : "opening_entry_stop_quant_recovery_bypass_flat_working_order_transition";
         return true;
+    }
+
+    private static bool CanClearQuantRecoveryRequiredForFreshOpeningSubmit(string? orderSubmitBlockedWhat) =>
+        string.Equals(orderSubmitBlockedWhat, "SUBMIT_ENTRY_STOP", StringComparison.Ordinal) ||
+        string.Equals(orderSubmitBlockedWhat, "SUBMIT_MARKET_REENTRY", StringComparison.Ordinal);
+
+    private static bool TryClearQuantRecoveryRequiredOnAuthoritativeFlat(
+        ExecutionSafetyEvaluationRequest req,
+        string inst,
+        string? orderSubmitBlockedWhat,
+        out string detail)
+    {
+        detail = "";
+        if (!CanClearQuantRecoveryRequiredForFreshOpeningSubmit(orderSubmitBlockedWhat))
+            return false;
+        if (req.RecoveryExecutionDisallowed || req.JournalIntegrityOrReconciliationRepairActive)
+            return false;
+        if (req.AccountSnapshot == null)
+            return false;
+
+        var canonical = string.IsNullOrWhiteSpace(req.CanonicalInstrument) ? inst : req.CanonicalInstrument.Trim();
+        var frame = req.AuthorityFrame;
+        var brokerAbs = frame != null
+            ? Math.Abs(frame.BrokerPositionQty)
+            : ExecutionJournal.SumAbsBrokerPositionForInstrument(req.AccountSnapshot, inst);
+        var brokerWorking = frame?.BrokerWorkingOrderCount ?? CountInstrumentWorkingOrders(req.AccountSnapshot, inst);
+        var (journalRealOpen, journalRecoveredOpen, _) =
+            req.Journal.GetPositionAuthorityOpenQuantitiesForInstrument(inst, canonical);
+        var ieaWorking = frame?.IeaOwnedPlusAdoptedWorking ?? req.IeaOwnedPlusAdoptedWorking;
+        var ledgerSigned = frame?.LedgerSignedNetQty ?? req.LedgerOwnershipSnapshot?.LedgerSignedNetQty;
+        var ledgerActive = frame?.LedgerActiveSlotCount ?? req.LedgerOwnershipSnapshot?.ActiveSlotCount;
+        var ledgerOrphan = frame?.LedgerOrphanSlotCount ?? req.LedgerOwnershipSnapshot?.OrphanSlotCount;
+
+        return QuantExecutionControlStore.TryClearRecoveryRequiredOnAuthoritativeFlat(
+            inst,
+            req.UtcNow,
+            brokerAbs,
+            journalRealOpen,
+            journalRecoveredOpen,
+            brokerWorking,
+            ieaWorking,
+            ledgerSigned,
+            ledgerActive,
+            ledgerOrphan,
+            out detail);
     }
 
     private static bool IsJournalAuthorityFallbackSubmit(string? orderSubmitBlockedWhat) =>
@@ -402,10 +472,23 @@ public static class ExecutionStructuralLayer
 
             if (qPhase == QuantExecutionInstrumentPhase.RecoveryRequired)
             {
+                if (CanClearQuantRecoveryRequiredForFreshOpeningSubmit(orderSubmitBlockedWhat) &&
+                    TryClearQuantRecoveryRequiredOnAuthoritativeFlat(req, inst, orderSubmitBlockedWhat, out var clearedDetail))
+                {
+                    snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
+                        ? clearedDetail
+                        : snapshot.Detail + ";" + clearedDetail;
+                    qSnap = QuantExecutionControlStore.GetSnapshot(inst);
+                    qPhase = qSnap.Phase;
+                }
+            }
+
+            if (qPhase == QuantExecutionInstrumentPhase.RecoveryRequired)
+            {
                 var blockDirectional = string.IsNullOrEmpty(orderSubmitBlockedWhat) || IsDirectionalOrderSubmit(orderSubmitBlockedWhat);
                 if (blockDirectional)
                 {
-                    if (TryBypassQuantRecoveryRequiredForMarketReentry(orderSubmitBlockedWhat, qSnap, out var quantBypassDetail))
+                    if (TryBypassQuantRecoveryRequiredForMarketReentry(orderSubmitBlockedWhat, req, inst, qSnap, out var quantBypassDetail))
                     {
                         snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
                             ? quantBypassDetail

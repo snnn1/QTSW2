@@ -19,6 +19,15 @@ public static class ReentryMarketCloseCommitTests
         var first = Case_OriginalCompletedButReentryOpen_DoesNotCommit();
         if (!first.Pass) return first;
 
+        var forcedFlattenReentry = Case_ForcedFlattenOriginalCompleteWithActiveReentry_DoesNotCommit();
+        if (!forcedFlattenReentry.Pass) return forcedFlattenReentry;
+
+        var preEntryBrackets = Case_ForcedFlattenPreEntryLiveBrackets_CancelsBeforeNoTradeCommit();
+        if (!preEntryBrackets.Pass) return preEntryBrackets;
+
+        var preEntryStreamJournalResidue = Case_ForcedFlattenPreEntryStreamJournalResidue_CancelsBeforeNoTradeCommit();
+        if (!preEntryStreamJournalResidue.Pass) return preEntryStreamJournalResidue;
+
         var second = Case_ReentryCompleted_CommitsAtMarketClose();
         if (!second.Pass) return second;
 
@@ -35,6 +44,227 @@ public static class ReentryMarketCloseCommitTests
         if (!sixth.Pass) return sixth;
 
         return (true, null);
+    }
+
+    private static (bool Pass, string? Error) Case_ForcedFlattenOriginalCompleteWithActiveReentry_DoesNotCommit()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "ForcedFlattenReentryGate_" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            Directory.CreateDirectory(Path.Combine(tempRoot, "logs", "robot", "journal"));
+            Directory.CreateDirectory(RobotRunArtifactPaths.StateExecutionJournals(tempRoot));
+
+            var spec = LoadSpec();
+            var time = new TimeService(spec.timezone);
+            var log = new RobotLogger(tempRoot);
+            var journals = new JournalStore(tempRoot);
+            var executionJournal = new ExecutionJournal(tempRoot, log);
+
+            const string tradingDate = "2026-04-13";
+            const string stream = "NG2";
+            const string instrument = "MNG";
+            const string originalIntent = "orig-ng2";
+            const string reentryIntent = "reentry-ng2";
+            var utc = DateTimeOffset.Parse("2026-04-14T22:01:00Z");
+
+            SeedCompletedTrade(executionJournal, tradingDate, stream, instrument, originalIntent, utc.AddMinutes(-90));
+            SeedOpenTrade(executionJournal, tradingDate, stream, instrument, reentryIntent, utc.AddMinutes(-2));
+
+            journals.Save(new StreamJournal
+            {
+                TradingDate = tradingDate,
+                Stream = stream,
+                Committed = false,
+                SlotStatus = SlotStatus.ACTIVE,
+                ExecutionInterruptedByClose = false,
+                OriginalIntentId = originalIntent,
+                ReentryIntentId = reentryIntent,
+                ReentrySubmitted = true,
+                ReentryFilled = true,
+                ProtectionSubmitted = true,
+                ProtectionAccepted = true,
+                SlotInstanceKey = "2026-04-13_NG2_11:00",
+                LastState = "RANGE_LOCKED",
+                NextSlotTimeUtc = DateTimeOffset.Parse("2026-04-14T16:00:00Z")
+            });
+
+            var sm = CreateStreamStateMachine(tempRoot, time, spec, log, journals, executionJournal, tradingDate, stream, instrument, new CapturingExecutionAdapter(log));
+            sm.HandleForcedFlatten(utc);
+
+            var reloaded = journals.TryLoad(tradingDate, stream);
+            if (reloaded?.Committed == true)
+                return (false, $"HandleForcedFlatten should not commit original-complete stream while reentry is open, got {reloaded.CommitReason ?? "null"}");
+
+            return (true, null);
+        }
+        finally
+        {
+            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, true); } catch { }
+        }
+    }
+
+    private static (bool Pass, string? Error) Case_ForcedFlattenPreEntryLiveBrackets_CancelsBeforeNoTradeCommit()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "ForcedFlattenPreEntryBrackets_" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            Directory.CreateDirectory(Path.Combine(tempRoot, "logs", "robot", "journal"));
+            Directory.CreateDirectory(RobotRunArtifactPaths.StateExecutionJournals(tempRoot));
+
+            var spec = LoadSpec();
+            var time = new TimeService(spec.timezone);
+            var log = new RobotLogger(tempRoot);
+            var journals = new JournalStore(tempRoot);
+            var executionJournal = new ExecutionJournal(tempRoot, log);
+
+            const string tradingDate = "2026-04-13";
+            const string stream = "RTY2";
+            const string instrument = "M2K";
+            var utc = DateTimeOffset.Parse("2026-04-13T20:55:00Z");
+
+            journals.Save(new StreamJournal
+            {
+                TradingDate = tradingDate,
+                Stream = stream,
+                Committed = false,
+                SlotStatus = SlotStatus.ACTIVE,
+                StopBracketsSubmittedAtLock = true,
+                SlotInstanceKey = "2026-04-13_RTY2_11:00",
+                LastState = "RANGE_LOCKED",
+                NextSlotTimeUtc = DateTimeOffset.Parse("2026-04-14T16:00:00Z")
+            });
+
+            var adapter = new CapturingExecutionAdapter(log);
+            var sm = CreateStreamStateMachine(tempRoot, time, spec, log, journals, executionJournal, tradingDate, stream, instrument, adapter);
+            SetPrivate(sm, "_brkLongRounded", 2726.1m);
+            SetPrivate(sm, "_brkShortRounded", 2696.1m);
+            SetPrivate(sm, "_stopBracketsSubmittedAtLock", true);
+
+            var longIntentId = InvokeComputeIntentId(sm, "Long", 2726.1m, "ENTRY_STOP_BRACKET_LONG");
+            var shortIntentId = InvokeComputeIntentId(sm, "Short", 2696.1m, "ENTRY_STOP_BRACKET_SHORT");
+            adapter.Snapshot.WorkingOrders.Add(new WorkingOrderSnapshot
+            {
+                OrderId = "long-working",
+                Instrument = instrument,
+                Tag = RobotOrderIds.EncodeTag(longIntentId) + ":ENTRY",
+                StopPrice = 2726.1m,
+                Quantity = 2
+            });
+            adapter.Snapshot.WorkingOrders.Add(new WorkingOrderSnapshot
+            {
+                OrderId = "short-working",
+                Instrument = instrument,
+                Tag = RobotOrderIds.EncodeTag(shortIntentId) + ":ENTRY",
+                StopPrice = 2696.1m,
+                Quantity = 2
+            });
+
+            sm.HandleForcedFlatten(utc);
+
+            var reloaded = journals.TryLoad(tradingDate, stream);
+            if (reloaded?.Committed == true)
+                return (false, "Pre-entry forced flatten must not commit while bracket orders are still working");
+            if (!adapter.CancelledOrderIds.Contains("long-working") || !adapter.CancelledOrderIds.Contains("short-working"))
+                return (false, "Expected pre-entry forced flatten to request cancellation of both live bracket orders");
+
+            adapter.Snapshot.WorkingOrders.Clear();
+            sm.HandleForcedFlatten(utc.AddSeconds(6));
+
+            reloaded = journals.TryLoad(tradingDate, stream);
+            if (reloaded?.CommitReason != "NO_TRADE_FORCED_FLATTEN_PRE_ENTRY")
+                return (false, $"Expected no-trade commit after bracket orders disappeared, got {reloaded?.CommitReason ?? "null"}");
+
+            return (true, null);
+        }
+        finally
+        {
+            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, true); } catch { }
+        }
+    }
+
+    private static (bool Pass, string? Error) Case_ForcedFlattenPreEntryStreamJournalResidue_CancelsBeforeNoTradeCommit()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "ForcedFlattenPreEntryStreamJournal_" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            Directory.CreateDirectory(Path.Combine(tempRoot, "logs", "robot", "journal"));
+            Directory.CreateDirectory(RobotRunArtifactPaths.StateExecutionJournals(tempRoot));
+
+            var spec = LoadSpec();
+            var time = new TimeService(spec.timezone);
+            var log = new RobotLogger(tempRoot);
+            var journals = new JournalStore(tempRoot);
+            var executionJournal = new ExecutionJournal(tempRoot, log);
+
+            const string tradingDate = "2026-04-14";
+            const string stream = "RTY2";
+            const string instrument = "M2K";
+            const string liveLongIntent = "actual-rty2-long";
+            const string liveShortIntent = "actual-rty2-short";
+            var utc = DateTimeOffset.Parse("2026-04-14T20:55:00Z");
+
+            journals.Save(new StreamJournal
+            {
+                TradingDate = tradingDate,
+                Stream = stream,
+                Committed = false,
+                SlotStatus = SlotStatus.ACTIVE,
+                StopBracketsSubmittedAtLock = true,
+                SlotInstanceKey = "2026-04-14_RTY2_11:00",
+                LastState = "RANGE_LOCKED",
+                NextSlotTimeUtc = DateTimeOffset.Parse("2026-04-15T16:00:00Z")
+            });
+
+            executionJournal.RecordSubmission(liveLongIntent, tradingDate, stream, instrument, "ENTRY_STOP", "long-broker", utc.AddHours(-5));
+            executionJournal.RecordSubmission(liveShortIntent, tradingDate, stream, instrument, "ENTRY_STOP", "short-broker", utc.AddHours(-5));
+
+            var adapter = new CapturingExecutionAdapter(log);
+            adapter.Snapshot.WorkingOrders.Add(new WorkingOrderSnapshot
+            {
+                OrderId = "unmatched-live-long",
+                Instrument = instrument,
+                Tag = RobotOrderIds.EncodeTag("different-long") + ":ENTRY",
+                StopPrice = 2726.1m,
+                Quantity = 2
+            });
+            adapter.Snapshot.WorkingOrders.Add(new WorkingOrderSnapshot
+            {
+                OrderId = "unmatched-live-short",
+                Instrument = instrument,
+                Tag = RobotOrderIds.EncodeTag("different-short") + ":ENTRY",
+                StopPrice = 2693.9m,
+                Quantity = 2
+            });
+
+            var sm = CreateStreamStateMachine(tempRoot, time, spec, log, journals, executionJournal, tradingDate, stream, instrument, adapter);
+            SetPrivate(sm, "_brkLongRounded", 2726.1m);
+            SetPrivate(sm, "_brkShortRounded", 2693.9m);
+            SetPrivate(sm, "_stopBracketsSubmittedAtLock", true);
+
+            sm.HandleForcedFlatten(utc);
+
+            var reloaded = journals.TryLoad(tradingDate, stream);
+            if (reloaded?.Committed == true)
+                return (false, "Pre-entry forced flatten must not commit while same-instrument working orders and pending stream journals remain");
+            if (!adapter.CancelledOrderIds.Contains("long-broker") || !adapter.CancelledOrderIds.Contains("short-broker"))
+                return (false, "Expected pre-entry forced flatten to cancel broker ids from pending stream journals when exact recomputed intent match is unavailable");
+
+            adapter.Snapshot.WorkingOrders.Clear();
+            sm.HandleForcedFlatten(utc.AddSeconds(6));
+
+            reloaded = journals.TryLoad(tradingDate, stream);
+            if (reloaded?.CommitReason != "NO_TRADE_FORCED_FLATTEN_PRE_ENTRY")
+                return (false, $"Expected no-trade commit after journal residue terminalized, got {reloaded?.CommitReason ?? "null"}");
+
+            return (true, null);
+        }
+        finally
+        {
+            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, true); } catch { }
+        }
     }
 
     private static (bool Pass, string? Error) Case_OriginalCompletedButReentryOpen_DoesNotCommit()
@@ -463,6 +693,20 @@ public static class ReentryMarketCloseCommitTests
     {
         var method = typeof(StreamStateMachine).GetMethod("HandleRangeLockedState", BindingFlags.Instance | BindingFlags.NonPublic);
         method?.Invoke(sm, new object[] { utcNow });
+    }
+
+    private static string InvokeComputeIntentId(StreamStateMachine sm, string direction, decimal entryPrice, string triggerReason)
+    {
+        var slotProp = typeof(StreamStateMachine).GetProperty("SlotTimeUtc", BindingFlags.Instance | BindingFlags.Public);
+        var slotTimeUtc = (DateTimeOffset)(slotProp?.GetValue(sm) ?? DateTimeOffset.MinValue);
+        var method = typeof(StreamStateMachine).GetMethod("ComputeIntentId", BindingFlags.Instance | BindingFlags.NonPublic);
+        return (string)(method?.Invoke(sm, new object[] { direction, entryPrice, slotTimeUtc, triggerReason }) ?? "");
+    }
+
+    private static void SetPrivate<T>(StreamStateMachine sm, string name, T value)
+    {
+        var field = typeof(StreamStateMachine).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic);
+        field?.SetValue(sm, value);
     }
 
     private static ParitySpec LoadSpec()

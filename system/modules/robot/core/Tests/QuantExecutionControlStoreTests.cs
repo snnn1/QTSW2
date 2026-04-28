@@ -539,6 +539,38 @@ public static class QuantExecutionControlStoreTests
             {
                 var log = new RobotLogger(root);
                 var journal = new ExecutionJournal(root, log);
+                var flatFirstSnap = new AccountSnapshot
+                {
+                    Positions = new List<PositionSnapshot> { new() { Instrument = inst, Quantity = 0 } },
+                    WorkingOrders = new List<WorkingOrderSnapshot>(),
+                    CapturedAtUtc = t0
+                };
+                var flatFirstReq = new ExecutionSafetyEvaluationRequest
+                {
+                    Instrument = inst,
+                    CanonicalInstrument = inst,
+                    UtcNow = t0.AddSeconds(1),
+                    Journal = journal,
+                    AccountSnapshot = flatFirstSnap,
+                    UseInstrumentExecutionAuthority = true,
+                    IeaOwnedPlusAdoptedWorking = 0,
+                    RecoveryExecutionDisallowed = false,
+                    JournalIntegrityOrReconciliationRepairActive = false
+                };
+
+                if (!ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(flatFirstReq, "SUBMIT_ENTRY_STOP", false, out var firstOk))
+                    return "opening entry stop first order: expected allow, got " + firstOk.Reason;
+                if (firstOk.Detail == null || firstOk.Detail.IndexOf("quant_recovery_required_cleared_authoritative_flat", StringComparison.Ordinal) < 0)
+                    return "opening entry stop first order: missing recovery clear detail, got " + firstOk.Detail;
+                if (QuantExecutionControlStore.GetSnapshot(inst).Phase != QuantExecutionInstrumentPhase.Normal)
+                    return "opening entry stop first order: expected RecoveryRequired to clear";
+
+                JournalParityPendingLedger.Clear();
+                QuantExecutionControlStore.Clear();
+                QuantExecutionControlStore.NotifyMappedTrustedFill(inst, 1, t0);
+                QuantExecutionControlStore.EvaluateEscalationAndApplyIfRequired(inst, t0.AddSeconds(1), 0, null);
+                QuantExecutionControlStore.NotifyWorkingOrderSubmitTransition(inst, 1, t0.AddSeconds(1));
+
                 var snap = new AccountSnapshot
                 {
                     Positions = new List<PositionSnapshot> { new() { Instrument = inst, Quantity = 0 } },

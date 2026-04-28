@@ -99,6 +99,89 @@ public sealed partial class InstrumentExecutionAuthority
         return AdoptionScanInstrumentGate.BrokerOrderMatchesExecutionInstrument(ExecutionInstrumentKey, brokerInstrument);
     }
 
+    private OrderSubmissionResult? TryBlockInvalidAggregateStopRelationship(
+        string intentId,
+        string instrument,
+        string direction,
+        decimal stopPrice,
+        int quantity,
+        string orderRole,
+        Instrument ntInstrument,
+        DateTimeOffset utcNow)
+    {
+        bool isBuyStop = string.Equals(direction, "Long", StringComparison.OrdinalIgnoreCase);
+        decimal? marketPrice = null;
+        var marketPriceSource = isBuyStop ? "Ask" : "Bid";
+
+        try
+        {
+            dynamic dynInstrument = ntInstrument;
+            var marketData = dynInstrument.MarketData;
+            if (marketData != null)
+            {
+                double? bid = null;
+                double? ask = null;
+                try
+                {
+                    bid = (double?)marketData.GetBid(0);
+                    ask = (double?)marketData.GetAsk(0);
+                }
+                catch
+                {
+                    try
+                    {
+                        bid = (double?)marketData.Bid;
+                        ask = (double?)marketData.Ask;
+                    }
+                    catch { }
+                }
+
+                var raw = isBuyStop ? ask : bid;
+                if (raw.HasValue && !double.IsNaN(raw.Value))
+                    marketPrice = (decimal)raw.Value;
+            }
+        }
+        catch { }
+
+        if (!marketPrice.HasValue)
+        {
+            Log?.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument,
+                "STOP_MARKET_RELATIONSHIP_VALIDATION_UNAVAILABLE", new
+                {
+                    intent_id = intentId,
+                    order_role = orderRole,
+                    stop_price = stopPrice,
+                    direction,
+                    note = "Market bid/ask unavailable; proceeding with aggregate submit path."
+                }));
+            return null;
+        }
+
+        var invalidRelationship = isBuyStop
+            ? stopPrice <= marketPrice.Value
+            : stopPrice >= marketPrice.Value;
+        if (!invalidRelationship)
+            return null;
+
+        var side = isBuyStop ? "Buy stop" : "Sell stop";
+        var relation = isBuyStop ? "at/below current ask" : "at/above current bid";
+        var reason = $"{side} can't be placed: stop price {stopPrice} is {relation} {marketPrice.Value}. Stop-market order is already crossed before aggregate submission.";
+        Log?.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ENTRY_STOP_ALREADY_CROSSED_BLOCKED", new
+        {
+            intent_id = intentId,
+            order_role = orderRole,
+            stop_price = stopPrice,
+            market_price = marketPrice.Value,
+            market_price_source = marketPriceSource,
+            direction,
+            quantity,
+            reason,
+            iea_instance_id = InstanceId,
+            note = "Blocked before aggregate cancel/recreate to avoid synchronous NinjaTrader stop rejection."
+        }));
+        return OrderSubmissionResult.FailureResult($"Stop price validation failed: {reason}", utcNow);
+    }
+
     // Phase 3: Trap G - queue serialization (replaces BE-specific lock; queue handles all mutations)
     /// <summary>
     /// Submit stop entry order. Tries aggregation first; falls back to single order.
@@ -192,6 +275,26 @@ public sealed partial class InstrumentExecutionAuthority
         var qtyPerIntent = new List<object> { new { id = intentId, qty = quantity } };
         foreach (var (id, _, q, _) in toAggregate)
             qtyPerIntent.Add(new { id, qty = q });
+
+        var aggregateRelationshipFailure = TryBlockInvalidAggregateStopRelationship(
+            intentId, instrument, direction, stopPrice, totalQty, "ENTRY_STOP_AGGREGATE", ntInstrument, utcNow);
+        if (aggregateRelationshipFailure != null)
+            return aggregateRelationshipFailure;
+
+        var aggregateOppositeDirection = direction == "Long" ? "Short" : "Long";
+        foreach (var id in allIntentIds)
+        {
+            var oppId = FindOppositeEntryIntentId(id);
+            if (oppId == null || !IntentMap.TryGetValue(oppId, out var oppIntent))
+                continue;
+
+            var oppPrice = oppIntent.EntryPrice ?? 0;
+            var oppQty = IntentPolicy.TryGetValue(oppId, out var oppPol) ? oppPol.ExpectedQuantity : 1;
+            var oppositeRelationshipFailure = TryBlockInvalidAggregateStopRelationship(
+                oppId, instrument, aggregateOppositeDirection, oppPrice, oppQty, "ENTRY_STOP_AGGREGATE_OPPOSITE", ntInstrument, utcNow);
+            if (oppositeRelationshipFailure != null)
+                return oppositeRelationshipFailure;
+        }
 
         string? failedStep = null;
         var replacedOrderIds = new List<string>();
@@ -2018,35 +2121,45 @@ public sealed partial class InstrumentExecutionAuthority
             var roleChar = isStop ? "S" : isTarget ? "T" : "E";
             var fingerprint = $"{orderStateStr}|{inRegistry}|{hasCandidate}|{roleChar}|{intentId ?? ""}";
 
-            _adoptionConvergence.RegisterEvaluation(orderId, utcNow, fingerprint, AdoptionConvergenceUnchangedThreshold, AdoptionConvergenceCooldownSeconds,
-                out var escalateNonConvergence, out var suppressHeavy, out var unchangedStreak);
-            if (escalateNonConvergence)
+            var suppressHeavy = false;
+            var unchangedStreak = 0;
+            var alreadyOwnedCandidate = inRegistry && hasCandidate;
+            if (alreadyOwnedCandidate)
             {
-                Interlocked.Increment(ref _metricAdoptionNonConvergentEscalationsTotal);
-                scanEscalations++;
-                _adoptionConvergence.TryGetTimestamps(orderId, out var fs, out var ls);
-                var episodeNonConv = _adoptionEpisodeId;
-                EndAdoptionEpisode("non_convergence_escalated");
-                LogIeaEngine(utcNow, "ADOPTION_NON_CONVERGENCE_ESCALATED", new
+                _adoptionConvergence.ClearOrder(orderId);
+            }
+            else
+            {
+                _adoptionConvergence.RegisterEvaluation(orderId, utcNow, fingerprint, AdoptionConvergenceUnchangedThreshold, AdoptionConvergenceCooldownSeconds,
+                    out var escalateNonConvergence, out suppressHeavy, out unchangedStreak);
+                if (escalateNonConvergence)
                 {
-                    adoption_episode_id = episodeNonConv,
-                    account_orders_total = accountOrdersTotal,
-                    same_instrument_qtsw2_working_count = qtsw2SameInstrumentWorking,
-                    candidate_intent_count = activeIntentIds.Count,
-                    deferred = _adoptionDeferred,
-                    adoption_scan_gate = _adoptionSingleFlightGate.State.ToString(),
-                    broker_order_id = orderId,
-                    instrument = brokerInstrument,
-                    intent_id = intentId,
-                    attempt_count = unchangedStreak,
-                    attempt_threshold = AdoptionConvergenceUnchangedThreshold,
-                    cooldown_seconds = AdoptionConvergenceCooldownSeconds,
-                    first_seen_utc = fs.ToString("o"),
-                    last_seen_utc = ls.ToString("o"),
-                    iea_instance_id = InstanceId,
-                    classification = fingerprint,
-                    execution_instrument_key = ExecutionInstrumentKey
-                });
+                    Interlocked.Increment(ref _metricAdoptionNonConvergentEscalationsTotal);
+                    scanEscalations++;
+                    _adoptionConvergence.TryGetTimestamps(orderId, out var fs, out var ls);
+                    var episodeNonConv = _adoptionEpisodeId;
+                    EndAdoptionEpisode("non_convergence_escalated");
+                    LogIeaEngine(utcNow, "ADOPTION_NON_CONVERGENCE_ESCALATED", new
+                    {
+                        adoption_episode_id = episodeNonConv,
+                        account_orders_total = accountOrdersTotal,
+                        same_instrument_qtsw2_working_count = qtsw2SameInstrumentWorking,
+                        candidate_intent_count = activeIntentIds.Count,
+                        deferred = _adoptionDeferred,
+                        adoption_scan_gate = _adoptionSingleFlightGate.State.ToString(),
+                        broker_order_id = orderId,
+                        instrument = brokerInstrument,
+                        intent_id = intentId,
+                        attempt_count = unchangedStreak,
+                        attempt_threshold = AdoptionConvergenceUnchangedThreshold,
+                        cooldown_seconds = AdoptionConvergenceCooldownSeconds,
+                        first_seen_utc = fs.ToString("o"),
+                        last_seen_utc = ls.ToString("o"),
+                        iea_instance_id = InstanceId,
+                        classification = fingerprint,
+                        execution_instrument_key = ExecutionInstrumentKey
+                    });
+                }
             }
 
             if (suppressHeavy)

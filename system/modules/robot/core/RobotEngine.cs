@@ -676,8 +676,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private readonly HashSet<(string, string)> _sessionCloseCacheMissingEmittedKeys = new();
     private readonly HashSet<(string, string)> _sessionCloseFallbackFailedEmittedKeys = new();
 
-    /// <summary>Watchdog session/flatten visibility: highest source wins per (tradingDay, sessionClass) (NT_CACHE &gt; SPEC &gt; DEFAULT_1600).</summary>
+    /// <summary>Watchdog session/flatten visibility: highest source wins per (tradingDay, sessionClass).</summary>
     private readonly Dictionary<(string tradingDay, string sessionClass), string> _sessionFlattenVisibilitySource = new();
+    private readonly HashSet<(string tradingDay, string sessionClass, string source)> _sessionTruthOverrideEmittedKeys = new();
 
     /// <summary>SESSION_CLOSE_FALLBACK_WARNING: once per (tradingDay, sessionClass).</summary>
     private readonly HashSet<(string, string)> _sessionCloseFallbackWarningEmitted = new();
@@ -790,6 +791,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private int _engineHeartbeatWallTick;
     private DateTimeOffset _playbackStallQuiesceEligibleSinceUtc = DateTimeOffset.MinValue;
     private DateTimeOffset _playbackStallQuiesceStopRequestedUtc = DateTimeOffset.MinValue;
+    private DateTimeOffset _playbackStallQuiesceExposureDeferLastLogUtc = DateTimeOffset.MinValue;
     private int _playbackStallQuiesceArmed;
     private int _playbackStallQuiesceStopRequested;
     private int _playbackStallQuiesceForceFinalizeRequested;
@@ -2611,6 +2613,26 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             return false;
         }
 
+        if (HasPlaybackStallBrokerExposureBlocker(quiesceSnap,
+                out var brokerPositionGross,
+                out var robotWorkingOrders,
+                out var totalWorkingOrders,
+                out var positionInstruments,
+                out var robotWorkingInstruments))
+        {
+            LogPlaybackStallQuiescenceDeferredByExposure(
+                utcNow,
+                brokerPositionGross,
+                robotWorkingOrders,
+                totalWorkingOrders,
+                positionInstruments,
+                robotWorkingInstruments,
+                execIngressQueued,
+                orderIngressQueued);
+            ResetPlaybackStallQuiescence();
+            return false;
+        }
+
         var liveRecoveryScope = GetPlaybackStallLiveRecoveryExecutionInstrumentKeys(quiesceSnap);
         if (liveRecoveryScope.Count > 0)
         {
@@ -2648,6 +2670,80 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     public bool IsPlaybackStallQuiescenceBlockingNtCalls() =>
         Volatile.Read(ref _playbackStallQuiesceArmed) != 0;
+
+    private bool HasPlaybackStallBrokerExposureBlocker(
+        AccountSnapshot snap,
+        out int brokerPositionGross,
+        out int robotWorkingOrders,
+        out int totalWorkingOrders,
+        out string positionInstruments,
+        out string robotWorkingInstruments)
+    {
+        brokerPositionGross = 0;
+        robotWorkingOrders = 0;
+        totalWorkingOrders = 0;
+
+        var positionInstrumentSet = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in snap.Positions ?? new List<PositionSnapshot>())
+        {
+            if (p == null || p.Quantity == 0)
+                continue;
+
+            brokerPositionGross += Math.Abs(p.Quantity);
+            if (!string.IsNullOrWhiteSpace(p.Instrument))
+                positionInstrumentSet.Add(p.Instrument.Trim());
+        }
+
+        var robotWorkingInstrumentSet = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var order in snap.WorkingOrders ?? new List<WorkingOrderSnapshot>())
+        {
+            if (order == null)
+                continue;
+
+            totalWorkingOrders++;
+            if (!IsRobotOwnedOrder(order))
+                continue;
+
+            robotWorkingOrders++;
+            if (!string.IsNullOrWhiteSpace(order.Instrument))
+                robotWorkingInstrumentSet.Add(order.Instrument.Trim());
+        }
+
+        positionInstruments = string.Join(",", positionInstrumentSet.Take(8));
+        robotWorkingInstruments = string.Join(",", robotWorkingInstrumentSet.Take(8));
+        return brokerPositionGross > 0 || robotWorkingOrders > 0;
+    }
+
+    private void LogPlaybackStallQuiescenceDeferredByExposure(
+        DateTimeOffset utcNow,
+        int brokerPositionGross,
+        int robotWorkingOrders,
+        int totalWorkingOrders,
+        string positionInstruments,
+        string robotWorkingInstruments,
+        int execIngressQueued,
+        int orderIngressQueued)
+    {
+        if (_playbackStallQuiesceExposureDeferLastLogUtc != DateTimeOffset.MinValue &&
+            (utcNow - _playbackStallQuiesceExposureDeferLastLogUtc).TotalSeconds < 10)
+            return;
+
+        _playbackStallQuiesceExposureDeferLastLogUtc = utcNow;
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+            eventType: "ENGINE_PLAYBACK_STALL_QUIESCENCE_DEFERRED_LIVE_EXPOSURE", state: "ENGINE",
+            new
+            {
+                source = "playback_stall_quiesce",
+                broker_position_gross = brokerPositionGross,
+                robot_working_orders = robotWorkingOrders,
+                total_working_orders = totalWorkingOrders,
+                position_instruments = positionInstruments,
+                robot_working_instruments = robotWorkingInstruments,
+                callback_ingress_queued = execIngressQueued,
+                order_ingress_queued = orderIngressQueued,
+                note = "Playback stall quiescence refused to arm because broker exposure or robot-owned working orders are still live."
+            }));
+    }
 
     private void RequestConnectivityHealthShutdown(string reason, DateTimeOffset utcNow, Dictionary<string, object> payload)
     {
@@ -3000,7 +3096,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     public void Stop()
     {
         var utcNow = DateTimeOffset.UtcNow;
-        LatchRunWideShutdownSignal(utcNow, "engine_stop", "local_engine_instance");
 
         if (Interlocked.Exchange(ref _shutdownRequested, 1) != 0)
         {
@@ -3010,6 +3105,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         StopEngineHeartbeatTimer();
         _runtimeAudit?.EmitEngineAuditSummary(utcNow, TradingDateString);
         RuntimeAuditHubRef.Active = null;
+        WaitForShutdownCallbackIngressQuiet();
 
         string? summaryPathToWrite = null;
         string? summaryJson = null;
@@ -3113,6 +3209,41 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             FeatureFlags.StructuralLayerUseLedgerOwnership);
 
         Volatile.Write(ref _shutdownCompleted, 1);
+    }
+
+    private void WaitForShutdownCallbackIngressQuiet()
+    {
+        if (!_isolatedPlaybackPersistence || _executionAdapter is not NinjaTraderSimAdapter simAdapter)
+            return;
+
+        var deadlineUtc = DateTimeOffset.UtcNow.AddMilliseconds(1500);
+        var quietSamples = 0;
+        while (DateTimeOffset.UtcNow < deadlineUtc)
+        {
+            var execQueued = 0;
+            var orderQueued = 0;
+            try
+            {
+                simAdapter.GetTotalCallbackIngressQueueLengths(out execQueued, out orderQueued);
+            }
+            catch
+            {
+                return;
+            }
+
+            if (execQueued == 0 && orderQueued == 0)
+            {
+                quietSamples++;
+                if (quietSamples >= 3)
+                    return;
+            }
+            else
+            {
+                quietSamples = 0;
+            }
+
+            Thread.Sleep(100);
+        }
     }
 
     private static ExecutionSummarySnapshot HydrateExecutionSummaryFromKeyEventsIfEmpty(string persistenceBase, ExecutionSummarySnapshot snapshot)
@@ -3509,8 +3640,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             {
                 foreach (var sessionClass in new[] { "S1", "S2" })
                 {
-                    var closeResult = GetSessionCloseResultOrFallback(tradingDateStr, sessionClass, utcNow, out var usedFallback);
-                    if (closeResult == null)
+                    var sessionTruth = ResolveSessionTruth(tradingDateStr, sessionClass, utcNow);
+                    if (!sessionTruth.IsResolved || sessionTruth.Result == null)
                     {
                         // No cache and fallback failed — log skip and SESSION_CLOSE_CACHE_MISSING if persistent
                         var shouldLogSkip = !_lastForcedFlattenSkipLogUtc.HasValue ||
@@ -3553,9 +3684,9 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         }
                         continue;
                     }
-                    if (!closeResult.HasSession || !closeResult.FlattenTriggerUtc.HasValue)
+                    if (!sessionTruth.HasSession || !sessionTruth.FlattenTriggerUtc.HasValue)
                         continue;
-                    if (utcNow < closeResult.FlattenTriggerUtc.Value)
+                    if (utcNow < sessionTruth.FlattenTriggerUtc.Value)
                         continue;
 
                     // Cache populated (or fallback used) — reset missing timer
@@ -3572,12 +3703,15 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                                 reason = "SESSION_CLOSE",
                                 session_class = sessionClass,
                                 instrument = _executionInstrument ?? "",
-                                source = usedFallback ? "FALLBACK_SPEC" : "LIVE_RESOLVER",
-                                resolved_session_close_utc = closeResult.ResolvedSessionCloseUtc?.ToString("o"),
-                                buffer_seconds = closeResult.BufferSeconds,
+                                source = sessionTruth.Source,
+                                authority_rank = sessionTruth.AuthorityRank,
+                                resolved_session_close_utc = sessionTruth.ResolvedSessionCloseUtc?.ToString("o"),
+                                buffer_seconds = sessionTruth.BufferSeconds,
                                 trading_date = tradingDateStr,
                                 streams_impacted = streamsInSession.Select(s => s.Stream).ToList(),
-                                used_fallback = usedFallback
+                                used_fallback = sessionTruth.UsedFallback,
+                                conflict_detected = sessionTruth.ConflictDetected,
+                                nt_failure_reason = sessionTruth.NtCacheResult?.FailureReason ?? ""
                             }));
                     }
 
@@ -4266,7 +4400,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         if (sessionClass != "S1" && sessionClass != "S2") return;
 
         var r = result ?? new SessionCloseResult();
-        var holidayOverrideApplied = false;
         var utcNow = DateTimeOffset.UtcNow;
         if (!r.HasSession && string.Equals(r.FailureReason, "HOLIDAY", StringComparison.Ordinal))
         {
@@ -4288,28 +4421,6 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         ["prefer_internal_calendar_over_nt_holiday"] = _loggingConfig.prefer_internal_calendar_over_nt_holiday,
                         ["note"] = "NinjaTrader TradingHours marked HOLIDAY while timetable indicates session activity"
                     }));
-
-                if (_loggingConfig.prefer_internal_calendar_over_nt_holiday)
-                {
-                    var overridden = BuildInternalSessionCloseOverride(tradingDay);
-                    if (overridden != null)
-                    {
-                        r = overridden;
-                        holidayOverrideApplied = true;
-                        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_HOLIDAY_OVERRIDDEN", state: "ENGINE",
-                            new Dictionary<string, object?>
-                            {
-                                ["trading_day"] = tradingDay,
-                                ["session_class"] = sessionClass,
-                                ["override_source"] = "INTERNAL_SPEC",
-                                ["resolved_session_close_utc"] = overridden.ResolvedSessionCloseUtc?.ToString("o"),
-                                ["flatten_trigger_utc"] = overridden.FlattenTriggerUtc?.ToString("o"),
-                                ["next_session_begin_utc"] = overridden.NextSessionBeginUtc?.ToString("o"),
-                                ["buffer_seconds"] = overridden.BufferSeconds,
-                                ["note"] = "Overrode NinjaTrader HOLIDAY using internal close/reopen contract"
-                            }));
-                    }
-                }
             }
         }
 
@@ -4336,7 +4447,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                     flatten_trigger_utc = r.FlattenTriggerUtc?.ToString("o"),
                     resolved_session_close_utc = r.ResolvedSessionCloseUtc?.ToString("o"),
                     buffer_seconds = r.BufferSeconds,
-                    resolution_source = holidayOverrideApplied ? "INTERNAL_OVERRIDE" : "LIVE_RESOLVER"
+                    resolution_source = "LIVE_RESOLVER"
                 }));
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: "SESSION_CLOSE_RESOLUTION_SUCCESS", state: "ENGINE",
                 new { trading_day = tradingDay, session_class = sessionClass, bars_count = r.BarsCount, bars_instrument = r.BarsInstrument ?? "N/A" }));
@@ -4395,13 +4506,29 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         lock (_engineLock)
         {
             var activeTradingDay = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
-            if (!string.Equals(activeTradingDay, tradingDay, StringComparison.Ordinal))
-                return (false, 0, 0, 0, "", activeTradingDay);
-
             if (_lastTimetable?.streams == null || _lastTimetable.streams.Count == 0)
-                return (false, 0, 0, 0, "", activeTradingDay);
+            {
+                var streamTotal = 0;
+                var streamEnabled = 0;
+                foreach (var stream in _streams.Values)
+                {
+                    if (!string.Equals(stream.Session, sessionClass, StringComparison.Ordinal))
+                        continue;
+                    if (!string.Equals(stream.TradingDate, tradingDay, StringComparison.Ordinal))
+                        continue;
+                    streamTotal++;
+                    if (!stream.Committed)
+                        streamEnabled++;
+                }
+
+                return (streamTotal > 0 && streamEnabled > 0, streamTotal, streamEnabled, 0, "", activeTradingDay);
+            }
 
             var timetableTradingDay = _lastTimetable.GetSessionTradingDateForHashCompatibility();
+            if (!string.Equals(activeTradingDay, tradingDay, StringComparison.Ordinal) &&
+                !string.Equals(timetableTradingDay, tradingDay, StringComparison.Ordinal))
+                return (false, 0, 0, 0, timetableTradingDay, activeTradingDay);
+
             var total = 0;
             var enabled = 0;
             var calendarBlocked = 0;
@@ -4486,13 +4613,13 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// </summary>
     public (DateTimeOffset? reentryUtc, bool hasSession) GetReentryAllowedUtc(string tradingDay, string sessionClass, DateTimeOffset utcNow)
     {
-        var closeResult = GetSessionCloseResultOrFallback(tradingDay, sessionClass, utcNow, out _);
-        if (closeResult == null)
+        var sessionTruth = ResolveSessionTruth(tradingDay, sessionClass, utcNow);
+        if (!sessionTruth.IsResolved || sessionTruth.Result == null)
             return (null, false);
-        if (!closeResult.HasSession)
+        if (!sessionTruth.HasSession)
             return (null, false);
-        if (closeResult.NextSessionBeginUtc.HasValue)
-            return (closeResult.NextSessionBeginUtc.Value, true);
+        if (sessionTruth.NextSessionBeginUtc.HasValue)
+            return (sessionTruth.NextSessionBeginUtc.Value, true);
         // Fallback: compute from spec market_reopen_time (same calendar day as market close)
         if (_spec != null && _time != null && DateOnly.TryParse(tradingDay, out var td))
         {
@@ -4525,6 +4652,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private static int SessionFlattenSourcePriority(string source) => source switch
     {
         "INTERNAL_CALENDAR" => 5,
+        "INTERNAL_OVERRIDE" => 4,
         "OVERRIDE" => 4,
         "NT_CACHE" => 3,
         "SPEC" => 2,
@@ -4534,7 +4662,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
 
     /// <summary>
     /// Emit SESSION_CLOSE_SOURCE_SELECTED, SESSION_RESOLVED, and FLATTEN_TRIGGER_SET for Watchdog aggregation.
-    /// Source priority allows SPEC/DEFAULT_1600 to be superseded later by NT_CACHE.
+    /// Source priority prevents advisory NT cache from superseding higher internal authority.
     /// </summary>
     private void TryEmitSessionFlattenVisibility(
         string tradingDay,
@@ -4726,8 +4854,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     }
 
     /// <summary>
-    /// Get session close from cache, or compute fallback. Ensures forced flatten can trigger even when
-    /// ResolveAndSetSessionCloseIfNeeded never ran.
+    /// Resolve one authoritative session truth frame from internal calendar, NT evidence, and spec fallback.
     ///
     /// TIMEZONE CONTRACT (non-negotiable):
     /// - spec.entry_cutoff.market_close_time is the fallback session-close authority in America/Chicago local time.
@@ -4736,9 +4863,92 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     /// - ConvertChicagoToUtc produces UTC for comparison with utcNow.
     /// - Never treat Chicago local as UTC.
     /// </summary>
-    private SessionCloseResult? GetSessionCloseResultOrFallback(string tradingDay, string sessionClass, DateTimeOffset utcNow, out bool usedFallback)
+    private static bool IsNtNoSessionFailure(string? reason)
     {
-        usedFallback = false;
+        var r = reason ?? "";
+        return r == "HOLIDAY" ||
+               r == "NO_ELIGIBLE_SEGMENTS" ||
+               r == "ITERATION_ERROR" ||
+               r == "NO_BARS" ||
+               r == "EMPTY_BARS" ||
+               r == "TRADING_HOURS_MISSING" ||
+               r == "TIMEZONE_ERROR" ||
+               r == "SESSION_ITERATOR_ERROR" ||
+               r == "SESSION_CALCULATION_ERROR" ||
+               r == "UNHANDLED_EXCEPTION";
+    }
+
+    private bool ShouldOverrideCachedNoSession(SessionCloseResult cached, bool activeTimetableConflict)
+    {
+        if (cached.HasSession || !activeTimetableConflict)
+            return false;
+        if (string.Equals(cached.FailureReason, "HOLIDAY", StringComparison.Ordinal))
+            return _loggingConfig.prefer_internal_calendar_over_nt_holiday;
+        return IsNtNoSessionFailure(cached.FailureReason);
+    }
+
+    private SessionTruthFrame BuildSessionTruthFrame(
+        string tradingDay,
+        string sessionClass,
+        string source,
+        SessionCloseResult result,
+        bool usedFallback = false,
+        bool conflictDetected = false,
+        SessionCloseResult? ntCacheResult = null,
+        SessionCloseResult? internalResult = null)
+    {
+        return new SessionTruthFrame
+        {
+            TradingDay = tradingDay,
+            SessionClass = sessionClass,
+            IsResolved = true,
+            HasSession = result.HasSession,
+            Source = source,
+            AuthorityRank = SessionFlattenSourcePriority(source),
+            UsedFallback = usedFallback,
+            ConflictDetected = conflictDetected,
+            FailureReason = result.HasSession ? null : result.FailureReason,
+            Result = result,
+            NtCacheResult = ntCacheResult,
+            InternalResult = internalResult
+        };
+    }
+
+    private void TryLogSessionTruthOverride(string tradingDay, string sessionClass, DateTimeOffset utcNow, SessionCloseResult cached, SessionCloseResult overridden)
+    {
+        var isHoliday = string.Equals(cached.FailureReason, "HOLIDAY", StringComparison.Ordinal);
+        var eventType = isHoliday ? "SESSION_CLOSE_HOLIDAY_OVERRIDDEN" : "SESSION_CLOSE_NO_SESSION_OVERRIDDEN";
+        bool shouldLog;
+        lock (_engineLock)
+        {
+            shouldLog = _sessionTruthOverrideEmittedKeys.Add((tradingDay, sessionClass, eventType));
+        }
+        if (!shouldLog)
+            return;
+
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDay, eventType: eventType, state: "ENGINE",
+            new Dictionary<string, object?>
+            {
+                ["trading_day"] = tradingDay,
+                ["session_class"] = sessionClass,
+                ["cached_failure_reason"] = cached.FailureReason ?? "UNKNOWN",
+                ["override_source"] = "INTERNAL_SPEC_RUNTIME",
+                ["resolved_session_close_utc"] = overridden.ResolvedSessionCloseUtc?.ToString("o"),
+                ["flatten_trigger_utc"] = overridden.FlattenTriggerUtc?.ToString("o"),
+                ["next_session_begin_utc"] = overridden.NextSessionBeginUtc?.ToString("o"),
+                ["buffer_seconds"] = overridden.BufferSeconds,
+                ["note"] = isHoliday
+                    ? "Runtime session truth overrode cached NinjaTrader HOLIDAY because timetable still has active streams"
+                    : "Runtime session truth overrode cached NinjaTrader no-session result because timetable still has active streams"
+            }));
+    }
+
+    public SessionTruthFrame ResolveSessionTruth(string tradingDay, string sessionClass, DateTimeOffset utcNow)
+    {
+        if (string.IsNullOrWhiteSpace(tradingDay) || string.IsNullOrWhiteSpace(sessionClass))
+            return SessionTruthFrame.Unresolved(tradingDay, sessionClass, "INVALID_REQUEST");
+
+        var usedFallback = false;
         EnsureInternalCalendarPolicyMaterializedForActiveDay(tradingDay, utcNow);
 
         SessionCloseResult? internalCal;
@@ -4747,20 +4957,44 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
             _internalCalendarSessionClose.TryGetValue((tradingDay, sessionClass), out internalCal);
         }
         if (internalCal != null)
-            return internalCal;
+        {
+            TryEmitSessionFlattenVisibility(tradingDay, sessionClass, "INTERNAL_CALENDAR", internalCal.HasSession,
+                internalCal.ResolvedSessionCloseUtc, internalCal.FlattenTriggerUtc, internalCal.BufferSeconds, utcNow,
+                internalCal.HasSession ? null : internalCal.FailureReason);
+            return BuildSessionTruthFrame(tradingDay, sessionClass, "INTERNAL_CALENDAR", internalCal, internalResult: internalCal);
+        }
 
         if (TryGetSessionCloseResult(tradingDay, sessionClass, out var cached) && cached != null)
         {
+            var conflict = false;
+            if (!cached.HasSession)
+            {
+                var (hasConflict, _, _, _, _, _) = DetectNtHolidayConflict(tradingDay, sessionClass);
+                conflict = hasConflict;
+                if (ShouldOverrideCachedNoSession(cached, hasConflict))
+                {
+                    var overridden = BuildInternalSessionCloseOverride(tradingDay);
+                    if (overridden != null)
+                    {
+                        usedFallback = true;
+                        TryEmitSessionFlattenVisibility(tradingDay, sessionClass, "INTERNAL_OVERRIDE", true,
+                            overridden.ResolvedSessionCloseUtc, overridden.FlattenTriggerUtc, overridden.BufferSeconds, utcNow);
+                        TryLogSessionTruthOverride(tradingDay, sessionClass, utcNow, cached, overridden);
+                        return BuildSessionTruthFrame(tradingDay, sessionClass, "INTERNAL_OVERRIDE", overridden,
+                            usedFallback: true, conflictDetected: true, ntCacheResult: cached, internalResult: overridden);
+                    }
+                }
+            }
+
             TryEmitSessionFlattenVisibility(tradingDay, sessionClass, "NT_CACHE", cached.HasSession,
                 cached.ResolvedSessionCloseUtc, cached.FlattenTriggerUtc, cached.BufferSeconds, utcNow,
                 cached.HasSession ? null : cached.FailureReason);
-            return cached;
+            return BuildSessionTruthFrame(tradingDay, sessionClass, "NT_CACHE", cached, conflictDetected: conflict, ntCacheResult: cached);
         }
 
         if (!DateOnly.TryParse(tradingDay, out var tradingDate))
-            return null;
+            return SessionTruthFrame.Unresolved(tradingDay, sessionClass, "INVALID_TRADING_DAY");
 
-        // Path 1: Spec available — use spec.entry_cutoff.market_close_time as fallback session-close authority
         if (_spec != null && _time != null)
         {
             var marketCloseTime = _spec.entry_cutoff?.market_close_time;
@@ -4771,12 +5005,11 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 {
                     TryEmitSessionFlattenVisibility(tradingDay, sessionClass, "SPEC", true,
                         result.ResolvedSessionCloseUtc, result.FlattenTriggerUtc, result.BufferSeconds, utcNow);
-                    return result;
+                    return BuildSessionTruthFrame(tradingDay, sessionClass, "SPEC", result, usedFallback: usedFallback, internalResult: result);
                 }
             }
         }
 
-        // Path 2: Spec null or market_close_time empty — emergency fail-closed (hard default 16:00 CT)
         if (_time != null)
         {
             var failKey = (tradingDay, sessionClass);
@@ -4795,7 +5028,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                         session_class = sessionClass,
                         reason = _spec == null ? "SPEC_NULL" : "MARKET_CLOSE_TIME_EMPTY",
                         emergency_close_used = EMERGENCY_MARKET_CLOSE_DEFAULT,
-                        note = "Spec unavailable — using emergency 16:00 CT default (fail-closed)"
+                        note = "Spec unavailable - using emergency 16:00 CT default (fail-closed)"
                     }));
             }
             var emergency = ComputeFallbackFromTime(tradingDate, EMERGENCY_MARKET_CLOSE_DEFAULT, tradingDay, sessionClass, utcNow, "EMERGENCY", ref usedFallback);
@@ -4804,11 +5037,18 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 TryEmitSessionFlattenVisibility(tradingDay, sessionClass, "DEFAULT_1600", true,
                     emergency.ResolvedSessionCloseUtc, emergency.FlattenTriggerUtc, emergency.BufferSeconds, utcNow);
                 TryEmitSessionCloseFallbackWarning(tradingDay, sessionClass, utcNow);
-                return emergency;
+                return BuildSessionTruthFrame(tradingDay, sessionClass, "DEFAULT_1600", emergency, usedFallback: usedFallback, internalResult: emergency);
             }
         }
 
-        return null;
+        return SessionTruthFrame.Unresolved(tradingDay, sessionClass, "NO_SESSION_TRUTH");
+    }
+
+    private SessionCloseResult? GetSessionCloseResultOrFallback(string tradingDay, string sessionClass, DateTimeOffset utcNow, out bool usedFallback)
+    {
+        var truth = ResolveSessionTruth(tradingDay, sessionClass, utcNow);
+        usedFallback = truth.UsedFallback;
+        return truth.IsResolved ? truth.Result : null;
     }
 
     /// <summary>
@@ -7737,7 +7977,8 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private bool IsInstrumentEpaAdapterSubmitBlocked(string instrument, string? submitPath)
     {
         if (IsInstrumentEpaExecutionLocked(instrument)) return true;
-        if (string.Equals(submitPath, "SUBMIT_PROTECTIVE_STOP", StringComparison.Ordinal))
+        if (string.Equals(submitPath, "SUBMIT_PROTECTIVE_STOP", StringComparison.Ordinal) ||
+            string.Equals(submitPath, "SUBMIT_TARGET", StringComparison.Ordinal))
             return false;
         if (_protectiveCoordinator != null && _protectiveCoordinator.IsInstrumentBlockedByProtective(instrument))
             return true;
@@ -9869,6 +10110,15 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         var qty = Math.Min(entry.EntryFilledQuantityTotal, Math.Abs(req.BrokerPositionQty));
         if (qty <= 0) qty = entry.EntryFilledQuantityTotal;
 
+        var shouldSubmitStop =
+            req.StopQty <= 0 ||
+            req.Status == ProtectiveAuditStatus.PROTECTIVE_STOP_QTY_MISMATCH ||
+            req.Status == ProtectiveAuditStatus.PROTECTIVE_STOP_PRICE_INVALID;
+        var shouldSubmitTarget =
+            req.TargetQty <= 0 ||
+            req.Status == ProtectiveAuditStatus.PROTECTIVE_MISSING_TARGET ||
+            req.Status == ProtectiveAuditStatus.PROTECTIVE_TARGET_QTY_MISMATCH;
+
         // Deterministic stop price: prefer StopPrice, else BEStopPrice; must be sane (protective)
         decimal? stopPrice = null;
         if (entry.StopPrice.HasValue && entry.StopPrice.Value >= ProtectiveAuditPolicy.MIN_STOP_PRICE)
@@ -9889,7 +10139,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 entry.BEStopPrice.Value > entryPrice.Value)
                 stopPrice = entry.BEStopPrice.Value;
         }
-        if (!stopPrice.HasValue)
+        if (shouldSubmitStop && !stopPrice.HasValue)
             return new ProtectiveCorrectiveResult { Submitted = false, FailureReason = "NO_SAFE_STOP_PRICE" };
 
         decimal? targetPrice = null;
@@ -9902,33 +10152,48 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 entry.TargetPrice.Value < entryPrice.Value)
                 targetPrice = entry.TargetPrice.Value;
         }
+        if (shouldSubmitTarget && !targetPrice.HasValue)
+            return new ProtectiveCorrectiveResult { Submitted = false, FailureReason = "NO_SAFE_TARGET_PRICE" };
 
         var utcNow = req.AuditUtc;
-        var shouldSubmitTarget = req.TargetQty <= 0 && targetPrice.HasValue;
-        var recoveryOcoGroup = shouldSubmitTarget
+        if (!shouldSubmitStop && !shouldSubmitTarget)
+            return new ProtectiveCorrectiveResult { Submitted = true, IntentId = intentId };
+
+        var recoveryOcoGroup = shouldSubmitStop && shouldSubmitTarget
             ? $"QTSW2:{intentId}_RECOVERY_{utcNow.UtcDateTime.Ticks}"
             : null;
 
-        var stopResult = _executionAdapter.SubmitProtectiveStop(intentId, req.Instrument, direction, stopPrice.Value, qty, recoveryOcoGroup, utcNow);
+        OrderSubmissionResult? stopResult = null;
         OrderSubmissionResult? targetResult = null;
-        if (stopResult.Success && shouldSubmitTarget)
+        if (shouldSubmitStop)
         {
-            targetResult = _executionAdapter.SubmitTargetOrder(intentId, req.Instrument, direction, targetPrice!.Value, qty, recoveryOcoGroup, utcNow);
+            stopResult = _executionAdapter.SubmitProtectiveStop(intentId, req.Instrument, direction, stopPrice!.Value, qty, recoveryOcoGroup, utcNow);
+            if (!stopResult.Success)
+            {
+                return new ProtectiveCorrectiveResult
+                {
+                    Submitted = false,
+                    IntentId = intentId,
+                    FailureReason = stopResult.ErrorMessage ?? "STOP_SUBMIT_FAILED"
+                };
+            }
         }
 
-        if (stopResult.Success || targetResult?.Success == true)
+        if (shouldSubmitTarget)
+            targetResult = _executionAdapter.SubmitTargetOrder(intentId, req.Instrument, direction, targetPrice!.Value, qty, recoveryOcoGroup, utcNow);
+
+        if (stopResult?.Success == true || targetResult?.Success == true)
             TryEnsureJournalIntegrityAfterExecutionActivity(req.Instrument, utcNow);
 
-        var submitted = stopResult.Success && (!shouldSubmitTarget || targetResult?.Success == true);
+        var submitted = (!shouldSubmitStop || stopResult?.Success == true) &&
+                        (!shouldSubmitTarget || targetResult?.Success == true);
         return new ProtectiveCorrectiveResult
         {
             Submitted = submitted,
             IntentId = intentId,
             FailureReason = submitted
                 ? null
-                : (stopResult.Success
-                    ? (targetResult?.ErrorMessage ?? "TARGET_SUBMIT_FAILED")
-                    : (stopResult.ErrorMessage ?? "STOP_SUBMIT_FAILED"))
+                : (targetResult?.ErrorMessage ?? "TARGET_SUBMIT_FAILED")
         };
     }
     
