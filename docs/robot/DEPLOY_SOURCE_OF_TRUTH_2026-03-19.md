@@ -17,6 +17,10 @@
 
 ## Workflow
 
+`system/NT_ADDONS` is a legacy/manual mirror only. Do not sync or deploy it during the normal DLL-plus-strategy workflow.
+
+If the legacy mirror is audited, use `tools/sync_nt_addons_from_robotcore.ps1 -CheckOnly`. A warning about source files missing from `NT_ADDONS` means the mirror is partial; it does not imply runtime deploy drift.
+
 1. Edit RobotCore_For_NinjaTrader
 2. Run `.\deploy_to_ninjatrader.ps1`
 3. Restart NinjaTrader

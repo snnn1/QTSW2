@@ -32,8 +32,8 @@ Validation already performed after current cleanup slice:
 | `system/NT_ADDONS` | Legacy/manual mirror only. | `tools/sync_nt_addons_from_robotcore.ps1` header says normal deploy is DLL-only and AddOns source is not compiled/copied. | Do not hand-refactor first. Sync or quarantine after active source changes. |
 
 Important mirror fact:
-- `tools/sync_nt_addons_from_robotcore.ps1 -CheckOnly` reports `86` managed mirror files and drift in `RobotEngine.cs`.
-- It does not currently create missing destination files for newly split partials, so it only reports existing managed drift. The new `RobotEngine.*.cs` partials are active-source cleanup, but `NT_ADDONS` has not been brought along.
+- `tools/sync_nt_addons_from_robotcore.ps1 -CheckOnly` reports `86` managed mirror files, `124` RobotCore/runtime source files missing from the legacy mirror, and drift in `RobotEngine.cs`.
+- The tool now reports source-only files and can create missing mirror files when explicitly run without `-CheckOnly`. Do not run that as part of normal deploy; `NT_ADDONS` is a legacy/manual mirror only.
 
 ## 2. Current Cleanup State
 
@@ -41,13 +41,20 @@ Important mirror fact:
 
 | File | Lines |
 |---|---:|
-| `system/modules/robot/core/RobotEngine.cs` | 2854 |
+| `system/modules/robot/core/RobotEngine.cs` | 2249 |
 | `system/modules/robot/core/RobotEngine.Bars.cs` | 1322 |
+| `system/modules/robot/core/RobotEngine.Connection.cs` | 109 |
+| `system/modules/robot/core/RobotEngine.Diagnostics.cs` | 429 |
+| `system/modules/robot/core/RobotEngine.Heartbeat.cs` | 97 |
 | `system/modules/robot/core/RobotEngine.Ownership.cs` | 517 |
 | `system/modules/robot/core/RobotEngine.Timetable.cs` | 1320 |
 | `system/modules/robot/core/RobotEngine.Streams.cs` | 715 |
 | `system/modules/robot/core/RobotEngine.PlaybackStall.cs` | 623 |
-| `system/modules/robot/core/RobotEngine.Reconciliation.cs` | 3184 |
+| `system/modules/robot/core/RobotEngine.Reconciliation.cs` | 630 |
+| `system/modules/robot/core/RobotEngine.Reconciliation.Observations.cs` | 694 |
+| `system/modules/robot/core/RobotEngine.Reconciliation.Release.cs` | 758 |
+| `system/modules/robot/core/RobotEngine.Reconciliation.JournalIntegrity.cs` | 314 |
+| `system/modules/robot/core/RobotEngine.Reconciliation.Recovery.cs` | 851 |
 | `system/modules/robot/core/RobotEngine.Session.cs` | 1147 |
 | `system/modules/robot/core/RobotEngine.Shutdown.cs` | 350 |
 
@@ -71,7 +78,7 @@ Worktree warning:
 | 8 | `system/modules/robot/core/Execution/NinjaTraderSimAdapter.cs` | 5024 | Adapter orchestration, gates, intent state, BE, IEA command routing. | High payoff, medium risk, split into pure adapter domains. |
 | 9 | `system/modules/robot/core/Execution/ExecutionJournal.cs` | 4978 | Durable order/fill lifecycle, indexing, repair, legacy field hydration. | High payoff, medium risk, split by write/read/repair/model. |
 | 10 | `system/modules/robot/core/Execution/MismatchEscalationCoordinator.cs` | 3366 | Mismatch/fail-closed escalation and release. | High conceptual risk; refactor only after authority/frame cleanup. |
-| 11 | `system/modules/robot/core/RobotEngine.Reconciliation.cs` | 3184 | Engine reconciliation assembly, recovery, state consistency, forced convergence. | Immediate next low-risk split candidate. |
+| 11 | `system/modules/robot/core/RobotEngine.Reconciliation*.cs` | 630 / 694 / 758 / 314 / 851 | Engine reconciliation assembly, recovery, state consistency, forced convergence. | Completed mechanical split; future work should be behavioral simplification only after runtime validation. |
 | 12 | `system/RobotCore_For_NinjaTrader/Strategies/RobotSimStrategy.cs` | 2983 | NT strategy callback shell. | Split later; runtime-sensitive but mostly platform adapter shell. |
 
 ## 4. Cleanup Lanes
@@ -94,22 +101,23 @@ Risk: low.
 ### Lane 1 - Source-Of-Truth And Mirror Policy
 
 Status: partially implemented.
+Decision: `NT_ADDONS` is documented as legacy/non-runtime source, not an active cleanup target.
 
 Work:
 - Treat `system/modules/robot/core` and `system/RobotCore_For_NinjaTrader` as active source.
 - Treat `system/NT_ADDONS` as legacy/manual mirror unless explicitly syncing it.
-- Update the mirror tool if we decide to keep `NT_ADDONS`: it should report source-only files and optionally create missing mirror files.
-- Alternative: add a clear README/manifest in `system/NT_ADDONS` stating it is not runtime compiled/deployed.
+- Mirror tool now reports source-only files and can create missing mirror files when intentionally run without `-CheckOnly`.
+- `system/NT_ADDONS/README.md` states it is not runtime compiled/deployed.
 
 Why:
 - `NT_ADDONS` still contains the huge monolithic `RobotEngine.cs`; active runtime trees have been split.
-- Current sync check reports only drift in `RobotEngine.cs`, not missing new partials.
+- Sync check now reports both existing-file drift and missing runtime source files, so partial mirror state is explicit.
 
 Risk: low if documented; medium if deleting/quarantining before all tools are checked.
 
 ### Lane 2 - Finish RobotEngine Mechanical Decomposition
 
-Status: in progress, safest next cleanup.
+Status: active mechanical split complete; behavioral simplification deferred.
 
 Already split:
 - Playback stall handling
@@ -124,11 +132,11 @@ Already split:
 Remaining useful splits:
 - `RobotEngine.Diagnostics.cs`: `LogEvent`, `LogEngineEvent`, `ConvertToRobotLogEvent`, runtime fingerprint/status logging, health monitor setup.
 - `RobotEngine.ExecutionCallbacks.cs`: adapter callback wiring, execution event callbacks, strategy/account status hooks.
-- `RobotEngine.Reconciliation.*.cs`: split the current 3184-line reconciliation partial into observation assembly, release readiness, forced convergence, and recovery.
+- `RobotEngine.Reconciliation.*.cs`: split into orchestration, observation assembly, release readiness, journal integrity, forced convergence, and recovery.
 
 Why:
 - Mechanical partial extraction has already proven safe with builds/harnesses.
-- Main `RobotEngine.cs` is still 2854 lines and reconciliation partial is 3184 lines.
+- Main `RobotEngine.cs` is still 2249 lines, but the high-risk reconciliation mass is now split into smaller partials.
 
 Risk: low if strictly move-only.
 
@@ -292,21 +300,22 @@ Exit criteria:
 
 ### Batch B - Finish RobotEngine Structure
 
-1. Extract `RobotEngine.Diagnostics.cs`.
-2. Extract `RobotEngine.ExecutionCallbacks.cs`.
-3. Split `RobotEngine.Reconciliation.cs` into 3-5 smaller partials.
+Completed:
+- Extracted `RobotEngine.Diagnostics.cs`, `RobotEngine.Connection.cs`, and `RobotEngine.Heartbeat.cs`.
+- Split `RobotEngine.Reconciliation.cs` into smaller responsibility partials.
 
 Exit criteria:
-- Same build/harness list passes.
+- Same build/harness list passes. Completed after commits `4401fff` and `ec12774`.
 - `RobotEngine.cs` and each partial are below roughly 2000 lines where practical.
 
 ### Batch C - Decide NT_ADDONS Policy
 
-1. Either update mirror sync to report/create source-only partials, then sync.
-2. Or explicitly quarantine `NT_ADDONS` as legacy non-runtime source and stop counting it as active cleanup debt.
+Completed:
+- Updated mirror sync to report source-only files and create them only when an explicit sync is run.
+- Added `system/NT_ADDONS/README.md` and deploy-doc wording that this tree is legacy/non-runtime source.
 
 Exit criteria:
-- `tools/sync_nt_addons_from_robotcore.ps1 -CheckOnly` is either clean or intentionally documented as legacy drift.
+- `tools/sync_nt_addons_from_robotcore.ps1 -CheckOnly` intentionally documents partial legacy mirror state.
 
 ### Batch D - StreamStateMachine Move-Only Split
 
