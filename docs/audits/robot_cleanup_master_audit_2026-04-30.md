@@ -71,8 +71,8 @@ Worktree warning:
 | 1 | `system/NT_ADDONS/RobotEngine.cs` | 11932 | Legacy mirror, currently monolithic. | Mirror drift/quarantine issue, not first runtime target. |
 | 2 | `system/RobotCore_For_NinjaTrader/Execution/NinjaTraderSimAdapter.NT.cs` | 11531 | NT API bridge: order update, execution update, submit, cancel, flatten, BE, account snapshot. | High payoff, high risk, split mechanically by NT domain. |
 | 3 | `system/NT_ADDONS/Execution/NinjaTraderSimAdapter.NT.cs` | 11531 | Legacy mirror. | Sync/quarantine after active source cleanup. |
-| 4 | `system/modules/robot/core/StreamStateMachine.cs` | 9702 | Stream lifecycle, range, brackets, commit, forced flatten, reentry, hydration. | High payoff, medium risk, split mechanically by lifecycle domain. |
-| 5 | `system/RobotCore_For_NinjaTrader/StreamStateMachine.cs` | 9702 | Same as core, identical copy. | Keep synchronized with core extraction. |
+| 4 | `system/modules/robot/core/StreamStateMachine*.cs` | 4957 / 1777 / 830 / 612 / 615 / 525 / 375 / 119 | Stream lifecycle, range, brackets, commit, forced flatten, reentry, hydration. | First move-only split complete; remaining main file still needs bracket/range extraction. |
+| 5 | `system/RobotCore_For_NinjaTrader/StreamStateMachine*.cs` | same as core | Same as core, identical copy. | Kept synchronized with core extraction. |
 | 6 | `system/NT_ADDONS/StreamStateMachine.cs` | 9702 | Legacy mirror. | Sync/quarantine after active source cleanup. |
 | 7 | `system/modules/robot/core/Execution/NinjaTraderSimAdapter.NT.cs` | 5571 | Core NT-conditional adapter implementation. | Split after RobotCore NT adapter plan is defined. |
 | 8 | `system/modules/robot/core/Execution/NinjaTraderSimAdapter.cs` | 5024 | Adapter orchestration, gates, intent state, BE, IEA command routing. | High payoff, medium risk, split into pure adapter domains. |
@@ -142,21 +142,21 @@ Risk: low if strictly move-only.
 
 ### Lane 3 - StreamStateMachine Decomposition
 
-Status: not started.
+Status: first move-only batch complete.
 
-Proposed partials:
-- `StreamStateMachine.PreHydration.cs`
-- `StreamStateMachine.Range.cs`
-- `StreamStateMachine.Brackets.cs`
+Extracted partials:
+- `StreamStateMachine.Hydration.cs`
 - `StreamStateMachine.Commit.cs`
+- `StreamStateMachine.Protectives.cs`
+- `StreamStateMachine.TimeAndJournal.cs`
 - `StreamStateMachine.ForcedFlatten.cs`
 - `StreamStateMachine.Reentry.cs`
-- `StreamStateMachine.Journals.cs`
-- `StreamStateMachine.Diagnostics.cs`
+- `StreamStateMachine.Bars.cs`
 
 Evidence:
-- `StreamStateMachine.cs` is 9702 lines in core, RobotCore, and NT_ADDONS.
+- Active `StreamStateMachine.cs` is now 4957 lines in core and RobotCore; the legacy `NT_ADDONS` mirror remains monolithic by policy.
 - Major method clusters are visible around pre-hydration, range building, bracket submission, journal recovery, commit, forced flatten, and reentry.
+- Builds and smoke harnesses passed after extraction.
 
 Cleanup rule:
 - Move-only extraction first.
@@ -319,8 +319,12 @@ Exit criteria:
 
 ### Batch D - StreamStateMachine Move-Only Split
 
-1. Extract pre-hydration/range/brackets/commit/reentry/journal/diagnostics partials.
-2. Keep identical active copies in core and RobotCore.
+Completed:
+- Extracted hydration, commit, protectives, time/journal helpers, forced flatten, reentry, and bar/transition helpers.
+- Kept identical active copies in core and RobotCore.
+
+Remaining:
+- Extract range-building and bracket-submission clusters from the still-large main file.
 
 Exit criteria:
 - Stream lifecycle harnesses pass: `RANGE_BUILDING_SNAPSHOT`, `REENTRY_TIMING`, `FORCED_FLATTEN_POLICY`, `EXECUTION_EVENT_REPLAY`, `RUN_SUMMARY`.
