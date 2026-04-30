@@ -71,7 +71,7 @@ Worktree warning:
 | 1 | `system/NT_ADDONS/RobotEngine.cs` | 11932 | Legacy mirror, currently monolithic. | Mirror drift/quarantine issue, not first runtime target. |
 | 2 | `system/RobotCore_For_NinjaTrader/Execution/NinjaTraderSimAdapter.NT.cs` | 11531 | NT API bridge: order update, execution update, submit, cancel, flatten, BE, account snapshot. | High payoff, high risk, split mechanically by NT domain. |
 | 3 | `system/NT_ADDONS/Execution/NinjaTraderSimAdapter.NT.cs` | 11531 | Legacy mirror. | Sync/quarantine after active source cleanup. |
-| 4 | `system/modules/robot/core/StreamStateMachine*.cs` | 4957 / 1777 / 830 / 612 / 615 / 525 / 375 / 119 | Stream lifecycle, range, brackets, commit, forced flatten, reentry, hydration. | First move-only split complete; remaining main file still needs bracket/range extraction. |
+| 4 | `system/modules/robot/core/StreamStateMachine*.cs` | 2119 / 1777 / 1431 / 1430 / 830 / 612 / 615 / 525 / 375 / 119 | Stream lifecycle, range, brackets, commit, forced flatten, reentry, hydration. | Move-only split complete for current cleanup pass; optional finer split later. |
 | 5 | `system/RobotCore_For_NinjaTrader/StreamStateMachine*.cs` | same as core | Same as core, identical copy. | Kept synchronized with core extraction. |
 | 6 | `system/NT_ADDONS/StreamStateMachine.cs` | 9702 | Legacy mirror. | Sync/quarantine after active source cleanup. |
 | 7 | `system/modules/robot/core/Execution/NinjaTraderSimAdapter.NT.cs` | 5571 | Core NT-conditional adapter implementation. | Split after RobotCore NT adapter plan is defined. |
@@ -142,10 +142,12 @@ Risk: low if strictly move-only.
 
 ### Lane 3 - StreamStateMachine Decomposition
 
-Status: first move-only batch complete.
+Status: active move-only split complete for current cleanup pass.
 
 Extracted partials:
 - `StreamStateMachine.Hydration.cs`
+- `StreamStateMachine.RangeFlow.cs`
+- `StreamStateMachine.EntryBrackets.cs`
 - `StreamStateMachine.Commit.cs`
 - `StreamStateMachine.Protectives.cs`
 - `StreamStateMachine.TimeAndJournal.cs`
@@ -154,8 +156,9 @@ Extracted partials:
 - `StreamStateMachine.Bars.cs`
 
 Evidence:
-- Active `StreamStateMachine.cs` is now 4957 lines in core and RobotCore; the legacy `NT_ADDONS` mirror remains monolithic by policy.
-- Major method clusters are visible around pre-hydration, range building, bracket submission, journal recovery, commit, forced flatten, and reentry.
+- Active `StreamStateMachine.cs` is now 1431 lines in core and RobotCore; the legacy `NT_ADDONS` mirror remains monolithic by policy.
+- `StreamStateMachine.RangeFlow.cs` owns pre-hydration/range-state handlers and is 1430 lines.
+- `StreamStateMachine.EntryBrackets.cs` owns entry-order recovery, `OnBar`, breakout validation, deferred bracket authority, and bracket submit at lock, and is 2119 lines.
 - Builds and smoke harnesses passed after extraction.
 
 Cleanup rule:
@@ -321,10 +324,12 @@ Exit criteria:
 
 Completed:
 - Extracted hydration, commit, protectives, time/journal helpers, forced flatten, reentry, and bar/transition helpers.
+- Extracted range-state flow and entry/bracket submission flow.
 - Kept identical active copies in core and RobotCore.
 
 Remaining:
-- Extract range-building and bracket-submission clusters from the still-large main file.
+- No required move-only StreamStateMachine split remains for this pass.
+- Optional later cleanup: split `StreamStateMachine.EntryBrackets.cs` more finely after adapter cleanup if it remains a hotspot.
 
 Exit criteria:
 - Stream lifecycle harnesses pass: `RANGE_BUILDING_SNAPSHOT`, `REENTRY_TIMING`, `FORCED_FLATTEN_POLICY`, `EXECUTION_EVENT_REPLAY`, `RUN_SUMMARY`.
@@ -373,12 +378,12 @@ Exit criteria:
 
 Cleanup should continue, but in batches:
 
-1. Checkpoint current proven `RobotEngine` extraction.
-2. Finish remaining `RobotEngine` diagnostics/callback/reconciliation splits.
-3. Decide `NT_ADDONS` mirror policy.
-4. Split `StreamStateMachine`.
-5. Split shared and NT adapter files.
-6. Split `ExecutionJournal`.
+1. Completed: checkpoint current proven `RobotEngine` extraction.
+2. Completed: finish remaining `RobotEngine` diagnostics/callback/reconciliation splits.
+3. Completed: decide `NT_ADDONS` mirror policy.
+4. Completed: split `StreamStateMachine`.
+5. Next: split shared and NT adapter files.
+6. Then split `ExecutionJournal`.
 7. Only then remove authority/fallback/deprecated code with fresh runtime proof.
 
 The system is stable enough for mechanical cleanup. It is not mature enough yet for aggressive deletion of fail-closed, recovery, journal compatibility, or authority fallback paths.
