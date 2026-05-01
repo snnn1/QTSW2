@@ -56,6 +56,7 @@
     <Compile Include="..\modules\robot\core\Execution\StateConsistencyGateModels.cs" Link="Execution\StateConsistencyGateModels.cs" />
     <Compile Include="..\modules\robot\core\Execution\MismatchConvergenceBridgeProbeMath.cs" Link="Execution\MismatchConvergenceBridgeProbeMath.cs" />
     <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.cs" Link="Execution\MismatchEscalationCoordinator.cs" />
+    <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.Convergence.cs" Link="Execution\MismatchEscalationCoordinator.Convergence.cs" />
     <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.PendingIea.cs" Link="Execution\MismatchEscalationCoordinator.PendingIea.cs" />
     <Compile Include="..\modules\robot\core\Execution\JournalIntegrityGuarantee.cs" Link="Execution\JournalIntegrityGuarantee.cs" />
     <Compile Include="..\modules\robot\core\Execution\JournalParityPendingLedger.cs" Link="Execution\JournalParityPendingLedger.cs" />
