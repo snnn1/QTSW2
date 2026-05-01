@@ -86,7 +86,8 @@ Move-only split started:
 - `MismatchEscalationCoordinator.PublicApi.cs` now owns public/wake/query entrypoints and execution-trigger notification.
 - `MismatchEscalationCoordinator.ReleaseReadiness.cs` now owns release quiet-window/fingerprint helpers, soft-transition predicates, residual-release blocker classification, and fail-closed strict stability keying.
 - `MismatchEscalationCoordinator.Diagnostics.cs` now owns canonical execution-event emission, gate progress-control payload merging, and shared gate payload builders.
-- The NinjaTrader runtime project links all seven shared partials explicitly.
+- `MismatchEscalationCoordinator.Progress.cs` now owns gate progress/throttle counter resets, throttled/cap/reentry-blocked progress emitters, expensive-pass progress accounting, and throttle-baseline helpers.
+- The NinjaTrader runtime project links all eight shared partials explicitly.
 - Verification after extraction: core build `0 Error(s)`, RobotCore build `0 Error(s)`, and focused checks passed: `AUTHORITY_CONTRADICTIONS`, `ORDER_RECONCILIATION`, `RUN_SUMMARY`, `RUN_SUMMARY_BUILDER`, `EXECUTION_CONTEXT_CONTRACT`, `MISMATCH_ESCALATION`, `MISMATCH_CONVERGENCE_CONTRACT`, `MISMATCH_CONVERGENCE_BRIDGE_PROBE`.
 
 Cleanup implication:
@@ -124,6 +125,7 @@ Step 3 - Start move-only coordinator split:
 - Continued: extracted public/wake/query entrypoints and execution-trigger notification.
 - Continued: extracted release-readiness helper predicates/fingerprints while leaving the release/fail-closed state machine in the main coordinator.
 - Continued: extracted canonical diagnostic emission and gate payload builders while leaving event-call sites in the main coordinator.
+- Continued: extracted gate progress/throttle helper accounting while leaving `AdvanceStateConsistencyGate` in the main coordinator.
 - Continue with coordinator state helpers or release telemetry helpers next.
 - Do not change release/fail-closed decisions.
 - Run `AUTHORITY_CONTRADICTIONS`, `ORDER_RECONCILIATION`, `RUN_SUMMARY`, `RUN_SUMMARY_BUILDER`, `EXECUTION_CONTEXT_CONTRACT`, and mismatch-specific harnesses.
