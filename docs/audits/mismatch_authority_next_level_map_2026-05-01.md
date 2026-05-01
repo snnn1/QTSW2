@@ -81,7 +81,8 @@ Primary responsibilities in `system/modules/robot/core/Execution/MismatchEscalat
 Move-only split started:
 - `MismatchEscalationCoordinator.PendingIea.cs` now owns pending-IEA defer state, decision data, throttle constants, and `ObservePendingIeaDefer`.
 - `MismatchEscalationCoordinator.Convergence.cs` now owns convergence-window state, first-escalation suppression, convergence invariant telemetry, pending-convergence diagnostics, and convergence test hooks.
-- The NinjaTrader runtime project links both shared partials explicitly.
+- `MismatchEscalationCoordinator.Telemetry.cs` now owns mismatch metric counters, test telemetry counters, type-metric incrementing, and `EmitMetrics`.
+- The NinjaTrader runtime project links all three shared partials explicitly.
 - Verification after extraction: core build `0 Error(s)`, RobotCore build `0 Error(s)`, and focused checks passed: `AUTHORITY_CONTRADICTIONS`, `ORDER_RECONCILIATION`, `RUN_SUMMARY`, `RUN_SUMMARY_BUILDER`, `EXECUTION_CONTEXT_CONTRACT`, `MISMATCH_ESCALATION`, `MISMATCH_CONVERGENCE_CONTRACT`, `MISMATCH_CONVERGENCE_BRIDGE_PROBE`.
 
 Cleanup implication:
@@ -114,7 +115,8 @@ Step 2 - Keep one more runtime proof loop:
 Step 3 - Start move-only coordinator split:
 - Started: extracted pending-IEA deferral first because it was a contained state/helper pocket.
 - Continued: extracted convergence suppression/invariant helpers while leaving forced-convergence release/fail-closed machinery in the main coordinator.
-- Continue with coordinator telemetry/state helpers or release-readiness helpers next.
+- Continued: extracted telemetry counters and `EmitMetrics` while leaving gate release/fail-closed telemetry emitters in the main coordinator.
+- Continue with coordinator state helpers or release-readiness helpers next.
 - Do not change release/fail-closed decisions.
 - Run `AUTHORITY_CONTRADICTIONS`, `ORDER_RECONCILIATION`, `RUN_SUMMARY`, `RUN_SUMMARY_BUILDER`, `EXECUTION_CONTEXT_CONTRACT`, and mismatch-specific harnesses.
 
