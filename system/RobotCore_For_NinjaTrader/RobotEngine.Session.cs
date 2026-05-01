@@ -416,6 +416,18 @@ public sealed partial class RobotEngine
             if (string.IsNullOrWhiteSpace(row.TradingDate) || string.IsNullOrWhiteSpace(row.Stream))
                 continue;
 
+            var rowOriginalIntentId = string.IsNullOrWhiteSpace(row.IntentId) ? primaryIntentId : row.IntentId;
+            var activeStream = _streams.Values.FirstOrDefault(s =>
+                !s.Committed &&
+                string.Equals(s.TradingDate, row.TradingDate, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(s.Stream, row.Stream, StringComparison.OrdinalIgnoreCase));
+            if (activeStream != null &&
+                activeStream.MarkSessionCloseInterruptedByGlobalSweep(utcNow, rowOriginalIntentId, "SESSION_CLOSE_GLOBAL_SWEEP"))
+            {
+                marked.Add(row.Stream);
+                continue;
+            }
+
             var journal = _journals.TryLoad(row.TradingDate, row.Stream);
             if (journal == null || journal.Committed)
                 continue;
@@ -423,7 +435,7 @@ public sealed partial class RobotEngine
             journal.ExecutionInterruptedByClose = true;
             journal.ForcedFlattenTimestamp = utcNow;
             if (string.IsNullOrWhiteSpace(journal.OriginalIntentId))
-                journal.OriginalIntentId = string.IsNullOrWhiteSpace(row.IntentId) ? primaryIntentId : row.IntentId;
+                journal.OriginalIntentId = rowOriginalIntentId;
             journal.LastUpdateUtc = utcNow.ToString("o");
             if (_journals.Save(journal))
                 marked.Add(row.Stream);

@@ -108,7 +108,9 @@ public sealed partial class StreamStateMachine
             return false;
 
         return string.Equals(entry.ExitOrderType, "FLATTEN", StringComparison.OrdinalIgnoreCase) ||
-               string.Equals(entry.CompletionReason, "FLATTEN", StringComparison.OrdinalIgnoreCase);
+               string.Equals(entry.CompletionReason, "FLATTEN", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(entry.ExitOrderType, CompletionReasons.RECONCILIATION_BROKER_FLAT, StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(entry.CompletionReason, CompletionReasons.RECONCILIATION_BROKER_FLAT, StringComparison.OrdinalIgnoreCase);
     }
 
     private static DateTimeOffset GetJournalEntryCompletionSortKey(ExecutionJournalEntry entry)
@@ -182,6 +184,40 @@ public sealed partial class StreamStateMachine
         });
 
         return true;
+    }
+
+    internal bool MarkSessionCloseInterruptedByGlobalSweep(DateTimeOffset utcNow, string? originalIntentId, string triggerSource)
+    {
+        if (_journal.Committed || _journal.SlotStatus != SlotStatus.ACTIVE)
+            return false;
+
+        var normalizedOriginalIntentId = originalIntentId?.Trim() ?? "";
+        var previousInterrupted = _journal.ExecutionInterruptedByClose;
+        var previousOriginalIntentId = _journal.OriginalIntentId ?? "";
+
+        _journal.ExecutionInterruptedByClose = true;
+        _journal.ForcedFlattenTimestamp ??= utcNow;
+        if (string.IsNullOrWhiteSpace(_journal.OriginalIntentId) && !string.IsNullOrWhiteSpace(normalizedOriginalIntentId))
+            _journal.OriginalIntentId = normalizedOriginalIntentId;
+        _journal.LastUpdateUtc = utcNow.ToString("o");
+
+        var persisted = _journals.Save(_journal);
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "SESSION_CLOSE_GLOBAL_SWEEP_STREAM_INTERRUPTED", State.ToString(),
+            new
+            {
+                original_intent_id = _journal.OriginalIntentId ?? "",
+                supplied_original_intent_id = normalizedOriginalIntentId,
+                previous_original_intent_id = previousOriginalIntentId,
+                execution_instrument = ExecutionInstrument,
+                forced_flatten_timestamp_utc = _journal.ForcedFlattenTimestamp?.ToString("o") ?? "",
+                previous_interrupted = previousInterrupted,
+                trigger_source = triggerSource,
+                persisted,
+                note = "Broker-level session-close sweep marked the live stream interrupted so later broker-flat reconciliation cannot terminally commit before reentry."
+            }));
+
+        return persisted;
     }
 
     private bool TryCommitCompletedTradeAtMarketClose(DateTimeOffset utcNow)
