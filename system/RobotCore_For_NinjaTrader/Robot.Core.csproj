@@ -57,6 +57,7 @@
     <Compile Include="..\modules\robot\core\Execution\MismatchConvergenceBridgeProbeMath.cs" Link="Execution\MismatchConvergenceBridgeProbeMath.cs" />
     <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.cs" Link="Execution\MismatchEscalationCoordinator.cs" />
     <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.Convergence.cs" Link="Execution\MismatchEscalationCoordinator.Convergence.cs" />
+    <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.Diagnostics.cs" Link="Execution\MismatchEscalationCoordinator.Diagnostics.cs" />
     <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.PendingIea.cs" Link="Execution\MismatchEscalationCoordinator.PendingIea.cs" />
     <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.Telemetry.cs" Link="Execution\MismatchEscalationCoordinator.Telemetry.cs" />
     <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.TestHooks.cs" Link="Execution\MismatchEscalationCoordinator.TestHooks.cs" />
