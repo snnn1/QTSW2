@@ -84,7 +84,8 @@ Move-only split started:
 - `MismatchEscalationCoordinator.Telemetry.cs` now owns mismatch metric counters, test telemetry counters, type-metric incrementing, and `EmitMetrics`.
 - `MismatchEscalationCoordinator.TestHooks.cs` now owns harness-only state/gate test helpers.
 - `MismatchEscalationCoordinator.PublicApi.cs` now owns public/wake/query entrypoints and execution-trigger notification.
-- The NinjaTrader runtime project links all five shared partials explicitly.
+- `MismatchEscalationCoordinator.ReleaseReadiness.cs` now owns release quiet-window/fingerprint helpers, soft-transition predicates, residual-release blocker classification, and fail-closed strict stability keying.
+- The NinjaTrader runtime project links all six shared partials explicitly.
 - Verification after extraction: core build `0 Error(s)`, RobotCore build `0 Error(s)`, and focused checks passed: `AUTHORITY_CONTRADICTIONS`, `ORDER_RECONCILIATION`, `RUN_SUMMARY`, `RUN_SUMMARY_BUILDER`, `EXECUTION_CONTEXT_CONTRACT`, `MISMATCH_ESCALATION`, `MISMATCH_CONVERGENCE_CONTRACT`, `MISMATCH_CONVERGENCE_BRIDGE_PROBE`.
 
 Cleanup implication:
@@ -120,7 +121,8 @@ Step 3 - Start move-only coordinator split:
 - Continued: extracted telemetry counters and `EmitMetrics` while leaving gate release/fail-closed telemetry emitters in the main coordinator.
 - Continued: extracted harness-only test hooks.
 - Continued: extracted public/wake/query entrypoints and execution-trigger notification.
-- Continue with coordinator state helpers or release-readiness helpers next.
+- Continued: extracted release-readiness helper predicates/fingerprints while leaving the release/fail-closed state machine in the main coordinator.
+- Continue with coordinator state helpers or release telemetry helpers next.
 - Do not change release/fail-closed decisions.
 - Run `AUTHORITY_CONTRADICTIONS`, `ORDER_RECONCILIATION`, `RUN_SUMMARY`, `RUN_SUMMARY_BUILDER`, `EXECUTION_CONTEXT_CONTRACT`, and mismatch-specific harnesses.
 
