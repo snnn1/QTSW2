@@ -15,15 +15,14 @@ namespace QTSW2.Robot.Core.Execution;
 /// <summary>
 /// Periodic mismatch audits + P1.5 instrument-scoped state-consistency gate:
 /// engage → gate-safe reconciliation → release readiness → stability window → release.
-/// Phase A: when <see cref="FeatureFlags.ControlPlaneMismatchExecutionBlockAuthority"/> is false, internal state and logs
-/// continue, but execution block authority is not published and <see cref="IsInstrumentBlockedByMismatch"/> is always false.
+/// Mismatch block state is always published as an execution-authority input; diagnostics continue through release.
 /// </summary>
 /// <remarks>
 /// Escalation layering: <see cref="PendingAlignmentAuthority"/> suppresses lag-explained categories during alignment windows;
 /// release-path journal integrity stays parity-only while pending; hard flatten / execution lock remain last resort for structural
 /// or persistent divergence outside those windows.
 /// </remarks>
-public sealed class MismatchEscalationCoordinator
+public sealed partial class MismatchEscalationCoordinator
 {
     private readonly Func<AccountSnapshot> _getSnapshot;
     private readonly Func<IReadOnlyList<string>> _getActiveInstruments;
@@ -122,30 +121,6 @@ public sealed class MismatchEscalationCoordinator
         new(StringComparer.OrdinalIgnoreCase);
 
     private const int MismatchPendingConvergenceLogSeconds = 3;
-    private const int PendingIeaSkipLogSeconds = 15;
-    private static readonly TimeSpan PendingIeaStableSignatureWindow = TimeSpan.FromSeconds(10);
-    private static readonly TimeSpan PendingIeaGateAdvanceCooldown = TimeSpan.FromSeconds(10);
-
-    private sealed class PendingIeaDeferState
-    {
-        public int PendingExecutionCount;
-        public DateTimeOffset FirstObservedUtc;
-        public DateTimeOffset LastObservedUtc;
-        public DateTimeOffset LastSkipLogUtc;
-        public DateTimeOffset NextGateAdvanceEligibleUtc;
-    }
-
-    private readonly struct PendingIeaDeferDecision
-    {
-        public bool EmitDiagnostic { get; init; }
-        public bool SkipGateAdvance { get; init; }
-        public bool GateAdvanceBackoffArmed { get; init; }
-        public double StableSignatureMs { get; init; }
-        public double GateAdvanceCooldownRemainingMs { get; init; }
-    }
-
-    private readonly Dictionary<string, PendingIeaDeferState> _pendingIeaDeferStates =
-        new(StringComparer.OrdinalIgnoreCase);
 
     private const int FailClosedSoftDeferHysteresisMs = 5_000;
 
@@ -193,73 +168,6 @@ public sealed class MismatchEscalationCoordinator
         int ExecutionCycleCount,
         bool HardStopActive,
         int TotalExpensiveSinceGateEngaged);
-
-    private PendingIeaDeferDecision ObservePendingIeaDefer(string inst, int pendingIeA, DateTimeOffset utcNow, bool forGateAdvance)
-    {
-        var trimmed = inst?.Trim() ?? string.Empty;
-        if (string.IsNullOrEmpty(trimmed))
-            return default;
-
-        if (pendingIeA <= 0)
-        {
-            _pendingIeaDeferStates.Remove(trimmed);
-            return default;
-        }
-
-        if (!_pendingIeaDeferStates.TryGetValue(trimmed, out var state) ||
-            state.PendingExecutionCount != pendingIeA)
-        {
-            state = new PendingIeaDeferState
-            {
-                PendingExecutionCount = pendingIeA,
-                FirstObservedUtc = utcNow,
-                LastObservedUtc = utcNow,
-                LastSkipLogUtc = utcNow,
-                NextGateAdvanceEligibleUtc = utcNow
-            };
-            _pendingIeaDeferStates[trimmed] = state;
-            return new PendingIeaDeferDecision
-            {
-                EmitDiagnostic = true,
-                StableSignatureMs = 0
-            };
-        }
-
-        state.LastObservedUtc = utcNow;
-        var stableSignatureMs = Math.Max(0, (utcNow - state.FirstObservedUtc).TotalMilliseconds);
-        var gateAdvanceBackoffArmed = false;
-        var skipGateAdvance = false;
-
-        if (forGateAdvance && stableSignatureMs >= PendingIeaStableSignatureWindow.TotalMilliseconds)
-        {
-            if (utcNow < state.NextGateAdvanceEligibleUtc)
-            {
-                skipGateAdvance = true;
-            }
-            else
-            {
-                state.NextGateAdvanceEligibleUtc = utcNow + PendingIeaGateAdvanceCooldown;
-                gateAdvanceBackoffArmed = true;
-            }
-        }
-
-        var emitDiagnostic = gateAdvanceBackoffArmed ||
-            (utcNow - state.LastSkipLogUtc).TotalSeconds >= PendingIeaSkipLogSeconds;
-        if (emitDiagnostic)
-            state.LastSkipLogUtc = utcNow;
-
-        _pendingIeaDeferStates[trimmed] = state;
-        return new PendingIeaDeferDecision
-        {
-            EmitDiagnostic = emitDiagnostic,
-            SkipGateAdvance = skipGateAdvance,
-            GateAdvanceBackoffArmed = gateAdvanceBackoffArmed,
-            StableSignatureMs = stableSignatureMs,
-            GateAdvanceCooldownRemainingMs = skipGateAdvance
-                ? Math.Max(0, (state.NextGateAdvanceEligibleUtc - utcNow).TotalMilliseconds)
-                : 0
-        };
-    }
 
     public MismatchEscalationCoordinator(
         Func<AccountSnapshot> getSnapshot,

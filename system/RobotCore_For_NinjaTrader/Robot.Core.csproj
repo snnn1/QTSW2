@@ -33,8 +33,6 @@
     <Compile Remove="SiblingProtectiveCancelQueue.Test\**\*" />
     <!-- Modules harness stubs — NT + OrderRegistryPhase2 supply real implementations -->
     <Compile Remove="Execution\InstrumentExecutionAuthority.HarnessPartial.cs" />
-    <!-- Single source: modules copy (avoid drift vs RobotCore duplicate) -->
-    <Compile Remove="Execution\MismatchEscalationCoordinator.cs" />
   </ItemGroup>
   <ItemGroup>
     <!-- Shared types from modules/robot/core (NT project targets net48, core targets net8) -->
@@ -58,6 +56,7 @@
     <Compile Include="..\modules\robot\core\Execution\StateConsistencyGateModels.cs" Link="Execution\StateConsistencyGateModels.cs" />
     <Compile Include="..\modules\robot\core\Execution\MismatchConvergenceBridgeProbeMath.cs" Link="Execution\MismatchConvergenceBridgeProbeMath.cs" />
     <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.cs" Link="Execution\MismatchEscalationCoordinator.cs" />
+    <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.PendingIea.cs" Link="Execution\MismatchEscalationCoordinator.PendingIea.cs" />
     <Compile Include="..\modules\robot\core\Execution\JournalIntegrityGuarantee.cs" Link="Execution\JournalIntegrityGuarantee.cs" />
     <Compile Include="..\modules\robot\core\Execution\JournalParityPendingLedger.cs" Link="Execution\JournalParityPendingLedger.cs" />
     <Compile Include="..\modules\robot\core\Execution\PostFillAlignmentGate.cs" Link="Execution\PostFillAlignmentGate.cs" />

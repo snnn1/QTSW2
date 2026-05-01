@@ -23,7 +23,7 @@ Important limitation:
 | Layer | Primary files | Runtime role | Cleanup posture |
 |---|---|---|---|
 | Mismatch detection | `Execution/ReconciliationRunner.cs`, `RobotEngine.Reconciliation*.cs` | Compares broker/account state with journal/ownership state and invokes mismatch handling. | Keep. Detection is safety-critical and not a cleanup deletion target. |
-| Mismatch escalation | `Execution/MismatchEscalationCoordinator.cs` | Maintains per-instrument mismatch state, blocks execution, drives convergence/release, and escalates to fail-closed when needed. | Map first. Refactor only after state-machine boundaries are documented. |
+| Mismatch escalation | `Execution/MismatchEscalationCoordinator*.cs` | Maintains per-instrument mismatch state, blocks execution, drives convergence/release, and escalates to fail-closed when needed. | Move-only split in progress. Keep release/fail-closed behavior unchanged until runtime proof catches up. |
 | Submit authority | `Execution/NinjaTraderSimAdapter.SubmitGate.cs`, `Execution/InstrumentExecutionAuthority*.cs`, `Execution/UnifiedExecutionAuthority*.cs` | Decides whether entry/protective/flatten/reentry submits are allowed. | Conditional. Playback uses UEA, but fallback/default paths remain rollback safety. |
 | Structural authority | `Execution/ExecutionStructuralLayer.cs` | Classifies submit safety from parity, ownership, repair, recovery, and quant-control snapshots. | Conditional. Ledger ownership is active in playback, but journal fallback remains safety evidence. |
 | Ownership authority | `Execution/InstrumentOwnershipLedger.cs`, `Execution/OwnershipEventJournal.cs`, `Execution/ExecutionJournal*.cs` | Provides durable ownership truth and open quantity evidence. | Keep. May become the only read path later, but not yet. |
@@ -78,10 +78,16 @@ Primary responsibilities in `system/modules/robot/core/Execution/MismatchEscalat
 - Escalates persistent mismatch to fail-closed only after convergence/progress controls are exhausted.
 - Emits operational diagnostics for release blockers, throttling, reentry blocking, and fail-closed counts.
 
+Move-only split started:
+- `MismatchEscalationCoordinator.PendingIea.cs` now owns pending-IEA defer state, decision data, throttle constants, and `ObservePendingIeaDefer`.
+- The NinjaTrader runtime project links this shared partial explicitly.
+- Verification after extraction: core build `0 Error(s)`, RobotCore build `0 Error(s)`, and focused checks passed: `AUTHORITY_CONTRADICTIONS`, `ORDER_RECONCILIATION`, `RUN_SUMMARY`, `RUN_SUMMARY_BUILDER`, `EXECUTION_CONTEXT_CONTRACT`.
+
 Cleanup implication:
 - The coordinator is too conceptually dense for deletion work.
 - First safe move is a documentation-assisted split by responsibility:
   - state models and counters
+  - pending-IEA deferral
   - convergence suppression
   - audit tick orchestration
   - release readiness and quiet-window release
@@ -105,7 +111,8 @@ Step 2 - Keep one more runtime proof loop:
 - Validate no `EXECUTION_BLOCKED:NT_CONTEXT_NOT_SET`, no protective failure, no crash/freeze/thread issue, no open exposure at shutdown.
 
 Step 3 - Start move-only coordinator split:
-- Extract coordinator telemetry/state helpers first.
+- Started: extracted pending-IEA deferral first because it was a contained state/helper pocket.
+- Continue with coordinator telemetry/state helpers or convergence suppression next.
 - Do not change release/fail-closed decisions.
 - Run `AUTHORITY_CONTRADICTIONS`, `ORDER_RECONCILIATION`, `RUN_SUMMARY`, `RUN_SUMMARY_BUILDER`, `EXECUTION_CONTEXT_CONTRACT`, and mismatch-specific harnesses.
 
