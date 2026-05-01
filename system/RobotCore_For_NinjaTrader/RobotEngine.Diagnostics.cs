@@ -384,11 +384,15 @@ public sealed partial class RobotEngine
     }
 
     private bool _robotBuildSignatureEmitted;
+    private static readonly object RobotBuildSignatureCacheLock = new();
+    private static string _cachedRobotBuildSignaturePath = "";
+    private static DateTime _cachedRobotBuildSignatureWriteUtc;
+    private static long _cachedRobotBuildSignatureLength = -1;
+    private static string _cachedRobotBuildSignatureHash = "";
 
     /// <summary>
-    /// Emit ROBOT_BUILD_SIGNATURE once per engine run when strategy reaches Realtime.
-    /// Proves which Robot.Core.dll is actually loaded (assembly path, last write time).
-    /// Call from RobotSimStrategy when State == Realtime.
+    /// Emit ROBOT_BUILD_SIGNATURE once per engine run from the DLL start path.
+    /// Proves which Robot.Core.dll is actually loaded (assembly path, hash, last write time).
     /// </summary>
     public void LogEngineBuildSignatureIfNeeded(DateTimeOffset utcNow, string instrumentName)
     {
@@ -401,19 +405,28 @@ public sealed partial class RobotEngine
         var asm = typeof(RobotEngine).Assembly;
         var loc = asm.Location;
         DateTime utcWrite = default;
+        long assemblyLength = -1;
         try
         {
             if (!string.IsNullOrEmpty(loc) && File.Exists(loc))
+            {
                 utcWrite = File.GetLastWriteTimeUtc(loc);
+                assemblyLength = new FileInfo(loc).Length;
+            }
         }
         catch { /* best-effort */ }
         var ver = asm.GetName().Version;
+        var assemblyHash = TryGetRobotCoreAssemblyHash(loc, utcWrite, assemblyLength, out var hashCacheHit);
         var payload = new Dictionary<string, object>
         {
             ["assembly_name"] = asm.GetName().Name ?? "Robot.Core",
             ["assembly_version"] = ver?.ToString() ?? "0.0.0.0",
             ["assembly_location"] = loc ?? "(null)",
+            ["assembly_hash_algorithm"] = "SHA256",
+            ["assembly_hash"] = assemblyHash,
+            ["assembly_hash_cache_hit"] = hashCacheHit,
             ["assembly_last_write_utc"] = utcWrite.ToString("o"),
+            ["assembly_length"] = assemblyLength,
             ["build_configuration"] =
 #if DEBUG
                 "Debug"
@@ -425,5 +438,57 @@ public sealed partial class RobotEngine
             ["note"] = "Runtime proof of loaded Robot.Core.dll; validate this signature appears in robot_ENGINE.jsonl after restart"
         };
         LogEngineEvent(utcNow, "ROBOT_BUILD_SIGNATURE", payload);
+    }
+
+    private static string TryGetRobotCoreAssemblyHash(string path, DateTime utcWrite, long assemblyLength, out bool cacheHit)
+    {
+        cacheHit = false;
+        try
+        {
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+                return "unavailable";
+
+            var fullPath = Path.GetFullPath(path.Trim());
+            lock (RobotBuildSignatureCacheLock)
+            {
+                if (string.Equals(_cachedRobotBuildSignaturePath, fullPath, StringComparison.OrdinalIgnoreCase) &&
+                    _cachedRobotBuildSignatureWriteUtc == utcWrite &&
+                    _cachedRobotBuildSignatureLength == assemblyLength &&
+                    !string.IsNullOrWhiteSpace(_cachedRobotBuildSignatureHash))
+                {
+                    cacheHit = true;
+                    return _cachedRobotBuildSignatureHash;
+                }
+
+                var hash = TryComputeRobotCoreAssemblyHash(fullPath);
+                _cachedRobotBuildSignaturePath = fullPath;
+                _cachedRobotBuildSignatureWriteUtc = utcWrite;
+                _cachedRobotBuildSignatureLength = assemblyLength;
+                _cachedRobotBuildSignatureHash = hash;
+                return hash;
+            }
+        }
+        catch (Exception ex)
+        {
+            return "error:" + ex.GetType().Name;
+        }
+    }
+
+    private static string TryComputeRobotCoreAssemblyHash(string path)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+                return "unavailable";
+
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            using var sha256 = System.Security.Cryptography.SHA256.Create();
+            var bytes = sha256.ComputeHash(stream);
+            return BitConverter.ToString(bytes).Replace("-", "").ToLowerInvariant();
+        }
+        catch (Exception ex)
+        {
+            return "error:" + ex.GetType().Name;
+        }
     }
 }
