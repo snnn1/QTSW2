@@ -2,6 +2,12 @@
 
 Append-only JSONL at run root: `KEY_EVENTS.jsonl`. Each line is one JSON object. This document defines **ordering expectations**, **field meanings**, and **invariants** so a run can be explained without ENGINE logs.
 
+## Evidence role
+
+`KEY_EVENTS.jsonl` is an operator narrative stream, not the sole source of run truth. Summary and verdict builders must tolerate a missing or empty file and hydrate decision-critical counts from durable execution journals, stream journals, daily summaries, and reconciliation artifacts.
+
+An empty `KEY_EVENTS.jsonl` is therefore a reporting/completeness issue, not by itself a safety failure. If durable artifacts prove intents, orders, fills, flatten activity, and shutdown flatness, the run summary should use those artifacts and annotate that key-event narrative coverage was absent.
+
 ## Line schema (all events)
 
 | Field | Meaning |

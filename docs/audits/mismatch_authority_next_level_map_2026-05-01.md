@@ -9,14 +9,14 @@ Purpose:
 
 Runtime anchor:
 - Latest run pointer: `runs/LATEST_RUN.txt`
-- Latest inspected run: `runs/2e1edfe08dc14685ac10bbf138e6222a`
+- Latest inspected run: `runs/c507bc382ee740cc951e2ffce560af49`
 - Run verdict: `status=WARN`, `status_reason=FLATTEN_OCCURRED`, `verdict_class=OPERATOR_REVIEW`, `recommended_action=MONITOR`, `confidence=MEDIUM`.
-- Runtime DLL proof: `assembly_hash=7d82321ee84875988d141042b3caf043d4a99030e919fb8bd6a3872ac27a8180`, `assembly_last_write_utc=2026-04-30T23:09:55.2207133Z`.
+- Runtime DLL proof: `assembly_hash=8675402c91a6d470a366e53bae92a8bbcf3cad2a51818714210c66133e632404`, `assembly_last_write_utc=2026-05-01T12:35:25.7769882Z`, `assembly_location=C:\Users\jakej\Documents\NinjaTrader 8\bin\Custom\Robot.Core.dll`.
 - Safety proof: no robot log errors/criticals/hard criticals, no broker position or working orders at shutdown, no ownership active/orphan/open journal quantity at shutdown, no diagnostic contradictions, no crash/freeze/thread/protective failure evidence.
 - MNG2/NG2 proof: session-close flatten armed reentry, submitted reentry intent `44cc7fdfeb6a16e6`, filled it, accepted protectives, and ended flat.
 
 Important limitation:
-- This run proves the deployed runtime path. The additional source hardening for global-sweep broker-flat reentry is harness-proven but should not be called runtime-proven until a deployed DLL with that source is confirmed by `ROBOT_BUILD_SIGNATURE`.
+- This run proves the deployed runtime path and local non-OneDrive NinjaTrader folder. The latest event-registry/noise hardening is build/harness/deploy-proven on SHA-256 `ABA18016F948CF6CF0B3D00C918291064046767BC30C22075FEC62F6DBBDA1CA`, but should not be called runtime-proven until a restarted NinjaTrader playback confirms that hash via `ROBOT_BUILD_SIGNATURE`.
 
 ## 1. Current Authority Layers
 
@@ -39,7 +39,7 @@ Playback/audit startup force-enables:
 - `StructuralLayerUseLedgerOwnership=true`
 
 Latest proof:
-- Run `2e1edfe08dc14685ac10bbf138e6222a` completed with these playback/audit flags active.
+- Run `c507bc382ee740cc951e2ffce560af49` completed with these playback/audit flags active.
 - Submit/reentry/protective paths worked for 11 filled trades.
 - MNG2 reentry used the deployed authority path and ended flat.
 
@@ -63,7 +63,7 @@ Not proven enough for deletion:
 | `StructuralLayerUseLedgerOwnership` fallback | Conditional remove later | Playback reads ledger ownership, but journal-based structural fallback remains rollback. |
 | `StructuralLayerPhase3DemoteParityNotOkSubmitDeny` | Keep | Rollout gate for demoting hard parity denies. |
 | `StructuralLayerPhase3DemoteRepairActiveSubmitDeny` | Keep | Rollout gate for demoting repair-active submit denies. |
-| `KEY_EVENTS.jsonl` primary evidence path | Candidate fix | Latest summary hydrated from journals, but key events stayed empty. Reporting should not rely on it as the only evidence source. |
+| `KEY_EVENTS.jsonl` primary evidence path | Policy clarified | Latest summary hydrated from journals while key events stayed empty. The contract now treats key events as operator narrative evidence, while verdicts hydrate from durable journals/summaries when needed. |
 
 ## 4. MismatchEscalationCoordinator Map
 
