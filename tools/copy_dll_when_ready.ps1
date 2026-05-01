@@ -13,18 +13,23 @@ for ($i = 0; $i -lt 6; $i++) {
 }
 $sourceDir = Join-Path $projectRoot "system\RobotCore_For_NinjaTrader\bin\Release\net48"
 
-# Resolve NinjaTrader Custom path(s) (Documents and/or OneDrive\Documents)
+# Resolve NinjaTrader Custom path from the Windows Documents known-folder.
+# Do not deploy to stale OneDrive mirrors just because they still exist.
 $ntCustomDirs = @()
+$documentsPath = [Environment]::GetFolderPath("MyDocuments")
+if ([string]::IsNullOrWhiteSpace($documentsPath)) {
+    $documentsPath = Join-Path $env:USERPROFILE "Documents"
+}
 foreach ($base in @(
-    (Join-Path $env:USERPROFILE "OneDrive\Documents\NinjaTrader 8\bin\Custom"),
+    (Join-Path $documentsPath "NinjaTrader 8\bin\Custom"),
     (Join-Path $env:USERPROFILE "Documents\NinjaTrader 8\bin\Custom")
-)) {
+) | Select-Object -Unique) {
     if (Test-Path $base) {
         $ntCustomDirs += $base
     }
 }
 if ($ntCustomDirs.Count -eq 0) {
-    Write-Host "[ERROR] NinjaTrader Custom folder not found. Tried OneDrive\Documents and Documents."
+    Write-Host "[ERROR] NinjaTrader Custom folder not found under Windows Documents or local Documents."
     pause
     exit 1
 }
@@ -113,6 +118,42 @@ if (-not $copied) {
     Write-Host ""
     Write-Host "[ERROR] Could not copy after $maxAttempts attempts. Close NinjaTrader and try again."
     pause
+    exit 1
+}
+
+Write-Host ""
+Write-Host "Verifying deployed DLL hashes..." -ForegroundColor Cyan
+$verificationFailed = $false
+foreach ($ntCustom in $ntCustomDirs) {
+    foreach ($f in $filesToCopy) {
+        $src = Join-Path $sourceDir $f.Name
+        $dst = Join-Path $ntCustom $f.Name
+        if (-not (Test-Path $src)) { continue }
+        if (-not (Test-Path $dst)) {
+            Write-Host "[ERROR] Missing deployed file: $dst" -ForegroundColor Red
+            $verificationFailed = $true
+            continue
+        }
+
+        $srcHash = (Get-FileHash $src -Algorithm SHA256).Hash
+        $dstHash = (Get-FileHash $dst -Algorithm SHA256).Hash
+        if ($srcHash -ne $dstHash) {
+            Write-Host "[ERROR] Hash mismatch for $($f.Name) at $ntCustom" -ForegroundColor Red
+            Write-Host "        source: $($srcHash.Substring(0, 24))"
+            Write-Host "        target: $($dstHash.Substring(0, 24))"
+            $verificationFailed = $true
+        } elseif ($f.Name -eq "Robot.Core.dll") {
+            $dstItem = Get-Item $dst
+            Write-Host "[OK] Robot.Core.dll verified at $ntCustom"
+            Write-Host "     hash=$($dstHash.Substring(0, 24)) last_write_utc=$($dstItem.LastWriteTimeUtc.ToString('o'))"
+        }
+    }
+}
+
+if ($verificationFailed) {
+    Write-Host ""
+    Write-Host "[ERROR] Deploy verification failed. NinjaTrader will keep loading the old DLL until this is fixed." -ForegroundColor Red
+    if (-not $NoPause) { pause }
     exit 1
 }
 

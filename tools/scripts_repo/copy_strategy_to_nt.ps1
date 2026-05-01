@@ -19,12 +19,17 @@ if (Test-Path $sourceModules) {
     Write-Host "Strategy source: system\RobotCore_For_NinjaTrader\Strategies" -ForegroundColor Gray
 }
 
-# Resolve NinjaTrader Strategies path(s) — deploy to every Custom folder that exists
+# Resolve NinjaTrader Strategies path from the Windows Documents known-folder.
+# Do not deploy to stale OneDrive mirrors just because they still exist.
 $ntStrategyDirs = @()
+$documentsPath = [Environment]::GetFolderPath("MyDocuments")
+if ([string]::IsNullOrWhiteSpace($documentsPath)) {
+    $documentsPath = Join-Path $env:USERPROFILE "Documents"
+}
 foreach ($base in @(
-    (Join-Path $env:USERPROFILE "OneDrive\Documents\NinjaTrader 8\bin\Custom\Strategies"),
+    (Join-Path $documentsPath "NinjaTrader 8\bin\Custom\Strategies"),
     (Join-Path $env:USERPROFILE "Documents\NinjaTrader 8\bin\Custom\Strategies")
-)) {
+) | Select-Object -Unique) {
     $customParent = Split-Path $base -Parent
     if (Test-Path $customParent) {
         if (-not (Test-Path $base)) {
@@ -35,7 +40,7 @@ foreach ($base in @(
     }
 }
 if ($ntStrategyDirs.Count -eq 0) {
-    $fallback = Join-Path $env:USERPROFILE "Documents\NinjaTrader 8\bin\Custom\Strategies"
+    $fallback = Join-Path $documentsPath "NinjaTrader 8\bin\Custom\Strategies"
     if (-not (Test-Path $fallback)) {
         New-Item -ItemType Directory -Path $fallback -Force | Out-Null
     }

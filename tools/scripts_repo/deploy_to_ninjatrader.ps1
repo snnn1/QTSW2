@@ -31,10 +31,14 @@ Write-Host ""
 Write-Host "NinjaTrader cache..." -ForegroundColor Cyan
 if ($ForceCacheClear) {
     $ntCustom = $null
+    $documentsPath = [Environment]::GetFolderPath("MyDocuments")
+    if ([string]::IsNullOrWhiteSpace($documentsPath)) {
+        $documentsPath = Join-Path $env:USERPROFILE "Documents"
+    }
     foreach ($base in @(
-        (Join-Path $env:USERPROFILE "OneDrive\Documents\NinjaTrader 8\bin\Custom"),
+        (Join-Path $documentsPath "NinjaTrader 8\bin\Custom"),
         (Join-Path $env:USERPROFILE "Documents\NinjaTrader 8\bin\Custom")
-    )) { if (Test-Path $base) { $ntCustom = $base; break } }
+    ) | Select-Object -Unique) { if (Test-Path $base) { $ntCustom = $base; break } }
     if ($ntCustom) {
         $custom = Join-Path $ntCustom "NinjaTrader.Custom.dll"
         $vendor = Join-Path $ntCustom "NinjaTrader.Vendor.dll"

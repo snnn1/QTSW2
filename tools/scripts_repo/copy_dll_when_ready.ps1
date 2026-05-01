@@ -14,18 +14,23 @@ for ($i = 0; $i -lt 6; $i++) {
 }
 $sourceDir = Join-Path $projectRoot "system\RobotCore_For_NinjaTrader\bin\Release\net48"
 
-# Resolve NinjaTrader Custom path(s) — copy to ALL that exist (OneDrive + plain Documents can both exist)
+# Resolve NinjaTrader Custom path from the Windows Documents known-folder.
+# Do not deploy to stale OneDrive mirrors just because they still exist.
 $ntCustomDirs = @()
+$documentsPath = [Environment]::GetFolderPath("MyDocuments")
+if ([string]::IsNullOrWhiteSpace($documentsPath)) {
+    $documentsPath = Join-Path $env:USERPROFILE "Documents"
+}
 foreach ($base in @(
-    (Join-Path $env:USERPROFILE "OneDrive\Documents\NinjaTrader 8\bin\Custom"),
+    (Join-Path $documentsPath "NinjaTrader 8\bin\Custom"),
     (Join-Path $env:USERPROFILE "Documents\NinjaTrader 8\bin\Custom")
-)) {
+) | Select-Object -Unique) {
     if (Test-Path $base) {
         $ntCustomDirs += $base
     }
 }
 if ($ntCustomDirs.Count -eq 0) {
-    Write-Host "[ERROR] NinjaTrader Custom folder not found. Tried OneDrive\Documents and Documents."
+    Write-Host "[ERROR] NinjaTrader Custom folder not found under Windows Documents or local Documents."
     if (-not $NoPause) { pause }
     exit 1
 }

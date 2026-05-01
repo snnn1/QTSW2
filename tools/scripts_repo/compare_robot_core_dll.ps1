@@ -1,11 +1,15 @@
-# Non-interactive: compare built Robot.Core.dll to NinjaTrader Custom (OneDrive + Documents).
+# Non-interactive: compare built Robot.Core.dll to the active NinjaTrader Custom folder.
 $ErrorActionPreference = "Stop"
 $projectRoot = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { $PWD }
 $src = Join-Path $projectRoot "RobotCore_For_NinjaTrader\bin\Release\net48\Robot.Core.dll"
+$documentsPath = [Environment]::GetFolderPath("MyDocuments")
+if ([string]::IsNullOrWhiteSpace($documentsPath)) {
+    $documentsPath = Join-Path $env:USERPROFILE "Documents"
+}
 $bases = @(
-    (Join-Path $env:USERPROFILE "OneDrive\Documents\NinjaTrader 8\bin\Custom"),
+    (Join-Path $documentsPath "NinjaTrader 8\bin\Custom"),
     (Join-Path $env:USERPROFILE "Documents\NinjaTrader 8\bin\Custom")
-)
+) | Select-Object -Unique
 
 function ShowDllInfo([string]$label, [string]$path) {
     if (-not (Test-Path -LiteralPath $path)) {
@@ -30,14 +34,14 @@ $hs = ShowDllInfo "SOURCE (repo Release build)" $src
 Write-Host ""
 $hashes = @{}
 foreach ($b in $bases) {
-    $short = if ($b -match "OneDrive") { "NT OneDrive ...\bin\Custom" } else { "NT Documents ...\bin\Custom" }
+    $short = if ($b -eq (Join-Path $documentsPath "NinjaTrader 8\bin\Custom")) { "NT active Documents ...\bin\Custom" } else { "NT local fallback ...\bin\Custom" }
     $t = Join-Path $b "Robot.Core.dll"
     $h = ShowDllInfo $short $t
     if ($h) { $hashes[$b] = $h }
     Write-Host ""
 }
 
-Write-Host "Deploy scripts use the first Custom folder that exists (OneDrive before Documents)." -ForegroundColor Gray
+Write-Host "Deploy scripts use the Windows Documents known-folder, with local Documents as fallback." -ForegroundColor Gray
 Write-Host ""
 
 if (-not $hs) {

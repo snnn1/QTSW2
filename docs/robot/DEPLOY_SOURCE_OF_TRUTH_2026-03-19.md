@@ -12,6 +12,9 @@
 - **Robot.Contracts.dll** — Dependency, copied with DLLs
 - **RobotSimStrategy.cs** — Strategy source, copied to Strategies folder
 - **AddOns source** — Do NOT copy. NinjaTrader's project lacks references (Robot.Contracts, System.Text.Json) needed to compile it.
+- **NinjaTrader user folder** — Keep active runtime files under local Documents, not OneDrive. Current expected path: `C:\Users\jakej\Documents\NinjaTrader 8`.
+
+As of 2026-05-01, Windows `MyDocuments` is intentionally set to `C:\Users\jakej\Documents`. Deploy tools resolve NinjaTrader through the Windows Documents known-folder and no longer deploy to stale OneDrive mirrors just because they still exist.
 
 ---
 

@@ -33,13 +33,6 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "[OK] Build succeeded" -ForegroundColor Green
 Write-Host ""
 
-# Step 1b: Sync NT_ADDONS from RobotCore (prevents divergence)
-if (Test-Path (Join-Path $projectRoot "system\NT_ADDONS")) {
-    Write-Host "[1b] Syncing NT_ADDONS from RobotCore..." -ForegroundColor Cyan
-    & (Join-Path $projectRoot "tools\sync_nt_addons_from_robotcore.ps1") | Out-Null
-}
-Write-Host ""
-
 # Step 2: Copy DLLs
 Write-Host "[2/4] Copying DLLs to NinjaTrader Custom..." -ForegroundColor Cyan
 & (Join-Path $projectRoot "tools\copy_dll_when_ready.ps1") -NoPause
@@ -56,10 +49,14 @@ Write-Host ""
 if ($ClearNinjaTraderCache) {
     Write-Host "[4/4] Clearing NinjaTrader cache (NinjaTrader must be closed)..." -ForegroundColor Cyan
     $ntCustomDirs = @()
+    $documentsPath = [Environment]::GetFolderPath("MyDocuments")
+    if ([string]::IsNullOrWhiteSpace($documentsPath)) {
+        $documentsPath = Join-Path $env:USERPROFILE "Documents"
+    }
     foreach ($base in @(
-        (Join-Path $env:USERPROFILE "OneDrive\Documents\NinjaTrader 8\bin\Custom"),
+        (Join-Path $documentsPath "NinjaTrader 8\bin\Custom"),
         (Join-Path $env:USERPROFILE "Documents\NinjaTrader 8\bin\Custom")
-    )) { if (Test-Path $base) { $ntCustomDirs += $base } }
+    ) | Select-Object -Unique) { if (Test-Path $base) { $ntCustomDirs += $base } }
     foreach ($ntCustom in $ntCustomDirs) {
         Write-Host "  Custom folder: $ntCustom"
         $custom = Join-Path $ntCustom "NinjaTrader.Custom.dll"

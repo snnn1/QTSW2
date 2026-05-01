@@ -1,5 +1,7 @@
 # Rebuild & Redeploy Investigation
 
+> Superseded path note (2026-05-01): NinjaTrader was migrated off OneDrive. Current Windows `MyDocuments` and active NinjaTrader runtime path are `C:\Users\jakej\Documents` and `C:\Users\jakej\Documents\NinjaTrader 8`. Older OneDrive path notes below are retained as historical investigation context only.
+
 **Date:** 2026-03-13  
 **Status:** Pipeline verified working. No critical failures found.
 
