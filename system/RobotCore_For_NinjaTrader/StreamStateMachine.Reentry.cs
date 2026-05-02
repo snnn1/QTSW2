@@ -250,6 +250,8 @@ public sealed partial class StreamStateMachine
         {
             CommandId = Guid.NewGuid().ToString(),
             TimestampUtc = utcNow,
+            Instrument = ExecutionInstrument ?? Instrument ?? "",
+            IntentId = _journal.ReentryIntentId,
             Stream = Stream,
             Session = Session,
             SlotTimeChicago = SlotTimeChicago,

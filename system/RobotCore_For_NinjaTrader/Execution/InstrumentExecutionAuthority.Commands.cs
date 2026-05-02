@@ -45,8 +45,7 @@ public sealed partial class InstrumentExecutionAuthority
     private void DispatchCommand(ExecutionCommandBase command)
     {
         var utcNow = command.TimestampUtc;
-        var instrument = command.Instrument ?? "";
-        var intentId = command.IntentId ?? "";
+        var (instrument, intentId) = GetCommandAuditIdentity(command);
         var commandType = command.GetType().Name;
 
         Log?.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "EXECUTION_COMMAND_RECEIVED",
@@ -113,6 +112,25 @@ public sealed partial class InstrumentExecutionAuthority
                 Payload = new { commandId = command.CommandId, commandType, error = ex.Message, exception_type = ex.GetType().Name }
             });
         }
+    }
+
+    private static (string Instrument, string IntentId) GetCommandAuditIdentity(ExecutionCommandBase command)
+    {
+        if (command is SubmitMarketReentryCommand reentry)
+        {
+            return (
+                (reentry.ExecutionInstrument ?? reentry.Instrument ?? "").Trim(),
+                (reentry.ReentryIntentId ?? reentry.IntentId ?? "").Trim());
+        }
+
+        if (command is SubmitEntryIntentCommand submit)
+        {
+            return (
+                (submit.ExecutionInstrument ?? submit.Instrument ?? "").Trim(),
+                (submit.LongIntentId ?? submit.IntentId ?? "").Trim());
+        }
+
+        return ((command.Instrument ?? "").Trim(), (command.IntentId ?? "").Trim());
     }
 
     private void HandleFlattenIntentCommand(FlattenIntentCommand cmd)

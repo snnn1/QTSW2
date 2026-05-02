@@ -28,7 +28,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LATEST_RUN_REL = Path("runs") / "LATEST_RUN.txt"
 AUDIT_REPORT_FILENAME = "audit_report.json"
 # Bump when the JSON shape changes (new/moved/renamed top-level or section fields).
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 # Equivalent to ENTRY_SUBMITTED for classification (file evidence)
 ENTRY_SUBMIT_EQUIV_EVENTS = frozenset(
@@ -182,6 +182,11 @@ class JournalRow:
     entry_submitted: bool
     entry_filled: bool
     source_file: str
+    entry_filled_at: Optional[datetime] = None
+    exit_filled_at: Optional[datetime] = None
+    completion_reason: str = ""
+    realized_pnl_gross: Optional[float] = None
+    trade_completed: bool = False
 
 
 @dataclass
@@ -256,6 +261,15 @@ def load_execution_journals(run_root: Path, files: List[Path]) -> List[JournalRo
                     entry_submitted=bool(obj.get("EntrySubmitted")),
                     entry_filled=bool(obj.get("EntryFilled")),
                     source_file=rp,
+                    entry_filled_at=_parse_ts(obj.get("EntryFilledAtUtc") or obj.get("EntryFilledAt")),
+                    exit_filled_at=_parse_ts(obj.get("ExitFilledAtUtc")),
+                    completion_reason=str(obj.get("CompletionReason") or "").strip(),
+                    realized_pnl_gross=(
+                        float(obj["RealizedPnLGross"])
+                        if obj.get("RealizedPnLGross") is not None
+                        else None
+                    ),
+                    trade_completed=bool(obj.get("TradeCompleted")),
                 )
             )
     return rows
@@ -271,6 +285,8 @@ def journal_timing_mismatch_flags(run_root: Path, files: List[Path]) -> List[str
         if path.suffix.lower() != ".json":
             continue
         for line_no, obj in iter_json_objects(path):
+            if not bool(obj.get("EntryFilled")):
+                continue
             a = _parse_ts(obj.get("EntrySubmittedAtUtc") or obj.get("EntrySubmittedAt"))
             b = _parse_ts(obj.get("EntrySubmittedObservedAtUtc"))
             if a and b and a.date() != b.date():
@@ -482,6 +498,28 @@ def _journal_row_to_dict(r: JournalRow) -> Dict[str, Any]:
     }
 
 
+def build_round_trip_rows(journal_rows: List[JournalRow]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for r in journal_rows:
+        if not (r.entry_filled_at and r.exit_filled_at):
+            continue
+        held_seconds = (r.exit_filled_at - r.entry_filled_at).total_seconds()
+        rows.append(
+            {
+                "instrument": r.instrument,
+                "stream": r.stream,
+                "intent_id": r.intent_id,
+                "entry_filled_at_utc": r.entry_filled_at.isoformat(),
+                "exit_filled_at_utc": r.exit_filled_at.isoformat(),
+                "held_seconds": round(held_seconds, 3),
+                "completion_reason": r.completion_reason,
+                "realized_pnl_gross": r.realized_pnl_gross,
+                "source_file": r.source_file,
+            }
+        )
+    return sorted(rows, key=lambda x: x["held_seconds"])
+
+
 def _qty_json(q: float) -> Any:
     """Integer when whole-number qty for cleaner diffs."""
     if abs(q - round(q)) < 1e-9:
@@ -679,19 +717,18 @@ def build_audit_report(
     mismatch_flag = "INSTRUMENT_MISMATCH"
     only_key = key_ins - ej_ins
     only_ev = ev_ins - ej_ins - key_ins
-    if not (only_key or only_ev or (ej_ins and ev_ins and ej_ins != ev_ins)):
+    execution_event_coverage_gap = bool(ej_ins and ev_ins and ev_ins < ej_ins)
+    key_events_empty = not any(x for x in key_ins if x)
+    if not (only_key or only_ev):
         mismatch_flag = "none_detected"
 
     unexplained_positions = build_unexplained_positions(broker_snaps, journal_rows)
     reasons: List[str] = [u["reason"] for u in unexplained_positions]
-    if ej_ins and ev_ins and ej_ins != ev_ins:
+    if only_key or only_ev:
         reasons.append("INSTRUMENT_MISMATCH")
     tm_flags = journal_timing_mismatch_flags(run_root, files)
     if tm_flags:
         reasons.append("TIMING_MISMATCH")
-    if not reasons:
-        reasons.append("UNKNOWN (insufficient flags)")
-
     tag_reasons = sorted({x for x in reasons if not x.startswith("TIMING_MISMATCH intent=")})
     preventable = "YES" if "INSTRUMENT_MISMATCH" in reasons or "NO_EXECUTION_JOURNAL" in reasons else "NO"
 
@@ -709,6 +746,7 @@ def build_audit_report(
     )
     broker_truth = broker_truth_summary(broker_snaps)
     system_truth = system_truth_summary(journal_rows)
+    round_trips = build_round_trip_rows(journal_rows)
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -738,12 +776,16 @@ def build_audit_report(
             "instruments_execution_events": sorted(ev_ins),
             "instruments_key_events": sorted(x for x in key_ins if x),
             "flag": mismatch_flag,
+            "execution_event_coverage_gap": execution_event_coverage_gap,
+            "missing_execution_event_instruments": sorted(ej_ins - ev_ins),
+            "key_events_empty": key_events_empty,
         },
         "section_l": {
             "position_not_adopted_tags": tag_reasons,
             "timing_mismatch_details": tm_flags[:20],
         },
         "section_m": {"preventable": preventable, "preventable_note": "heuristic: YES if INSTRUMENT_MISMATCH or NO_EXECUTION_JOURNAL"},
+        "section_n": {"quick_round_trips": round_trips[:20]},
     }
 
 
@@ -811,6 +853,7 @@ def print_phase2(report: Dict[str, Any]) -> None:
     k = report["section_k"]
     l_ = report["section_l"]
     m = report["section_m"]
+    n = report.get("section_n", {})
 
     print("")
     print("=" * 72)
@@ -864,12 +907,21 @@ def print_phase2(report: Dict[str, Any]) -> None:
         print(f"    KEY_EVENTS instruments: {k['instruments_key_events']}")
     else:
         print("  flag: none detected (coarse set comparison)")
+    if k.get("execution_event_coverage_gap"):
+        print(
+            "  coverage_gap: execution_events are sparse narrative evidence; "
+            f"missing instruments={k.get('missing_execution_event_instruments', [])}"
+        )
+    if k.get("key_events_empty"):
+        print("  coverage_gap: KEY_EVENTS is empty; durable journals remain primary verdict evidence")
 
     print("")
     print("=" * 72)
     print("SECTION L - Root cause (expanded, Level 2)")
     print("=" * 72)
     print("  POSITION_NOT_ADOPTED:")
+    if not l_["position_not_adopted_tags"] and not l_["timing_mismatch_details"]:
+        print("    - none")
     for r in l_["position_not_adopted_tags"]:
         print(f"    - {r}")
     for line in l_["timing_mismatch_details"]:
@@ -882,6 +934,20 @@ def print_phase2(report: Dict[str, Any]) -> None:
     print(
         f"  preventable: {m['preventable']}  (YES if mapping/adoption/journal path; NO if purely external broker noise - heuristic)"
     )
+
+    print("")
+    print("=" * 72)
+    print("SECTION N - Quick round trips")
+    print("=" * 72)
+    rows = n.get("quick_round_trips", [])
+    if not rows:
+        print("  none detected")
+    for row in rows[:20]:
+        print(
+            f"  {row['instrument']} {row['stream']} intent={row['intent_id'][:8]}... "
+            f"held={row['held_seconds']}s completion={row['completion_reason'] or '?'} "
+            f"pnl={row['realized_pnl_gross']} file={row['source_file']}"
+        )
 
 
 def main() -> None:

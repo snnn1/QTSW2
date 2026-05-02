@@ -111,9 +111,12 @@ public static class ExecutionCommandTests
                 reentryCmd.BeTrigger,
                 reentryCmd.TimestampUtc,
                 "SUBMIT_MARKET_REENTRY").ComputeIntentId();
+            reentryCmd.IntentId = reentryCmd.ReentryIntentId;
         }
         if (string.IsNullOrEmpty(reentryCmd.ReentryIntentId) || reentryCmd.Direction != "Long" || reentryCmd.Quantity != 1)
             return (false, "SubmitMarketReentryCommand fields not set correctly");
+        if (reentryCmd.IntentId != reentryCmd.ReentryIntentId || reentryCmd.Instrument != reentryCmd.ExecutionInstrument)
+            return (false, "SubmitMarketReentryCommand should expose base command audit identity");
         if (reentryCmd.EntryPrice != 20123.75m || reentryCmd.BeTrigger != 20097.75m)
             return (false, "SubmitMarketReentryCommand should preserve reentry BE metadata");
         if (!(reentryCmd is ExecutionCommandBase))
