@@ -228,7 +228,7 @@ public static partial class RobotEventTypes
         // Gap detection
         ["BAR_GAP_DETECTED"] = "DEBUG",
         ["GAP_TOLERANCE_VIOLATION"] = "ERROR",
-        ["GAP_TOLERATED"] = "WARN",
+        ["GAP_TOLERATED"] = "INFO",
 
         // Execution
         ["EXECUTION_MODE_SET"] = "INFO",

@@ -948,8 +948,8 @@ public sealed partial class StreamStateMachine
                         }
                         else
                         {
-                            // Gap within tolerance - log as WARN with gap type classification
-                            LogHealth("WARN", "GAP_TOLERATED", $"Gap missing {missingMinutes:F1} minutes tolerated (within limits for {gapType})",
+                            // Gap within tolerance - keep diagnostic detail without inflating warning counts.
+                            LogHealth("INFO", "GAP_TOLERATED", $"Gap missing {missingMinutes:F1} minutes tolerated (within limits for {gapType})",
                                 new
                                 {
                                     instrument = Instrument,
