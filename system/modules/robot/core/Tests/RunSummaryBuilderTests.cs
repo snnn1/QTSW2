@@ -35,6 +35,79 @@ public static class RunSummaryBuilderTests
             if (doc.status != "WARN" || doc.status_reason != "FLATTEN_OCCURRED")
                 return (false, $"expected late confirmed flatten to be WARN/FLATTEN_OCCURRED, got {doc.status}/{doc.status_reason}");
 
+            var brokerFlatProofRoot = Path.Combine(root, "broker_flat_proof_summary");
+            Directory.CreateDirectory(brokerFlatProofRoot);
+            File.WriteAllText(Path.Combine(brokerFlatProofRoot, RunRootArtifacts.KeyEventsFileName), "");
+            var brokerFlatProofDecisionDir = RobotRunArtifactPaths.DecisionsDir(brokerFlatProofRoot);
+            Directory.CreateDirectory(brokerFlatProofDecisionDir);
+            File.WriteAllText(Path.Combine(brokerFlatProofDecisionDir, "flatten_broker_flat_completions.jsonl"),
+                "{\"Utc\":\"\\/Date(1777555578977)\\/\",\"Instrument\":\"MNG\",\"CanonicalBrokerKey\":\"MNG\",\"ReconciliationAbsRemaining\":0,\"Proof\":\"BROKER_CANONICAL_RECONCILIATION_ABS_ZERO\",\"CorrelationId\":\"SESSION_CLOSE_FLATTEN:intent-a:20260414205500000\",\"EpisodeId\":\"episode-a\",\"Source\":\"ADAPTER_VERIFY\"}" + Environment.NewLine);
+
+            var brokerFlatProofDoc = RunSummaryBuilder.Build(
+                brokerFlatProofRoot,
+                "broker-flat-proof-summary-test",
+                DateTimeOffset.Parse("2026-04-26T18:00:00+00:00"),
+                ExecutionMode.SIM,
+                new[] { "MNG" },
+                new ExecutionSummarySnapshot());
+
+            if (brokerFlatProofDoc.status != "OK" ||
+                brokerFlatProofDoc.status_reason != "NORMAL_RUN" ||
+                brokerFlatProofDoc.verdict_class != "GREEN")
+            {
+                return (false, $"expected broker-flat verification proof to stay green, got {brokerFlatProofDoc.status}/{brokerFlatProofDoc.status_reason}/{brokerFlatProofDoc.verdict_class}");
+            }
+            if (brokerFlatProofDoc.flags.had_flatten ||
+                brokerFlatProofDoc.key_counts.flatten_confirmed != 0)
+            {
+                return (false, "expected broker-flat verification proof not to count as flatten activity");
+            }
+
+            var flattenJournalRoot = Path.Combine(root, "flatten_journal_summary");
+            Directory.CreateDirectory(flattenJournalRoot);
+            File.WriteAllText(Path.Combine(flattenJournalRoot, RunRootArtifacts.KeyEventsFileName), "");
+            var flattenJournalDir = RobotRunArtifactPaths.StateExecutionJournals(flattenJournalRoot);
+            Directory.CreateDirectory(flattenJournalDir);
+            File.WriteAllText(Path.Combine(flattenJournalDir, "2026-04-13_NG2_session-flatten-intent.json"), JsonUtil.Serialize(new ExecutionJournalEntry
+            {
+                IntentId = "session-flatten-intent",
+                TradingDate = "2026-04-13",
+                Stream = "NG2",
+                Instrument = "MNG",
+                EntrySubmitted = true,
+                EntryFilled = true,
+                EntryFilledQuantityTotal = 2,
+                ExitFilledQuantityTotal = 2,
+                TradeCompleted = true,
+                Direction = "Short",
+                ExitOrderType = "FLATTEN",
+                CompletionReason = "FLATTEN",
+                ExitFilledAtUtc = "2026-04-26T21:00:00.0000000Z",
+                CompletedAtUtc = "2026-04-26T21:00:00.0000000Z"
+            }));
+
+            var flattenJournalDoc = RunSummaryBuilder.Build(
+                flattenJournalRoot,
+                "flatten-journal-summary-test",
+                DateTimeOffset.Parse("2026-04-26T18:00:00+00:00"),
+                ExecutionMode.SIM,
+                new[] { "MNG" },
+                new ExecutionSummarySnapshot());
+
+            if (flattenJournalDoc.status != "WARN" ||
+                flattenJournalDoc.status_reason != "FLATTEN_OCCURRED" ||
+                flattenJournalDoc.verdict_class != "OPERATOR_REVIEW")
+            {
+                return (false, $"expected completed flatten journal to be WARN/FLATTEN_OCCURRED/OPERATOR_REVIEW, got {flattenJournalDoc.status}/{flattenJournalDoc.status_reason}/{flattenJournalDoc.verdict_class}");
+            }
+            if (!flattenJournalDoc.flags.had_flatten ||
+                flattenJournalDoc.key_counts.flatten_confirmed != 1 ||
+                flattenJournalDoc.key_counts.completed_filled_trade_journals != 1 ||
+                flattenJournalDoc.key_counts.unique_entry_filled_intents != 1)
+            {
+                return (false, "expected completed flatten journal to count as one flatten-confirmed completed trade");
+            }
+
             var journalDir = RobotRunArtifactPaths.StateExecutionJournals(root);
             Directory.CreateDirectory(journalDir);
             File.WriteAllText(Path.Combine(journalDir, "2026-04-13_NG2_open-intent.json"), JsonUtil.Serialize(new ExecutionJournalEntry
@@ -107,22 +180,88 @@ public static class RunSummaryBuilderTests
                 new[] { "M2K" },
                 new ExecutionSummarySnapshot());
 
-            if (staleDoc.status != "WARN" ||
-                staleDoc.status_reason != "DIAGNOSTIC_CONTRADICTION" ||
-                staleDoc.verdict_class != "DIAGNOSTIC_CONTRADICTION")
+            if (staleDoc.status != "OK" ||
+                staleDoc.status_reason != "NORMAL_RUN" ||
+                staleDoc.verdict_class != "GREEN")
             {
-                return (false, $"expected stale ownership to be WARN/DIAGNOSTIC_CONTRADICTION, got {staleDoc.status}/{staleDoc.status_reason}/{staleDoc.verdict_class}");
+                return (false, $"expected stale ownership suppression to keep summary green, got {staleDoc.status}/{staleDoc.status_reason}/{staleDoc.verdict_class}");
             }
             if (staleDoc.key_counts.broker_working_orders_at_shutdown != 0 ||
                 staleDoc.key_counts.stale_ownership_working_orders_suppressed != 2 ||
-                staleDoc.key_counts.diagnostic_contradictions == 0)
+                staleDoc.key_counts.diagnostic_contradictions != 0)
             {
-                return (false, "expected stale ownership working orders to be suppressed and counted as diagnostic contradiction");
+                return (false, "expected stale ownership working orders to be suppressed without diagnostic contradiction");
             }
-            if (staleDoc.flags.had_open_exposure_at_shutdown || !staleDoc.flags.had_diagnostic_contradiction)
-                return (false, "expected stale ownership to avoid unsafe exposure while flagging diagnostic contradiction");
+            if (staleDoc.flags.had_open_exposure_at_shutdown || staleDoc.flags.had_diagnostic_contradiction)
+                return (false, "expected stale ownership suppression to avoid unsafe exposure and diagnostic contradiction");
             if (staleDoc.errors != 0)
-                return (false, $"expected stale diagnostic contradiction to keep hard error count zero, got {staleDoc.errors}");
+                return (false, $"expected stale ownership suppression to keep hard error count zero, got {staleDoc.errors}");
+
+            var staleTerminalRoot = Path.Combine(root, "stale_ownership_terminal_orders_summary");
+            Directory.CreateDirectory(staleTerminalRoot);
+            File.WriteAllText(Path.Combine(staleTerminalRoot, RunRootArtifacts.KeyEventsFileName), "");
+            var staleTerminalSnapshotDir = RobotRunArtifactPaths.EventsOwnershipSnapshotsTradingDate(staleTerminalRoot, "2026-04-14");
+            Directory.CreateDirectory(staleTerminalSnapshotDir);
+            File.WriteAllText(Path.Combine(staleTerminalSnapshotDir, "ownership_snapshots.jsonl"),
+                "{\"EmittedUtc\":\"2026-04-30T00:20:36.3247835+00:00\",\"Instruments\":[{\"Instrument\":\"M2K\",\"BrokerPositionQty\":0,\"BrokerWorkingOrderCount\":2,\"JournalOpenQty\":0,\"ActiveSlotCount\":0,\"OrphanSlotCount\":0,\"SnapshotSequence\":38,\"SnapshotUtc\":\"2026-04-30T00:20:36.3247835+00:00\"}]}" + Environment.NewLine);
+            var staleTerminalLogDir = Path.Combine(staleTerminalRoot, "logs", "robot");
+            Directory.CreateDirectory(staleTerminalLogDir);
+            File.WriteAllLines(Path.Combine(staleTerminalLogDir, "robot_M2K.jsonl"), new[]
+            {
+                "{\"ts_utc\":\"2026-04-30T00:21:04.2337276+00:00\",\"level\":\"INFO\",\"instrument\":\"M2K\",\"event\":\"ORDER_REGISTRY_LIFECYCLE\",\"data\":{\"broker_order_id\":\"2a86feb7c7664646b86272b88f6254be\",\"intent_id\":\"5c046e4f194fbd2c\",\"previous_state\":\"WORKING\",\"new_state\":\"CANCELED\",\"ownership_status\":\"TERMINAL\"}}",
+                "{\"ts_utc\":\"2026-04-30T00:21:04.2728667+00:00\",\"level\":\"INFO\",\"instrument\":\"M2K\",\"event\":\"ORDER_REGISTRY_LIFECYCLE\",\"data\":{\"broker_order_id\":\"a341669e74174e489dc87977b56415b6\",\"intent_id\":\"312eb00c98d0599b\",\"previous_state\":\"WORKING\",\"new_state\":\"CANCELED\",\"ownership_status\":\"TERMINAL\"}}"
+            });
+
+            var staleTerminalDoc = RunSummaryBuilder.Build(
+                staleTerminalRoot,
+                "stale-ownership-terminal-orders-summary-test",
+                DateTimeOffset.Parse("2026-04-12T22:01:00+00:00"),
+                ExecutionMode.SIM,
+                new[] { "M2K" },
+                new ExecutionSummarySnapshot());
+
+            if (staleTerminalDoc.status != "OK" ||
+                staleTerminalDoc.status_reason != "NORMAL_RUN" ||
+                staleTerminalDoc.verdict_class != "GREEN" ||
+                staleTerminalDoc.key_counts.broker_working_orders_at_shutdown != 0 ||
+                staleTerminalDoc.key_counts.stale_ownership_working_orders_suppressed != 2 ||
+                staleTerminalDoc.key_counts.diagnostic_contradictions != 0 ||
+                staleTerminalDoc.flags.had_open_exposure_at_shutdown ||
+                staleTerminalDoc.flags.had_diagnostic_contradiction)
+            {
+                return (false, "expected terminal order evidence to suppress stale ownership working orders without warning or unsafe exposure");
+            }
+
+            var staleCohortRoot = Path.Combine(root, "stale_ownership_final_cohort_summary");
+            Directory.CreateDirectory(staleCohortRoot);
+            File.WriteAllText(Path.Combine(staleCohortRoot, RunRootArtifacts.KeyEventsFileName), "");
+            var staleCohortSnapshotDir = RobotRunArtifactPaths.EventsOwnershipSnapshotsTradingDate(staleCohortRoot, "2026-04-14");
+            Directory.CreateDirectory(staleCohortSnapshotDir);
+            File.WriteAllLines(Path.Combine(staleCohortSnapshotDir, "ownership_snapshots.jsonl"), new[]
+            {
+                "{\"EmittedUtc\":\"2026-04-30T02:27:37.0843102+00:00\",\"Instruments\":[{\"Instrument\":\"M2K\",\"BrokerPositionQty\":0,\"BrokerWorkingOrderCount\":2,\"JournalOpenQty\":0,\"ActiveSlotCount\":0,\"OrphanSlotCount\":0,\"SnapshotSequence\":38,\"SnapshotUtc\":\"2026-04-30T02:27:37.0843102+00:00\"}]}",
+                "{\"EmittedUtc\":\"2026-04-30T03:11:38.3839950+00:00\",\"Instruments\":[{\"Instrument\":\"MYM\",\"BrokerPositionQty\":0,\"BrokerWorkingOrderCount\":0,\"JournalOpenQty\":0,\"ActiveSlotCount\":0,\"OrphanSlotCount\":0,\"SnapshotSequence\":133,\"SnapshotUtc\":\"2026-04-30T03:11:38.3839950+00:00\"}]}"
+            });
+
+            var staleCohortDoc = RunSummaryBuilder.Build(
+                staleCohortRoot,
+                "stale-ownership-final-cohort-summary-test",
+                DateTimeOffset.Parse("2026-04-12T22:01:00+00:00"),
+                ExecutionMode.SIM,
+                new[] { "M2K", "MYM" },
+                new ExecutionSummarySnapshot());
+
+            if (staleCohortDoc.status != "OK" ||
+                staleCohortDoc.status_reason != "NORMAL_RUN" ||
+                staleCohortDoc.verdict_class != "GREEN" ||
+                staleCohortDoc.key_counts.broker_working_orders_at_shutdown != 0 ||
+                staleCohortDoc.key_counts.stale_ownership_working_orders_suppressed != 2 ||
+                staleCohortDoc.key_counts.diagnostic_contradictions != 0 ||
+                staleCohortDoc.flags.had_open_exposure_at_shutdown ||
+                staleCohortDoc.flags.had_diagnostic_contradiction)
+            {
+                return (false, "expected stale ownership outside final snapshot cohort to be suppressed without warning or unsafe exposure");
+            }
 
             var incompleteRoot = Path.Combine(root, "incomplete_stream_summary");
             Directory.CreateDirectory(incompleteRoot);
@@ -180,12 +319,53 @@ public static class RunSummaryBuilderTests
                 new[] { "MGC" },
                 new ExecutionSummarySnapshot());
 
-            if (protectiveDoc.status != "FAIL" || protectiveDoc.status_reason != "PROTECTIVE_FAILED")
-                return (false, $"expected active protective journal failure to fail summary, got {protectiveDoc.status}/{protectiveDoc.status_reason}");
+            if (protectiveDoc.status != "FAIL" || protectiveDoc.status_reason != "OPEN_EXPOSURE_AT_SHUTDOWN")
+                return (false, $"expected active protective journal failure with open exposure to fail summary as open exposure, got {protectiveDoc.status}/{protectiveDoc.status_reason}");
             if (protectiveDoc.key_counts.protective_failed != 1 || !protectiveDoc.flags.had_protective_failure)
                 return (false, "expected protective failure count and flag from active journal");
             if (protectiveDoc.errors != 2)
                 return (false, $"expected two summary errors for protective failure plus open exposure, got {protectiveDoc.errors}");
+
+            var recoveredProtectiveRoot = Path.Combine(root, "recovered_protective_failure_summary");
+            Directory.CreateDirectory(recoveredProtectiveRoot);
+            File.WriteAllText(Path.Combine(recoveredProtectiveRoot, RunRootArtifacts.KeyEventsFileName), "");
+            var recoveredProtectiveJournalDir = RobotRunArtifactPaths.StateExecutionJournals(recoveredProtectiveRoot);
+            Directory.CreateDirectory(recoveredProtectiveJournalDir);
+            File.WriteAllText(Path.Combine(recoveredProtectiveJournalDir, "2026-04-13_CL2-protective-recovered.json"), JsonUtil.Serialize(new ExecutionJournalEntry
+            {
+                IntentId = "protective-recovered",
+                TradingDate = "2026-04-13",
+                Stream = "CL2",
+                Instrument = "MCL",
+                EntrySubmitted = true,
+                EntryFilled = true,
+                EntryFilledQuantityTotal = 2,
+                ExitFilledQuantityTotal = 2,
+                TradeCompleted = true,
+                CompletionReason = "TARGET",
+                Rejected = false,
+                ProtectiveRejectedAt = "2026-04-26T21:00:04.0000000+00:00",
+                ProtectiveRejectionReason = "STOP_SUBMIT_FAILED: Object reference not set to an instance of an object.",
+                ProtectiveRejectionOrderType = "STOP",
+                Direction = "Long"
+            }));
+
+            var recoveredProtectiveDoc = RunSummaryBuilder.Build(
+                recoveredProtectiveRoot,
+                "recovered-protective-summary-test",
+                DateTimeOffset.Parse("2026-04-26T18:00:00+00:00"),
+                ExecutionMode.SIM,
+                new[] { "MCL" },
+                new ExecutionSummarySnapshot());
+
+            if (recoveredProtectiveDoc.status != "FAIL" || recoveredProtectiveDoc.status_reason != "PROTECTIVE_FAILED")
+                return (false, $"expected recovered protective rejection to remain visible as PROTECTIVE_FAILED, got {recoveredProtectiveDoc.status}/{recoveredProtectiveDoc.status_reason}");
+            if (recoveredProtectiveDoc.key_counts.protective_failed != 1 ||
+                recoveredProtectiveDoc.flags.had_open_exposure_at_shutdown ||
+                !recoveredProtectiveDoc.flags.had_protective_failure)
+            {
+                return (false, "expected recovered protective failure to count without open shutdown exposure");
+            }
 
             var badRoot = Path.Combine(root, "bad_summary");
             Directory.CreateDirectory(badRoot);
@@ -250,6 +430,170 @@ public static class RunSummaryBuilderTests
                 return (false, $"expected summary errors to include log error + log critical + completed rejected journal, got {badDoc.errors}");
             if (!badDoc.flags.had_completed_rejected_journal || !badDoc.flags.had_robot_log_error)
                 return (false, "expected completed rejected journal and robot log error flags");
+
+            var dailyOnlyRoot = Path.Combine(root, "daily_only_critical_summary");
+            Directory.CreateDirectory(dailyOnlyRoot);
+            File.WriteAllText(Path.Combine(dailyOnlyRoot, RunRootArtifacts.KeyEventsFileName), "");
+            var dailyOnlyLogDir = Path.Combine(dailyOnlyRoot, "logs", "robot");
+            Directory.CreateDirectory(dailyOnlyLogDir);
+            File.WriteAllText(Path.Combine(dailyOnlyLogDir, "daily_20260501.md"),
+                "# Robot Daily Log Summary (20260501)" + Environment.NewLine +
+                "- errors: 1" + Environment.NewLine +
+                "- latest_error: 2026-05-01T22:59:44.6307820+00:00 | MNG | PROTECTIVE_MISSING_STOP | PROTECTIVE_MISSING_STOP" + Environment.NewLine);
+
+            var dailyOnlyDoc = RunSummaryBuilder.Build(
+                dailyOnlyRoot,
+                "daily-only-critical-summary-test",
+                DateTimeOffset.Parse("2026-05-01T22:00:00+00:00"),
+                ExecutionMode.SIM,
+                new[] { "MNG" },
+                new ExecutionSummarySnapshot());
+
+            if (dailyOnlyDoc.status != "FAIL" ||
+                dailyOnlyDoc.status_reason != "ROBOT_LOG_CRITICAL" ||
+                dailyOnlyDoc.key_counts.robot_log_critical != 1 ||
+                dailyOnlyDoc.key_counts.robot_log_hard_critical != 1)
+            {
+                return (false, "expected daily summary critical fallback to fail summary; got " +
+                    $"{dailyOnlyDoc.status}/{dailyOnlyDoc.status_reason}, " +
+                    $"robot_log_critical={dailyOnlyDoc.key_counts.robot_log_critical}, " +
+                    $"robot_log_hard_critical={dailyOnlyDoc.key_counts.robot_log_hard_critical}");
+            }
+
+            var normalTerminatedRoot = Path.Combine(root, "normal_strategy_terminated_summary");
+            Directory.CreateDirectory(normalTerminatedRoot);
+            File.WriteAllText(Path.Combine(normalTerminatedRoot, RunRootArtifacts.KeyEventsFileName), "");
+            var normalTerminatedLogDir = Path.Combine(normalTerminatedRoot, "logs", "robot");
+            Directory.CreateDirectory(normalTerminatedLogDir);
+            File.WriteAllText(Path.Combine(normalTerminatedLogDir, "robot_ENGINE.jsonl"),
+                "{\"ts_utc\":\"2026-04-29T11:48:00.0000000+00:00\",\"level\":\"INFO\",\"event\":\"STRATEGY_TERMINATED_BY_NINJATRADER\",\"message\":\"STRATEGY_TERMINATED_BY_NINJATRADER\",\"data\":{\"termination_classification\":\"STATE_TERMINATED\",\"platform_disable_signal\":false}}" + Environment.NewLine);
+
+            var normalTerminatedDoc = RunSummaryBuilder.Build(
+                normalTerminatedRoot,
+                "normal-strategy-terminated-summary-test",
+                DateTimeOffset.Parse("2026-04-29T11:40:00+00:00"),
+                ExecutionMode.SIM,
+                new[] { "MYM" },
+                new ExecutionSummarySnapshot());
+
+            if (normalTerminatedDoc.status != "OK" ||
+                normalTerminatedDoc.status_reason != "NORMAL_RUN" ||
+                normalTerminatedDoc.verdict_class != "GREEN")
+            {
+                return (false, $"expected normal State.Terminated lifecycle to stay green, got {normalTerminatedDoc.status}/{normalTerminatedDoc.status_reason}/{normalTerminatedDoc.verdict_class}");
+            }
+            if (normalTerminatedDoc.key_counts.strategy_disabled_events != 0 ||
+                normalTerminatedDoc.flags.had_platform_disable_signal ||
+                normalTerminatedDoc.flags.had_crash_or_freeze_signal)
+            {
+                return (false, "expected normal State.Terminated lifecycle not to count as platform disable/crash signal");
+            }
+
+            var platformRoot = Path.Combine(root, "platform_disable_summary");
+            Directory.CreateDirectory(platformRoot);
+            File.WriteAllText(Path.Combine(platformRoot, RunRootArtifacts.KeyEventsFileName), "");
+            var platformLogDir = Path.Combine(platformRoot, "logs", "robot");
+            Directory.CreateDirectory(platformLogDir);
+            File.WriteAllLines(Path.Combine(platformLogDir, "robot_ENGINE.jsonl"), new[]
+            {
+                "{\"ts_utc\":\"2026-04-29T11:47:00.0000000+00:00\",\"level\":\"WARN\",\"event\":\"ENGINE_PLAYBACK_STALL_QUIESCENCE_DEFERRED_IEA_WORK\",\"message\":\"ENGINE_PLAYBACK_STALL_QUIESCENCE_DEFERRED_IEA_WORK\",\"data\":{\"iea_pending_work\":7,\"iea_pending_instruments\":\"MYM:7\"}}",
+                "{\"ts_utc\":\"2026-04-29T11:47:31.0000000+00:00\",\"level\":\"WARN\",\"event\":\"ENGINE_PLAYBACK_STALL_QUIESCENCE_STALE_IEA_WORK_RELEASED\",\"message\":\"ENGINE_PLAYBACK_STALL_QUIESCENCE_STALE_IEA_WORK_RELEASED\",\"data\":{\"iea_pending_work\":7,\"iea_pending_instruments\":\"MYM:7\"}}",
+                "{\"ts_utc\":\"2026-04-29T11:48:00.0000000+00:00\",\"level\":\"WARN\",\"event\":\"STRATEGY_DISABLED_BY_NINJATRADER\",\"message\":\"STRATEGY_DISABLED_BY_NINJATRADER\",\"data\":{\"reason\":\"Lost price connection\"}}"
+            });
+
+            var platformDoc = RunSummaryBuilder.Build(
+                platformRoot,
+                "platform-disable-summary-test",
+                DateTimeOffset.Parse("2026-04-29T11:40:00+00:00"),
+                ExecutionMode.SIM,
+                new[] { "MYM" },
+                new ExecutionSummarySnapshot());
+
+            if (platformDoc.status != "FAIL" ||
+                platformDoc.status_reason != "CRASH_OR_FREEZE_SIGNAL" ||
+                platformDoc.verdict_class != "CRASH_OR_FREEZE")
+            {
+                return (false, $"expected platform disable/stall to be FAIL/CRASH_OR_FREEZE_SIGNAL/CRASH_OR_FREEZE, got {platformDoc.status}/{platformDoc.status_reason}/{platformDoc.verdict_class}");
+            }
+            if (platformDoc.key_counts.playback_stall_warnings != 2 ||
+                platformDoc.key_counts.strategy_disabled_events != 1 ||
+                !platformDoc.flags.had_crash_or_freeze_signal ||
+                !platformDoc.flags.had_platform_disable_signal)
+            {
+                return (false, "expected platform disable/stall counters and flags");
+            }
+            if (platformDoc.recommended_action != "STOP" || platformDoc.confidence != "HIGH")
+                return (false, $"expected STOP/HIGH for platform disable/stall, got {platformDoc.recommended_action}/{platformDoc.confidence}");
+
+            var shutdownSignalRoot = Path.Combine(root, "playback_shutdown_signal_summary");
+            Directory.CreateDirectory(shutdownSignalRoot);
+            File.WriteAllText(Path.Combine(shutdownSignalRoot, RunRootArtifacts.KeyEventsFileName), "");
+            File.WriteAllText(Path.Combine(shutdownSignalRoot, RunRootArtifacts.RunShutdownSignalFileName),
+                "{\"ts_utc\":\"2026-04-29T19:15:31.3617783+00:00\",\"reason\":\"playback_stall_live_exposure_timeout\",\"source\":\"playback_stall_quiesce\"}");
+
+            var shutdownSignalDoc = RunSummaryBuilder.Build(
+                shutdownSignalRoot,
+                "playback-shutdown-signal-summary-test",
+                DateTimeOffset.Parse("2026-04-29T19:10:00+00:00"),
+                ExecutionMode.SIM,
+                new[] { "MNG" },
+                new ExecutionSummarySnapshot());
+
+            if (shutdownSignalDoc.status != "FAIL" ||
+                shutdownSignalDoc.status_reason != "CRASH_OR_FREEZE_SIGNAL" ||
+                shutdownSignalDoc.verdict_class != "CRASH_OR_FREEZE")
+            {
+                return (false, $"expected durable playback shutdown signal to be FAIL/CRASH_OR_FREEZE_SIGNAL/CRASH_OR_FREEZE, got {shutdownSignalDoc.status}/{shutdownSignalDoc.status_reason}/{shutdownSignalDoc.verdict_class}");
+            }
+            if (shutdownSignalDoc.key_counts.playback_stall_warnings != 1 ||
+                !shutdownSignalDoc.flags.had_crash_or_freeze_signal)
+            {
+                return (false, "expected durable playback shutdown signal to set playback stall count and crash/freeze flag");
+            }
+
+            var platformExposureRoot = Path.Combine(root, "platform_disable_open_exposure_summary");
+            Directory.CreateDirectory(platformExposureRoot);
+            File.WriteAllText(Path.Combine(platformExposureRoot, RunRootArtifacts.KeyEventsFileName), "");
+            var platformExposureLogDir = Path.Combine(platformExposureRoot, "logs", "robot");
+            Directory.CreateDirectory(platformExposureLogDir);
+            File.WriteAllText(Path.Combine(platformExposureLogDir, "robot_ENGINE.jsonl"),
+                "{\"ts_utc\":\"2026-04-29T11:48:00.0000000+00:00\",\"level\":\"WARN\",\"event\":\"STRATEGY_DISABLED_BY_NINJATRADER\",\"message\":\"STRATEGY_DISABLED_BY_NINJATRADER\",\"data\":{\"reason\":\"Lost price connection\"}}" + Environment.NewLine);
+            var platformExposureJournalDir = RobotRunArtifactPaths.StateExecutionJournals(platformExposureRoot);
+            Directory.CreateDirectory(platformExposureJournalDir);
+            File.WriteAllText(Path.Combine(platformExposureJournalDir, "2026-04-13_YM2_open-after-disable.json"), JsonUtil.Serialize(new ExecutionJournalEntry
+            {
+                IntentId = "open-after-disable",
+                TradingDate = "2026-04-13",
+                Stream = "YM2",
+                Instrument = "MYM",
+                EntrySubmitted = true,
+                EntryFilled = true,
+                EntryFilledQuantityTotal = 2,
+                ExitFilledQuantityTotal = 0,
+                TradeCompleted = false,
+                Direction = "Long"
+            }));
+
+            var platformExposureDoc = RunSummaryBuilder.Build(
+                platformExposureRoot,
+                "platform-disable-open-exposure-summary-test",
+                DateTimeOffset.Parse("2026-04-29T11:40:00+00:00"),
+                ExecutionMode.SIM,
+                new[] { "MYM" },
+                new ExecutionSummarySnapshot());
+
+            if (platformExposureDoc.status != "FAIL" ||
+                platformExposureDoc.status_reason != "OPEN_EXPOSURE_AT_SHUTDOWN" ||
+                platformExposureDoc.verdict_class != "UNSAFE_EXPOSURE")
+            {
+                return (false, $"expected open exposure to outrank platform disable, got {platformExposureDoc.status}/{platformExposureDoc.status_reason}/{platformExposureDoc.verdict_class}");
+            }
+            if (!platformExposureDoc.flags.had_open_exposure_at_shutdown ||
+                !platformExposureDoc.flags.had_crash_or_freeze_signal ||
+                !platformExposureDoc.flags.had_platform_disable_signal)
+            {
+                return (false, "expected open exposure and platform disable flags together");
+            }
 
             return (true, null);
         }

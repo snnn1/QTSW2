@@ -42,6 +42,8 @@ public static class RunSummaryBuilder
         TryParseOpenExposureAtShutdown(persistenceBase, agg);
         TryParseIncompleteStreamJournalsAtShutdown(persistenceBase, agg);
         TryParseRobotLogSeverityCounts(persistenceBase, agg);
+        TryParseDailyRobotLogSeverityCounts(persistenceBase, agg);
+        TryParseRunShutdownSignal(persistenceBase, agg);
 
         ApplyTertiaryExecutionSummary(execSnap, agg, keyEventsPresent);
 
@@ -113,7 +115,7 @@ public static class RunSummaryBuilder
                 robot_log_errors = agg.RobotLogErrorCount,
                 robot_log_critical = agg.RobotLogCriticalCount,
                 robot_log_hard_critical = agg.HardRobotLogCriticalCount,
-                diagnostic_contradictions = agg.DiagnosticContradictionCount,
+                diagnostic_contradictions = agg.EffectiveDiagnosticContradictionCount,
                 stale_ownership_working_orders_suppressed = agg.StaleOwnershipWorkingOrdersSuppressed,
                 playback_stall_warnings = agg.PlaybackStallWarningCount,
                 strategy_disabled_events = agg.StrategyDisabledCount,
@@ -160,6 +162,7 @@ public static class RunSummaryBuilder
         public int HardRobotLogCriticalCount;
         public int DiagnosticContradictionCount;
         public int PlaybackStallWarningCount;
+        public int PlaybackForceFinalizeCount;
         public int StrategyDisabledCount;
         public int ExecutionCommandStalledCount;
         public int StaleOwnershipWorkingOrdersSuppressed;
@@ -185,9 +188,12 @@ public static class RunSummaryBuilder
         public bool TertiaryEntryReject;
         public bool TertiaryExecutionBlock;
         public int UniqueEntryFilledIntentCount => EntryFilledIntentIds.Count;
-        public bool HasDiagnosticContradiction => DiagnosticContradictionCount > 0 ||
-                                                  StaleOwnershipWorkingOrdersSuppressed > 0;
-        public bool HasCrashOrFreezeSignal => ExecutionCommandStalledCount > 0;
+        public int EffectiveDiagnosticContradictionCount =>
+            RobotLogCriticalCount > 0 ? DiagnosticContradictionCount : 0;
+        public bool HasDiagnosticContradiction => EffectiveDiagnosticContradictionCount > 0;
+        public bool HasCrashOrFreezeSignal => ExecutionCommandStalledCount > 0 ||
+                                              StrategyDisabledCount > 0 ||
+                                              PlaybackForceFinalizeCount > 0;
 
         public bool HasMismatchBlocks => MismatchEnter > 0 || MismatchExit > 0;
         public bool HasLongRecoveredMismatch => MaxResolvedMismatchDurationMs > RecoveredMismatchWarnThresholdMs;
@@ -249,15 +255,16 @@ public static class RunSummaryBuilder
 
     private static string PickStatusReason(KeyEventAggregate agg)
     {
+        if (agg.HasOpenExposureAtShutdown) return "OPEN_EXPOSURE_AT_SHUTDOWN";
         if (agg.RobotLogErrorCount > 0) return "ROBOT_LOG_ERROR";
         if (agg.HardRobotLogCriticalCount > 0) return "ROBOT_LOG_CRITICAL";
-        if (agg.HasCrashOrFreezeSignal) return "CRASH_OR_FREEZE_SIGNAL";
         if (agg.CompletedRejectedJournalCount > 0) return "COMPLETED_REJECTED_JOURNAL";
         if (agg.IncompleteStreamJournalCount > 0) return "STREAM_INCOMPLETE_AT_SHUTDOWN";
         if (agg.CommitPersistFailed > 0) return "COMMIT_PERSIST_FAILED";
         if (agg.ProtectiveFailed > 0) return "PROTECTIVE_FAILED";
         if (agg.EntryRejected > 0 || agg.TertiaryEntryReject) return "ENTRY_REJECTED";
-        if (agg.HasOpenExposureAtShutdown) return "OPEN_EXPOSURE_AT_SHUTDOWN";
+        if (agg.HasCrashOrFreezeSignal) return "CRASH_OR_FREEZE_SIGNAL";
+        if (agg.StrategyDisabledCount > 0) return "PLATFORM_DISABLED_SIGNAL";
         foreach (var kv in agg.MismatchDepth)
             if (kv.Value > 0) return "MISMATCH_BLOCK_ACTIVE_AT_END";
         if (agg.RecoveryStarted > agg.RecoveryComplete) return "RECOVERY_INCOMPLETE";
@@ -278,10 +285,10 @@ public static class RunSummaryBuilder
 
     private static string PickVerdictClass(KeyEventAggregate agg, string status, string reason)
     {
-        if (reason == "CRASH_OR_FREEZE_SIGNAL")
-            return "CRASH_OR_FREEZE";
         if (agg.HasOpenExposureAtShutdown)
             return "UNSAFE_EXPOSURE";
+        if (reason == "CRASH_OR_FREEZE_SIGNAL")
+            return "CRASH_OR_FREEZE";
         if (agg.IncompleteStreamJournalCount > 0)
             return "INCOMPLETE_STREAM";
         if (agg.HasDiagnosticContradiction)
@@ -488,6 +495,12 @@ public static class RunSummaryBuilder
                     if (r == null) continue;
                     var inst = NormInst(r.Instrument);
                     if (string.IsNullOrEmpty(inst)) continue;
+                    if (IsBenignBrokerFlatVerification(r) && !agg.FlattenActivity)
+                    {
+                        ClearFlattenPending(agg, inst);
+                        continue;
+                    }
+
                     if (!keyEventsPresent && MarkFlattenConfirmedOnce(agg, inst, null))
                         agg.FlattenConfirmed++;
                     agg.FlattenActivity = true;
@@ -503,6 +516,12 @@ public static class RunSummaryBuilder
         {
             // best-effort
         }
+    }
+
+    private static bool IsBenignBrokerFlatVerification(FlattenCompletionJsonlLine line)
+    {
+        return line.ReconciliationAbsRemaining == 0 &&
+               string.Equals(line.Proof, "BROKER_CANONICAL_RECONCILIATION_ABS_ZERO", StringComparison.OrdinalIgnoreCase);
     }
 
     private static void TryParseOpenExposureAtShutdown(string persistenceBase, KeyEventAggregate agg)
@@ -599,6 +618,82 @@ public static class RunSummaryBuilder
         }
     }
 
+    private static void TryParseDailyRobotLogSeverityCounts(string persistenceBase, KeyEventAggregate agg)
+    {
+        var dir = Path.Combine(persistenceBase ?? "", "logs", "robot");
+        if (!Directory.Exists(dir)) return;
+
+        try
+        {
+            var dailyPath = Directory.EnumerateFiles(dir, "daily_*.md", SearchOption.TopDirectoryOnly)
+                .OrderByDescending(File.GetLastWriteTimeUtc)
+                .FirstOrDefault();
+            if (string.IsNullOrWhiteSpace(dailyPath))
+                return;
+
+            int? dailyErrors = null;
+            string latestErrorEvent = "";
+            foreach (var line in File.ReadLines(dailyPath))
+            {
+                dailyErrors ??= TryParseDailySummaryInt(line, "errors");
+                var latestEvent = TryParseDailyLatestErrorEvent(line);
+                if (!string.IsNullOrWhiteSpace(latestEvent))
+                    latestErrorEvent = latestEvent;
+            }
+
+            var observedErrors = agg.RobotLogErrorCount + agg.RobotLogCriticalCount;
+            if (!dailyErrors.HasValue || dailyErrors.Value <= observedErrors)
+                return;
+
+            var missing = dailyErrors.Value - observedErrors;
+            var level = RobotEventTypes.GetLevel(latestErrorEvent);
+            if (level.Equals("CRITICAL", StringComparison.OrdinalIgnoreCase))
+            {
+                agg.RobotLogCriticalCount += missing;
+                if (IsDiagnosticContradictionEvent(latestErrorEvent))
+                    agg.DiagnosticContradictionCount += missing;
+                else
+                    agg.HardRobotLogCriticalCount += missing;
+            }
+            else
+            {
+                agg.RobotLogErrorCount += missing;
+            }
+        }
+        catch
+        {
+            // Daily markdown is advisory; JSONL remains primary.
+        }
+    }
+
+    private static int? TryParseDailySummaryInt(string line, string key)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+            return null;
+
+        var prefix = "- " + key + ":";
+        var trimmed = line.Trim();
+        if (!trimmed.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        var value = trimmed.Substring(prefix.Length).Trim();
+        return int.TryParse(value, out var parsed) ? parsed : null;
+    }
+
+    private static string TryParseDailyLatestErrorEvent(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+            return "";
+
+        var prefix = "- latest_error:";
+        var trimmed = line.Trim();
+        if (!trimmed.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            return "";
+
+        var parts = trimmed.Substring(prefix.Length).Split('|');
+        return parts.Length >= 3 ? parts[2].Trim() : "";
+    }
+
     private static void TrackRuntimeSignalEvent(string eventType, KeyEventAggregate agg)
     {
         if (string.IsNullOrWhiteSpace(eventType))
@@ -608,7 +703,14 @@ public static class RunSummaryBuilder
         {
             case "ENGINE_TICK_STALL_PLAYBACK":
             case "ENGINE_PLAYBACK_STALL_QUIESCENCE_DEFERRED_LIVE_EXPOSURE":
+            case "ENGINE_PLAYBACK_STALL_QUIESCENCE_DEFERRED_IEA_WORK":
+            case "ENGINE_PLAYBACK_STALL_QUIESCENCE_STALE_IEA_WORK_RELEASED":
                 agg.PlaybackStallWarningCount++;
+                break;
+            case "ENGINE_PLAYBACK_STALL_QUIESCENCE_FORCE_FINALIZE":
+            case "ENGINE_PLAYBACK_STALL_QUIESCENCE_FORCE_FINALIZE_LIVE_EXPOSURE":
+                agg.PlaybackStallWarningCount++;
+                agg.PlaybackForceFinalizeCount++;
                 break;
             case "EXECUTION_COMMAND_STALLED":
                 agg.ExecutionCommandStalledCount++;
@@ -617,6 +719,55 @@ public static class RunSummaryBuilder
                 agg.StrategyDisabledCount++;
                 break;
         }
+    }
+
+    private static void TryParseRunShutdownSignal(string persistenceBase, KeyEventAggregate agg)
+    {
+        try
+        {
+            var path = Path.Combine(persistenceBase ?? "", RunRootArtifacts.RunShutdownSignalFileName);
+            if (!File.Exists(path)) return;
+
+            var d = JsonUtil.Deserialize<Dictionary<string, object>>(File.ReadAllText(path));
+            if (d == null) return;
+
+            d.TryGetValue("reason", out var reasonObj);
+            d.TryGetValue("source", out var sourceObj);
+            var reason = reasonObj?.ToString();
+            var source = sourceObj?.ToString();
+
+            if (!IsCrashOrFreezeShutdownSignal(reason, source))
+                return;
+
+            if (agg.PlaybackForceFinalizeCount <= 0)
+                agg.PlaybackStallWarningCount++;
+            agg.PlaybackForceFinalizeCount = Math.Max(agg.PlaybackForceFinalizeCount, 1);
+        }
+        catch
+        {
+            // best-effort summary signal
+        }
+    }
+
+    private static bool IsCrashOrFreezeShutdownSignal(string? reason, string? source)
+    {
+        var r = reason?.Trim() ?? "";
+        var s = source?.Trim() ?? "";
+        if (string.IsNullOrWhiteSpace(r) && string.IsNullOrWhiteSpace(s))
+            return false;
+
+        return ContainsCrashOrFreezeToken(r) || ContainsCrashOrFreezeToken(s);
+    }
+
+    private static bool ContainsCrashOrFreezeToken(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+
+        return value.IndexOf("stall", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               value.IndexOf("timeout", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               value.IndexOf("freeze", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               value.IndexOf("crash", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     private static bool IsDiagnosticContradictionEvent(string eventType)
@@ -653,9 +804,22 @@ public static class RunSummaryBuilder
 
                     if (entry.EntryFilled && entry.TradeCompleted)
                     {
+                        if (!string.IsNullOrWhiteSpace(entry.IntentId))
+                            agg.EntryFilledIntentIds.Add(entry.IntentId.Trim());
                         agg.CompletedFilledTradeJournalCount++;
                         if (entry.Rejected)
                             agg.CompletedRejectedJournalCount++;
+                        if (IsFlattenCompletedJournal(entry))
+                        {
+                            var inst = NormInst(entry.Instrument);
+                            var completedAtUtc = TryParseDateTimeOffset(entry.CompletedAtUtc) ??
+                                                 TryParseDateTimeOffset(entry.ExitFilledObservedAtUtc) ??
+                                                 TryParseDateTimeOffset(entry.ExitFilledAtUtc);
+                            if (MarkFlattenConfirmedOnce(agg, inst, completedAtUtc))
+                                agg.FlattenConfirmed++;
+                            agg.FlattenActivity = true;
+                            ClearFlattenPending(agg, inst);
+                        }
                     }
 
                     if (entry.TradeCompleted) continue;
@@ -747,16 +911,30 @@ public static class RunSummaryBuilder
             // best-effort
         }
 
+        var shutdownReferenceUtc = shutdownUtc ??
+                                   latest.Values
+                                       .Where(x => x.TimestampUtc != DateTimeOffset.MinValue)
+                                       .Select(x => (DateTimeOffset?)x.TimestampUtc)
+                                       .DefaultIfEmpty(null)
+                                       .Max();
+
         foreach (var snapshot in latest.Values)
         {
             var inst = snapshot.Instrument;
             var workingOrders = Math.Max(0, inst.BrokerWorkingOrderCount);
+            var instrumentKey = NormInst(inst.Instrument);
             if (workingOrders > 0 &&
-                registryEvidence.TryGetValue(snapshot.Instrument.Instrument, out var evidence) &&
-                ShouldSuppressStaleOwnershipWorkingOrders(snapshot, evidence))
+                ShouldSuppressStaleShutdownWorkingOrders(snapshot, shutdownReferenceUtc, workingOrders))
             {
                 agg.StaleOwnershipWorkingOrdersSuppressed += workingOrders;
-                agg.DiagnosticContradictionCount++;
+                workingOrders = 0;
+            }
+            else if (workingOrders > 0 &&
+                !string.IsNullOrEmpty(instrumentKey) &&
+                registryEvidence.TryGetValue(instrumentKey, out var evidence) &&
+                ShouldSuppressStaleOwnershipWorkingOrders(snapshot, evidence, workingOrders))
+            {
+                agg.StaleOwnershipWorkingOrdersSuppressed += workingOrders;
                 workingOrders = 0;
             }
 
@@ -768,11 +946,34 @@ public static class RunSummaryBuilder
         }
     }
 
+    private static bool ShouldSuppressStaleShutdownWorkingOrders(
+        LatestOwnershipSnapshot snapshot,
+        DateTimeOffset? shutdownReferenceUtc,
+        int workingOrders)
+    {
+        if (!shutdownReferenceUtc.HasValue ||
+            workingOrders <= 0 ||
+            snapshot.TimestampUtc == DateTimeOffset.MinValue)
+        {
+            return false;
+        }
+
+        if (shutdownReferenceUtc.Value - snapshot.TimestampUtc <= TimeSpan.FromMinutes(5))
+            return false;
+
+        var inst = snapshot.Instrument;
+        return inst.BrokerPositionQty == 0 &&
+               inst.JournalOpenQty == 0 &&
+               inst.ActiveSlotCount == 0 &&
+               inst.OrphanSlotCount == 0;
+    }
+
     private static bool ShouldSuppressStaleOwnershipWorkingOrders(
         LatestOwnershipSnapshot snapshot,
-        OrderRegistryEvidence evidence)
+        OrderRegistryEvidence evidence,
+        int workingOrders)
     {
-        if (evidence.TimestampUtc <= snapshot.TimestampUtc)
+        if (evidence.LatestEvidenceUtc <= snapshot.TimestampUtc)
             return false;
 
         var inst = snapshot.Instrument;
@@ -782,7 +983,15 @@ public static class RunSummaryBuilder
             inst.OrphanSlotCount != 0)
             return false;
 
-        return evidence.ActiveRobotWorkingOrders == 0;
+        if (evidence.HasActiveOrderMetric &&
+            evidence.ActiveOrderMetricUtc > snapshot.TimestampUtc &&
+            evidence.ActiveRobotWorkingOrders == 0)
+        {
+            return true;
+        }
+
+        return evidence.LatestTerminalOrderUtc > snapshot.TimestampUtc &&
+               evidence.TerminalRobotOrderCount >= workingOrders;
     }
 
     private static Dictionary<string, OrderRegistryEvidence> TryParseLatestOrderRegistryEvidence(string persistenceBase)
@@ -804,12 +1013,12 @@ public static class RunSummaryBuilder
                     {
                         var d = JsonUtil.Deserialize<Dictionary<string, object>>(line);
                         if (d == null ||
-                            !d.TryGetValue("event", out var evObj) ||
-                            !string.Equals(evObj?.ToString(), "ORDER_REGISTRY_METRICS", StringComparison.Ordinal))
+                            !d.TryGetValue("event", out var evObj))
                         {
                             continue;
                         }
 
+                        var ev = evObj?.ToString() ?? "";
                         d.TryGetValue("instrument", out var instObj);
                         var inst = NormInst(instObj?.ToString());
                         if (string.IsNullOrEmpty(inst)) continue;
@@ -817,17 +1026,34 @@ public static class RunSummaryBuilder
                         var ts = TryGetTimestampUtc(d);
                         if (!ts.HasValue) continue;
 
-                        var owned = TryParseInt(TryGetDataString(d, "owned_orders_active"));
-                        var adopted = TryParseInt(TryGetDataString(d, "adopted_orders_active"));
-                        var active = Math.Max(0, owned) + Math.Max(0, adopted);
-
-                        if (!result.TryGetValue(inst, out var existing) || ts.Value > existing.TimestampUtc)
+                        if (!result.TryGetValue(inst, out var existing))
                         {
-                            result[inst] = new OrderRegistryEvidence
+                            existing = new OrderRegistryEvidence();
+                            result[inst] = existing;
+                        }
+
+                        existing.LatestEvidenceUtc = Max(existing.LatestEvidenceUtc, ts.Value);
+
+                        if (string.Equals(ev, "ORDER_REGISTRY_METRICS", StringComparison.Ordinal))
+                        {
+                            var owned = TryParseInt(TryGetDataString(d, "owned_orders_active"));
+                            var adopted = TryParseInt(TryGetDataString(d, "adopted_orders_active"));
+                            var active = Math.Max(0, owned) + Math.Max(0, adopted);
+
+                            if (!existing.HasActiveOrderMetric || ts.Value > existing.ActiveOrderMetricUtc)
                             {
-                                TimestampUtc = ts.Value,
-                                ActiveRobotWorkingOrders = active
-                            };
+                                existing.HasActiveOrderMetric = true;
+                                existing.ActiveOrderMetricUtc = ts.Value;
+                                existing.ActiveRobotWorkingOrders = active;
+                            }
+
+                            continue;
+                        }
+
+                        if (TryReadTerminalBrokerOrderId(ev, d, out var brokerOrderId))
+                        {
+                            existing.LatestTerminalOrderUtc = Max(existing.LatestTerminalOrderUtc, ts.Value);
+                            existing.TerminalRobotOrderIds.Add(brokerOrderId);
                         }
                     }
                     catch
@@ -844,6 +1070,52 @@ public static class RunSummaryBuilder
 
         return result;
     }
+
+    private static bool TryReadTerminalBrokerOrderId(
+        string eventType,
+        Dictionary<string, object> d,
+        out string brokerOrderId)
+    {
+        brokerOrderId = "";
+
+        if (string.Equals(eventType, "ORDER_CANCELLED", StringComparison.Ordinal) ||
+            string.Equals(eventType, "ORDER_REJECTED", StringComparison.Ordinal))
+        {
+            brokerOrderId = NormBrokerOrderId(TryGetDataString(d, "broker_order_id"));
+            return !string.IsNullOrEmpty(brokerOrderId);
+        }
+
+        if (!string.Equals(eventType, "ORDER_REGISTRY_LIFECYCLE", StringComparison.Ordinal) &&
+            !string.Equals(eventType, "ORDER_REGISTRY_LIFECYCLE_BROKER_SYNC", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var state = TryGetDataString(d, "new_state") ??
+                    TryGetDataString(d, "target_lifecycle") ??
+                    TryGetDataString(d, "broker_order_state");
+        if (!IsTerminalOrderState(state))
+            return false;
+
+        brokerOrderId = NormBrokerOrderId(TryGetDataString(d, "broker_order_id"));
+        return !string.IsNullOrEmpty(brokerOrderId);
+    }
+
+    private static bool IsTerminalOrderState(string? state)
+    {
+        if (string.IsNullOrWhiteSpace(state)) return false;
+        var s = state.Trim();
+        return s.Equals("CANCELED", StringComparison.OrdinalIgnoreCase) ||
+               s.Equals("CANCELLED", StringComparison.OrdinalIgnoreCase) ||
+               s.Equals("FILLED", StringComparison.OrdinalIgnoreCase) ||
+               s.Equals("REJECTED", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string NormBrokerOrderId(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? "" : value.Trim();
+
+    private static DateTimeOffset Max(DateTimeOffset left, DateTimeOffset right) =>
+        left >= right ? left : right;
 
     private static bool IsNewerOwnershipSnapshot(LatestOwnershipSnapshot candidate, LatestOwnershipSnapshot existing)
     {
@@ -941,12 +1213,12 @@ public static class RunSummaryBuilder
 
     private static bool HasProtectiveFailure(ExecutionJournalEntry entry)
     {
-        if (entry.TradeCompleted)
-            return false;
-
         if (!string.IsNullOrWhiteSpace(entry.ProtectiveRejectedAt) ||
             !string.IsNullOrWhiteSpace(entry.ProtectiveRejectionReason))
             return true;
+
+        if (entry.TradeCompleted)
+            return false;
 
         if (!entry.EntryFilled || string.IsNullOrWhiteSpace(entry.RejectionReason))
             return false;
@@ -958,6 +1230,18 @@ public static class RunSummaryBuilder
                reason.IndexOf("STOP_SUBMIT_FAILED", StringComparison.OrdinalIgnoreCase) >= 0 ||
                reason.IndexOf("TARGET_SUBMIT_FAILED", StringComparison.OrdinalIgnoreCase) >= 0 ||
                reason.IndexOf("STOP_PRICE_VALIDATION_FAILED", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static bool IsFlattenCompletedJournal(ExecutionJournalEntry entry)
+    {
+        return IsFlattenExit(entry.CompletionReason) || IsFlattenExit(entry.ExitOrderType);
+    }
+
+    private static bool IsFlattenExit(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+        return string.Equals(value.Trim(), "FLATTEN", StringComparison.OrdinalIgnoreCase);
     }
 
     private static DateTimeOffset? TryGetTimestampUtc(Dictionary<string, object> d)
@@ -1049,6 +1333,8 @@ public static class RunSummaryBuilder
     private sealed class FlattenCompletionJsonlLine
     {
         public string Instrument { get; set; } = "";
+        public int ReconciliationAbsRemaining { get; set; }
+        public string Proof { get; set; } = "";
     }
 
     private sealed class OwnershipSnapshotJsonlLine
@@ -1078,8 +1364,13 @@ public static class RunSummaryBuilder
 
     private sealed class OrderRegistryEvidence
     {
-        public DateTimeOffset TimestampUtc { get; set; }
+        public DateTimeOffset LatestEvidenceUtc { get; set; }
+        public bool HasActiveOrderMetric { get; set; }
+        public DateTimeOffset ActiveOrderMetricUtc { get; set; }
         public int ActiveRobotWorkingOrders { get; set; }
+        public DateTimeOffset LatestTerminalOrderUtc { get; set; }
+        public HashSet<string> TerminalRobotOrderIds { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public int TerminalRobotOrderCount => TerminalRobotOrderIds.Count;
     }
 
     private sealed class StreamJournalShutdownLine
