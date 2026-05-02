@@ -263,6 +263,37 @@ public static class RunSummaryBuilderTests
                 return (false, "expected stale ownership outside final snapshot cohort to be suppressed without warning or unsafe exposure");
             }
 
+            var finalFlatRoot = Path.Combine(root, "final_flat_ownership_snapshot_summary");
+            Directory.CreateDirectory(finalFlatRoot);
+            File.WriteAllText(Path.Combine(finalFlatRoot, RunRootArtifacts.KeyEventsFileName), "");
+            File.WriteAllText(Path.Combine(finalFlatRoot, RunRootArtifacts.RunShutdownSignalFileName),
+                "{\"ts_utc\":\"2026-05-02T02:49:58.0000000+00:00\",\"reason\":\"engine_stop\",\"source\":\"test\"}");
+            var finalFlatSnapshotDir = RobotRunArtifactPaths.EventsOwnershipSnapshotsTradingDate(finalFlatRoot, "2026-04-14");
+            Directory.CreateDirectory(finalFlatSnapshotDir);
+            File.WriteAllLines(Path.Combine(finalFlatSnapshotDir, "ownership_snapshots.jsonl"), new[]
+            {
+                "{\"EmittedUtc\":\"2026-05-02T02:10:19.5988193+00:00\",\"Instruments\":[{\"Instrument\":\"M2K\",\"BrokerPositionQty\":0,\"BrokerWorkingOrderCount\":2,\"JournalOpenQty\":0,\"ActiveSlotCount\":0,\"OrphanSlotCount\":0,\"SnapshotSequence\":37,\"SnapshotUtc\":\"2026-05-02T02:10:19.5988193+00:00\"}]}",
+                "{\"EmittedUtc\":\"2026-05-02T02:49:53.0374628+00:00\",\"Trigger\":13,\"Instruments\":[{\"Instrument\":\"M2K\",\"BrokerPositionQty\":0,\"BrokerWorkingOrderCount\":0,\"JournalOpenQty\":0,\"ActiveSlotCount\":0,\"OrphanSlotCount\":0,\"SnapshotSequence\":38,\"SnapshotUtc\":\"2026-05-02T02:49:53.0374628+00:00\",\"SnapshotTrigger\":13}]}"
+            });
+
+            var finalFlatDoc = RunSummaryBuilder.Build(
+                finalFlatRoot,
+                "final-flat-ownership-snapshot-summary-test",
+                DateTimeOffset.Parse("2026-04-12T22:01:00+00:00"),
+                ExecutionMode.SIM,
+                new[] { "M2K" },
+                new ExecutionSummarySnapshot());
+
+            if (finalFlatDoc.status != "OK" ||
+                finalFlatDoc.status_reason != "NORMAL_RUN" ||
+                finalFlatDoc.verdict_class != "GREEN" ||
+                finalFlatDoc.key_counts.broker_working_orders_at_shutdown != 0 ||
+                finalFlatDoc.key_counts.stale_ownership_working_orders_suppressed != 0 ||
+                finalFlatDoc.flags.had_open_exposure_at_shutdown)
+            {
+                return (false, "expected final flat ownership snapshot to supersede older working-order snapshot without stale suppression");
+            }
+
             var incompleteRoot = Path.Combine(root, "incomplete_stream_summary");
             Directory.CreateDirectory(incompleteRoot);
             File.WriteAllText(Path.Combine(incompleteRoot, RunRootArtifacts.KeyEventsFileName), "");

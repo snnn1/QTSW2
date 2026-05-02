@@ -1038,6 +1038,8 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
                 () =>
                 {
                     var instruments = new HashSet<string>(GetEngineScopedExecutionInstrumentKeys(), StringComparer.OrdinalIgnoreCase);
+                    if (!string.IsNullOrWhiteSpace(_executionInstrument))
+                        instruments.Add(_executionInstrument.Trim());
                     foreach (var s in _ownershipLedger.SnapshotAll(OwnershipAccountKey))
                     {
                         if (!string.IsNullOrWhiteSpace(s.ExecutionInstrumentKey))
@@ -1107,6 +1109,7 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
         Volatile.Write(ref _playbackStallQuiesceForceFinalizeRequested, 0);
         Volatile.Write(ref _connectivityShutdownStopRequested, 0);
         Volatile.Write(ref _runWideShutdownStopRequested, 0);
+        _robotBuildSignatureEmitted = false;
         if (_isolatedPlaybackPersistence)
             RunRootArtifacts.ClearRunShutdownSignal(_persistenceBase);
         // CRITICAL: Set run_id before any Start-path logs (RebindPersistenceIfNeeded → ApplyOptionalRunIdFromEnvironment refines from env after this)
@@ -1144,6 +1147,7 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
         _reconciliationConvergence = new ReconciliationConvergenceTracker(_log, () => _runId ?? "");
 
         var utcNow = _engineStartUtc;
+        LogEngineBuildSignatureIfNeeded(utcNow, "ENGINE_START");
 
         // Initialize HealthMonitor after run_id is set so any health-monitor logs include run_id.
         InitializeHealthMonitorIfNeeded();
