@@ -106,6 +106,7 @@ public static partial class RobotEventTypes
         ["TIMETABLE_APPLY_ELIGIBILITY_MISSING_CRIT"] = "ERROR",
         ["TIMETABLE_APPLY_ELIGIBILITY_SESSION_MISMATCH_CRIT"] = "ERROR",
         ["TIMETABLE_ENABLED_STREAM_SET"] = "INFO",
+        ["TIMETABLE_APPLY_ANCHOR_FILTERED"] = "INFO",
         ["TIMETABLE_APPLY_PARTIAL_REFUSAL"] = "WARN",
         ["TIMETABLE_PARSING_COMPLETE"] = "INFO",
         ["TIMETABLE_DERIVED"] = "INFO",
@@ -185,6 +186,7 @@ public static partial class RobotEventTypes
         ["PRE_HYDRATION_DEFERRED_EXECUTION_CONTEXT_NOT_READY"] = "INFO",
         ["PRE_HYDRATION_BARS_SKIPPED_STREAM_STATE"] = "DEBUG",
         ["PRE_HYDRATION_BARS_SKIPPED_ACTIVE_STREAM"] = "DEBUG",
+        ["PRE_HYDRATION_NO_BARS_AFTER_FILTER_PLAYBACK_FUTURE_ONLY"] = "INFO",
         ["PRE_HYDRATION_NO_BARS_AFTER_FILTER"] = "WARN",
         ["PRE_HYDRATION_WAITING_FOR_BARSREQUEST"] = "DEBUG",
         ["PRE_HYDRATION_COMPLETE_SET"] = "DEBUG",
@@ -347,6 +349,7 @@ public static partial class RobotEventTypes
         ["ORDER_CREATED_MARKET_OR_LIMIT"] = "INFO",
         ["ORDER_CREATED_VERIFICATION"] = "INFO",
         ["ROBOT_ORDER_UPDATE_REGISTRY_RACE"] = "WARN",
+        ["ROBOT_ORDER_UPDATE_REGISTRY_RACE_INITIALIZED"] = "INFO",
         ["STOP_MARKET_RELATIONSHIP_VALIDATION_UNAVAILABLE"] = "INFO",
         ["OPPOSITE_ENTRY_CANCELLED_DEFENSIVELY"] = "INFO",
         ["OCO_SIBLING_CANCELLED"] = "INFO",
@@ -565,6 +568,8 @@ public static partial class RobotEventTypes
 
         // Journal
         ["JOURNAL_WRITTEN"] = "DEBUG",
+        ["JOURNAL_IO_SLOW"] = "INFO",
+        ["JOURNAL_LOCK_SLOW"] = "INFO",
         ["JOURNAL_LATE_SUBMISSION_OBSERVATION"] = "INFO",
         ["JOURNAL_INSTRUMENT_KEY_MISMATCH"] = "CRITICAL",
         ["INTENT_EXECUTION_INSTRUMENT_MISSING"] = "CRITICAL",
@@ -710,6 +715,7 @@ public static partial class RobotEventTypes
         ["LOG_BACKPRESSURE_DROP"] = "ERROR",
         ["LOG_PIPELINE_METRIC"] = "INFO",
         ["SNAPSHOT_METRICS"] = "INFO",
+        ["OWNERSHIP_EVENT_JOURNAL_WRITE_SLOW"] = "INFO",
         ["LOG_WORKER_LOOP_ERROR"] = "ERROR",
         ["LOG_WRITE_FAILURE"] = "ERROR",
         ["LOG_HEALTH_ERROR"] = "ERROR",
@@ -725,6 +731,7 @@ public static partial class RobotEventTypes
 
         // Account snapshots
         ["ACCOUNT_SNAPSHOT_DRYRUN"] = "DEBUG",
+        ["ACCOUNT_SNAPSHOT_SLOW"] = "INFO",
         ["ACCOUNT_SNAPSHOT_ERROR"] = "ERROR",
         ["ACCOUNT_SNAPSHOT_LIVE_ERROR"] = "ERROR",
         ["ACCOUNT_SNAPSHOT_LIVE_STUB"] = "DEBUG",

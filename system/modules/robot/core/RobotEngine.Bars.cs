@@ -846,8 +846,20 @@ public sealed partial class RobotEngine
                     }
                 }));
 
-            // All bars filtered out - this is unusual and should be logged as warning
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "PRE_HYDRATION_NO_BARS_AFTER_FILTER", state: "ENGINE",
+            var expectedPlaybackFutureOnly =
+                _isolatedPlaybackPersistence
+                && bars.Count > 0
+                && barsFilteredFuture == bars.Count
+                && barsFilteredPartial == 0;
+            var noBarsEventType = expectedPlaybackFutureOnly
+                ? "PRE_HYDRATION_NO_BARS_AFTER_FILTER_PLAYBACK_FUTURE_ONLY"
+                : "PRE_HYDRATION_NO_BARS_AFTER_FILTER";
+            var noBarsNote = expectedPlaybackFutureOnly
+                ? "Playback BarsRequest returned bars ahead of the current playback anchor, so pre-hydration intentionally filtered them and will rely on live/playback bars."
+                : "All bars were filtered out (all were future or partial/in-progress). This may indicate timing issues or data feed problems. Range computation will rely on live bars only - may be incomplete.";
+
+            // All bars filtered out - warn only when it is not the expected isolated-playback future-only case.
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: noBarsEventType, state: "ENGINE",
                 new
                 {
                     instrument = instrument,
@@ -856,9 +868,10 @@ public sealed partial class RobotEngine
                     filtered_partial = barsFilteredPartial,
                     total_filtered = totalFiltered,
                     current_time_utc = utcNow.ToString("o"),
-                    note = "All bars were filtered out (all were future or partial/in-progress). " +
-                           "This may indicate timing issues or data feed problems. " +
-                           "Range computation will rely on live bars only - may be incomplete."
+                    isolated_playback = _isolatedPlaybackPersistence,
+                    expected_playback_future_only = expectedPlaybackFutureOnly,
+                    classification = expectedPlaybackFutureOnly ? "AUDIT_EXPECTED_PLAYBACK_ANCHOR_FILTER" : "NO_PREHYDRATION_BARS_AFTER_FILTER",
+                    note = noBarsNote
                 }));
             // Don't return - allow degraded operation, but make it visible
             // Streams will start without historical bars

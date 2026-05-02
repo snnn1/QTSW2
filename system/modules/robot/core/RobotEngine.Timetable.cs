@@ -1194,16 +1194,36 @@ public sealed partial class RobotEngine
 
         if (skippedCount > 0 || committedDirectiveSkips > 0 || blockedNewStreamMidSession > 0)
         {
+            var expectedAnchorFilter =
+                acceptedCount > 0
+                && skippedCount > 0
+                && committedDirectiveSkips == 0
+                && blockedNewStreamMidSession == 0
+                && !string.IsNullOrWhiteSpace(_executionInstrument)
+                && skippedReasons.Count == 1
+                && skippedReasons.TryGetValue("CANONICAL_MISMATCH", out var anchorFilteredCount)
+                && anchorFilteredCount == skippedCount;
+            var eventType = expectedAnchorFilter
+                ? "TIMETABLE_APPLY_ANCHOR_FILTERED"
+                : "TIMETABLE_APPLY_PARTIAL_REFUSAL";
+            var note = expectedAnchorFilter
+                ? "Timetable application skipped other canonical instruments because this NinjaTrader strategy instance is anchored to one execution instrument; per-stream skips are expected audit evidence."
+                : "Timetable had enabled directives that were skipped, blocked, or not applied; execution not fully armed for every enabled row.";
+
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDate.ToString("yyyy-MM-dd"),
-                eventType: "TIMETABLE_APPLY_PARTIAL_REFUSAL", state: "ENGINE",
+                eventType: eventType, state: "ENGINE",
                 new
                 {
                     timetable_enabled_directives = incoming.Count,
+                    accepted = acceptedCount,
                     skipped = skippedCount,
                     skipped_reasons = skippedReasons,
                     committed_directive_skips = committedDirectiveSkips,
                     blocked_mid_session_new_streams = blockedNewStreamMidSession,
-                    note = "Timetable had enabled directives that were skipped, blocked, or not applied — see per-stream events; execution not fully armed for every enabled row"
+                    expected_anchor_filter = expectedAnchorFilter,
+                    ninjatrader_execution_instrument = _executionInstrument ?? "",
+                    classification = expectedAnchorFilter ? "AUDIT_EXPECTED_ANCHOR_FILTER" : "PARTIAL_REFUSAL",
+                    note = note
                 }));
         }
 

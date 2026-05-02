@@ -308,9 +308,27 @@ public sealed partial class RobotEngine
                 foreach (var kvp in dataDict)
                     data[kvp.Key] = kvp.Value;
             }
+            else if (dataObj is System.Collections.IDictionary dataMap)
+            {
+                foreach (System.Collections.DictionaryEntry entry in dataMap)
+                {
+                    var key = entry.Key?.ToString();
+                    if (!string.IsNullOrWhiteSpace(key))
+                        data[key] = entry.Value;
+                }
+            }
             else if (dataObj != null)
             {
-                data["payload"] = dataObj;
+                var converted = ConvertAnonymousObjectToDictionary(dataObj);
+                if (converted != null)
+                {
+                    foreach (var kvp in converted)
+                        data[kvp.Key] = kvp.Value;
+                }
+                else
+                {
+                    data["payload"] = dataObj;
+                }
             }
         }
 
@@ -325,6 +343,25 @@ public sealed partial class RobotEngine
         }
 
         return new RobotLogEvent(utcNow, level, source, instrument, eventType, message, runId: _runId, data: data.Count > 0 ? data : null);
+    }
+
+    private static Dictionary<string, object?>? ConvertAnonymousObjectToDictionary(object obj)
+    {
+        var dict = new Dictionary<string, object?>();
+        var props = obj.GetType().GetProperties(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+        foreach (var prop in props)
+        {
+            try
+            {
+                dict[prop.Name] = prop.GetValue(obj);
+            }
+            catch
+            {
+                // Logging conversion must never disturb runtime flow.
+            }
+        }
+
+        return dict.Count > 0 ? dict : null;
     }
 
     /// <summary>
