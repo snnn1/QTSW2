@@ -28,7 +28,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LATEST_RUN_REL = Path("runs") / "LATEST_RUN.txt"
 AUDIT_REPORT_FILENAME = "audit_report.json"
 # Bump when the JSON shape changes (new/moved/renamed top-level or section fields).
-SCHEMA_VERSION = "4"
+SCHEMA_VERSION = "5"
 
 # Equivalent to ENTRY_SUBMITTED for classification (file evidence)
 ENTRY_SUBMIT_EQUIV_EVENTS = frozenset(
@@ -857,12 +857,13 @@ def build_audit_report(
     only_ev = ev_ins - ej_ins - key_ins
     execution_event_coverage_gap = bool(ej_ins and ev_ins and ev_ins < ej_ins)
     key_events_empty = not any(x for x in key_ins if x)
-    if not (only_key or only_ev):
+    key_event_extra_instrument_gap = bool(only_key and not only_ev)
+    if not only_ev:
         mismatch_flag = "none_detected"
 
     unexplained_positions = build_unexplained_positions(broker_snaps, journal_rows)
     reasons: List[str] = [u["reason"] for u in unexplained_positions]
-    if only_key or only_ev:
+    if only_ev:
         reasons.append("INSTRUMENT_MISMATCH")
     tm_flags = journal_timing_mismatch_flags(run_root, files)
     if tm_flags:
@@ -919,6 +920,8 @@ def build_audit_report(
             "execution_event_coverage_gap": execution_event_coverage_gap,
             "missing_execution_event_instruments": sorted(ej_ins - ev_ins),
             "key_events_empty": key_events_empty,
+            "key_event_extra_instruments": sorted(only_key),
+            "key_event_extra_instrument_gap": key_event_extra_instrument_gap,
             "execution_event_audit_gaps": execution_event_audit_gaps,
         },
         "section_l": {
@@ -1057,6 +1060,11 @@ def print_phase2(report: Dict[str, Any]) -> None:
         )
     if k.get("key_events_empty"):
         print("  coverage_gap: KEY_EVENTS is empty; durable journals remain primary verdict evidence")
+    if k.get("key_event_extra_instrument_gap"):
+        print(
+            "  coverage_gap: KEY_EVENTS contains extra/native instruments; "
+            f"extra instruments={k.get('key_event_extra_instruments', [])}"
+        )
     gap_rows = k.get("execution_event_audit_gaps") or []
     if gap_rows:
         print("  audit_gap: execution_events missing fields / _unknown files")
