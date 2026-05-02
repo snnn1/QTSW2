@@ -100,6 +100,14 @@ public sealed class AuthoritativeStateEmitter : IDisposable
         EmitSnapshot(SnapshotTrigger.RestoreBaseline);
     }
 
+    /// <summary>
+    /// Emit the final shutdown snapshot after callback ingress has quieted.
+    /// </summary>
+    public void EmitEngineStop()
+    {
+        EmitSnapshot(SnapshotTrigger.EngineStop);
+    }
+
     private void EmitSnapshot(SnapshotTrigger trigger)
     {
         if (_disposed) return;

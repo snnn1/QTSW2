@@ -20,7 +20,8 @@ public enum SnapshotTrigger
     ExitOverflow,
     TransferRejected,
     InstrumentFreeze,
-    InstrumentUnfreeze
+    InstrumentUnfreeze,
+    EngineStop
 }
 
 /// <summary>

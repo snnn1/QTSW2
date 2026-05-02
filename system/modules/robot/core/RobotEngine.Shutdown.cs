@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
@@ -81,6 +82,7 @@ public sealed partial class RobotEngine
         RuntimeAuditHubRef.Active = null;
         WaitForShutdownCallbackIngressQuiet();
         _ownershipEventJournal?.Flush(TimeSpan.FromMilliseconds(500), "engine_stop");
+        _stateEmitter?.EmitEngineStop();
 
         string? summaryPathToWrite = null;
         string? summaryJson = null;
@@ -238,7 +240,7 @@ public sealed partial class RobotEngine
 
         var keyEventsPath = Path.Combine(persistenceBase, RunRootArtifacts.KeyEventsFileName);
         if (!File.Exists(keyEventsPath))
-            return snapshot;
+            return HydrateExecutionSummaryFromRunArtifactsIfEmpty(persistenceBase, snapshot);
 
         var intents = new Dictionary<string, IntentSummary>(StringComparer.OrdinalIgnoreCase);
         var blockedByReason = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
@@ -326,7 +328,7 @@ public sealed partial class RobotEngine
         }
 
         if (intents.Count == 0 && submitted == 0 && filled == 0 && rejected == 0 && blocked == 0)
-            return snapshot;
+            return HydrateExecutionSummaryFromRunArtifactsIfEmpty(persistenceBase, snapshot);
 
         snapshot.IntentsSeen = intents.Count;
         snapshot.IntentsExecuted = intents.Values.Count(i => i.Executed);
@@ -336,7 +338,165 @@ public sealed partial class RobotEngine
         snapshot.OrdersBlocked = blocked;
         snapshot.BlockedByReason = blockedByReason;
         snapshot.IntentDetails = intents.Values.ToList();
+        ApplyDailySummaryCountsIfPresent(persistenceBase, snapshot);
         return snapshot;
+    }
+
+    private static ExecutionSummarySnapshot HydrateExecutionSummaryFromRunArtifactsIfEmpty(string persistenceBase, ExecutionSummarySnapshot snapshot)
+    {
+        if (HasExecutionSummaryActivity(snapshot))
+            return snapshot;
+
+        var journalDir = RobotRunArtifactPaths.StateExecutionJournals(persistenceBase);
+        if (!Directory.Exists(journalDir))
+        {
+            ApplyDailySummaryCountsIfPresent(persistenceBase, snapshot);
+            return snapshot;
+        }
+
+        var intents = new Dictionary<string, IntentSummary>(StringComparer.OrdinalIgnoreCase);
+        var submitted = 0;
+        var rejected = 0;
+        var filled = 0;
+
+        try
+        {
+            foreach (var path in Directory.EnumerateFiles(journalDir, "*.json", SearchOption.TopDirectoryOnly))
+            {
+                try
+                {
+                    var json = File.ReadAllText(path);
+                    if (string.IsNullOrWhiteSpace(json))
+                        continue;
+
+                    var entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                    if (entry == null)
+                        continue;
+
+                    var intentId = string.IsNullOrWhiteSpace(entry.IntentId)
+                        ? Path.GetFileNameWithoutExtension(path)
+                        : entry.IntentId.Trim();
+                    if (string.IsNullOrWhiteSpace(intentId))
+                        continue;
+
+                    if (!intents.TryGetValue(intentId, out var intent))
+                    {
+                        intent = new IntentSummary
+                        {
+                            IntentId = intentId,
+                            TradingDate = entry.TradingDate ?? "",
+                            Stream = entry.Stream ?? "",
+                            Instrument = entry.Instrument ?? ""
+                        };
+                        intents[intentId] = intent;
+                    }
+
+                    if (entry.EntrySubmitted)
+                    {
+                        submitted++;
+                        intent.OrdersSubmitted++;
+                        intent.OrderTypes.Add(string.IsNullOrWhiteSpace(entry.EntryOrderType) ? "ENTRY" : entry.EntryOrderType!.Trim());
+                    }
+
+                    if (entry.EntryFilled || entry.EntryFilledQuantityTotal > 0 || Math.Max(0, entry.FillQuantity ?? 0) > 0)
+                    {
+                        filled++;
+                        intent.Executed = true;
+                        intent.OrdersFilled++;
+                    }
+
+                    if (entry.Rejected)
+                    {
+                        rejected++;
+                        intent.OrdersRejected++;
+                        intent.RejectionReasons.Add(string.IsNullOrWhiteSpace(entry.RejectionReason) ? "rejected" : entry.RejectionReason!.Trim());
+                    }
+                }
+                catch
+                {
+                    // A malformed journal row should not block shutdown summary writes.
+                }
+            }
+        }
+        catch
+        {
+            // Best-effort fallback only.
+        }
+
+        if (intents.Count > 0 || submitted > 0 || filled > 0 || rejected > 0)
+        {
+            snapshot.IntentsSeen = intents.Count;
+            snapshot.IntentsExecuted = intents.Values.Count(i => i.Executed);
+            snapshot.OrdersSubmitted = submitted;
+            snapshot.OrdersFilled = filled;
+            snapshot.OrdersRejected = rejected;
+            snapshot.IntentDetails = intents.Values.ToList();
+        }
+
+        ApplyDailySummaryCountsIfPresent(persistenceBase, snapshot);
+        return snapshot;
+    }
+
+    private static bool HasExecutionSummaryActivity(ExecutionSummarySnapshot snapshot)
+    {
+        return snapshot.IntentsSeen > 0 ||
+               snapshot.OrdersSubmitted > 0 ||
+               snapshot.OrdersFilled > 0 ||
+               snapshot.OrdersRejected > 0 ||
+               snapshot.OrdersBlocked > 0;
+    }
+
+    private static void ApplyDailySummaryCountsIfPresent(string persistenceBase, ExecutionSummarySnapshot snapshot)
+    {
+        var logDir = Path.Combine(persistenceBase ?? "", "logs", "robot");
+        if (!Directory.Exists(logDir))
+            return;
+
+        try
+        {
+            var dailyPath = Directory.EnumerateFiles(logDir, "daily_*.md", SearchOption.TopDirectoryOnly)
+                .OrderByDescending(File.GetLastWriteTimeUtc)
+                .FirstOrDefault();
+            if (string.IsNullOrWhiteSpace(dailyPath))
+                return;
+
+            int? ordersSubmitted = null;
+            int? ordersRejected = null;
+            int? executionsFilled = null;
+            foreach (var line in File.ReadLines(dailyPath))
+            {
+                ordersSubmitted ??= TryParseDailySummaryInt(line, "orders_submitted");
+                ordersRejected ??= TryParseDailySummaryInt(line, "orders_rejected");
+                executionsFilled ??= TryParseDailySummaryInt(line, "executions_filled");
+            }
+
+            if (ordersSubmitted.HasValue && ordersSubmitted.Value > snapshot.OrdersSubmitted)
+                snapshot.OrdersSubmitted = ordersSubmitted.Value;
+            if (ordersRejected.HasValue && ordersRejected.Value > snapshot.OrdersRejected)
+                snapshot.OrdersRejected = ordersRejected.Value;
+            if (executionsFilled.HasValue && executionsFilled.Value > snapshot.OrdersFilled)
+                snapshot.OrdersFilled = executionsFilled.Value;
+        }
+        catch
+        {
+            // Daily markdown is advisory; journal/key-event evidence remains authoritative.
+        }
+    }
+
+    private static int? TryParseDailySummaryInt(string line, string key)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+            return null;
+
+        var prefix = "- " + key + ":";
+        var trimmed = line.Trim();
+        if (!trimmed.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        var value = trimmed.Substring(prefix.Length).Trim();
+        return int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : null;
     }
 
     private static string? TryGetJsonString(JsonElement element, string propertyName)
