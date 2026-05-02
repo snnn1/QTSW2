@@ -9,14 +9,14 @@ Purpose:
 
 Runtime anchor:
 - Latest run pointer: `runs/LATEST_RUN.txt`
-- Latest inspected run: `runs/c507bc382ee740cc951e2ffce560af49`
+- Latest inspected run: `runs/e5c893c3f63e4feda0e891027db75b03`
 - Run verdict: `status=WARN`, `status_reason=FLATTEN_OCCURRED`, `verdict_class=OPERATOR_REVIEW`, `recommended_action=MONITOR`, `confidence=MEDIUM`.
-- Runtime DLL proof: `assembly_hash=8675402c91a6d470a366e53bae92a8bbcf3cad2a51818714210c66133e632404`, `assembly_last_write_utc=2026-05-01T12:35:25.7769882Z`, `assembly_location=C:\Users\jakej\Documents\NinjaTrader 8\bin\Custom\Robot.Core.dll`.
-- Safety proof: no robot log errors/criticals/hard criticals, no broker position or working orders at shutdown, no ownership active/orphan/open journal quantity at shutdown, no diagnostic contradictions, no crash/freeze/thread/protective failure evidence.
+- Runtime DLL proof: `assembly_hash=aac2a7ebb9eb3acdc229ad8ed6168acc841abc828745eeceae8f172764c5ca69`, `assembly_last_write_utc=2026-05-02T14:20:13.3498384Z`, `assembly_location=C:\Users\jakej\Documents\NinjaTrader 8\bin\Custom\Robot.Core.dll`.
+- Safety proof: no robot log errors/criticals/hard criticals, no rejected journals, no orphan fills, no broker position or working orders at shutdown, no ownership active/orphan/open journal quantity at shutdown, no diagnostic contradictions, no crash/freeze/thread/protective failure evidence.
 - MNG2/NG2 proof: session-close flatten armed reentry, submitted reentry intent `44cc7fdfeb6a16e6`, filled it, accepted protectives, and ended flat.
 
 Important limitation:
-- This run proves the deployed runtime path and local non-OneDrive NinjaTrader folder. The latest event-registry/noise hardening is build/harness/deploy-proven on SHA-256 `ABA18016F948CF6CF0B3D00C918291064046767BC30C22075FEC62F6DBBDA1CA`, but should not be called runtime-proven until a restarted NinjaTrader playback confirms that hash via `ROBOT_BUILD_SIGNATURE`.
+- This run proves the deployed runtime path and local non-OneDrive NinjaTrader folder. The newest fail-closed/mismatch-flow coordinator split is build/harness-proven only; it should not be called runtime-proven until a deployed DLL with that source is confirmed by `ROBOT_BUILD_SIGNATURE`.
 
 ## 1. Current Authority Layers
 
@@ -88,8 +88,13 @@ Move-only split started:
 - `MismatchEscalationCoordinator.Diagnostics.cs` now owns canonical execution-event emission, gate progress-control payload merging, and shared gate payload builders.
 - `MismatchEscalationCoordinator.Progress.cs` now owns gate progress/throttle counter resets, throttled/cap/reentry-blocked progress emitters, expensive-pass progress accounting, and throttle-baseline helpers.
 - `MismatchEscalationCoordinator.ReleaseTelemetry.cs` now owns gate/release telemetry throttles, release progress/reset/released/blocked emitters, release-blocked-after-flat diagnostics, and pending-IEA execution deferral diagnostics.
-- The NinjaTrader runtime project links all nine shared partials explicitly.
+- `MismatchEscalationCoordinator.FailClosed.cs` now owns fail-closed soft deferral, strict release snapshots, submit-block bypass checks, and post-release re-engage helpers.
+- `MismatchEscalationCoordinator.MismatchFlow.cs` now owns mismatch-present/absent state flow and hedged net-flat persistent escalation.
+- `MismatchEscalationCoordinator.AuditLoop.cs` now owns audit timer ticks, scoped instrument collection, pending-IEA audit deferral, inactive-scope quiesce, audit fingerprinting, and next-tick scheduling.
+- `MismatchEscalationCoordinator.ForcedConvergence.cs` now owns gate observation coalescing, convergence episode starts, and forced broker-alignment invocation/failure publication helpers.
+- The NinjaTrader runtime project links all thirteen shared partials explicitly.
 - Verification after extraction: core build `0 Error(s)`, RobotCore build `0 Error(s)`, and focused checks passed: `AUTHORITY_CONTRADICTIONS`, `ORDER_RECONCILIATION`, `RUN_SUMMARY`, `RUN_SUMMARY_BUILDER`, `EXECUTION_CONTEXT_CONTRACT`, `MISMATCH_ESCALATION`, `MISMATCH_CONVERGENCE_CONTRACT`, `MISMATCH_CONVERGENCE_BRIDGE_PROBE`.
+- Current coordinator sizes after this pass: main `758` lines; largest partials are release telemetry `404`, audit loop `349`, fail-closed `331`, convergence `292`, diagnostics `240`, progress `214`, release readiness `209`, mismatch flow `201`, and forced convergence `137`.
 
 Cleanup implication:
 - The coordinator is too conceptually dense for deletion work.
@@ -128,7 +133,11 @@ Step 3 - Start move-only coordinator split:
 - Continued: extracted canonical diagnostic emission and gate payload builders while leaving event-call sites in the main coordinator.
 - Continued: extracted gate progress/throttle helper accounting while leaving `AdvanceStateConsistencyGate` in the main coordinator.
 - Continued: extracted release/gate telemetry emitters while leaving release/fail-closed decisions in the main coordinator.
-- Continue with coordinator state helpers or fail-closed strict snapshot helpers next.
+- Continued: extracted fail-closed strict snapshot/soft-deferral helpers while leaving call sites and policy decisions unchanged.
+- Continued: extracted mismatch-present/absent flow while leaving `OnAuditTick` and `AdvanceStateConsistencyGate` orchestration in the main coordinator.
+- Continued: extracted audit tick orchestration while leaving `AdvanceStateConsistencyGate` release/fail-closed decisions in the main coordinator.
+- Continued: extracted forced-convergence helper flow while leaving the call site and release-gate policy in `AdvanceStateConsistencyGate`.
+- Stop at this checkpoint for deploy/runtime proof before splitting the remaining release gate core.
 - Do not change release/fail-closed decisions.
 - Run `AUTHORITY_CONTRADICTIONS`, `ORDER_RECONCILIATION`, `RUN_SUMMARY`, `RUN_SUMMARY_BUILDER`, `EXECUTION_CONTEXT_CONTRACT`, and mismatch-specific harnesses.
 

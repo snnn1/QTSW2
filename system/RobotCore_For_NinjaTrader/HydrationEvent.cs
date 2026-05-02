@@ -43,7 +43,7 @@ public sealed class HydrationEvent
         stream_id = streamId;
         canonical_instrument = canonicalInstrument;
         execution_instrument = executionInstrument;
-        session = session;
+        this.session = session;
         slot_time_chicago = slotTimeChicago;
         timestamp_utc = timestampUtc.ToString("o");
         timestamp_chicago = timestampChicago.ToString("o");

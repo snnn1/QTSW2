@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -60,6 +61,43 @@ public static class ExecutionInstrumentResolver
         var bNorm = b.Trim().ToUpperInvariant();
         if (aNorm == bNorm) return true;
         return GetCanonicalForInstrumentMatch(aNorm) == GetCanonicalForInstrumentMatch(bNorm);
+    }
+
+    /// <summary>
+    /// Matching aliases for broker/audit convergence windows only. Do not use this to key IEA ownership.
+    /// </summary>
+    public static IReadOnlyList<string> GetInstrumentMatchAliases(string? instrument)
+    {
+        if (string.IsNullOrWhiteSpace(instrument))
+            return Array.Empty<string>();
+
+        var inst = instrument.Trim().ToUpperInvariant();
+        switch (inst)
+        {
+            case "ES":
+            case "MES":
+                return new[] { "ES", "MES" };
+            case "NQ":
+            case "MNQ":
+                return new[] { "NQ", "MNQ" };
+            case "YM":
+            case "MYM":
+                return new[] { "YM", "MYM" };
+            case "RTY":
+            case "M2K":
+                return new[] { "RTY", "M2K" };
+            case "CL":
+            case "MCL":
+                return new[] { "CL", "MCL" };
+            case "GC":
+            case "MGC":
+                return new[] { "GC", "MGC" };
+            case "NG":
+            case "MNG":
+                return new[] { "NG", "MNG" };
+            default:
+                return new[] { inst };
+        }
     }
 
     private static string GetCanonicalForInstrumentMatch(string instrument)

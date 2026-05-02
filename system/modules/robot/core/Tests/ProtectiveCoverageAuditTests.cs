@@ -82,6 +82,19 @@ public static class ProtectiveCoverageAuditTests
             return (false, $"Expired protective submit handoff: expected PROTECTIVE_MISSING_STOP, got {r.Status}");
         QuantExecutionControlStore.Clear();
 
+        // 2c. A queued protective action may be keyed by the full root (NG) while audit runs on the micro execution key (MNG).
+        var aliasSubmitUtc = utcNow.AddMilliseconds(20);
+        QuantExecutionControlStore.NotifyProtectiveSubmitPending("NG", 2, aliasSubmitUtc);
+        snap = new AccountSnapshot
+        {
+            Positions = new List<PositionSnapshot> { new() { Instrument = "MNG", Quantity = -2, AveragePrice = 2.650m } },
+            WorkingOrders = new List<WorkingOrderSnapshot>()
+        };
+        r = ProtectiveCoverageAudit.Audit("MNG", snap, null, false, false, false, aliasSubmitUtc.AddMilliseconds(1));
+        if (r.Status != ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE)
+            return (false, $"Protective alias handoff NG->MNG: expected PROTECTIVE_PENDING_CONVERGENCE, got {r.Status}");
+        QuantExecutionControlStore.Clear();
+
         // 3. Long position, stop qty less than broker qty -> PROTECTIVE_STOP_QTY_MISMATCH
         snap = new AccountSnapshot
         {
@@ -192,6 +205,23 @@ public static class ProtectiveCoverageAuditTests
         r = ProtectiveCoverageAudit.Audit("MNQ", snap, null, false, false, false, t0);
         if (r.Status != ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE)
             return (false, $"Mapped fill first-submit handoff: expected PROTECTIVE_PENDING_CONVERGENCE, got {r.Status}");
+
+        // 8a. Execution/root alias mapped fill handoff (NG store evidence, MNG broker snapshot)
+        QuantExecutionControlStore.Clear();
+        QuantExecutionControlStore.NotifyMappedTrustedFill("NG", 2, t0);
+        var aliasSnap = new AccountSnapshot
+        {
+            Positions = new List<PositionSnapshot> { new() { Instrument = "MNG", Quantity = -2, AveragePrice = 2.20m } },
+            WorkingOrders = new List<WorkingOrderSnapshot>()
+        };
+        r = ProtectiveCoverageAudit.Audit("MNG", aliasSnap, null, false, false, false, t0);
+        if (r.Status != ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE)
+            return (false, $"Alias mapped fill handoff: expected PROTECTIVE_PENDING_CONVERGENCE, got {r.Status}");
+
+        r = ProtectiveCoverageAudit.Audit("MNG", aliasSnap, null, false, false, false,
+            t0.AddMilliseconds(FeatureFlags.PostFillAlignmentWindowMs + 500));
+        if (r.Status != ProtectiveAuditStatus.PROTECTIVE_MISSING_STOP)
+            return (false, $"Alias mapped fill after expiry: expected PROTECTIVE_MISSING_STOP, got {r.Status}");
 
         // 8b. PendingAlignment + NotifyProtectiveStopSubmit + no broker-visible stop -> PROTECTIVE_PENDING_CONVERGENCE
         QuantExecutionControlStore.Clear();

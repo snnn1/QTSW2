@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using QTSW2.Robot.Contracts;
 using QTSW2.Robot.Core;
 using QTSW2.Robot.Core.Execution;
 
@@ -26,6 +27,8 @@ public static class LateSessionCloseJournalRepairTests
         e = Case_SuppressBrokerFlatReleaseWhileFlattenPending();
         if (e != null) return (false, e);
         e = Case_AllowFinalTaggedResidualBrokerFlatRetirement();
+        if (e != null) return (false, e);
+        e = Case_ReconciliationRunnerDoesNotCloseJournalsFromNonAuthoritativeSnapshot();
         if (e != null) return (false, e);
         return (true, null);
     }
@@ -271,6 +274,50 @@ public static class LateSessionCloseJournalRepairTests
         var direction = string.IsNullOrWhiteSpace(entry.Direction) ? "Short" : entry.Direction;
         journal.RecordSubmission(intentId, tradingDate, stream, instrument, "ENTRY", intentId + "-entry", DateTimeOffset.UtcNow, direction: direction);
         journal.RecordEntryFill(intentId, tradingDate, stream, 1m, qty, DateTimeOffset.UtcNow, 1m, direction, instrument, instrument);
+    }
+
+    private static string? Case_ReconciliationRunnerDoesNotCloseJournalsFromNonAuthoritativeSnapshot()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "broker_flat_non_authoritative_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+
+        try
+        {
+            var log = new RobotLogger(root);
+            var journal = new ExecutionJournal(root, log);
+            var utcNow = DateTimeOffset.UtcNow;
+            const string tradingDate = "2026-04-29";
+            const string stream = "NG2";
+            const string intentId = "intent-platform-disabled";
+
+            WriteEntry(journal, tradingDate, stream, intentId, CreateOpenEntry(intentId, "MNG", 2));
+
+            var adapter = new SnapshotExecutionAdapter(new AccountSnapshot
+            {
+                Positions = new List<PositionSnapshot>(),
+                WorkingOrders = new List<WorkingOrderSnapshot>(),
+                CapturedAtUtc = utcNow,
+                IsAuthoritative = false,
+                NonAuthoritativeReason = "PLAYBACK_STALL_NT_CALL_BLOCKED"
+            });
+
+            var runner = new ReconciliationRunner(adapter, journal, log);
+            runner.ForceRunNow(utcNow);
+
+            var entry = journal.GetEntry(intentId, tradingDate, stream);
+            if (entry == null)
+                return "expected platform-disabled journal row to remain readable";
+            if (entry.TradeCompleted)
+                return "non-authoritative empty broker snapshot must not close open journal rows as broker-flat";
+            if (adapter.SnapshotCallCount != 1)
+                return $"expected one account snapshot read, got {adapter.SnapshotCallCount}";
+
+            return null;
+        }
+        finally
+        {
+            try { Directory.Delete(root, true); } catch { }
+        }
     }
 
     private static string? Case_ReconcileLingeringBrokerFlatJournalRowsWithoutLiveOwnership()
@@ -534,5 +581,66 @@ public static class LateSessionCloseJournalRepairTests
         {
             try { Directory.Delete(root, true); } catch { }
         }
+    }
+
+    private sealed class SnapshotExecutionAdapter : IExecutionAdapter
+    {
+        private readonly AccountSnapshot _snapshot;
+
+        public SnapshotExecutionAdapter(AccountSnapshot snapshot)
+        {
+            _snapshot = snapshot;
+        }
+
+        public int SnapshotCallCount { get; private set; }
+
+        public OrderSubmissionResult SubmitEntryOrder(string intentId, string instrument, string direction, decimal? entryPrice, int quantity, string? entryOrderType, string? ocoGroup, DateTimeOffset utcNow)
+            => OrderSubmissionResult.SuccessResult(null, utcNow, utcNow);
+
+        public OrderSubmissionResult SubmitStopEntryOrder(string intentId, string instrument, string direction, decimal stopPrice, int quantity, string? ocoGroup, DateTimeOffset utcNow)
+            => OrderSubmissionResult.SuccessResult(null, utcNow, utcNow);
+
+        public OrderSubmissionResult SubmitProtectiveStop(string intentId, string instrument, string direction, decimal stopPrice, int quantity, string? ocoGroup, DateTimeOffset utcNow)
+            => OrderSubmissionResult.SuccessResult(null, utcNow, utcNow);
+
+        public OrderSubmissionResult SubmitTargetOrder(string intentId, string instrument, string direction, decimal targetPrice, int quantity, string? ocoGroup, DateTimeOffset utcNow)
+            => OrderSubmissionResult.SuccessResult(null, utcNow, utcNow);
+
+        public OrderModificationResult ModifyStopToBreakEven(string intentId, string instrument, decimal beStopPrice, DateTimeOffset utcNow)
+            => OrderModificationResult.SuccessResult(utcNow);
+
+        public FlattenResult Flatten(string intentId, string instrument, DateTimeOffset utcNow)
+            => FlattenResult.SuccessResult(utcNow);
+
+        public FlattenResult FlattenEmergency(string instrument, DateTimeOffset utcNow)
+            => FlattenResult.SuccessResult(utcNow);
+
+        public bool TryEnqueueEmergencyFlattenProtective(string instrument, DateTimeOffset utcNow) => true;
+
+        public AccountSnapshot GetAccountSnapshot(DateTimeOffset utcNow)
+        {
+            SnapshotCallCount++;
+            return _snapshot;
+        }
+
+        public (decimal? Bid, decimal? Ask) GetCurrentMarketPrice(string instrument, DateTimeOffset utcNow) => (null, null);
+
+        public void CancelRobotOwnedWorkingOrders(AccountSnapshot snap, DateTimeOffset utcNow) { }
+
+        public void CancelOrders(IEnumerable<string> orderIds, DateTimeOffset utcNow) { }
+
+        public void EnqueueExecutionCommand(ExecutionCommandBase command) { }
+
+        public bool TryRepairTaggedBrokerWithoutJournal(string instrument, int accountQtyAbs, int journalOpenQtySum, DateTimeOffset utcNow, out string resultCode, out string? detail)
+        {
+            resultCode = "NOT_NEEDED";
+            detail = null;
+            return false;
+        }
+
+        public FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow)
+            => FlattenResult.SuccessResult(utcNow);
+
+        public bool IsExecutionContextReady => true;
     }
 }

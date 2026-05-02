@@ -41,6 +41,9 @@ public static class StructuralLagBypassTests
             e = Case_RiskCoverage_Target_PendingAlignmentPartialJournalLag_AllowsStructural();
             if (e != null) return (false, e);
 
+            e = Case_Flatten_WorkingOrderMismatch_WithBrokerExposure_AllowsSafetyExit();
+            if (e != null) return (false, e);
+
             e = Case_Flatten_BrokerFlatJournalLag_IsNoOpNotParityDeny();
             if (e != null) return (false, e);
 
@@ -569,6 +572,73 @@ public static class StructuralLagBypassTests
                 return $"expected broker_flat no-op, got reason={reason} snap={s.Reason}";
             if (s.BrokerQty != 0 || s.JournalQty != 2)
                 return $"expected broker 0 / journal 2 facts, got broker={s.BrokerQty} journal={s.JournalQty}";
+            return null;
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(root))
+                    Directory.Delete(root, true);
+            }
+            catch
+            {
+                /* best effort */
+            }
+        }
+    }
+
+    private static string? Case_Flatten_WorkingOrderMismatch_WithBrokerExposure_AllowsSafetyExit()
+    {
+        JournalParityPendingLedger.Clear();
+        var utc = DateTimeOffset.Parse("2099-07-07T16:00:00Z");
+        const string inst = "MNG_FLATTEN_SAFETY_EXIT";
+        var root = Path.Combine(Path.GetTempPath(), "struct_flat_safety_" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var log = new RobotLogger(root);
+            var journal = new ExecutionJournal(root, log);
+            journal.RecordSubmission("intent-flat-safety", "2099-07-07", "S4", inst, "ENTRY", "broker-entry", utc);
+            journal.RecordEntryFill("intent-flat-safety", "2099-07-07", "S4", 100m, 2, utc, 1m, "Long", inst, inst);
+
+            var snap = new AccountSnapshot
+            {
+                Positions = new List<PositionSnapshot> { new() { Instrument = inst, Quantity = 2 } },
+                WorkingOrders = new List<WorkingOrderSnapshot>
+                {
+                    new()
+                    {
+                        OrderId = "protective-working",
+                        Instrument = inst,
+                        Quantity = 2,
+                        OcoGroup = "QTSW2:PROTECTIVE:test"
+                    }
+                },
+                CapturedAtUtc = utc
+            };
+            var req = new ExecutionSafetyEvaluationRequest
+            {
+                Instrument = inst,
+                CanonicalInstrument = inst,
+                UtcNow = utc,
+                Journal = journal,
+                AccountSnapshot = snap,
+                UseInstrumentExecutionAuthority = true,
+                IeaOwnedPlusAdoptedWorking = 0,
+                RecoveryExecutionDisallowed = false,
+                JournalIntegrityOrReconciliationRepairActive = false
+            };
+
+            if (!ExecutionStructuralLayer.TryEvaluateFlattenStructure(req, out var s, out var reason))
+                return $"expected flatten safety exit to bypass submit diagnostics, got reason={reason} snap={s.Reason}";
+            if (s.ParityStatus != JournalParityStatus.WORKING_ORDER_MISMATCH.ToString())
+                return $"expected WORKING_ORDER_MISMATCH diagnostic, got {s.ParityStatus}";
+            if (s.BrokerQty != 2 || s.JournalQty != 2)
+                return $"expected broker 2 / journal 2 facts, got broker={s.BrokerQty} journal={s.JournalQty}";
+            if (s.Detail == null ||
+                s.Detail.IndexOf("flatten_safety_exit_bypassed_submit_diagnostics:parity=WORKING_ORDER_MISMATCH", StringComparison.Ordinal) < 0)
+                return "expected flatten diagnostic bypass detail, got " + s.Detail;
             return null;
         }
         finally

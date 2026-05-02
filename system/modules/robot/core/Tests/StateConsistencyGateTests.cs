@@ -12,9 +12,7 @@ public static class StateConsistencyGateTests
 {
     public static (bool Pass, string? Error) RunStateConsistencyGateTests()
     {
-        var prevMismatchBlock = FeatureFlags.ControlPlaneMismatchExecutionBlockAuthority;
         var prevParityFlatten = FeatureFlags.ControlPlaneParityHardFlattenFromTryEnsureJournalIntegrity;
-        FeatureFlags.ControlPlaneMismatchExecutionBlockAuthority = true;
         FeatureFlags.ControlPlaneParityHardFlattenFromTryEnsureJournalIntegrity = true;
         try
         {
@@ -1146,7 +1144,6 @@ public static class StateConsistencyGateTests
         }
         finally
         {
-            FeatureFlags.ControlPlaneMismatchExecutionBlockAuthority = prevMismatchBlock;
             FeatureFlags.ControlPlaneParityHardFlattenFromTryEnsureJournalIntegrity = prevParityFlatten;
         }
     }

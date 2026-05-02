@@ -9,6 +9,7 @@ public sealed class UnresolvedExecutionRecord
 {
     public object Execution { get; }
     public object Order { get; }
+    public ExecutionUpdateSnapshot? Snapshot { get; }
     public string IntentId { get; }
     public string Instrument { get; }
     public string? EncodedTag { get; }
@@ -39,6 +40,36 @@ public sealed class UnresolvedExecutionRecord
     {
         Execution = execution ?? throw new ArgumentNullException(nameof(execution));
         Order = order ?? throw new ArgumentNullException(nameof(order));
+        IntentId = intentId ?? "";
+        Instrument = instrument ?? "";
+        EncodedTag = encodedTag;
+        FillPrice = fillPrice;
+        FillQuantity = fillQuantity;
+        OrderState = orderState ?? "";
+        IsProtectiveOrder = isProtectiveOrder;
+        OrderTypeFromTag = orderTypeFromTag;
+        FirstSeenUtc = firstSeenUtc;
+        ExecutionId = executionId;
+        BrokerOrderId = brokerOrderId;
+    }
+
+    public UnresolvedExecutionRecord(
+        ExecutionUpdateSnapshot snapshot,
+        string intentId,
+        string instrument,
+        string? encodedTag,
+        decimal fillPrice,
+        int fillQuantity,
+        string orderState,
+        bool isProtectiveOrder,
+        string? orderTypeFromTag,
+        DateTimeOffset firstSeenUtc,
+        string? executionId = null,
+        string? brokerOrderId = null)
+    {
+        Snapshot = snapshot ?? throw new ArgumentNullException(nameof(snapshot));
+        Execution = snapshot;
+        Order = snapshot;
         IntentId = intentId ?? "";
         Instrument = instrument ?? "";
         EncodedTag = encodedTag;

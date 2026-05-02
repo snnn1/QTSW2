@@ -176,7 +176,10 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
             return new AccountSnapshot
             {
                 Positions = new List<PositionSnapshot>(),
-                WorkingOrders = new List<WorkingOrderSnapshot>()
+                WorkingOrders = new List<WorkingOrderSnapshot>(),
+                CapturedAtUtc = utcNow,
+                IsAuthoritative = false,
+                NonAuthoritativeReason = "LIVE_SNAPSHOT_STUB"
             };
         }
         catch (Exception ex)
@@ -194,7 +197,10 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
             return new AccountSnapshot
             {
                 Positions = new List<PositionSnapshot>(),
-                WorkingOrders = new List<WorkingOrderSnapshot>()
+                WorkingOrders = new List<WorkingOrderSnapshot>(),
+                CapturedAtUtc = utcNow,
+                IsAuthoritative = false,
+                NonAuthoritativeReason = "LIVE_SNAPSHOT_ERROR:" + ex.GetType().Name
             };
         }
     }

@@ -71,7 +71,7 @@ public sealed class HydrationEventPersister
                     // Append to JSONL file
                     File.AppendAllText(filePath, json + Environment.NewLine);
                 }
-                catch (IOException ex)
+                catch (IOException)
                 {
                     // File might be locked by another process - fail silently (fail-safe)
                     // This is acceptable - hydration logging is non-critical

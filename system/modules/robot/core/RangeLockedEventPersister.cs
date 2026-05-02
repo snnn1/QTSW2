@@ -116,7 +116,7 @@ public sealed class RangeLockedEventPersister
                         streamSet.Add(evt.stream_id);
                     }
                 }
-                catch (IOException ex)
+                catch (IOException)
                 {
                     // File might be locked by another process - fail silently (fail-safe)
                     // This is acceptable - idempotency check will catch duplicate on retry

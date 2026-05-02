@@ -465,11 +465,20 @@ namespace NinjaTrader.NinjaScript.Strategies
         // Keep NinjaTrader's visible log focused on actionable warnings/errors by default.
         // Detailed startup and BarsRequest tracing remains available in engine events and lifecycle files.
         private const bool EmitVerboseNtStartupLogs = false;
+        private const string TestInjectRuntimeOptInEnvVar = "QTSW2_ENABLE_TEST_INJECT";
 
         private void LogVerboseNtStartup(string message)
         {
             if (EmitVerboseNtStartupLogs)
                 Log(message, LogLevel.Information);
+        }
+
+        private static bool IsTestInjectRuntimeOptInEnabled()
+        {
+            var value = Environment.GetEnvironmentVariable(TestInjectRuntimeOptInEnvVar);
+            return string.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(value, "true", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase);
         }
 
         public RobotSimStrategy()
@@ -1069,8 +1078,34 @@ namespace NinjaTrader.NinjaScript.Strategies
                     try { Account.OrderUpdate -= OnOrderUpdate; } catch { }
                     try { Account.ExecutionUpdate -= OnExecutionUpdate; } catch { }
                 }
-                // Log to robot JSONL for ops: NinjaTrader disabled strategy (common cause: lost price connection 4+ times in 5 min)
-                _engine?.LogEngineEvent(DateTimeOffset.UtcNow, "STRATEGY_DISABLED_BY_NINJATRADER", new Dictionary<string, object>
+
+                var remainingActiveInstances = 0;
+                if (Account != null && Instrument != null)
+                {
+                    var executionInstrumentFullName = Instrument.FullName ?? "UNKNOWN";
+                    var accountName = Account.Name ?? "UNKNOWN";
+                    var instanceKey = (accountName, executionInstrumentFullName);
+
+                    lock (_activeInstancesLock)
+                    {
+                        if (_activeInstanceOwnerByKey.TryGetValue(instanceKey, out var owner) &&
+                            string.Equals(owner, _instanceId, StringComparison.Ordinal))
+                            _activeInstanceOwnerByKey.Remove(instanceKey);
+
+                        remainingActiveInstances = _activeInstanceOwnerByKey.Keys.Count(k =>
+                            string.Equals(k.account, accountName, StringComparison.OrdinalIgnoreCase));
+                    }
+
+                    // Log filtered callback counts if any occurred for shutdown diagnostics.
+                    if (_filteredOrderUpdateCount > 0 || _filteredExecutionUpdateCount > 0)
+                    {
+                        Log($"Instance terminated: InstanceId={_instanceId}, FilteredOrderUpdates={_filteredOrderUpdateCount}, FilteredExecutionUpdates={_filteredExecutionUpdateCount}", LogLevel.Information);
+                    }
+                }
+
+                var writeRunSummary = remainingActiveInstances == 0;
+                // State.Terminated is normal during playback/shutdown; reserve platform-disable events for explicit disable signals.
+                _engine?.LogEngineEvent(DateTimeOffset.UtcNow, "STRATEGY_TERMINATED_BY_NINJATRADER", new Dictionary<string, object>
                 {
                     { "instrument", Instrument?.MasterInstrument?.Name ?? "UNKNOWN" },
                     { "strategy_instrument_full_name", Instrument?.FullName ?? "" },
@@ -1078,30 +1113,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                     { "master_instrument", Instrument?.MasterInstrument?.Name ?? "" },
                     { "instance_id", _instanceId },
                     { "account", Account?.Name ?? "UNKNOWN" },
-                    { "note", "NinjaTrader disabled strategy. Common cause: 'lost price connection more than 4 times in the past 5 minutes'." }
+                    { "remaining_active_strategy_instances", remainingActiveInstances },
+                    { "write_run_summary", writeRunSummary },
+                    { "platform_disable_signal", false },
+                    { "termination_classification", "STATE_TERMINATED" },
+                    { "note", "NinjaTrader State.Terminated lifecycle; normal during playback/shutdown. STRATEGY_DISABLED_BY_NINJATRADER is reserved for explicit platform-disable evidence." }
                 });
-                _engine?.Stop();
-
-                // FUTURE HARDENING: Unregister instance on termination
-                if (Account != null && Instrument != null)
-                {
-                    var executionInstrumentFullName = Instrument.FullName ?? "UNKNOWN";
-                    var accountName = Account.Name ?? "UNKNOWN";
-                    var instanceKey = (accountName, executionInstrumentFullName);
-                    
-                    lock (_activeInstancesLock)
-                    {
-                        if (_activeInstanceOwnerByKey.TryGetValue(instanceKey, out var owner) &&
-                            string.Equals(owner, _instanceId, StringComparison.Ordinal))
-                            _activeInstanceOwnerByKey.Remove(instanceKey);
-                    }
-                    
-                    // Log filtered callback counts if any occurred for shutdown diagnostics.
-                    if (_filteredOrderUpdateCount > 0 || _filteredExecutionUpdateCount > 0)
-                    {
-                        Log($"Instance terminated: InstanceId={_instanceId}, FilteredOrderUpdates={_filteredOrderUpdateCount}, FilteredExecutionUpdates={_filteredExecutionUpdateCount}", LogLevel.Information);
-                    }
-                }
+                _engine?.Stop(writeRunSummary: writeRunSummary, stopSource: "strategy_terminated");
             }
         }
 
@@ -1778,8 +1796,21 @@ namespace NinjaTrader.NinjaScript.Strategies
             // Test inject: synthetic market entry on first Realtime bar to exercise IEA (SIM only)
             if (TestInjectTradeOnStart && State == State.Realtime && _adapter != null && _engine != null)
             {
+                // Two-key guard: a saved NinjaTrader template/workspace flag is not enough to place a test order.
+                if (!IsTestInjectRuntimeOptInEnabled())
+                {
+                    if (Interlocked.CompareExchange(ref _testInjectNonce, 1, 0) == 0)
+                    {
+                        _engine.LogEngineEvent(DateTimeOffset.UtcNow, "TEST_INJECT_SKIPPED", new Dictionary<string, object>
+                        {
+                            { "reason", "RUNTIME_OPT_IN_REQUIRED" },
+                            { "env_var", TestInjectRuntimeOptInEnvVar },
+                            { "note", "Test inject property was true, but runtime opt-in env var was not enabled. Skipped to prevent stale NinjaTrader saved settings from submitting an order." }
+                        });
+                    }
+                }
                 // Safety: SIM guard — never run on live account
-                if (!_simAccountVerified)
+                else if (!_simAccountVerified)
                 {
                     _engine.LogEngineEvent(DateTimeOffset.UtcNow, "TEST_INJECT_SKIPPED", new Dictionary<string, object>
                     {
@@ -2529,6 +2560,9 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             var now = DateTimeOffset.UtcNow;
+            var pendingIeaWorkload = _engine?.GetPendingIeaWorkloadForInstrument(executionInstrument) ?? 0;
+            var brokerJournalAlignmentWindowActive = QuantExecutionControlStore.IsAnyBrokerJournalAlignmentWindowActive(executionInstrument, now);
+            var postFillOrIeaConvergenceActive = pendingIeaWorkload > 0 || brokerJournalAlignmentWindowActive;
 
             // BE_PATH_ACTIVE diagnostic: rate-limited to once per minute per instrument
             if (_engine != null && (!_lastBePathActiveLogUtc.TryGetValue(instrumentName, out var lastPathLog) || (now - lastPathLog).TotalSeconds >= BE_PATH_ACTIVE_RATE_LIMIT_SECONDS))
@@ -2572,7 +2606,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                             { "note", "Exposure has open robot intent(s), but none need BE monitoring." }
                         });
                     }
-                    else if (QuantExecutionControlStore.IsAnyBrokerJournalAlignmentWindowActive(executionInstrument, now))
+                    else if (postFillOrIeaConvergenceActive)
                     {
                         _beZeroIntentExposureFirstSeenUtc.Remove(executionInstrument);
                         _engine.LogEngineEvent(now, "OWNERSHIP_PENDING_CONVERGENCE", new Dictionary<string, object>
@@ -2580,6 +2614,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                             { "chart_instrument", instrumentName },
                             { "execution_instrument", executionInstrument },
                             { "resolved_active_intent_count", 0 },
+                            { "pending_execution_workload", pendingIeaWorkload },
+                            { "broker_journal_alignment_window_active", brokerJournalAlignmentWindowActive },
                             { "tick_price", tickPrice },
                             { "note", "Tier-1 PendingAlignment window — not classified as unowned exposure (journal/intent may lag)" }
                         });
@@ -2618,7 +2654,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             // Phase 4B: During Tier-1 post-fill alignment, defer BE when no intents resolved yet (transient journal lag).
-            var postFillAlignment = QuantExecutionControlStore.IsAnyBrokerJournalAlignmentWindowActive(executionInstrument, now);
+            var postFillAlignment = postFillOrIeaConvergenceActive;
             var skipBeForPostFillConvergence = false;
             if (postFillAlignment)
             {
@@ -2638,6 +2674,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                     {
                         { "chart_instrument", instrumentName },
                         { "execution_instrument", executionInstrument },
+                        { "pending_execution_workload", pendingIeaWorkload },
+                        { "broker_journal_alignment_window_active", brokerJournalAlignmentWindowActive },
                         { "tick_price", tickPrice },
                         { "note", "Tier-1 PendingAlignment window — BE evaluation deferred until intents resolve" }
                     });
@@ -2646,6 +2684,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                         { "chart_instrument", instrumentName },
                         { "execution_instrument", executionInstrument },
                         { "resolved_active_intent_count", 0 },
+                        { "pending_execution_workload", pendingIeaWorkload },
+                        { "broker_journal_alignment_window_active", brokerJournalAlignmentWindowActive },
                         { "tick_price", tickPrice },
                         { "note", "Bounded post-fill convergence — not treating as ownership failure" }
                     });

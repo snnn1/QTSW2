@@ -202,6 +202,15 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
         return FlattenResult.SuccessResult(utcNow);
     }
 
+    public int RequestSessionCloseCancelIntents(IEnumerable<string> intentIds, string instrument, DateTimeOffset utcNow)
+    {
+        var ids = intentIds?.Where(id => !string.IsNullOrWhiteSpace(id)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
+                  ?? Array.Empty<string>();
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SESSION_CLOSE_CANCEL_INTENTS_DRYRUN", state: "ENGINE",
+            new { instrument, intent_ids = ids, note = "DRYRUN - session-close cancel intents not placed" }));
+        return ids.Length;
+    }
+
     /// <inheritdoc />
     public bool TryTriggerHardFlatten(string instrument, string reason, DateTimeOffset utcNow)
     {

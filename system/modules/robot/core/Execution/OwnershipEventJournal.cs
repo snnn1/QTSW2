@@ -1,9 +1,12 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading;
 
 namespace QTSW2.Robot.Core.Execution;
 
@@ -22,7 +25,15 @@ public sealed class OwnershipEventJournal
 {
     private readonly string _baseDir;
     private readonly RobotLogger _log;
-    private readonly object _writeLock = new();
+    private readonly object _sequenceLock = new();
+    private readonly object _fileWriteLock = new();
+    private readonly object _writerStartLock = new();
+    private readonly ConcurrentQueue<QueuedOwnershipEventWrite> _writeQueue = new();
+    private readonly AutoResetEvent _writeSignal = new(false);
+    private volatile bool _writerStarted;
+    private int _pendingWriteCount;
+    private int _lastBacklogWarningBucket;
+    private const int BacklogWarningInterval = 100;
 
     /// <summary>Per-instrument monotonic counter. Assigned under the ledger's per-instrument lock.</summary>
     private readonly Dictionary<string, long> _nextSequence = new(StringComparer.OrdinalIgnoreCase);
@@ -40,7 +51,7 @@ public sealed class OwnershipEventJournal
     public long AssignNextSequence(string instrument)
     {
         var key = instrument?.Trim() ?? "";
-        lock (_writeLock)
+        lock (_sequenceLock)
         {
             if (!_nextSequence.TryGetValue(key, out var seq))
                 seq = 0;
@@ -50,29 +61,128 @@ public sealed class OwnershipEventJournal
     }
 
     /// <summary>
-    /// Persist an ownership event record. Thread-safe; uses its own write lock for file I/O.
+    /// Queue an ownership event record for durable persistence. Thread-safe and non-blocking for hot execution paths.
     /// </summary>
     public void Append(string tradingDate, OwnershipEventRecord record)
     {
+        var td = string.IsNullOrWhiteSpace(tradingDate)
+            ? DateTimeOffset.UtcNow.ToString("yyyy-MM-dd")
+            : tradingDate.Trim();
+
+        _writeQueue.Enqueue(new QueuedOwnershipEventWrite(td, record));
+        var pending = Interlocked.Increment(ref _pendingWriteCount);
+        EnsureWriterStarted();
+        _writeSignal.Set();
+
+        var bucket = pending / BacklogWarningInterval;
+        if (bucket > 0 && bucket != Volatile.Read(ref _lastBacklogWarningBucket) &&
+            Interlocked.Exchange(ref _lastBacklogWarningBucket, bucket) != bucket)
+        {
+            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "OWNERSHIP_EVENT_JOURNAL_BACKLOG", "ENGINE",
+                new
+                {
+                    pending_writes = pending,
+                    warning_interval = BacklogWarningInterval,
+                    note = "Ownership event persistence is lagging, but execution workers are not blocked on file I/O."
+                }));
+        }
+    }
+
+    public bool Flush(TimeSpan timeout, string reason = "manual")
+    {
+        EnsureWriterStarted();
+        _writeSignal.Set();
+
+        var sw = Stopwatch.StartNew();
+        while (Volatile.Read(ref _pendingWriteCount) > 0 && sw.Elapsed < timeout)
+            Thread.Sleep(10);
+
+        var remaining = Volatile.Read(ref _pendingWriteCount);
+        if (remaining > 0)
+        {
+            _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "OWNERSHIP_EVENT_JOURNAL_FLUSH_TIMEOUT", "ENGINE",
+                new
+                {
+                    reason,
+                    timeout_ms = (long)timeout.TotalMilliseconds,
+                    pending_writes = remaining,
+                    note = "Flush timed out; execution state remains in memory and persistence writer continues in the background."
+                }));
+            return false;
+        }
+
+        return true;
+    }
+
+    private void EnsureWriterStarted()
+    {
+        if (_writerStarted) return;
+        lock (_writerStartLock)
+        {
+            if (_writerStarted) return;
+            _writerStarted = true;
+            var writer = new Thread(WriterLoop)
+            {
+                IsBackground = true,
+                Name = "QTSW2OwnershipEventJournalWriter"
+            };
+            writer.Start();
+        }
+    }
+
+    private void WriterLoop()
+    {
+        while (true)
+        {
+            while (_writeQueue.TryDequeue(out var queued))
+            {
+                try
+                {
+                    WriteRecordSync(queued);
+                }
+                finally
+                {
+                    var remaining = Interlocked.Decrement(ref _pendingWriteCount);
+                    if (remaining < BacklogWarningInterval)
+                        Volatile.Write(ref _lastBacklogWarningBucket, 0);
+                }
+            }
+
+            _writeSignal.WaitOne(TimeSpan.FromMilliseconds(250));
+        }
+    }
+
+    private void WriteRecordSync(QueuedOwnershipEventWrite queued)
+    {
         try
         {
-            var td = string.IsNullOrWhiteSpace(tradingDate)
-                ? DateTimeOffset.UtcNow.ToString("yyyy-MM-dd")
-                : tradingDate.Trim();
-            var dir = Path.Combine(_baseDir, td);
+            var sw = Stopwatch.StartNew();
+            var dir = Path.Combine(_baseDir, queued.TradingDate);
             Directory.CreateDirectory(dir);
             var filePath = Path.Combine(dir, "events.jsonl");
 
-            var json = JsonSerializer.Serialize(record, OwnershipEventRecordJsonCtx.Default.OwnershipEventRecord);
-            lock (_writeLock)
+            var json = JsonSerializer.Serialize(queued.Record, OwnershipEventRecordJsonCtx.Default.OwnershipEventRecord);
+            lock (_fileWriteLock)
             {
                 File.AppendAllText(filePath, json + Environment.NewLine);
+            }
+            if (sw.ElapsedMilliseconds >= 500)
+            {
+                _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, queued.TradingDate, "OWNERSHIP_EVENT_JOURNAL_WRITE_SLOW", "ENGINE",
+                    new
+                    {
+                        elapsed_ms = sw.ElapsedMilliseconds,
+                        instrument = queued.Record.Instrument,
+                        kind = queued.Record.Kind.ToString(),
+                        pending_writes = Volatile.Read(ref _pendingWriteCount),
+                        note = "Durable ownership event write was slow on the background writer thread."
+                    }));
             }
         }
         catch (Exception ex)
         {
             _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "OWNERSHIP_EVENT_JOURNAL_WRITE_ERROR", "ENGINE",
-                new { error = ex.Message, kind = record.Kind.ToString(), instrument = record.Instrument }));
+                new { error = ex.Message, kind = queued.Record.Kind.ToString(), instrument = queued.Record.Instrument }));
         }
     }
 
@@ -82,6 +192,8 @@ public sealed class OwnershipEventJournal
     /// </summary>
     public List<OwnershipEventRecord> ReadEvents(string tradingDate)
     {
+        Flush(TimeSpan.FromMilliseconds(250), "read_events");
+
         var td = string.IsNullOrWhiteSpace(tradingDate)
             ? DateTimeOffset.UtcNow.ToString("yyyy-MM-dd")
             : tradingDate.Trim();
@@ -93,7 +205,12 @@ public sealed class OwnershipEventJournal
         try
         {
             string[] lines;
-            lock (_writeLock) { lines = File.ReadAllLines(filePath); }
+            using (var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var reader = new StreamReader(stream))
+            {
+                lines = reader.ReadToEnd()
+                    .Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+            }
 
             foreach (var line in lines)
             {
@@ -114,10 +231,13 @@ public sealed class OwnershipEventJournal
             });
 
             // Update in-memory sequence counters so live writes continue from max+1
-            foreach (var group in records.GroupBy(r => r.Instrument?.Trim() ?? "", StringComparer.OrdinalIgnoreCase))
+            lock (_sequenceLock)
             {
-                var maxSeq = group.Max(r => r.OwnershipEventSequence);
-                _nextSequence[group.Key] = maxSeq + 1;
+                foreach (var group in records.GroupBy(r => r.Instrument?.Trim() ?? "", StringComparer.OrdinalIgnoreCase))
+                {
+                    var maxSeq = group.Max(r => r.OwnershipEventSequence);
+                    _nextSequence[group.Key] = maxSeq + 1;
+                }
             }
 
             return records;
@@ -127,6 +247,18 @@ public sealed class OwnershipEventJournal
             _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "OWNERSHIP_EVENT_JOURNAL_READ_ERROR", "ENGINE",
                 new { error = ex.Message, trading_date = td }));
             return new List<OwnershipEventRecord>();
+        }
+    }
+
+    private readonly struct QueuedOwnershipEventWrite
+    {
+        public string TradingDate { get; }
+        public OwnershipEventRecord Record { get; }
+
+        public QueuedOwnershipEventWrite(string tradingDate, OwnershipEventRecord record)
+        {
+            TradingDate = tradingDate;
+            Record = record;
         }
     }
 }

@@ -48,6 +48,9 @@ public static class HealthMonitorDataStallTests
             var (pass9, err9) = TestPlaybackSuppressesBarTimestampDataLoss(CreateTestDir(baseTemp, "9"));
             if (!pass9) return (false, $"Test 9 (Playback bar timestamp data loss suppression): {err9}");
 
+            var (pass10, err10) = TestPlaybackEngineTickUsesObservedWallClock(CreateTestDir(baseTemp, "10"));
+            if (!pass10) return (false, $"Test 10 (Playback engine tick observed wall clock): {err10}");
+
             return (true, null);
         }
         finally
@@ -332,6 +335,40 @@ public static class HealthMonitorDataStallTests
             return (false, $"Playback bar time should not emit DATA_LOSS_DETECTED, got {events.Count}");
         if (shutdownRequests.Count > 0)
             return (false, $"Playback bar time should not request connectivity shutdown, got {string.Join(", ", shutdownRequests)}");
+        return (true, null);
+    }
+
+    private static (bool Pass, string? Error) TestPlaybackEngineTickUsesObservedWallClock((string tempDir, string logDir) paths)
+    {
+        var (tempDir, logDir) = paths;
+        var svc = RobotLoggingService.GetOrCreate(tempDir, logDir);
+        svc.Start();
+        var config = new HealthMonitorConfig { enabled = true, default_stall_seconds = 300 };
+        var log = new RobotLogger(tempDir, logDir, "MNG");
+        var hm = new HealthMonitor(tempDir, config, log);
+        hm.SetPlaybackTelemetryMode(true);
+        hm.SetActiveStreamsCallback(() => true);
+
+        var observedUtc = DateTimeOffset.Parse("2026-04-29T20:03:00Z");
+        var replayTickUtc = DateTimeOffset.Parse("2026-04-14T17:05:00Z");
+        hm.UpdateEngineTick(replayTickUtc, observedUtc);
+
+        hm.Evaluate(observedUtc.AddSeconds(2));
+        hm.Evaluate(observedUtc.AddSeconds(4));
+        if (hm.IsPlaybackEngineTickStallActive)
+            return (false, "Playback replay timestamp should not create an engine stall when the observed wall-clock tick is fresh");
+
+        hm.Evaluate(observedUtc.AddSeconds(130));
+        hm.Evaluate(observedUtc.AddSeconds(132));
+        if (!hm.IsPlaybackEngineTickStallActive)
+            return (false, "Playback engine stall should still trigger when no tick is observed for the wall-clock threshold");
+
+        hm.UpdateEngineTick(replayTickUtc.AddMinutes(1), observedUtc.AddSeconds(133));
+        if (hm.IsPlaybackEngineTickStallActive)
+            return (false, "Playback engine stall should clear when a new tick is observed");
+
+        hm.Stop();
+        svc.Stop();
         return (true, null);
     }
 

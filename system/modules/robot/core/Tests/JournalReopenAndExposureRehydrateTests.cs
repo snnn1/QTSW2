@@ -17,8 +17,10 @@ public static class JournalReopenAndExposureRehydrateTests
         if (!a.Pass) return (false, $"reopen_norm: {a.Error}");
         var b = PartialExitNotWiped();
         if (!b.Pass) return (false, $"partial: {b.Error}");
-        var c = RehydrateAllowsExitWithoutNoExposure();
-        if (!c.Pass) return (false, $"rehydrate: {c.Error}");
+        var c = TaggedRecoveryHydratesMultiplierFromSiblingAndClosesOnFlatten();
+        if (!c.Pass) return (false, $"multiplier_hydrate: {c.Error}");
+        var d = RehydrateAllowsExitWithoutNoExposure();
+        if (!d.Pass) return (false, $"rehydrate: {d.Error}");
         return (true, null);
     }
 
@@ -115,6 +117,100 @@ public static class JournalReopenAndExposureRehydrateTests
             if (after == null) return (false, "deserialized null");
             if (after.ExitFilledQuantityTotal != 1)
                 return (false, $"partial exit should be preserved, got exit {after.ExitFilledQuantityTotal}");
+            return (true, null);
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(tempRoot))
+                    Directory.Delete(tempRoot, true);
+            }
+            catch { /* best-effort */ }
+        }
+    }
+
+    private static (bool Pass, string? Error) TaggedRecoveryHydratesMultiplierFromSiblingAndClosesOnFlatten()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"TaggedRecoveryMultiplier_{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            var journalDir = RobotRunArtifactPaths.StateExecutionJournals(tempRoot);
+            Directory.CreateDirectory(journalDir);
+
+            const string tradingDate = "2026-04-14";
+            const string stream = "GC1";
+            const string siblingIntent = "265cb3d9c03e8d4f";
+            const string recoveredIntent = "f27b9be8a8e29ac9";
+
+            var siblingPath = Path.Combine(journalDir, $"{tradingDate}_{stream}_{siblingIntent}.json");
+            var sibling = new ExecutionJournalEntry
+            {
+                IntentId = siblingIntent,
+                TradingDate = tradingDate,
+                Stream = stream,
+                Instrument = "MGC",
+                EntrySubmitted = true,
+                EntryFilled = true,
+                EntryFilledQuantityTotal = 2,
+                EntryAvgFillPrice = 4820.4m,
+                EntryFillNotional = 9640.8m,
+                ContractMultiplier = 10m,
+                Direction = "Short",
+                TradeCompleted = true,
+                CompletionReason = "TARGET"
+            };
+            File.WriteAllText(siblingPath, JsonUtil.Serialize(sibling));
+
+            var stoodDown = false;
+            var log = new RobotLogger(tempRoot);
+            var journal = new ExecutionJournal(tempRoot, log);
+            journal.SetJournalCorruptionCallback((_, _, _, _) => stoodDown = true);
+            var utc = DateTimeOffset.Parse("2026-04-14T12:38:55.900+00:00");
+
+            journal.UpsertTaggedBrokerExposureRecoveryJournal(
+                recoveredIntent,
+                tradingDate,
+                stream,
+                "MGC",
+                "target-order",
+                1,
+                "Short",
+                4825.7m,
+                null,
+                null,
+                utc,
+                "test");
+
+            var recoveredPath = Path.Combine(journalDir, $"{tradingDate}_{stream}_{recoveredIntent}.json");
+            var afterUpsert = JsonUtil.Deserialize<ExecutionJournalEntry>(File.ReadAllText(recoveredPath));
+            if (afterUpsert == null) return (false, "recovered row missing after upsert");
+            if (afterUpsert.ContractMultiplier != 10m)
+                return (false, $"expected hydrated ContractMultiplier 10, got {afterUpsert.ContractMultiplier}");
+            if (afterUpsert.EntryFillNotional != 4825.7m)
+                return (false, $"expected EntryFillNotional 4825.7, got {afterUpsert.EntryFillNotional}");
+
+            journal.RecordExitFill(
+                recoveredIntent,
+                tradingDate,
+                stream,
+                4812.3m,
+                1,
+                "FLATTEN",
+                utc.AddSeconds(1));
+
+            var afterExit = JsonUtil.Deserialize<ExecutionJournalEntry>(File.ReadAllText(recoveredPath));
+            if (afterExit == null) return (false, "recovered row missing after exit");
+            if (stoodDown)
+                return (false, "journal corruption callback should not fire when sibling multiplier evidence exists");
+            if (!afterExit.TradeCompleted)
+                return (false, "recovered row should complete after matching flatten exit");
+            if (afterExit.ExitFilledQuantityTotal != 1)
+                return (false, $"expected exit qty 1, got {afterExit.ExitFilledQuantityTotal}");
+            if (afterExit.RealizedPnLGross != 134.0m)
+                return (false, $"expected gross PnL 134.0, got {afterExit.RealizedPnLGross}");
+
             return (true, null);
         }
         finally

@@ -773,7 +773,17 @@ public static class ExecutionStructuralLayer
         return true;
     }
 
-    /// <summary>Flatten structural path: parity + authority bypass + broker/exposure + duplicate flatten — no overlay locks.</summary>
+    private static void AppendDetail(ExecutionSafetySnapshot snapshot, string detail)
+    {
+        if (string.IsNullOrWhiteSpace(detail))
+            return;
+
+        snapshot.Detail = string.IsNullOrEmpty(snapshot.Detail)
+            ? detail
+            : snapshot.Detail + ";" + detail;
+    }
+
+    /// <summary>Flatten structural path: diagnostic parity + broker/exposure + duplicate flatten — no submit-style parity veto.</summary>
     public static bool TryEvaluateFlattenStructure(
         ExecutionSafetyEvaluationRequest req,
         out ExecutionSafetySnapshot snapshot,
@@ -821,13 +831,60 @@ public static class ExecutionStructuralLayer
             return false;
         }
 
-        if (!TryEvaluateOrderSubmitStructure(req, orderSubmitBlockedWhat: null, flattenAuthorityBypass: true, out snapshot))
+        if (req.AccountSnapshot == null)
         {
-            flattenBlockReason = snapshot.Reason ?? "";
+            flattenBlockReason = StructuralBlocker.ParityNotOk;
+            snapshot.Reason = flattenBlockReason;
+            snapshot.Detail = "account_snapshot_null";
             return false;
         }
 
         var inst = snapshot.Instrument;
+        var canonical = string.IsNullOrWhiteSpace(req.CanonicalInstrument) ? inst : req.CanonicalInstrument.Trim();
+        var registry = new ParityRegistryView(req.UseInstrumentExecutionAuthority, req.IeaOwnedPlusAdoptedWorking);
+        var parity = JournalParityChecker.CheckJournalParity(
+            inst,
+            req.AccountSnapshot,
+            req.Journal,
+            registry,
+            canonical,
+            req.UtcNow,
+            req.SnapshotTakenUtc);
+
+        var (journalRealOpen, journalRecoveredOpen, _) =
+            req.Journal.GetPositionAuthorityOpenQuantitiesForInstrument(inst, canonical);
+        var realOpen = journalRealOpen;
+        var recoveredOpen = journalRecoveredOpen;
+        var authority = PositionAuthorityDerivation.DerivePositionAuthority(
+            parity.BrokerPositionQty,
+            realOpen,
+            recoveredOpen);
+
+        if (FeatureFlags.StructuralLayerUseLedgerOwnership && req.LedgerOwnershipSnapshot != null)
+        {
+            var ledgerOpen = Math.Abs(req.LedgerOwnershipSnapshot.LedgerSignedNetQty);
+            authority = PositionAuthorityDerivation.DerivePositionAuthority(
+                parity.BrokerPositionQty,
+                ledgerOpen,
+                0);
+        }
+
+        var repairActive =
+            req.RecoveryExecutionDisallowed ||
+            req.JournalIntegrityOrReconciliationRepairActive;
+        ApplyFacts(snapshot, parity, realOpen, recoveredOpen, authority.ToString(), repairActive,
+            noExposureBrokerOpen: false);
+
+        if (!parity.IsOkOrPendingAlignment || repairActive)
+        {
+            var detail = "flatten_safety_exit_bypassed_submit_diagnostics:parity=" + parity.Status;
+            if (req.RecoveryExecutionDisallowed)
+                detail += ";recovery_execution_disallowed=True";
+            if (req.JournalIntegrityOrReconciliationRepairActive)
+                detail += ";journal_repair_active=True";
+            AppendDetail(snapshot, detail);
+        }
+
         if (snapshot.BrokerQty <= 0)
         {
             flattenBlockReason = "broker_flat";
@@ -835,14 +892,12 @@ public static class ExecutionStructuralLayer
             return false;
         }
 
-        var canonical = string.IsNullOrWhiteSpace(req.CanonicalInstrument) ? inst : req.CanonicalInstrument.Trim();
-        var (realOpen, _, _) = req.Journal.GetPositionAuthorityOpenQuantitiesForInstrument(inst, canonical);
         var coord = req.Coordinator;
         var expA = coord?.GetActiveExposuresForInstrument(inst)?.Count ?? 0;
         var expB = string.IsNullOrEmpty(req.ExecutionInstrumentKey)
             ? 0
             : coord?.GetActiveExposuresForInstrument(req.ExecutionInstrumentKey)?.Count ?? 0;
-        var hasTrackedExposure = realOpen > 0 || expA > 0 || expB > 0;
+        var hasTrackedExposure = realOpen > 0 || recoveredOpen > 0 || parity.JournalOpenQty > 0 || expA > 0 || expB > 0;
         if (!hasTrackedExposure)
         {
             flattenBlockReason = "no_mapped_exposure";

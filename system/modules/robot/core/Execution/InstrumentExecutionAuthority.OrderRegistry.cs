@@ -175,6 +175,16 @@ public sealed partial class InstrumentExecutionAuthority
         var prevOwnership = entry.OwnershipStatus;
         var role = entry.OrderRole;
         var inst = entry.Instrument;
+        if (ShouldArmBrokerLifecycleAlignment(prevOwnership, newState))
+        {
+            // Arm before terminalizing the row so reconciliation sees the broker/registry handoff as bounded.
+            QuantExecutionControlStore.NotifyBrokerExecutionCallbackPending(
+                inst,
+                utcNow,
+                role.ToString(),
+                newState.ToString());
+        }
+
         if (!_orderRegistry.UpdateLifecycle(brokerOrderId, newState, utcNow))
         {
             if (IsBenignTerminalLifecycleReplay(prev, newState))
@@ -213,7 +223,7 @@ public sealed partial class InstrumentExecutionAuthority
             ownership_status = entry.OwnershipStatus.ToString(),
             iea_instance_id = InstanceId
         }));
-        if (newState is OrderLifecycleState.PART_FILLED or OrderLifecycleState.FILLED &&
+        if (newState is OrderLifecycleState.PART_FILLED &&
             prevOwnership is OrderOwnershipStatus.OWNED or OrderOwnershipStatus.ADOPTED or OrderOwnershipStatus.RECOVERABLE_ROBOT_OWNED)
         {
             QuantExecutionControlStore.NotifyBrokerExecutionCallbackPending(
@@ -236,6 +246,16 @@ public sealed partial class InstrumentExecutionAuthority
         var previousTerminal = previous is OrderLifecycleState.FILLED or OrderLifecycleState.CANCELED or OrderLifecycleState.REJECTED;
         var attemptedLiveReplay = attempted is OrderLifecycleState.SUBMITTED or OrderLifecycleState.WORKING or OrderLifecycleState.PART_FILLED;
         return previousTerminal && attemptedLiveReplay;
+    }
+
+    private static bool ShouldArmBrokerLifecycleAlignment(
+        OrderOwnershipStatus previousOwnership,
+        OrderLifecycleState newState)
+    {
+        if (previousOwnership is not (OrderOwnershipStatus.OWNED or OrderOwnershipStatus.ADOPTED or OrderOwnershipStatus.RECOVERABLE_ROBOT_OWNED))
+            return false;
+
+        return newState is OrderLifecycleState.FILLED or OrderLifecycleState.CANCELED or OrderLifecycleState.REJECTED;
     }
 
     /// <summary>Add alias for an existing registry entry (e.g. when adopting).</summary>

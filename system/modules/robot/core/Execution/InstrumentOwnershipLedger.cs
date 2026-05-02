@@ -244,9 +244,22 @@ public sealed class InstrumentOwnershipLedger
                 var existing = state.Slots.FirstOrDefault(s => s.IntentId == row.IntentId);
                 if (existing != null)
                 {
-                    existing.EntryFilledQty = row.EntryFilledQty;
-                    existing.ExitFilledQty = row.ExitFilledQty;
+                    existing.EntryFilledQty += row.EntryFilledQty;
+                    existing.ExitFilledQty += row.ExitFilledQty;
+                    if (string.IsNullOrWhiteSpace(existing.StreamId) && !string.IsNullOrWhiteSpace(row.Stream))
+                        existing.StreamId = row.Stream;
                     existing.LastUpdateUtc = utcNow;
+                    if (row.IsOrphan)
+                    {
+                        existing.OrphanReason = OrphanReason.UnknownOrder;
+                        if (existing.Remaining > 0)
+                            existing.State = SlotState.Orphan;
+                    }
+                    else if (existing.Remaining > 0 && existing.State == SlotState.Closed)
+                    {
+                        existing.State = SlotState.Active;
+                    }
+
                     if (existing.Remaining == 0)
                         existing.State = SlotState.Closed;
                 }
@@ -528,12 +541,12 @@ public sealed class InstrumentOwnershipLedger
 
     private void EmitEvent(OwnershipEvent evt)
     {
+        PersistToEventJournal(evt);
+
         if (evt.EventClass == OwnershipEventClass.ClassA)
             _onClassAEvent?.Invoke(evt);
         else
             _onClassBEvent?.Invoke(evt);
-
-        PersistToEventJournal(evt);
     }
 
     /// <summary>

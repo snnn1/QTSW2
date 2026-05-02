@@ -166,6 +166,101 @@ public sealed class JournalStore
         }
     }
 
+    /// <summary>
+    /// Cross-engine idempotency marker for the broker-level session-close exposure sweep.
+    /// Returns false when another engine instance has already claimed this (tradingDay, instrument).
+    /// </summary>
+    public bool TryMarkSessionCloseGlobalSweepRequested(string tradingDay, string instrument)
+    {
+        if (string.IsNullOrWhiteSpace(tradingDay) || string.IsNullOrWhiteSpace(instrument))
+            return false;
+
+        var path = GetForcedFlattenMarkersPath(_journalDir);
+        var key = $"{tradingDay}|GLOBAL_SWEEP|{instrument.Trim().ToUpperInvariant()}";
+        var fileLock = GetFileLock(path);
+        lock (fileLock)
+        {
+            if (TryMarkBoolMarker(path, key, out var marked))
+                return marked;
+            Thread.Sleep(10);
+            if (TryMarkBoolMarker(path, key, out marked))
+                return marked;
+
+            // Fail open for safety: a marker write problem must not suppress a flatten.
+            return true;
+        }
+    }
+
+    /// <summary>Remove a failed global-sweep claim so a later tick/engine can retry.</summary>
+    public void ClearSessionCloseGlobalSweepRequested(string tradingDay, string instrument)
+    {
+        if (string.IsNullOrWhiteSpace(tradingDay) || string.IsNullOrWhiteSpace(instrument))
+            return;
+
+        var path = GetForcedFlattenMarkersPath(_journalDir);
+        var key = $"{tradingDay}|GLOBAL_SWEEP|{instrument.Trim().ToUpperInvariant()}";
+        var fileLock = GetFileLock(path);
+        lock (fileLock)
+        {
+            if (TryRemoveBoolMarker(path, key))
+                return;
+            Thread.Sleep(10);
+            _ = TryRemoveBoolMarker(path, key);
+        }
+    }
+
+    private static bool TryMarkBoolMarker(string path, string key, out bool marked)
+    {
+        marked = false;
+        try
+        {
+            var dict = ReadBoolMarkers(path);
+            if (dict.TryGetValue(key, out var existing) && existing)
+                return true;
+            dict[key] = true;
+            WriteBoolMarkers(path, dict);
+            marked = true;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool TryRemoveBoolMarker(string path, string key)
+    {
+        try
+        {
+            if (!File.Exists(path)) return true;
+            var dict = ReadBoolMarkers(path);
+            if (!dict.Remove(key)) return true;
+            WriteBoolMarkers(path, dict);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static Dictionary<string, bool> ReadBoolMarkers(string path)
+    {
+        if (!File.Exists(path)) return new Dictionary<string, bool>();
+        var json = File.ReadAllText(path);
+        var existing = JsonUtil.Deserialize<Dictionary<string, bool>>(json);
+        return existing != null ? new Dictionary<string, bool>(existing) : new Dictionary<string, bool>();
+    }
+
+    private static void WriteBoolMarkers(string path, Dictionary<string, bool> dict)
+    {
+        var newJson = JsonUtil.Serialize(dict);
+        var tempPath = path + ".tmp";
+        File.WriteAllText(tempPath, newJson);
+        if (File.Exists(path)) File.Delete(path);
+        File.Move(tempPath, path);
+    }
+
     public StreamJournal? TryLoad(string tradingDate, string stream)
     {
         var path = GetJournalPath(tradingDate, stream);

@@ -92,11 +92,6 @@ public sealed partial class InstrumentExecutionAuthority
     private const int QueuePressureEnqueueDequeueSkew = 28;
     private const double QueuePressureEmitMinSeconds = 45;
 
-    /// <summary>Recovery adoption: single <see cref="IIEAOrderExecutor.GetAdoptionCandidateIntentIds"/> result reused for fingerprint + scan body (cleared after each gated scan).</summary>
-    private IReadOnlyCollection<string>? _preResolvedAdoptionCandidatesForScan;
-
-    private int? _adoptionScanProofCandidateCountOverride;
-
     /// <summary>Gap 5: Callback when instrument is blocked (notify engine to stand down streams, freeze instrument).</summary>
     private Action<string, DateTimeOffset, string>? _onEnqueueFailureCallback;
 
@@ -526,16 +521,6 @@ public sealed partial class InstrumentExecutionAuthority
 
     /// <summary>Restart adoption / reconciliation: non-convergent broker order quarantine.</summary>
     private readonly AdoptionReconciliationConvergence _adoptionConvergence = new();
-
-    /// <summary>Lightweight cumulative metrics (logged at end of adoption scan).</summary>
-    private long _metricAdoptionScannedOrdersTotal;
-    private long _metricAdoptionSkippedForeignInstrumentOrdersTotal;
-    private long _metricAdoptionStaleQtsw2OrdersTotal;
-    private long _metricAdoptionSuccessfulAdoptionsTotal;
-    private long _metricAdoptionNonConvergentEscalationsTotal;
-    private long _metricAdoptionSuppressedRechecksTotal;
-
-    private int _foreignInstrumentSkipLogCounter;
 
     /// <summary>Identical evaluations before quarantine + single escalation.</summary>
     private const int AdoptionConvergenceUnchangedThreshold = 4;

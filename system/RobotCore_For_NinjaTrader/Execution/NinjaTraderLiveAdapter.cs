@@ -191,7 +191,10 @@ public sealed partial class NinjaTraderLiveAdapter : IExecutionAdapter
             var snap = new AccountSnapshot
             {
                 Positions = new List<PositionSnapshot>(),
-                WorkingOrders = new List<WorkingOrderSnapshot>()
+                WorkingOrders = new List<WorkingOrderSnapshot>(),
+                CapturedAtUtc = utcNow,
+                IsAuthoritative = false,
+                NonAuthoritativeReason = "LIVE_SNAPSHOT_STUB"
             };
             sw.Stop();
             SnapshotMetricsCollector.GetOrCreate(_log).RecordCall(DateTimeOffset.UtcNow, sw.ElapsedMilliseconds, 0, 0);
@@ -214,7 +217,10 @@ public sealed partial class NinjaTraderLiveAdapter : IExecutionAdapter
             return new AccountSnapshot
             {
                 Positions = new List<PositionSnapshot>(),
-                WorkingOrders = new List<WorkingOrderSnapshot>()
+                WorkingOrders = new List<WorkingOrderSnapshot>(),
+                CapturedAtUtc = utcNow,
+                IsAuthoritative = false,
+                NonAuthoritativeReason = "LIVE_SNAPSHOT_ERROR:" + ex.GetType().Name
             };
         }
     }
@@ -377,5 +383,10 @@ public sealed partial class NinjaTraderLiveAdapter : IExecutionAdapter
     {
         // LIVE adapter: Not yet implemented - return null so caller uses EmergencyFlatten fallback
         return null;
+    }
+
+    public int RequestSessionCloseCancelIntents(IEnumerable<string> intentIds, string instrument, DateTimeOffset utcNow)
+    {
+        return 0;
     }
 }

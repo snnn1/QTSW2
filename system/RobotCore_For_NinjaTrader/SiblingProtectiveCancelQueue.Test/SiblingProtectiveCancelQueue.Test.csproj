@@ -6,8 +6,10 @@
     <Nullable>enable</Nullable>
     <RootNamespace>QTSW2.Robot.SiblingProtectiveCancelQueue.Test</RootNamespace>
     <AssemblyName>SiblingProtectiveCancelQueue.Test</AssemblyName>
+    <DisableTransitiveProjectReferences>true</DisableTransitiveProjectReferences>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\Robot.Core.csproj" />
+    <ProjectReference Include="..\..\modules\robot\contracts\Robot.Contracts.csproj" SetTargetFramework="TargetFramework=netstandard2.0" />
   </ItemGroup>
 </Project>

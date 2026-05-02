@@ -12,10 +12,6 @@ public static class MismatchEscalationTests
 {
     public static (bool Pass, string? Error) RunMismatchEscalationTests()
     {
-        var prevMismatchBlock = FeatureFlags.ControlPlaneMismatchExecutionBlockAuthority;
-        FeatureFlags.ControlPlaneMismatchExecutionBlockAuthority = true;
-        try
-        {
         var utcNow = DateTimeOffset.UtcNow;
         var emptySnap = new AccountSnapshot { Positions = new List<PositionSnapshot>(), WorkingOrders = new List<WorkingOrderSnapshot>() };
 
@@ -256,10 +252,5 @@ public static class MismatchEscalationTests
         JournalParityPendingLedger.Clear();
 
         return (true, null);
-        }
-        finally
-        {
-            FeatureFlags.ControlPlaneMismatchExecutionBlockAuthority = prevMismatchBlock;
-        }
     }
 }

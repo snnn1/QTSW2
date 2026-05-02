@@ -56,8 +56,12 @@
     <Compile Include="..\modules\robot\core\Execution\StateConsistencyGateModels.cs" Link="Execution\StateConsistencyGateModels.cs" />
     <Compile Include="..\modules\robot\core\Execution\MismatchConvergenceBridgeProbeMath.cs" Link="Execution\MismatchConvergenceBridgeProbeMath.cs" />
     <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.cs" Link="Execution\MismatchEscalationCoordinator.cs" />
+    <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.AuditLoop.cs" Link="Execution\MismatchEscalationCoordinator.AuditLoop.cs" />
     <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.Convergence.cs" Link="Execution\MismatchEscalationCoordinator.Convergence.cs" />
     <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.Diagnostics.cs" Link="Execution\MismatchEscalationCoordinator.Diagnostics.cs" />
+    <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.FailClosed.cs" Link="Execution\MismatchEscalationCoordinator.FailClosed.cs" />
+    <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.ForcedConvergence.cs" Link="Execution\MismatchEscalationCoordinator.ForcedConvergence.cs" />
+    <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.MismatchFlow.cs" Link="Execution\MismatchEscalationCoordinator.MismatchFlow.cs" />
     <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.PendingIea.cs" Link="Execution\MismatchEscalationCoordinator.PendingIea.cs" />
     <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.Progress.cs" Link="Execution\MismatchEscalationCoordinator.Progress.cs" />
     <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.Telemetry.cs" Link="Execution\MismatchEscalationCoordinator.Telemetry.cs" />

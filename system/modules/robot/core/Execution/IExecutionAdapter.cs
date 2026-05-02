@@ -234,10 +234,16 @@ public interface IExecutionAdapter
 
     /// <summary>
     /// Session-close flatten: enqueue cancel+flatten NtActions (no drain). Strategy thread drains the queue.
-    /// Caller must confirm broker flat (or time out) before persisting session-close journal state.
-    /// Returns null if not supported (caller should use Flatten fallback + broker wait).
+    /// Broker-flat confirmation is delivered later by execution/reconciliation; callers must not block waiting on NT.
+    /// Returns null if not supported (caller should use an enqueue-safe fallback when available).
     /// </summary>
     FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow);
+
+    /// <summary>
+    /// Session-close cancel-only companion for sibling intents before a single broker-level flatten.
+    /// Implementations should enqueue onto the strategy thread and return without touching NT synchronously.
+    /// </summary>
+    int RequestSessionCloseCancelIntents(IEnumerable<string> intentIds, string instrument, DateTimeOffset utcNow) => 0;
 
     /// <summary>
     /// Hard fail-closed: broker flatten once per instrument. Harness/default adapters do not touch broker state.
@@ -267,6 +273,12 @@ public class AccountSnapshot
 
     /// <summary>Wall-clock UTC when positions/orders were read from the broker (execution safety gate freshness).</summary>
     public DateTimeOffset? CapturedAtUtc { get; set; }
+
+    /// <summary>False when the adapter could not read the broker state and returned a placeholder or partial snapshot.</summary>
+    public bool IsAuthoritative { get; set; } = true;
+
+    /// <summary>Diagnostic reason when <see cref="IsAuthoritative"/> is false.</summary>
+    public string? NonAuthoritativeReason { get; set; }
 }
 
 /// <summary>

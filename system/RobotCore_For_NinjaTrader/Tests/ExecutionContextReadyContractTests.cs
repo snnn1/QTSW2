@@ -32,6 +32,31 @@ public static class ExecutionContextReadyContractTests
                 return false;
             }
 
+            var utcNow = DateTimeOffset.Parse("2026-04-30T18:00:00+00:00");
+            if (!ExpectThrows(() => sim.GetCurrentPosition("MNG"), "GetCurrentPosition", log) ||
+                !ExpectThrows(() => sim.GetAccountSnapshot(utcNow), "GetAccountSnapshot", log) ||
+                !ExpectThrows(() => sim.CancelRobotOwnedWorkingOrders(new AccountSnapshot(), utcNow), "CancelRobotOwnedWorkingOrders", log))
+            {
+                return false;
+            }
+
+            RobotLoggingService.GetInstance(tmp, RobotRunArtifactPaths.LogsRobot(tmp))?.FlushNowForSummary();
+            var logText = ReadRobotLogs(tmp);
+            if (!ContainsToken(logText, "EXECUTION_CONTEXT_NOT_READY") ||
+                !ContainsToken(logText, "GetCurrentPosition") ||
+                !ContainsToken(logText, "GetAccountSnapshot") ||
+                !ContainsToken(logText, "CancelRobotOwnedWorkingOrders"))
+            {
+                log?.Invoke("pre-wire broker calls must log EXECUTION_CONTEXT_NOT_READY with operation names");
+                return false;
+            }
+
+            if (ContainsToken(logText, "EXECUTION_BLOCKED"))
+            {
+                log?.Invoke("pre-wire broker calls must not log EXECUTION_BLOCKED");
+                return false;
+            }
+
             log?.Invoke("PASS: ExecutionContextReady contract (Null + Sim pre-wire)");
             return true;
         }
@@ -39,5 +64,36 @@ public static class ExecutionContextReadyContractTests
         {
             try { Directory.Delete(tmp, recursive: true); } catch { /* best-effort */ }
         }
+    }
+
+    private static bool ExpectThrows(Action action, string operation, Action<string>? log)
+    {
+        try
+        {
+            action();
+            log?.Invoke(operation + " should throw before SetNTContext");
+            return false;
+        }
+        catch (InvalidOperationException)
+        {
+            return true;
+        }
+    }
+
+    private static string ReadRobotLogs(string root)
+    {
+        var robotLogDir = RobotRunArtifactPaths.LogsRobot(root);
+        if (!Directory.Exists(robotLogDir))
+            return "";
+
+        var text = "";
+        foreach (var file in Directory.GetFiles(robotLogDir, "*.jsonl", SearchOption.AllDirectories))
+            text += File.ReadAllText(file);
+        return text;
+    }
+
+    private static bool ContainsToken(string text, string token)
+    {
+        return text.IndexOf(token, StringComparison.OrdinalIgnoreCase) >= 0;
     }
 }

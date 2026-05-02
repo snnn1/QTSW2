@@ -733,8 +733,24 @@ public static class QuantExecutionControlStoreTests
 
                 if (!ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure(req, "SUBMIT_ENTRY_STOP", false, out var ok))
                     return "opening entry stop bypass: expected allow, got " + ok.Reason;
-                if (ok.Detail == null || ok.Detail.IndexOf("opening_entry_stop_quant_recovery_bypass_flat_working_order_transition", StringComparison.Ordinal) < 0)
-                    return "opening entry stop bypass: missing detail, got " + ok.Detail;
+                if (ok.Detail == null || ok.Detail.IndexOf("quant_recovery_required_cleared_authoritative_flat_owned_working", StringComparison.Ordinal) < 0)
+                    return "opening entry stop bypass: expected stale recovery clear detail, got " + ok.Detail;
+                if (QuantExecutionControlStore.GetSnapshot(inst).Phase != QuantExecutionInstrumentPhase.Normal)
+                    return "opening entry stop bypass: expected stale RecoveryRequired to clear before fill";
+
+                QuantExecutionControlStore.NotifyMappedTrustedFill(inst, 1, t0.AddSeconds(2));
+                if (QuantExecutionControlStore.GetSnapshot(inst).Phase != QuantExecutionInstrumentPhase.PendingAlignment)
+                    return "opening entry stop bypass: expected mapped fill after clear to arm PendingAlignment";
+
+                var filledSnap = new AccountSnapshot
+                {
+                    Positions = new List<PositionSnapshot> { new() { Instrument = inst, Quantity = 1 } },
+                    WorkingOrders = new List<WorkingOrderSnapshot>(),
+                    CapturedAtUtc = t0.AddSeconds(2)
+                };
+                var audit = ProtectiveCoverageAudit.Audit(inst, filledSnap, null, false, false, false, t0.AddSeconds(2).AddMilliseconds(1));
+                if (audit.Status != ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE)
+                    return "opening entry stop bypass: expected protective audit to tolerate first post-fill handoff, got " + audit.Status;
                 return null;
             }
             finally

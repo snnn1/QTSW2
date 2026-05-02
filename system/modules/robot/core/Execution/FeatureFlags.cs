@@ -44,15 +44,6 @@ public static class FeatureFlags
     public static bool FailClosedStrictReleaseConfirmationEnabled { get; set; } = true;
 
     /// <summary>
-    /// [DEPRECATED — P6 refactor] Mismatch execution block is now a first-class authority input
-    /// via <see cref="MismatchEscalationCoordinator.IsInstrumentBlockedByMismatch"/> feeding
-    /// <see cref="UnifiedExecutionAuthority"/> Gate 2. This flag is retained only for backwards
-    /// compatibility — it no longer gates the coordinator's block publication or query.
-    /// </summary>
-    [Obsolete("P6: Mismatch block is now unconditionally published. Remove after dual-run validation.")]
-    public static bool ControlPlaneMismatchExecutionBlockAuthority { get; set; } = true;
-
-    /// <summary>
     /// When true (default), <see cref="ExecutionStructuralLayer.TryEvaluateOrderSubmitStructure"/> does not deny solely for
     /// journal-repair latch or non-OK parity during <see cref="PendingAlignmentAuthority"/> (mapped-fill / post-adoption lag),
     /// if broker shows open quantity and the case is not a foreign-order or insufficient-data structural fault.

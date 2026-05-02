@@ -845,6 +845,28 @@ public sealed partial class InstrumentExecutionAuthority
         }, "ExecutionUpdate");
     }
 
+    /// <summary>
+    /// Enqueue execution update facts captured on the NT callback path. The worker must not read live NT objects.
+    /// </summary>
+    public void EnqueueExecutionUpdate(ExecutionUpdateSnapshot snapshot)
+    {
+        if (Executor == null || snapshot == null)
+            return;
+        EnqueueRecoveryEssential(() =>
+        {
+            IeExecutionLatencyTrace.WriteResolved("IEA_WORKER_EXEC_BEGIN", snapshot.BrokerOrderId, snapshot.IntentId,
+                snapshot.ExecutionInstrumentKey, InstanceId.ToString(), snapshot.FillQuantity);
+
+            if (IsInBootstrap && IsCriticalBootstrapEvent(snapshot))
+                MarkBootstrapSnapshotStale(NowEvent());
+
+            Executor.ProcessExecutionUpdate(snapshot, snapshot);
+
+            if (!_hasScannedForAdoption && !IsInBootstrap && (CurrentRecoveryState == RecoveryState.NORMAL || CurrentRecoveryState == RecoveryState.RESOLVED))
+                _ = RequestAdoptionScan(AdoptionScanRequestSource.FirstExecutionUpdate, applyRecoveryThrottle: false, postScanOnWorker: null);
+        }, "ExecutionUpdate");
+    }
+
     /// <summary>Phase 4: True if execution/order represents a critical event (fill or order state change to Working/Filled/Cancelled).</summary>
     private static bool IsCriticalBootstrapEvent(object execution, object order)
     {
@@ -863,6 +885,17 @@ public sealed partial class InstrumentExecutionAuthority
         }
         catch { }
         return false;
+    }
+
+    private static bool IsCriticalBootstrapEvent(ExecutionUpdateSnapshot snapshot)
+    {
+        if (snapshot == null) return false;
+        if (snapshot.FillQuantity != 0) return true;
+        var state = snapshot.OrderState ?? "";
+        return state.IndexOf("Working", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               state.IndexOf("Filled", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               state.IndexOf("Cancelled", StringComparison.OrdinalIgnoreCase) >= 0 ||
+               state.IndexOf("Rejected", StringComparison.OrdinalIgnoreCase) >= 0;
     }
 
     private enum AdoptionScanRequestSource
@@ -2576,6 +2609,17 @@ public sealed partial class InstrumentExecutionAuthority
             return TryMarkAndCheckDuplicateCore(execId, orderId, ticks, qty, mpos);
         }
         catch { return false; }
+    }
+
+    internal bool TryMarkAndCheckDuplicate(ExecutionUpdateSnapshot snapshot)
+    {
+        if (snapshot == null) return false;
+        return TryMarkAndCheckDuplicateCore(
+            snapshot.ExecutionId,
+            snapshot.BrokerOrderId,
+            snapshot.ExecutionTimeTicks,
+            snapshot.FillQuantity,
+            snapshot.MarketPosition);
     }
 
     private void EvictDedupEntries()

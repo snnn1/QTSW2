@@ -39,6 +39,22 @@ public static class QuantExecutionControlStore
         var inst = Norm(instrument);
         if (string.IsNullOrEmpty(inst) || expectedWorkingOrderCount <= 0) return;
 
+        var notified = false;
+        foreach (var alias in ExecutionInstrumentResolver.GetInstrumentMatchAliases(inst))
+        {
+            NotifyProtectiveSubmitPendingExact(alias, expectedWorkingOrderCount, utcNow);
+            notified = true;
+        }
+
+        if (!notified)
+            NotifyProtectiveSubmitPendingExact(inst, expectedWorkingOrderCount, utcNow);
+    }
+
+    private static void NotifyProtectiveSubmitPendingExact(string instrument, int expectedWorkingOrderCount, DateTimeOffset utcNow)
+    {
+        var inst = Norm(instrument);
+        if (string.IsNullOrEmpty(inst) || expectedWorkingOrderCount <= 0) return;
+
         var windowMs = FeatureFlags.PostFillAlignmentWindowMs > 0 ? FeatureFlags.PostFillAlignmentWindowMs : 5000;
         var expiry = utcNow.AddMilliseconds(windowMs);
         var expectedCount = Math.Abs(expectedWorkingOrderCount);
@@ -274,7 +290,7 @@ public static class QuantExecutionControlStore
     }
 
     /// <summary>
-    /// Broker/order lifecycle observed a fill before the execution callback may have finished journaling it.
+    /// Broker/order lifecycle observed fill or terminal-order activity before all broker/journal/registry views have converged.
     /// This arms the same short alignment horizon as mapped fills, but without asserting signed quantity yet.
     /// </summary>
     public static void NotifyBrokerExecutionCallbackPending(
@@ -419,7 +435,9 @@ public static class QuantExecutionControlStore
 
     /// <summary>
     /// Explicit release valve for stale <see cref="QuantExecutionInstrumentPhase.RecoveryRequired"/> when a single
-    /// sampled authority frame proves the instrument is broker/journal/ledger/IEA flat before a fresh opening submit.
+    /// sampled authority frame proves the instrument is broker/journal/ledger flat before a fresh opening submit.
+    /// A flat instrument with only robot-owned working orders is still exposure-flat; keeping the stale recovery phase
+    /// would suppress the next entry fill's bounded protective handoff.
     /// </summary>
     public static bool TryClearRecoveryRequiredOnAuthoritativeFlat(
         string instrument,
@@ -442,9 +460,7 @@ public static class QuantExecutionControlStore
         if (e.Phase != QuantExecutionInstrumentPhase.RecoveryRequired) return false;
 
         if (brokerAbsPositionQty != 0 ||
-            journalRealOpenQty + journalRecoveredOpenQty != 0 ||
-            brokerWorkingOrderCount != 0 ||
-            ieaOwnedPlusAdoptedWorking != 0)
+            journalRealOpenQty + journalRecoveredOpenQty != 0)
             return false;
 
         if ((ledgerSignedNetQty.HasValue && ledgerSignedNetQty.Value != 0) ||
@@ -452,12 +468,23 @@ public static class QuantExecutionControlStore
             (ledgerOrphanSlotCount.HasValue && ledgerOrphanSlotCount.Value != 0))
             return false;
 
+        var noWorkingOrders = brokerWorkingOrderCount == 0 && ieaOwnedPlusAdoptedWorking == 0;
+        var robotOwnedWorkingOnly =
+            brokerWorkingOrderCount > 0 &&
+            brokerWorkingOrderCount == ieaOwnedPlusAdoptedWorking;
+        if (!noWorkingOrders && !robotOwnedWorkingOnly)
+            return false;
+
         var reason = e.RecoveryRequiredReason ?? "";
         e.Phase = QuantExecutionInstrumentPhase.Normal;
         e.Expected = new QuantExpectedInstrumentState();
         e.LockOrUnmappedReason = null;
         e.RecoveryRequiredReason = null;
-        detail = "quant_recovery_required_cleared_authoritative_flat:reason=" + reason;
+        detail = robotOwnedWorkingOnly
+            ? "quant_recovery_required_cleared_authoritative_flat_owned_working:reason=" + reason +
+              ";broker_working_order_count=" + brokerWorkingOrderCount +
+              ";iea_owned_plus_adopted_working=" + ieaOwnedPlusAdoptedWorking
+            : "quant_recovery_required_cleared_authoritative_flat:reason=" + reason;
         return true;
     }
 

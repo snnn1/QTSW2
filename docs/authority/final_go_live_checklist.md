@@ -11,7 +11,8 @@ This document is the **bounded** go-live gate for the trading robot. It does **n
 **Conditional GO** only for an **explicitly bounded production path**:
 
 - **`RobotCore_For_NinjaTrader`** (authoritative, buildable core for NinjaTrader)
-- **`NT_ADDONS`** as a **synced mirror** of authority-critical sources (same logic as RobotCore)
+- **`RobotSimStrategy.cs`** copied to NinjaTrader Strategies
+- **`NT_ADDONS`** is a **legacy/manual mirror only**; it is not compiled or copied by the runtime deploy path
 - **Sign-off evidence** produced from the **same linked source set** as that production build (see [Sign-off evidence commands](#sign-off-evidence-commands))
 
 That is the correct professional stance.
@@ -41,7 +42,7 @@ As long as **`modules/robot/core`** does not build and is not clearly **quaranti
 
 **Correct live statement:**
 
-> Only the **`RobotCore_For_NinjaTrader`** path is in scope for live sign-off (plus aligned **`NT_ADDONS`** deployment).
+> Only the **`RobotCore_For_NinjaTrader` DLL** plus copied **`RobotSimStrategy.cs`** path is in scope for live sign-off.
 
 ### 2. Best-effort decision-completion append
 
@@ -194,7 +195,7 @@ As long as **`modules/robot/core`** does not build and is not clearly **quaranti
 ### 5.1 Runtime parity
 
 - [ ] The **actual runtime build path** uses the corrected authority logic (**`RobotCore_For_NinjaTrader`**).
-- [ ] **`NT_ADDONS`** is aligned with RobotCore for **authority-critical** changes.
+- [ ] **`NT_ADDONS`**, if kept, is explicitly treated as a manual mirror/non-runtime audit artifact.
 - [ ] No **production-capable** tree still uses **outdated** authority wiring without an explicit exception.
 - [ ] Any **non-aligned** tree is **explicitly non-production** (e.g. **`modules/robot/core`** until it builds and is re-audited).
 
@@ -202,7 +203,7 @@ As long as **`modules/robot/core`** does not build and is not clearly **quaranti
 
 ### 5.2 Build discipline
 
-- [ ] The **live deployment artifact** is clearly identified (**RobotCore DLL + NT integration + NT_ADDONS**).
+- [ ] The **live deployment artifact** is clearly identified (**RobotCore DLL + RobotSimStrategy.cs**).
 - [ ] The live deployment artifact **builds successfully**.
 - [ ] The **test harness** used for sign-off is tied to the **same authority logic** as production (linked sources / same project).
 - [ ] There is **no ambiguity** about which codebase is authoritative for live trading.
@@ -315,7 +316,7 @@ Until then, treat **`modules/robot/core`** as **non-production**.
 | **Architecture** | PASS |
 | **Enforcement** | PASS |
 | **Scenario proof** | PASS for the **audited runner path** |
-| **Deployment parity** | **FAIL** unless production scope is **explicitly narrowed** to RobotCore + NT_ADDONS |
+| **Deployment parity** | **FAIL** unless production scope is **explicitly narrowed** to RobotCore DLL + RobotSimStrategy.cs |
 | **Forensic auditability** | **PARTIAL** (best-effort decision append) |
 | **Operational readiness** | **UNKNOWN** from repo alone |
 
@@ -325,7 +326,7 @@ Until then, treat **`modules/robot/core`** as **non-production**.
 
 **Conditional GO for live deployment** only if **all** of the following are true:
 
-1. **Production** is explicitly limited to **`RobotCore_For_NinjaTrader`** plus the aligned **`NT_ADDONS`** deployment path.
+1. **Production** is explicitly limited to **`RobotCore_For_NinjaTrader`** DLL plus copied **`RobotSimStrategy.cs`**.
 2. **`modules/robot/core`** is explicitly treated as **non-production** until fixed (and quarantined in process, not only in this doc).
 3. **Sign-off evidence** is the passing **`SCENARIO_HARNESS_SIX`** and **`AUTHORITY_CONTRADICTIONS`** runs against **that** production-linked source path.
 4. The team **explicitly accepts** the residual forensic risk that mismatch/flatten **decision append logs** are **best-effort** under disk failure.
@@ -346,7 +347,7 @@ You are **not** blocked by architecture anymore. You are blocked by **production
 | Path | Status |
 |------|--------|
 | `RobotCore_For_NinjaTrader/` | **In scope** for live sign-off (when checklist above is satisfied). |
-| `NT_ADDONS/` | **In scope** only when maintained as a **mirror** of authority-critical RobotCore sources. |
+| `NT_ADDONS/` | **Out of runtime scope**; legacy/manual mirror only while it exists. |
 | `modules/robot/core/` | **Out of scope** for live until it **builds** and is **re-audited** against the same gates. |
 
 ---

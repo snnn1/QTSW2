@@ -348,6 +348,21 @@ public sealed class ReconciliationRunner
             return;
         }
 
+        if (!snap.IsAuthoritative)
+        {
+            if (cpuStart != 0) _runtimeAudit?.CpuEnd(cpuStart, RuntimeAuditSubsystem.Reconciliation);
+            _log.Write(RobotEvents.EngineBase(utcNow, "", "RECONCILIATION_SKIPPED_NON_AUTHORITATIVE_SNAPSHOT", "ENGINE",
+                new
+                {
+                    reason = string.IsNullOrWhiteSpace(snap.NonAuthoritativeReason) ? "UNKNOWN" : snap.NonAuthoritativeReason,
+                    captured_at_utc = snap.CapturedAtUtc,
+                    gate_mode = gateMode,
+                    gate_instrument = gateInst,
+                    note = "Broker snapshot was unavailable or partial; skipping reconciliation and broker-flat journal cleanup"
+                }));
+            return;
+        }
+
         var positions = snap.Positions ?? new List<PositionSnapshot>();
         var workingOrders = snap.WorkingOrders ?? new List<WorkingOrderSnapshot>();
 
