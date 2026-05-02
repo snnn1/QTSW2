@@ -9,7 +9,7 @@ Usage:
   python tools/run_folder_integrity_audit.py --run-root runs/ebcc66de9d714fa4a35190bd11761aa0
   python tools/run_folder_integrity_audit.py --phase2-only
 
-Legacy-style sections (A-G) print first; Phase 2 (H-M) extends unless --legacy-only.
+Legacy-style sections (A-G) print first; Phase 2 (H-O) extends unless --legacy-only.
 
 Writes audit_report.json under the run root by default (same data as stdout, structured).
 Top-level rollup: verdict, broker_truth, system_truth, unexplained_positions (schema_version 2+).
@@ -28,7 +28,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LATEST_RUN_REL = Path("runs") / "LATEST_RUN.txt"
 AUDIT_REPORT_FILENAME = "audit_report.json"
 # Bump when the JSON shape changes (new/moved/renamed top-level or section fields).
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "4"
 
 # Equivalent to ENTRY_SUBMITTED for classification (file evidence)
 ENTRY_SUBMIT_EQUIV_EVENTS = frozenset(
@@ -157,6 +157,22 @@ def extract_ts_from_obj(obj: Dict[str, Any], path: Path) -> Optional[datetime]:
     return None
 
 
+def _to_float_or_none(val: Any) -> Optional[float]:
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_present(obj: Dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in obj and obj[key] is not None:
+            return obj[key]
+    return None
+
+
 def flatten_payload_instrument(obj: Dict[str, Any]) -> Optional[str]:
     pl = obj.get("payload")
     if isinstance(pl, dict) and pl.get("instrument"):
@@ -182,9 +198,15 @@ class JournalRow:
     entry_submitted: bool
     entry_filled: bool
     source_file: str
+    entry_submitted_at: Optional[datetime] = None
     entry_filled_at: Optional[datetime] = None
     exit_filled_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
     completion_reason: str = ""
+    entry_order_type: str = ""
+    exit_order_type: str = ""
+    entry_filled_quantity_total: Optional[float] = None
+    exit_filled_quantity_total: Optional[float] = None
     realized_pnl_gross: Optional[float] = None
     trade_completed: bool = False
 
@@ -261,14 +283,16 @@ def load_execution_journals(run_root: Path, files: List[Path]) -> List[JournalRo
                     entry_submitted=bool(obj.get("EntrySubmitted")),
                     entry_filled=bool(obj.get("EntryFilled")),
                     source_file=rp,
+                    entry_submitted_at=_parse_ts(obj.get("EntrySubmittedAtUtc") or obj.get("EntrySubmittedAt")),
                     entry_filled_at=_parse_ts(obj.get("EntryFilledAtUtc") or obj.get("EntryFilledAt")),
                     exit_filled_at=_parse_ts(obj.get("ExitFilledAtUtc")),
+                    completed_at=_parse_ts(obj.get("CompletedAtUtc") or obj.get("CompletedAt")),
                     completion_reason=str(obj.get("CompletionReason") or "").strip(),
-                    realized_pnl_gross=(
-                        float(obj["RealizedPnLGross"])
-                        if obj.get("RealizedPnLGross") is not None
-                        else None
-                    ),
+                    entry_order_type=str(obj.get("EntryOrderType") or "").strip(),
+                    exit_order_type=str(obj.get("ExitOrderType") or "").strip(),
+                    entry_filled_quantity_total=_to_float_or_none(obj.get("EntryFilledQuantityTotal")),
+                    exit_filled_quantity_total=_to_float_or_none(obj.get("ExitFilledQuantityTotal")),
+                    realized_pnl_gross=_to_float_or_none(obj.get("RealizedPnLGross")),
                     trade_completed=bool(obj.get("TradeCompleted")),
                 )
             )
@@ -476,6 +500,75 @@ def collect_instruments_by_layer(
     return key_ev, ej, ev_files
 
 
+def build_execution_event_audit_gaps(run_root: Path, files: List[Path]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for path in files:
+        rp = rel_path(run_root, path).replace("\\", "/")
+        if "execution_events" not in rp:
+            continue
+        is_unknown_file = "/_unknown_" in f"/{rp}" or rp.startswith("_unknown_")
+        for line_no, obj in iter_json_objects(path):
+            event_type = str(obj.get("event_type") or obj.get("event") or "").strip()
+            payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+            data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+            instrument = str(
+                _first_present(obj, "instrument")
+                or _first_present(payload, "instrument")
+                or _first_present(data, "instrument")
+                or ""
+            ).strip()
+            intent_id = str(
+                _first_present(obj, "intent_id", "intentId", "IntentId")
+                or _first_present(payload, "intent_id", "intentId", "IntentId")
+                or _first_present(data, "intent_id", "intentId", "IntentId")
+                or ""
+            ).strip()
+            stream_key = str(
+                _first_present(obj, "stream_key", "stream", "Stream")
+                or _first_present(payload, "stream_key", "stream", "Stream")
+                or _first_present(data, "stream_key", "stream", "Stream")
+                or ""
+            ).strip()
+            command_id = str(
+                _first_present(obj, "command_id", "commandId", "CommandId")
+                or _first_present(payload, "command_id", "commandId", "CommandId")
+                or ""
+            ).strip()
+            command_type = str(_first_present(payload, "commandType", "command_type") or "").strip()
+            missing: List[str] = []
+            if event_type == "COMMAND_RECEIVED":
+                if not instrument:
+                    missing.append("instrument")
+                if not intent_id:
+                    missing.append("intent_id")
+                if not stream_key:
+                    missing.append("stream_key")
+                if not str(_first_present(payload, "order_role") or "").strip():
+                    missing.append("order_role")
+                if not str(_first_present(payload, "request_id") or "").strip():
+                    missing.append("request_id")
+                if not str(_first_present(payload, "correlation_id") or "").strip():
+                    missing.append("correlation_id")
+            elif is_unknown_file and not instrument:
+                missing.append("instrument")
+
+            if missing or is_unknown_file:
+                rows.append(
+                    {
+                        "source_file": f"{rp}:{line_no}",
+                        "event_type": event_type or "?",
+                        "command_id": command_id,
+                        "command_type": command_type,
+                        "instrument": instrument,
+                        "intent_id": intent_id,
+                        "stream_key": stream_key,
+                        "missing_fields": missing,
+                        "unknown_file": is_unknown_file,
+                    }
+                )
+    return rows
+
+
 def _snap_to_dict(b: BrokerSnap) -> Dict[str, Any]:
     return {
         "instrument": b.instrument,
@@ -494,8 +587,19 @@ def _journal_row_to_dict(r: JournalRow) -> Dict[str, Any]:
         "broker_order_id": r.broker_order_id,
         "entry_submitted": r.entry_submitted,
         "entry_filled": r.entry_filled,
+        "trade_completed": r.trade_completed,
         "source_file": r.source_file,
     }
+
+
+def classify_hold_seconds(seconds: float) -> str:
+    if seconds < 5:
+        return "very_fast"
+    if seconds < 15:
+        return "fast"
+    if seconds < 60:
+        return "normal_short"
+    return "normal"
 
 
 def build_round_trip_rows(journal_rows: List[JournalRow]) -> List[Dict[str, Any]]:
@@ -512,12 +616,46 @@ def build_round_trip_rows(journal_rows: List[JournalRow]) -> List[Dict[str, Any]
                 "entry_filled_at_utc": r.entry_filled_at.isoformat(),
                 "exit_filled_at_utc": r.exit_filled_at.isoformat(),
                 "held_seconds": round(held_seconds, 3),
+                "speed_class": classify_hold_seconds(held_seconds),
+                "entry_type": r.entry_order_type,
+                "exit_type": r.exit_order_type,
                 "completion_reason": r.completion_reason,
+                "trade_completed": r.trade_completed,
                 "realized_pnl_gross": r.realized_pnl_gross,
                 "source_file": r.source_file,
             }
         )
     return sorted(rows, key=lambda x: x["held_seconds"])
+
+
+def build_operator_timeline_rows(journal_rows: List[JournalRow]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+
+    def add_row(r: JournalRow, ts: Optional[datetime], event: str, qty: Optional[float], reason: str) -> None:
+        if ts is None:
+            return
+        rows.append(
+            {
+                "timestamp_utc": ts.isoformat(),
+                "instrument": r.instrument,
+                "stream": r.stream,
+                "event": event,
+                "intent_id": r.intent_id,
+                "qty": _qty_json(qty) if qty is not None else None,
+                "reason": reason,
+                "source_file": r.source_file,
+            }
+        )
+
+    for r in journal_rows:
+        add_row(r, r.entry_submitted_at, "ENTRY_SUBMITTED", r.entry_filled_quantity_total, r.entry_order_type)
+        add_row(r, r.entry_filled_at, "ENTRY_FILLED", r.entry_filled_quantity_total, r.entry_order_type)
+        exit_ts = r.exit_filled_at or (r.completed_at if r.trade_completed else None)
+        exit_event = "EXIT_FILLED" if r.exit_filled_at else "TRADE_COMPLETED"
+        exit_reason = r.exit_order_type or r.completion_reason
+        add_row(r, exit_ts, exit_event, r.exit_filled_quantity_total, exit_reason)
+
+    return sorted(rows, key=lambda x: (x["timestamp_utc"], x["instrument"], x["stream"], x["event"]))
 
 
 def _qty_json(q: float) -> Any:
@@ -747,6 +885,8 @@ def build_audit_report(
     broker_truth = broker_truth_summary(broker_snaps)
     system_truth = system_truth_summary(journal_rows)
     round_trips = build_round_trip_rows(journal_rows)
+    operator_timeline = build_operator_timeline_rows(journal_rows)
+    execution_event_audit_gaps = build_execution_event_audit_gaps(run_root, files)
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -779,6 +919,7 @@ def build_audit_report(
             "execution_event_coverage_gap": execution_event_coverage_gap,
             "missing_execution_event_instruments": sorted(ej_ins - ev_ins),
             "key_events_empty": key_events_empty,
+            "execution_event_audit_gaps": execution_event_audit_gaps,
         },
         "section_l": {
             "position_not_adopted_tags": tag_reasons,
@@ -786,6 +927,7 @@ def build_audit_report(
         },
         "section_m": {"preventable": preventable, "preventable_note": "heuristic: YES if INSTRUMENT_MISMATCH or NO_EXECUTION_JOURNAL"},
         "section_n": {"quick_round_trips": round_trips[:20]},
+        "section_o": {"operator_timeline": operator_timeline[:120]},
     }
 
 
@@ -854,6 +996,7 @@ def print_phase2(report: Dict[str, Any]) -> None:
     l_ = report["section_l"]
     m = report["section_m"]
     n = report.get("section_n", {})
+    o = report.get("section_o", {})
 
     print("")
     print("=" * 72)
@@ -914,6 +1057,16 @@ def print_phase2(report: Dict[str, Any]) -> None:
         )
     if k.get("key_events_empty"):
         print("  coverage_gap: KEY_EVENTS is empty; durable journals remain primary verdict evidence")
+    gap_rows = k.get("execution_event_audit_gaps") or []
+    if gap_rows:
+        print("  audit_gap: execution_events missing fields / _unknown files")
+        for row in gap_rows[:20]:
+            missing = ",".join(row.get("missing_fields") or []) or "none"
+            print(
+                f"    {row['source_file']} event={row['event_type']} command={row.get('command_type') or '?'} "
+                f"missing={missing} inst={row.get('instrument') or '?'} intent={row.get('intent_id') or '?'} "
+                f"stream={row.get('stream_key') or '?'}"
+            )
 
     print("")
     print("=" * 72)
@@ -945,8 +1098,25 @@ def print_phase2(report: Dict[str, Any]) -> None:
     for row in rows[:20]:
         print(
             f"  {row['instrument']} {row['stream']} intent={row['intent_id'][:8]}... "
-            f"held={row['held_seconds']}s completion={row['completion_reason'] or '?'} "
+            f"held={row['held_seconds']}s class={row['speed_class']} entry={row['entry_type'] or '?'} "
+            f"exit={row['exit_type'] or '?'} completed={row['trade_completed']} "
+            f"completion={row['completion_reason'] or '?'} "
             f"pnl={row['realized_pnl_gross']} file={row['source_file']}"
+        )
+
+    print("")
+    print("=" * 72)
+    print("SECTION O - Operator timeline fallback")
+    print("=" * 72)
+    timeline_rows = o.get("operator_timeline", [])
+    if not timeline_rows:
+        print("  none detected")
+    else:
+        print("timestamp | instrument | stream | event | intent_id | qty | reason")
+    for row in timeline_rows[:80]:
+        print(
+            f"{row['timestamp_utc']} | {row['instrument']} | {row['stream']} | {row['event']} | "
+            f"{row['intent_id']} | {row['qty'] if row['qty'] is not None else ''} | {row['reason'] or ''}"
         )
 
 
@@ -964,7 +1134,7 @@ def main() -> None:
     ap.add_argument(
         "--phase2-only",
         action="store_true",
-        help="Print only sections H-M.",
+        help="Print only sections H-O.",
     )
     ap.add_argument(
         "--no-write-report",

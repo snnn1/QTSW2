@@ -1141,6 +1141,9 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
                 PLAYBACK_ANCHOR_UTC = _playbackStartTimeUtc.HasValue ? _playbackStartTimeUtc.Value.ToString("o") : null
             }));
         _eventWriter = new ExecutionEventWriter(_persistenceBase, () => TradingDateString, _log, () => _runId ?? "");
+#if NINJATRADER
+        var keyEventWriter = new KeyEventWriter(_persistenceBase);
+#endif
         _log.SetRunId(_runId);
         _runtimeAudit = new RuntimeAuditHub(_log, () => _runId ?? "");
         RuntimeAuditHubRef.Active = _runtimeAudit;
@@ -1507,6 +1510,9 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
                 simAdapter.SetUseInstrumentExecutionAuthority(_executionPolicy?.UseInstrumentExecutionAuthority ?? false);
                 simAdapter.SetAggregationPolicy(_executionPolicy?.Aggregation);
                 simAdapter.SetEventWriter(_eventWriter);
+#if NINJATRADER
+                simAdapter.SetKeyEventWriter(keyEventWriter);
+#endif
                 simAdapter.SetFlattenCoordinationInstanceId(_reconciliationWriterInstanceId);
                 simAdapter.SetCanonicalInstrumentForJournalAggregation(s => GetCanonicalInstrument(s));
                 simAdapter.SetEngineCallbacks(

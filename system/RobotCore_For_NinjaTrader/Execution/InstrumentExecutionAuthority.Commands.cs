@@ -24,18 +24,40 @@ public sealed partial class InstrumentExecutionAuthority
         if (command == null) return;
         if (Executor == null)
         {
-            Log?.Write(RobotEvents.ExecutionBase(command.TimestampUtc, command.IntentId ?? "", command.Instrument, "EXECUTION_COMMAND_REJECTED",
-                new { commandId = command.CommandId, reason = "Executor not set", commandType = command.GetType().Name }));
+            var rejectedAudit = GetCommandAuditIdentity(command);
+            Log?.Write(RobotEvents.ExecutionBase(command.TimestampUtc, rejectedAudit.IntentId, rejectedAudit.Instrument, "EXECUTION_COMMAND_REJECTED",
+                new
+                {
+                    commandId = command.CommandId,
+                    reason = "Executor not set",
+                    commandType = command.GetType().Name,
+                    stream_key = rejectedAudit.StreamKey,
+                    order_role = rejectedAudit.OrderRole,
+                    request_id = command.CommandId,
+                    correlation_id = rejectedAudit.CorrelationId
+                }));
             _eventWriter?.Emit(new CanonicalExecutionEvent
             {
                 TimestampUtc = command.TimestampUtc.ToString("o"),
-                Instrument = command.Instrument ?? "",
-                IntentId = command.IntentId,
+                Instrument = rejectedAudit.Instrument,
+                StreamKey = rejectedAudit.StreamKey,
+                IntentId = rejectedAudit.IntentId,
                 CommandId = command.CommandId,
                 EventType = ExecutionEventTypes.COMMAND_REJECTED,
                 Source = "IEA",
                 Severity = "ERROR",
-                Payload = new { commandId = command.CommandId, reason = "Executor not set", commandType = command.GetType().Name }
+                Payload = new
+                {
+                    commandId = command.CommandId,
+                    reason = "Executor not set",
+                    commandType = command.GetType().Name,
+                    instrument = rejectedAudit.Instrument,
+                    stream_key = rejectedAudit.StreamKey,
+                    intent_id = rejectedAudit.IntentId,
+                    order_role = rejectedAudit.OrderRole,
+                    request_id = command.CommandId,
+                    correlation_id = rejectedAudit.CorrelationId
+                }
             });
             return;
         }
@@ -45,20 +67,45 @@ public sealed partial class InstrumentExecutionAuthority
     private void DispatchCommand(ExecutionCommandBase command)
     {
         var utcNow = command.TimestampUtc;
-        var (instrument, intentId) = GetCommandAuditIdentity(command);
+        var audit = GetCommandAuditIdentity(command);
+        var instrument = audit.Instrument;
+        var intentId = audit.IntentId;
         var commandType = command.GetType().Name;
 
         Log?.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "EXECUTION_COMMAND_RECEIVED",
-            new { commandType, reason = command.Reason, callerContext = command.CallerContext, instrument }));
+            new
+            {
+                commandType,
+                reason = command.Reason,
+                callerContext = command.CallerContext,
+                instrument,
+                stream_key = audit.StreamKey,
+                intent_id = intentId,
+                order_role = audit.OrderRole,
+                request_id = command.CommandId,
+                correlation_id = audit.CorrelationId
+            }));
         _eventWriter?.Emit(new CanonicalExecutionEvent
         {
             TimestampUtc = utcNow.ToString("o"),
             Instrument = instrument,
+            StreamKey = audit.StreamKey,
             IntentId = intentId,
             CommandId = command.CommandId,
             EventType = ExecutionEventTypes.COMMAND_RECEIVED,
             Source = "IEA",
-            Payload = new { commandType, reason = command.Reason, callerContext = command.CallerContext, instrument }
+            Payload = new
+            {
+                commandType,
+                reason = command.Reason,
+                callerContext = command.CallerContext,
+                instrument,
+                stream_key = audit.StreamKey,
+                intent_id = intentId,
+                order_role = audit.OrderRole,
+                request_id = command.CommandId,
+                correlation_id = audit.CorrelationId
+            }
         });
 
         try
@@ -114,23 +161,46 @@ public sealed partial class InstrumentExecutionAuthority
         }
     }
 
-    private static (string Instrument, string IntentId) GetCommandAuditIdentity(ExecutionCommandBase command)
+    private static (string Instrument, string IntentId, string? StreamKey, string OrderRole, string? CorrelationId) GetCommandAuditIdentity(ExecutionCommandBase command)
     {
         if (command is SubmitMarketReentryCommand reentry)
         {
+            var intentId = (reentry.ReentryIntentId ?? reentry.IntentId ?? "").Trim();
             return (
                 (reentry.ExecutionInstrument ?? reentry.Instrument ?? "").Trim(),
-                (reentry.ReentryIntentId ?? reentry.IntentId ?? "").Trim());
+                intentId,
+                string.IsNullOrWhiteSpace(reentry.Stream) ? null : reentry.Stream.Trim(),
+                "ENTRY",
+                string.IsNullOrWhiteSpace(intentId) ? null : $"REENTRY:{intentId}:{command.TimestampUtc:yyyyMMddHHmmssfff}");
         }
 
         if (command is SubmitEntryIntentCommand submit)
         {
+            var intentId = (submit.LongIntentId ?? submit.IntentId ?? "").Trim();
             return (
                 (submit.ExecutionInstrument ?? submit.Instrument ?? "").Trim(),
-                (submit.LongIntentId ?? submit.IntentId ?? "").Trim());
+                intentId,
+                string.IsNullOrWhiteSpace(submit.Stream) ? null : submit.Stream.Trim(),
+                "ENTRY",
+                string.IsNullOrWhiteSpace(intentId) ? null : $"SUBMIT_ENTRY:{intentId}:{command.TimestampUtc:yyyyMMddHHmmssfff}");
         }
 
-        return ((command.Instrument ?? "").Trim(), (command.IntentId ?? "").Trim());
+        var baseInstrument = (command.Instrument ?? "").Trim();
+        var baseIntentId = (command.IntentId ?? "").Trim();
+        var role = command switch
+        {
+            FlattenIntentCommand => "FLATTEN",
+            CancelIntentOrdersCommand => "CANCEL",
+            _ => command.GetType().Name
+        };
+        var correlationId = command switch
+        {
+            FlattenIntentCommand => $"FLATTEN:{(string.IsNullOrEmpty(baseIntentId) ? "CMD" : baseIntentId)}:{command.TimestampUtc:yyyyMMddHHmmssfff}",
+            CancelIntentOrdersCommand => $"CANCEL:{baseIntentId}:{command.TimestampUtc:yyyyMMddHHmmssfff}",
+            _ => null
+        };
+
+        return (baseInstrument, baseIntentId, null, role, correlationId);
     }
 
     private void HandleFlattenIntentCommand(FlattenIntentCommand cmd)
