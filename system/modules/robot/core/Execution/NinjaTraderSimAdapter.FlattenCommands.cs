@@ -692,6 +692,26 @@ public sealed partial class NinjaTraderSimAdapter
         return ids;
     }
 
+    public int ReopenBrokerFlatCompletedJournalsForCarryover(
+        string? executionInstrument,
+        IReadOnlyDictionary<string, int> workingIntentOpenQtyByIntent,
+        DateTimeOffset utcNow,
+        string triggerSource)
+    {
+        if (string.IsNullOrWhiteSpace(executionInstrument) ||
+            workingIntentOpenQtyByIntent == null ||
+            workingIntentOpenQtyByIntent.Count == 0)
+            return 0;
+
+        var canonical = DeriveCanonicalFromExecutionInstrument(executionInstrument);
+        return _executionJournal.ReopenBrokerFlatCompletedJournalRowsForCarryover(
+            executionInstrument,
+            canonical,
+            workingIntentOpenQtyByIntent,
+            utcNow,
+            triggerSource);
+    }
+
     /// <summary>
     /// Get journal visibility diagnostics for adoption deferral logging.
     /// </summary>

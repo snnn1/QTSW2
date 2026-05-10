@@ -225,11 +225,9 @@ public sealed partial class NinjaTraderSimAdapter
                 return;
             }
 
-            // Gap 3 / Step 5: Deduplicate execution callbacks before any state mutation (multi-forwarding from router)
+            // Gap 3 / Step 5: Non-IEA dedupe. IEA dedupe runs before worker enqueue.
             bool isDuplicate = false;
-            if (_useInstrumentExecutionAuthority && _iea != null)
-                isDuplicate = _iea.TryMarkAndCheckDuplicate(executionObj, orderObj);
-            else
+            if (!(_useInstrumentExecutionAuthority && _iea != null))
             {
                 var dedupKey = BuildNonIeaDedupKey(execution, order);
                 isDuplicate = TryMarkAndCheckDuplicateNonIea(dedupKey);

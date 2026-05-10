@@ -60,6 +60,16 @@ public sealed class StateConsistencyReleaseEvaluationInput
     public int PendingExecutionWorkload { get; set; }
     /// <summary>Open journal remaining quantity (same semantics as mismatch assembly).</summary>
     public int JournalOpenQty { get; set; }
+    /// <summary>True when release evaluation had a canonical ownership snapshot for this instrument.</summary>
+    public bool OwnershipSnapshotAvailable { get; set; }
+    /// <summary>Gross non-closed ownership quantity across active/orphan/manual slots.</summary>
+    public int OwnershipGrossOpenQty { get; set; }
+    /// <summary>Signed net quantity from the ownership ledger.</summary>
+    public int OwnershipSignedNetQty { get; set; }
+    /// <summary>Active ownership slots for this execution instrument.</summary>
+    public int OwnershipActiveSlotCount { get; set; }
+    /// <summary>Orphan ownership slots for this execution instrument.</summary>
+    public int OwnershipOrphanSlotCount { get; set; }
     /// <summary>IEA owned+adopted working count, or -1 if unavailable / fail-closed.</summary>
     public int IeaOwnedPlusAdoptedWorking { get; set; }
     /// <summary>
@@ -124,6 +134,11 @@ public sealed class StateConsistencyReleaseReadinessResult
     /// <summary>Mirrors inputs used for Evaluate (diagnostics / gate telemetry).</summary>
     public int DiagnosticBrokerPositionQty { get; set; }
     public int DiagnosticJournalOpenQty { get; set; }
+    public bool DiagnosticOwnershipSnapshotAvailable { get; set; }
+    public int DiagnosticOwnershipGrossOpenQty { get; set; }
+    public int DiagnosticOwnershipSignedNetQty { get; set; }
+    public int DiagnosticOwnershipActiveSlotCount { get; set; }
+    public int DiagnosticOwnershipOrphanSlotCount { get; set; }
     public int DiagnosticBrokerWorkingCount { get; set; }
     public int DiagnosticIeaOwnedPlusAdoptedWorking { get; set; }
     public int DiagnosticPendingAdoptionCandidateCount { get; set; }
@@ -276,6 +291,13 @@ public static class StateConsistencyReleaseEvaluator
         else
             r.LocalStateCoherent = true;
 
+        if (HasActiveOwnershipGross(i) && i.BrokerPositionQty == 0)
+        {
+            r.LocalStateCoherent = false;
+            r.Contradictions.Add(
+                $"ownership_gross_open_on_broker_net_flat:qty={i.OwnershipGrossOpenQty}:active_slots={i.OwnershipActiveSlotCount}:orphan_slots={i.OwnershipOrphanSlotCount}");
+        }
+
         var posDiff = Math.Abs(i.BrokerPositionQty - i.JournalOpenQty);
         r.UnexplainedBrokerPositionQty = posDiff;
         var positionToleratedPending = i.PendingAlignmentActive && ieaOk && posDiff > 0;
@@ -337,6 +359,11 @@ public static class StateConsistencyReleaseEvaluator
         r.SnapshotSufficient = true;
         r.DiagnosticBrokerPositionQty = i.BrokerPositionQty;
         r.DiagnosticJournalOpenQty = i.JournalOpenQty;
+        r.DiagnosticOwnershipSnapshotAvailable = i.OwnershipSnapshotAvailable;
+        r.DiagnosticOwnershipGrossOpenQty = i.OwnershipGrossOpenQty;
+        r.DiagnosticOwnershipSignedNetQty = i.OwnershipSignedNetQty;
+        r.DiagnosticOwnershipActiveSlotCount = i.OwnershipActiveSlotCount;
+        r.DiagnosticOwnershipOrphanSlotCount = i.OwnershipOrphanSlotCount;
         r.DiagnosticBrokerWorkingCount = i.BrokerWorkingCount;
         r.DiagnosticIeaOwnedPlusAdoptedWorking = i.IeaOwnedPlusAdoptedWorking;
         r.DiagnosticPendingAdoptionCandidateCount = adoptCount;
@@ -368,6 +395,8 @@ public static class StateConsistencyReleaseEvaluator
             return false;
 
         if (input.UseInstrumentExecutionAuthority && input.IeaOwnedPlusAdoptedWorking > 0)
+            return false;
+        if (HasActiveOwnershipGross(input))
             return false;
 
         if (!readiness.BrokerPositionExplainable || !readiness.BrokerWorkingExplainable ||
@@ -414,6 +443,8 @@ public static class StateConsistencyReleaseEvaluator
         if (input.BrokerPositionQty != 0 || input.BrokerWorkingCount != 0)
             return ResidualCleanupMismatchClass.None;
         if (input.UseInstrumentExecutionAuthority && input.IeaOwnedPlusAdoptedWorking > 0)
+            return ResidualCleanupMismatchClass.None;
+        if (HasActiveOwnershipGross(input))
             return ResidualCleanupMismatchClass.None;
         var brokerFlatJournalResidual = input.BrokerPositionQty == 0 && input.JournalOpenQty > 0;
         if ((!readiness.BrokerPositionExplainable && !brokerFlatJournalResidual) ||
@@ -469,6 +500,11 @@ public static class StateConsistencyReleaseEvaluator
             or ReconciliationBlockerReasonCode.JournalOnlyBrokerFlat
             or ReconciliationBlockerReasonCode.AlreadyOwnedElsewhere
             or ReconciliationBlockerReasonCode.StaleSnapshot;
+
+    private static bool HasActiveOwnershipGross(StateConsistencyReleaseEvaluationInput input) =>
+        input.OwnershipGrossOpenQty > 0 ||
+        input.OwnershipActiveSlotCount > 0 ||
+        input.OwnershipOrphanSlotCount > 0;
 }
 
 /// <summary>Policy for whether forced-convergence failure should also persist a restart-durable risk latch.</summary>

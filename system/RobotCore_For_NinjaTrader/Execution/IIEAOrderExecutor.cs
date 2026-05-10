@@ -70,6 +70,16 @@ public interface IIEAOrderExecutor
     IReadOnlyCollection<string> GetAdoptionCandidateIntentIds(string? executionInstrument);
 
     /// <summary>
+    /// Restart carryover repair: reopen broker-flat-completed journals when current working QTSW2 orders prove
+    /// the exact intent is still live. Returns reopened row count.
+    /// </summary>
+    int ReopenBrokerFlatCompletedJournalsForCarryover(
+        string? executionInstrument,
+        IReadOnlyDictionary<string, int> workingIntentOpenQtyByIntent,
+        DateTimeOffset utcNow,
+        string triggerSource);
+
+    /// <summary>
     /// Get journal visibility diagnostics for adoption deferral logging.
     /// Returns (journalDir, fileCount, directoryExists). FileCount is -1 on read failure.
     /// </summary>

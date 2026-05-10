@@ -146,6 +146,29 @@ public sealed class NullExecutionAdapter : IExecutionAdapter
             new { instrument, note = "DRYRUN — simulated protective emergency enqueue" }));
         return true;
     }
+
+    public FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow)
+    {
+        _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "SESSION_CLOSE_FLATTEN_DRYRUN", new
+        {
+            note = "DRYRUN mode - session-close flatten not placed"
+        }));
+        return FlattenResult.SuccessResult(utcNow);
+    }
+
+    public int RequestSessionCloseCancelIntents(IEnumerable<string> intentIds, string instrument, DateTimeOffset utcNow)
+    {
+        var ids = intentIds?.Where(id => !string.IsNullOrWhiteSpace(id)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray()
+                  ?? Array.Empty<string>();
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SESSION_CLOSE_CANCEL_INTENTS_DRYRUN", state: "ENGINE",
+            new
+            {
+                instrument,
+                intent_ids = ids,
+                note = "DRYRUN mode - session-close cancels not placed"
+            }));
+        return ids.Length;
+    }
     
     public AccountSnapshot GetAccountSnapshot(DateTimeOffset utcNow)
     {

@@ -22,6 +22,7 @@ public sealed partial class InstrumentExecutionAuthority
     private sealed class FlattenLatchEntry
     {
         public DateTimeOffset StartedUtc { get; set; }
+        public DateTimeOffset WallStartedUtc { get; set; }
         public string Reason { get; set; } = "";
         public string RequestId { get; set; } = "";
         public string? OrderId { get; set; }
@@ -67,6 +68,7 @@ public sealed partial class InstrumentExecutionAuthority
         var entry = new FlattenLatchEntry
         {
             StartedUtc = utcNow,
+            WallStartedUtc = DateTimeOffset.UtcNow,
             Reason = reason,
             RequestId = requestId,
             State = FlattenLatchState.Acquired
@@ -354,7 +356,7 @@ public sealed partial class InstrumentExecutionAuthority
         {
             var entry = kvp.Value;
             if (entry.State == FlattenLatchState.Sent &&
-                (utcNow - entry.StartedUtc).TotalSeconds >= FLATTEN_LATCH_TIMEOUT_SEC)
+                (utcNow - entry.WallStartedUtc).TotalSeconds >= FLATTEN_LATCH_TIMEOUT_SEC)
             {
                 if (_flattenLatchByInstrument.TryRemove(kvp.Key, out _))
                 {
@@ -363,7 +365,8 @@ public sealed partial class InstrumentExecutionAuthority
                         {
                             instrument = kvp.Key,
                             request_id = entry.RequestId,
-                            started_utc = entry.StartedUtc.ToString("o"),
+                            started_event_utc = entry.StartedUtc.ToString("o"),
+                            started_wall_utc = entry.WallStartedUtc.ToString("o"),
                             timeout_sec = FLATTEN_LATCH_TIMEOUT_SEC,
                             note = "Latch held beyond timeout - released; position may still be open"
                         }));

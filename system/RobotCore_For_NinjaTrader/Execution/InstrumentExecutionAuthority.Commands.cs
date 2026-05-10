@@ -308,10 +308,9 @@ public sealed partial class InstrumentExecutionAuthority
 
         var correlationId = $"SUBMIT_ENTRY:{longIntentId}:{cmd.TimestampUtc:yyyyMMddHHmmssfff}";
         var ntCmd = new NtSubmitEntryIntentCommand(correlationId, cmd);
-        Executor.EnqueueNtAction(ntCmd);
-
         TryTransitionIntentLifecycle(longIntentId, IntentLifecycleTransition.SUBMIT_ENTRY, cmd.CommandId, cmd.TimestampUtc);
         TryTransitionIntentLifecycle(shortIntentId, IntentLifecycleTransition.SUBMIT_ENTRY, cmd.CommandId, cmd.TimestampUtc);
+        Executor.EnqueueNtAction(ntCmd);
 
         Log?.Write(RobotEvents.ExecutionBase(cmd.TimestampUtc, longIntentId, instrument, "EXECUTION_COMMAND_COMPLETED",
             new { commandId = cmd.CommandId, commandType = nameof(SubmitEntryIntentCommand) }));
@@ -342,10 +341,11 @@ public sealed partial class InstrumentExecutionAuthority
 
         var correlationId = $"REENTRY:{reentryIntentId}:{cmd.TimestampUtc:yyyyMMddHHmmssfff}";
         var ntCmd = new NtSubmitMarketReentryCommand(correlationId, cmd);
+        TryTransitionIntentLifecycle(reentryIntentId, IntentLifecycleTransition.SUBMIT_ENTRY, cmd.CommandId, cmd.TimestampUtc);
         Executor.EnqueueNtAction(ntCmd);
 
         Log?.Write(RobotEvents.ExecutionBase(cmd.TimestampUtc, reentryIntentId, instrument, "EXECUTION_COMMAND_COMPLETED",
-            new { commandId = cmd.CommandId, commandType = nameof(SubmitMarketReentryCommand), lifecycle_transition_deferred = true }));
+            new { commandId = cmd.CommandId, commandType = nameof(SubmitMarketReentryCommand), lifecycle_transition_before_nt_enqueue = true }));
         _eventWriter?.Emit(new CanonicalExecutionEvent
         {
             TimestampUtc = cmd.TimestampUtc.ToString("o"),

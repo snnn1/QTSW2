@@ -107,6 +107,7 @@ export function WatchdogPage() {
   const {
     status,
     streams,
+    carriedActiveLifecycles,
     timetableUnavailable,
     outOfTimetableActiveStreams,
     executionExpectationGaps,
@@ -487,6 +488,7 @@ export function WatchdogPage() {
                 onStreamClick={setSelectedStream}
                 referenceTimeUtc={streamStateReferenceUtc ?? status?.snapshot_utc ?? null}
                 marketOpen={status?.market_open ?? null}
+                carriedActiveLifecycles={carriedActiveLifecycles}
                 outOfTimetableActiveStreams={outOfTimetableActiveStreams}
                 executionExpectationGaps={executionExpectationGaps}
                 flattenLookupMetrics={flattenLookupMetrics ?? undefined}

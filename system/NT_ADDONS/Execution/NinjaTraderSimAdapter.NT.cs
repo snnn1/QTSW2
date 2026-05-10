@@ -1405,6 +1405,37 @@ public sealed partial class NinjaTraderSimAdapter
         var coordInst = GetFlattenCoordinationInstanceId();
         var coordAcct = GetCoordinationAccountName();
         var canonicalKey = BrokerPositionResolver.NormalizeCanonicalKey(cmd.Instrument);
+        var targetExecKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(coordAcct, cmd.Instrument, null);
+        if (_useInstrumentExecutionAuthority &&
+            _iea != null &&
+            !string.IsNullOrWhiteSpace(targetExecKey) &&
+            !string.Equals(targetExecKey, "UNKNOWN", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(targetExecKey, execKey, StringComparison.OrdinalIgnoreCase))
+        {
+            var accepted = TryEnqueueNtActionOnInstrumentOwner(
+                cmd,
+                cmd.Instrument ?? "",
+                utcNow,
+                out var routeAttempted,
+                abortCurrentCoordinationOwnerFirst: true);
+            var eventType = accepted ? "NT_ACTION_ROUTED_TO_INSTRUMENT_OWNER" : "FLATTEN_SECONDARY_INSTANCE_SKIPPED";
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: eventType, state: accepted ? "ENGINE" : "WARN",
+                new
+                {
+                    account = coordAcct,
+                    canonical_broker_key = canonicalKey,
+                    target_execution_instrument_key = targetExecKey,
+                    current_execution_instrument_key = execKey,
+                    current_instance_id = coordInst,
+                    host_chart_instrument = GetHostChartInstrumentName(),
+                    correlation_id = cmd.CorrelationId,
+                    route_attempted = routeAttempted,
+                    route_accepted = accepted,
+                    reason = "execute_phase_wrong_execution_instrument_forwarded"
+                }));
+            if (accepted || routeAttempted)
+                return;
+        }
         if (!string.IsNullOrEmpty(canonicalKey) &&
             !FlattenCoordinationTracker.Shared.IsActiveFlattenOwner(coordAcct, cmd.Instrument, coordInst))
         {
@@ -1796,6 +1827,7 @@ public sealed partial class NinjaTraderSimAdapter
                     EpisodeId = pendingEpisodeId,
                     Source = "ADAPTER_VERIFY"
                 });
+                _iea?.ReleaseFlattenLatch(instrumentKey, InstrumentExecutionAuthority.FlattenLatchState.Resolved, utcNow);
                 try
                 {
                     var uDone = _executionJournal.CompleteOpenUntrackedFillRecoveryForInstrument(
@@ -3870,7 +3902,14 @@ public sealed partial class NinjaTraderSimAdapter
                 else if (time is DateTimeOffset dto) ticks = dto.UtcTicks;
                 else try { ticks = ((dynamic)time).Ticks; } catch { }
             }
-            var qty = (int)(execution.Quantity ?? 0);
+            var qty = 0;
+            try
+            {
+                object? rawQty = execution.Quantity;
+                if (rawQty != null)
+                    qty = Convert.ToInt32(rawQty);
+            }
+            catch { }
             var mpos = (execution.MarketPosition?.ToString() ?? "");
             return !string.IsNullOrEmpty(execId) ? execId : $"{orderId}|{ticks}|{qty}|{mpos}|{orderId}";
         }
@@ -4036,11 +4075,9 @@ public sealed partial class NinjaTraderSimAdapter
                 return;
             }
 
-            // Gap 3 / Step 5: Deduplicate execution callbacks before any state mutation (multi-forwarding from router)
+            // Gap 3 / Step 5: Non-IEA dedupe. IEA dedupe runs before worker enqueue.
             bool isDuplicate = false;
-            if (_useInstrumentExecutionAuthority && _iea != null)
-                isDuplicate = _iea.TryMarkAndCheckDuplicate(executionObj, orderObj);
-            else
+            if (!(_useInstrumentExecutionAuthority && _iea != null))
             {
                 var dedupKey = BuildNonIeaDedupKey(execution, order);
                 isDuplicate = TryMarkAndCheckDuplicateNonIea(dedupKey);
@@ -7578,73 +7615,6 @@ public sealed partial class NinjaTraderSimAdapter
                         cancelled_count = ordersToCancel.Count,
                         cancelled_order_ids = ordersToCancel.Select(o => o.OrderId).ToList()
                     }));
-            }
-            
-            // CRITICAL FIX: Defensively cancel opposite entry stop order to prevent re-entry
-            // This handles cases where cancellation is called but opposite entry wasn't explicitly cancelled
-            if (IntentMap.TryGetValue(intentId, out var cancelledIntent))
-            {
-                // Find the opposite entry intent for this stream
-                var oppositeDirection = cancelledIntent.Direction == "Long" ? "Short" : "Long";
-                string? oppositeIntentId = null;
-                
-                foreach (var kvp in IntentMap)
-                {
-                    var otherIntent = kvp.Value;
-                    if (otherIntent.Stream == cancelledIntent.Stream &&
-                        otherIntent.TradingDate == cancelledIntent.TradingDate &&
-                        otherIntent.Direction == oppositeDirection &&
-                        otherIntent.TriggerReason != null &&
-                        (otherIntent.TriggerReason.Contains("ENTRY_STOP_BRACKET_LONG") ||
-                         otherIntent.TriggerReason.Contains("ENTRY_STOP_BRACKET_SHORT")))
-                    {
-                        // Check if opposite entry hasn't filled yet
-                        var oppositeEntryFilled = false;
-                        if (_executionJournal != null && !string.IsNullOrEmpty(otherIntent.TradingDate) && !string.IsNullOrEmpty(otherIntent.Stream))
-                        {
-                            var oppositeEntry = _executionJournal.GetEntry(kvp.Key, otherIntent.TradingDate, otherIntent.Stream);
-                            oppositeEntryFilled = oppositeEntry != null && (oppositeEntry.EntryFilled || oppositeEntry.EntryFilledQuantityTotal > 0);
-                        }
-                        
-                        if (!oppositeEntryFilled)
-                        {
-                            oppositeIntentId = kvp.Key;
-                            break;
-                        }
-                    }
-                }
-                
-                // Cancel opposite entry if found and not filled
-                if (oppositeIntentId != null && oppositeIntentId != intentId)
-                {
-                    try
-                    {
-                        var oppositeCancelled = CancelIntentOrdersReal(oppositeIntentId, utcNow);
-                        if (oppositeCancelled)
-                        {
-                            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "OPPOSITE_ENTRY_CANCELLED_DEFENSIVELY", state: "ENGINE",
-                                new
-                                {
-                                    cancelled_intent_id = intentId,
-                                    opposite_intent_id = oppositeIntentId,
-                                    stream = cancelledIntent.Stream,
-                                    note = "Defensively cancelled opposite entry stop order when cancelling intent to prevent re-entry"
-                                }));
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        // Log but don't fail - defensive cancellation failure is not critical
-                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "OPPOSITE_ENTRY_CANCEL_DEFENSIVE_FAILED", state: "ENGINE",
-                            new
-                            {
-                                cancelled_intent_id = intentId,
-                                opposite_intent_id = oppositeIntentId,
-                                error = ex.Message,
-                                note = "Failed to defensively cancel opposite entry - may cause re-entry"
-                            }));
-                    }
-                }
             }
             
             return true; // Success (even if no orders to cancel)

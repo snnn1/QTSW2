@@ -88,7 +88,8 @@ public sealed partial class NinjaTraderSimAdapter
         // Stage 1: Entry fill during recovery — queue protective submission (three-stage safety model)
         if (_isRecoveryExecutionAllowedCallback != null && !_isRecoveryExecutionAllowedCallback())
         {
-            if (Volatile.Read(ref _sessionMismatchBlocked) != 0)
+            if (Volatile.Read(ref _sessionMismatchBlocked) != 0 &&
+                !IsSessionIdentityCarryoverActionAllowed(intentId, intent.Instrument ?? "", "recovery", intent, utcNow, out _))
                 return;
             QueueProtectiveForRecovery(intentId, intent, totalFilledQuantity, utcNow);
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, intent.Instrument, "PROTECTIVE_ORDERS_QUEUED_RECOVERY",

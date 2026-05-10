@@ -74,6 +74,43 @@ public static class SessionIdentityGateTests
             if (adapter.SessionIdentityBlockCount != 2)
                 return (false, $"Expected session_identity_block_count 2 after latched reject, got {adapter.SessionIdentityBlockCount}");
 
+            // A latched session mismatch must not prevent safety actions for a carried, already-open lifecycle.
+            var carryIntent = new Intent(
+                "2026-03-31",
+                "S2",
+                "MES",
+                "MES",
+                "S1",
+                "08:00",
+                "Long",
+                5001m,
+                4991m,
+                5011m,
+                5006m,
+                utc,
+                "SUBMIT_MARKET_REENTRY");
+            var carryId = carryIntent.ComputeIntentId();
+            adapter.RegisterIntent(carryIntent);
+            adapter.RegisterIntentPolicy(carryId, 1, 5, "MES", "MES", "TEST");
+            journal.RecordSubmission(carryId, carryIntent.TradingDate, carryIntent.Stream, carryIntent.ExecutionInstrument,
+                "ENTRY", "broker-carry", utc, entryPrice: carryIntent.EntryPrice, stopPrice: carryIntent.StopPrice,
+                targetPrice: carryIntent.TargetPrice, beTriggerPrice: carryIntent.BeTrigger, direction: carryIntent.Direction);
+            journal.RecordEntryFill(carryId, carryIntent.TradingDate, carryIntent.Stream, 5001m, 1, utc, 5m,
+                "Long", "MES", "MES");
+
+            var rCarryProtective = adapter.SubmitProtectiveStop(carryId, "MES", "Long", 5001m, 1, null, utc);
+            if (string.Equals(rCarryProtective.ErrorMessage, "SESSION_IDENTITY_LATCHED", StringComparison.Ordinal) ||
+                string.Equals(rCarryProtective.ErrorMessage, "SESSION_IDENTITY_MISMATCH", StringComparison.Ordinal))
+                return (false, $"Carryover protective action should bypass session identity latch, got {rCarryProtective.ErrorMessage}");
+
+            if (adapter.SessionIdentityBlockCount != 2)
+                return (false, $"Carryover safety action must not increment session block count, got {adapter.SessionIdentityBlockCount}");
+
+            var rCarryReentry = adapter.SubmitMarketReentryOrder(carryId, "MES", "Long", 1, utc);
+            if (string.Equals(rCarryReentry.ErrorMessage, "SESSION_IDENTITY_LATCHED", StringComparison.Ordinal) ||
+                string.Equals(rCarryReentry.ErrorMessage, "SESSION_IDENTITY_MISMATCH", StringComparison.Ordinal))
+                return (false, $"Carryover market reentry should bypass session identity latch, got {rCarryReentry.ErrorMessage}");
+
             // Correct session: new adapter instance (latch is per-adapter; sim preconditions may still fail — we only assert gate passes).
             var adapter2 = new NinjaTraderSimAdapter(tempRoot, tempRoot, log, journal);
             adapter2.SetEngineCallbacks(null, null, null, getActiveTradingDateString: () => activeDay);

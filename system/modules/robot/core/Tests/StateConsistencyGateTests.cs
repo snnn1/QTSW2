@@ -435,6 +435,66 @@ public static class StateConsistencyGateTests
         if (ev.ResidualCleanupClass != ResidualCleanupMismatchClass.MISMATCH_RESIDUAL_JOURNAL_AND_ADOPTION_RETIREMENT.ToString())
             return (false, "8b: residual cleanup class");
 
+        // 8c) Broker-net flat is not clean-flat while ownership still has gross stream exposure.
+        inp = new StateConsistencyReleaseEvaluationInput
+        {
+            Instrument = "MNG",
+            BrokerPositionQty = 0,
+            BrokerWorkingCount = 0,
+            PendingExecutionWorkload = 0,
+            JournalOpenQty = 2,
+            OwnershipSnapshotAvailable = true,
+            OwnershipGrossOpenQty = 2,
+            OwnershipSignedNetQty = 0,
+            OwnershipActiveSlotCount = 1,
+            OwnershipOrphanSlotCount = 0,
+            IeaOwnedPlusAdoptedWorking = 0,
+            PendingAdoptionCandidateCount = 1,
+            SnapshotSufficient = true,
+            UseInstrumentExecutionAuthority = true,
+            ReconciliationBlockers = new List<ReconciliationBlocker>
+            {
+                new()
+                {
+                    ReasonCode = ReconciliationBlockerReasonCode.JournalOnlyBrokerFlat,
+                    IntentId = "active-gross-row",
+                    Disposition = ReleaseAdoptionDisposition.NeedsDifferentReconciliationLane,
+                    BlocksRelease = true,
+                    ShouldAdopt = false
+                }
+            }
+        };
+        ev = StateConsistencyReleaseEvaluator.Evaluate(inp);
+        if (ev.ReleaseReady || ev.ResidualCleanupOnly)
+            return (false, "8c: broker-net flat with ownership gross open must not release as cleanup");
+        if (!ev.Contradictions.Any(c => c.StartsWith("ownership_gross_open_on_broker_net_flat", StringComparison.Ordinal)))
+            return (false, "8c: ownership gross-open contradiction missing");
+
+        // 8d) Coherent active exposure may release the mismatch gate; this does not declare the stream flat.
+        inp = new StateConsistencyReleaseEvaluationInput
+        {
+            Instrument = "M2K",
+            BrokerPositionQty = 2,
+            BrokerWorkingCount = 2,
+            PendingExecutionWorkload = 0,
+            JournalOpenQty = 2,
+            OwnershipSnapshotAvailable = true,
+            OwnershipGrossOpenQty = 2,
+            OwnershipSignedNetQty = 2,
+            OwnershipActiveSlotCount = 1,
+            OwnershipOrphanSlotCount = 0,
+            IeaOwnedPlusAdoptedWorking = 2,
+            PendingAdoptionCandidateCount = 0,
+            SnapshotSufficient = true,
+            UseInstrumentExecutionAuthority = true,
+            ReconciliationBlockers = Array.Empty<ReconciliationBlocker>()
+        };
+        ev = StateConsistencyReleaseEvaluator.Evaluate(inp);
+        if (!ev.ReleaseReady || !ev.IsExplainable)
+            return (false, "8d: coherent active protected exposure should release the mismatch gate");
+        if (ev.ResidualCleanupOnly)
+            return (false, "8d: active exposure must not be classified as residual cleanup");
+
         // 9) PERSISTENT_MISMATCH + release_ready: after stability window, gate releases (no stuck-forever)
         var coord9 = new MismatchEscalationCoordinator(
             getSnapshot: () => snap,

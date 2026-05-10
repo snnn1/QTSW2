@@ -6,6 +6,7 @@
 import { formatDuration, computeTimeInState } from '../../utils/timeUtils.ts'
 import { useStreamPnl } from '../../hooks/useStreamPnl'
 import type {
+  CarriedActiveLifecycle,
   ExecutionExpectationGap,
   FlattenLookupMetrics,
   OutOfTimetableActiveStream,
@@ -17,6 +18,7 @@ interface StreamStatusTableProps {
   onStreamClick: (stream: StreamState) => void
   referenceTimeUtc?: string | null
   marketOpen?: boolean | null
+  carriedActiveLifecycles?: CarriedActiveLifecycle[]
   outOfTimetableActiveStreams?: OutOfTimetableActiveStream[]
   executionExpectationGaps?: ExecutionExpectationGap[]
   flattenLookupMetrics?: FlattenLookupMetrics | null
@@ -215,6 +217,7 @@ export function StreamStatusTable({
   onStreamClick,
   referenceTimeUtc,
   marketOpen,
+  carriedActiveLifecycles = [],
   outOfTimetableActiveStreams = [],
   executionExpectationGaps = [],
   flattenLookupMetrics,
@@ -222,6 +225,7 @@ export function StreamStatusTable({
   const sessionTradingDay = streams.find((s) => s.trading_date)?.trading_date ?? null
   const currentTradingDate = sessionTradingDay ?? new Date().toISOString().split('T')[0]
   const { pnl } = useStreamPnl(currentTradingDate, undefined, marketOpen)
+  const carriedLifecycles = carriedActiveLifecycles ?? []
   const carryOver = outOfTimetableActiveStreams ?? []
 
   const mainTableEmptyState = () => {
@@ -497,6 +501,62 @@ export function StreamStatusTable({
                       {gap.gap_type === 'slot_missing_summary'
                         ? gap.timetable_slot_time || gap.slot_boundary_chicago || '-'
                         : gap.slot_reason || '-'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {carriedLifecycles.length > 0 && (
+        <div className="overflow-hidden rounded-lg border border-sky-600/60 bg-sky-950/25">
+          <div className="border-b border-sky-600/40 bg-sky-900/40 px-3 py-2">
+            <h3 className="text-sm font-semibold tracking-tight text-sky-200">
+              Carried Stream Lifecycles
+            </h3>
+            <p className="mt-1 text-xs text-sky-300/90">
+              Prior-date nonterminal streams retained across timetable rollover. Same stream id rows are deferred until the retained lifecycle is terminal.
+            </p>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-gray-900/80 text-sky-200/90">
+                <tr>
+                  <th className="px-2 py-1.5 text-left">Stream</th>
+                  <th className="px-2 py-1.5 text-left">Instrument</th>
+                  <th className="px-2 py-1.5 text-left">State</th>
+                  <th className="px-2 py-1.5 text-left">Prior date</th>
+                  <th className="px-2 py-1.5 text-left">Current day lane</th>
+                  <th className="px-2 py-1.5 text-left">Defer reason</th>
+                  <th className="px-2 py-1.5 text-left">Authority</th>
+                </tr>
+              </thead>
+              <tbody>
+                {carriedLifecycles.map((row) => (
+                  <tr
+                    key={`carry-life-${row.trading_date}-${row.stream}`}
+                    className="border-b border-sky-900/40 text-gray-200"
+                  >
+                    <td className="px-2 py-1.5 font-mono">{row.stream}</td>
+                    <td className="px-2 py-1.5">{row.execution_instrument || row.instrument || '-'}</td>
+                    <td className="px-2 py-1.5">
+                      <span className={`${PILL_CLASS} ${getStateBadgeColor(row.state)}`}>
+                        {row.state || '-'}
+                      </span>
+                    </td>
+                    <td className="px-2 py-1.5 whitespace-nowrap text-sky-100/90">
+                      {row.trading_date || '-'}
+                    </td>
+                    <td className="px-2 py-1.5">
+                      {row.current_timetable_lane_present ? 'present' : 'not present'}
+                    </td>
+                    <td className="px-2 py-1.5 font-mono text-xs text-sky-100/90">
+                      {row.same_stream_deferred_reason || '-'}
+                    </td>
+                    <td className="px-2 py-1.5 font-mono text-xs text-gray-300">
+                      {row.position_authority?.authority_state || row.operator_classification || '-'}
                     </td>
                   </tr>
                 ))}

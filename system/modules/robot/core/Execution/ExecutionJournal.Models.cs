@@ -19,6 +19,7 @@ public static class ReleaseBlockingExclusionReasons
     public const string NOT_IN_REGISTRY = "NOT_IN_REGISTRY";
     public const string DIRECTION_MISMATCH = "DIRECTION_MISMATCH";
     public const string LIVE_TAGGED_UNFILLED_ENTRY = "LIVE_TAGGED_UNFILLED_ENTRY";
+    public const string REGISTRY_TRUSTED_ACTIVE_EXPOSURE = "REGISTRY_TRUSTED_ACTIVE_EXPOSURE";
     /// <summary>Direction matches broker but row has no open qty and is not tied to live tag/registry working state.</summary>
     public const string NON_LIVE_STALE_ADOPTION = "NON_LIVE_STALE_ADOPTION";
     public const string OTHER = "OTHER";
@@ -202,6 +203,12 @@ public static class CompletionReasons
     /// Trade was closed externally; broker position flat; journal reconciled.
     /// </summary>
     public const string RECONCILIATION_BROKER_FLAT = "RECONCILIATION_BROKER_FLAT";
+
+    /// <summary>
+    /// A row previously closed as broker-flat was restored because restart recovery found live QTSW2 working orders
+    /// for the same intent. The stream remains carried exposure until broker, journal, ownership, and orders prove flat.
+    /// </summary>
+    public const string CARRYOVER_REOPENED_FROM_FALSE_BROKER_FLAT = "CARRYOVER_REOPENED_FROM_FALSE_BROKER_FLAT";
 
     /// <summary>
     /// Operator confirmed account correct; orphan journals force-closed via manual trigger.

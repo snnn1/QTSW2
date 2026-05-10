@@ -146,7 +146,8 @@ public sealed partial class NinjaTraderSimAdapter
     }
 
     /// <summary>
-    /// Flatten / emergency-close: no stream intent; align session line to engine active day so we do not open wrong-day intent while still blocking when latched.
+    /// Flatten / emergency-close: no stream intent; align session line to engine active day.
+    /// Session identity protects opening submissions; it must not block exposure-reducing flatten.
     /// </summary>
     private bool TrySessionIdentityGateDestructiveFlatten(string instrument, DateTimeOffset utcNow, out OrderSubmissionResult? failure)
     {
@@ -157,7 +158,17 @@ public sealed partial class NinjaTraderSimAdapter
         var active = (getActive() ?? "").Trim();
         if (string.IsNullOrEmpty(active))
             return true;
-        return TrySessionIdentityGate("", instrument, "flatten", utcNow, explicitAttemptedTradingDate: active, out failure);
+        if (Volatile.Read(ref _sessionMismatchBlocked) != 0)
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: active, eventType: "SESSION_IDENTITY_FLATTEN_ALLOWED_WHILE_LATCHED", state: "ENGINE",
+                new
+                {
+                    instrument,
+                    submit_path = "flatten",
+                    note = "Session identity latch blocks new/opening submissions, but flatten is exposure-reducing and remains available."
+                }));
+        }
+        return true;
     }
 
     /// <summary>
@@ -174,8 +185,31 @@ public sealed partial class NinjaTraderSimAdapter
         out OrderSubmissionResult? failure)
     {
         failure = null;
+        Intent? intentFromMap = null;
+        var mapLookupSucceeded = false;
+        if (!string.IsNullOrEmpty(intentId) &&
+            IntentMap.TryGetValue(intentId, out var mappedIntent) && mappedIntent != null)
+        {
+            mapLookupSucceeded = true;
+            intentFromMap = mappedIntent;
+        }
+
         if (Volatile.Read(ref _sessionMismatchBlocked) != 0)
         {
+            if (IsSessionIdentityCarryoverActionAllowed(intentId, instrument, submitPath, intentFromMap, utcNow, out var latchCarryReason))
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: _getActiveTradingDateString?.Invoke() ?? "", eventType: "SESSION_IDENTITY_CARRYOVER_ALLOWED_WHILE_LATCHED", state: "ENGINE",
+                    new
+                    {
+                        intent_id = intentId,
+                        instrument,
+                        submit_path = submitPath,
+                        reason = latchCarryReason,
+                        note = "Prior-day carried lifecycle action allowed despite session identity latch; opening submissions remain blocked."
+                    }));
+                return true;
+            }
+
             RecordSessionIdentityBlockAttempt();
             failure = OrderSubmissionResult.FailureResult("SESSION_IDENTITY_LATCHED", utcNow);
             return false;
@@ -190,14 +224,9 @@ public sealed partial class NinjaTraderSimAdapter
             return true;
 
         string? attempted = explicitAttemptedTradingDate?.Trim();
-        Intent? intentFromMap = null;
-        var mapLookupSucceeded = false;
-        if (string.IsNullOrEmpty(attempted) && !string.IsNullOrEmpty(intentId) &&
-            IntentMap.TryGetValue(intentId, out var intent) && intent != null)
+        if (string.IsNullOrEmpty(attempted) && intentFromMap != null)
         {
-            mapLookupSucceeded = true;
-            intentFromMap = intent;
-            attempted = intent.TradingDate?.Trim();
+            attempted = intentFromMap.TradingDate?.Trim();
         }
 
         if (string.IsNullOrEmpty(attempted))
@@ -226,6 +255,22 @@ public sealed partial class NinjaTraderSimAdapter
         if (string.Equals(attempted, active, StringComparison.Ordinal))
             return true;
 
+        if (IsSessionIdentityCarryoverActionAllowed(intentId, instrument, submitPath, intentFromMap, utcNow, out var carryReason))
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: active, eventType: "SESSION_IDENTITY_CARRYOVER_ALLOWED", state: "ENGINE",
+                new
+                {
+                    active_trading_date = active,
+                    attempted_trading_date = attempted,
+                    intent_id = string.IsNullOrEmpty(intentId) ? null : intentId,
+                    instrument,
+                    submit_path = submitPath,
+                    reason = carryReason,
+                    note = "Prior-day carried lifecycle action allowed; same check still rejects prior-day opening entries."
+                }));
+            return true;
+        }
+
         if (Interlocked.CompareExchange(ref _sessionMismatchBlocked, 1, 0) == 0)
         {
             Interlocked.Increment(ref _sessionIdentityMismatchCriticalEmitCount);
@@ -245,6 +290,55 @@ public sealed partial class NinjaTraderSimAdapter
         else
             RecordSessionIdentityBlockAttempt();
         failure = OrderSubmissionResult.FailureResult("SESSION_IDENTITY_MISMATCH", utcNow);
+        return false;
+    }
+
+    private bool IsSessionIdentityCarryoverActionAllowed(
+        string intentId,
+        string instrument,
+        string submitPath,
+        Intent? intent,
+        DateTimeOffset utcNow,
+        out string reason)
+    {
+        reason = "";
+        if (string.IsNullOrWhiteSpace(intentId) || intent == null)
+            return false;
+
+        var path = (submitPath ?? "").Trim();
+        var trigger = intent.TriggerReason ?? "";
+        var isMarketReentry = string.Equals(trigger, "SUBMIT_MARKET_REENTRY", StringComparison.OrdinalIgnoreCase);
+        if (path.Equals("entry", StringComparison.OrdinalIgnoreCase) ||
+            path.Equals("entry_stop", StringComparison.OrdinalIgnoreCase) ||
+            path.Equals("entry_stop_aggregate", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!isMarketReentry)
+                return false;
+
+            reason = "market_reentry_resumes_interrupted_lifecycle";
+            return true;
+        }
+
+        var isLifecycleProtection =
+            path.Equals("protective", StringComparison.OrdinalIgnoreCase) ||
+            path.Equals("target", StringComparison.OrdinalIgnoreCase) ||
+            path.Equals("recovery", StringComparison.OrdinalIgnoreCase);
+
+        if (!isLifecycleProtection)
+            return false;
+
+        var entry = _executionJournal.GetEntry(intentId, intent.TradingDate ?? "", intent.Stream ?? "");
+        if (entry == null || entry.TradeCompleted)
+            return false;
+
+        if (entry.EntrySubmitted || entry.EntryFilled || entry.EntryFilledQuantityTotal > 0)
+        {
+            reason = isMarketReentry
+                ? "open_market_reentry_lifecycle"
+                : "open_prior_day_journal_lifecycle";
+            return true;
+        }
+
         return false;
     }
 
@@ -654,13 +748,25 @@ public sealed partial class NinjaTraderSimAdapter
     /// </summary>
     public FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow)
     {
-        if (_ntActionQueue == null || !(this is INtActionExecutor)) return null;
+        if (!(this is INtActionExecutor)) return null;
         var cidCancel = $"SESSION_CLOSE_CANCEL:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
         var cidFlatten = $"SESSION_CLOSE_FLATTEN:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
-        _ntActionQueue.EnqueueNtAction(new NtCancelOrdersCommand(cidCancel, intentId, instrument, false,
-            "FORCED_FLATTEN_CANCEL", utcNow, preferUrgentDrain: true), out _);
-        EnqueueNtActionInternal(new NtFlattenInstrumentCommand(cidFlatten, intentId, instrument, "SESSION_FORCED_FLATTEN", utcNow,
-            DestructiveActionSource.MANUAL, DestructiveTriggerReason.MANUAL, preferUrgentDrain: true));
+
+        var cancel = new NtCancelOrdersCommand(cidCancel, intentId, instrument, false,
+            "FORCED_FLATTEN_CANCEL", utcNow, preferUrgentDrain: true);
+        if (!TryEnqueueNtActionOnInstrumentOwner(cancel, instrument, utcNow, out _))
+        {
+            if (_ntActionQueue == null) return null;
+            _ntActionQueue.EnqueueNtAction(cancel, out _);
+        }
+
+        var flatten = new NtFlattenInstrumentCommand(cidFlatten, intentId, instrument, "SESSION_FORCED_FLATTEN", utcNow,
+            DestructiveActionSource.MANUAL, DestructiveTriggerReason.MANUAL, preferUrgentDrain: true);
+        if (!TryEnqueueNtActionOnInstrumentOwner(flatten, instrument, utcNow, out _))
+        {
+            if (_ntActionQueue == null) return null;
+            EnqueueNtActionInternal(flatten);
+        }
         return FlattenResult.FailureResult("SESSION_CLOSE_FLATTEN_ENQUEUED", utcNow);
     }
 
@@ -670,7 +776,7 @@ public sealed partial class NinjaTraderSimAdapter
     /// </summary>
     public int RequestSessionCloseCancelIntents(IEnumerable<string> intentIds, string instrument, DateTimeOffset utcNow)
     {
-        if (_ntActionQueue == null || !(this is INtActionExecutor)) return 0;
+        if (!(this is INtActionExecutor)) return 0;
 
         var count = 0;
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -681,12 +787,60 @@ public sealed partial class NinjaTraderSimAdapter
                 continue;
 
             var cid = $"SESSION_CLOSE_CANCEL:{intentId}:{utcNow:yyyyMMddHHmmssfff}:{count}";
-            _ntActionQueue.EnqueueNtAction(new NtCancelOrdersCommand(cid, intentId, instrument, false,
-                "FORCED_FLATTEN_CANCEL", utcNow, preferUrgentDrain: true), out _);
+            var cancel = new NtCancelOrdersCommand(cid, intentId, instrument, false,
+                "FORCED_FLATTEN_CANCEL", utcNow, preferUrgentDrain: true);
+            if (!TryEnqueueNtActionOnInstrumentOwner(cancel, instrument, utcNow, out _))
+            {
+                if (_ntActionQueue == null)
+                    continue;
+                _ntActionQueue.EnqueueNtAction(cancel, out _);
+            }
             count++;
         }
 
         return count;
+    }
+
+    private bool TryEnqueueNtActionOnInstrumentOwner(INtAction action, string instrument, DateTimeOffset utcNow, out bool routeAttempted, bool abortCurrentCoordinationOwnerFirst = false)
+    {
+        routeAttempted = false;
+        if (!_useInstrumentExecutionAuthority || action == null || string.IsNullOrWhiteSpace(instrument))
+            return false;
+
+        var account = !string.IsNullOrWhiteSpace(_ieaAccountName) ? _ieaAccountName! : GetCoordinationAccountName();
+        if (string.IsNullOrWhiteSpace(account))
+            return false;
+
+        var execKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(account, instrument, null);
+        if (string.IsNullOrWhiteSpace(execKey) || string.Equals(execKey, "UNKNOWN", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (!InstrumentExecutionAuthorityRegistry.TryGet(account, execKey, out var ownerIea) || ownerIea?.Executor == null)
+            return false;
+
+        routeAttempted = true;
+        if (abortCurrentCoordinationOwnerFirst && action is NtFlattenInstrumentCommand && !ReferenceEquals(ownerIea, _iea))
+            FlattenCoordinationTracker.Shared.NotifyFlattenAborted(account, instrument, GetFlattenCoordinationInstanceId(), utcNow);
+        var accepted = ownerIea.Executor.EnqueueNtAction(action);
+        if (!ReferenceEquals(ownerIea, _iea))
+        {
+            var eventType = accepted ? "NT_ACTION_ROUTED_TO_INSTRUMENT_OWNER" : "FLATTEN_SECONDARY_INSTANCE_SKIPPED";
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: eventType, state: accepted ? "ENGINE" : "WARN",
+                new
+                {
+                    account,
+                    action_type = action.ActionType,
+                    correlation_id = action.CorrelationId,
+                    instrument,
+                    target_execution_instrument_key = ownerIea.ExecutionInstrumentKey,
+                    target_iea_instance_id = ownerIea.InstanceId,
+                    current_execution_instrument_key = _iea?.ExecutionInstrumentKey ?? "",
+                    current_iea_instance_id = _iea?.InstanceId,
+                    route_accepted = accepted,
+                    reason = "session_close_action_forwarded_to_instrument_owner"
+                }));
+        }
+        return accepted;
     }
 
     /// <summary>

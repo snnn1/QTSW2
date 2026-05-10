@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +26,15 @@ from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 # --- Repo root (tools/..) ---
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SYSTEM_ROOT = PROJECT_ROOT / "system"
+if str(SYSTEM_ROOT) not in sys.path:
+    sys.path.insert(0, str(SYSTEM_ROOT))
+
+try:
+    from modules.watchdog.platform_diagnostics import detect_ninjatrader_platform_signals
+except Exception:  # pragma: no cover - audit still works without watchdog package context
+    detect_ninjatrader_platform_signals = None
+
 LATEST_RUN_REL = Path("runs") / "LATEST_RUN.txt"
 AUDIT_REPORT_FILENAME = "audit_report.json"
 # Bump when the JSON shape changes (new/moved/renamed top-level or section fields).
@@ -888,6 +898,16 @@ def build_audit_report(
     round_trips = build_round_trip_rows(journal_rows)
     operator_timeline = build_operator_timeline_rows(journal_rows)
     execution_event_audit_gaps = build_execution_event_audit_gaps(run_root, files)
+    platform_truth = (
+        detect_ninjatrader_platform_signals(run_root)
+        if detect_ninjatrader_platform_signals is not None
+        else {
+            "available": False,
+            "reason": "WATCHDOG_PLATFORM_DIAGNOSTICS_IMPORT_FAILED",
+            "had_platform_crash_or_freeze_signal": False,
+            "events": [],
+        }
+    )
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -896,6 +916,7 @@ def build_audit_report(
         "verdict": verdict,
         "broker_truth": broker_truth,
         "system_truth": system_truth,
+        "platform_truth": platform_truth,
         "unexplained_positions": unexplained_positions,
         "section_a": {
             "files_matched_json_jsonl": len(files),
@@ -953,6 +974,16 @@ def print_verdict_block(report: Dict[str, Any]) -> None:
     )
     print(f"  broker_truth.positions: {bt if bt else '(none)'}")
     print(f"  system_truth.positions: {st if st else '(none)'}")
+    pt = report.get("platform_truth") or {}
+    if pt.get("had_platform_crash_or_freeze_signal"):
+        events = pt.get("events") or []
+        print(f"  platform_truth.crash_or_freeze: TRUE events={len(events)}")
+        if events:
+            first = events[0]
+            print(
+                "  platform_truth.first_event: "
+                f"{first.get('timestamp_local')} {first.get('signal')} {first.get('path')}:{first.get('line')}"
+            )
     print(f"  unexplained_positions ({len(up)}): {up if up else '[]'}")
     print("")
 

@@ -77,6 +77,46 @@ def _stable_json_hash(payload: Dict[str, Any]) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def _coerce_string_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        item = value.strip()
+        if not item or item in ("[]", "null", "None"):
+            return []
+        return [item]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def _coerce_int_or_none(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        text = str(value).strip()
+        if not text or text.lower() in ("none", "null", "nan"):
+            return None
+        return int(float(text))
+    except (TypeError, ValueError):
+        return None
+
+
+def _position_authority_snapshot_is_clean_flat(snapshot: Optional[Dict[str, Any]]) -> bool:
+    if not snapshot:
+        return False
+    broker_qty = _coerce_int_or_none(snapshot.get("broker_qty"))
+    real_open_qty = _coerce_int_or_none(snapshot.get("real_open_qty"))
+    journal_open_qty = _coerce_int_or_none(snapshot.get("journal_open_qty"))
+    recovery_open_qty = _coerce_int_or_none(snapshot.get("recovery_open_qty"))
+    return (
+        broker_qty == 0
+        and real_open_qty == 0
+        and journal_open_qty == 0
+        and (recovery_open_qty is None or recovery_open_qty == 0)
+    )
+
+
 def _earliest_session_slot_time(session: str) -> Optional[time]:
     slots = SLOT_ENDS.get(session, [])
     parsed: List[time] = []
@@ -150,7 +190,7 @@ def _get_execution_instrument_for_canonical(canonical: str) -> Optional[str]:
     canonical = str(canonical).strip().upper()
     try:
         if _execution_instrument_cache is None:
-            policy_path = Path(__file__).parent.parent.parent / "configs" / "execution_policy.json"
+            policy_path = _execution_policy_path()
             if not policy_path.exists():
                 return None
             with open(policy_path, "r", encoding="utf-8") as f:
@@ -376,6 +416,47 @@ class WatchdogStateManager:
     def get_intent_exposures(self) -> Dict[str, Any]:
         """Live intent_id -> IntentExposureInfo map; same object identity as internal store."""
         return self._intent_exposures
+
+    def reconcile_intent_exposures_with_position_authority(self) -> int:
+        """
+        Close stale watchdog-only active intents when robot authority proves clean flat.
+
+        This deliberately does not use broker net flat by itself: broker_qty,
+        real_open_qty, and journal_open_qty must all be zero. That preserves the
+        same-instrument gross-open case where net broker quantity can be zero while
+        stream exposure is still real.
+        """
+        closed = 0
+        for intent_id, exposure in list(self._intent_exposures.items()):
+            if getattr(exposure, "state", "") != "ACTIVE":
+                continue
+
+            entry_qty = int(getattr(exposure, "entry_filled_qty", 0) or 0)
+            exit_qty = int(getattr(exposure, "exit_filled_qty", 0) or 0)
+            if entry_qty <= 0 or exit_qty >= entry_qty:
+                exposure.state = "CLOSED"
+                closed += 1
+                continue
+
+            instrument = getattr(exposure, "instrument", "") or ""
+            snapshot = self.resolve_position_authority_for_stream_row(instrument, instrument)
+            if not _position_authority_snapshot_is_clean_flat(snapshot):
+                continue
+
+            exposure.exit_filled_qty = entry_qty
+            exposure.state = "CLOSED"
+            closed += 1
+            logger.info(
+                "WATCHDOG_STALE_INTENT_CLOSED_BY_AUTHORITY intent_id=%s instrument=%s "
+                "stream=%s broker_qty=%s real_open_qty=%s journal_open_qty=%s",
+                intent_id,
+                instrument,
+                getattr(exposure, "stream_id", ""),
+                snapshot.get("broker_qty") if snapshot else None,
+                snapshot.get("real_open_qty") if snapshot else None,
+                snapshot.get("journal_open_qty") if snapshot else None,
+            )
+        return closed
 
     def get_position_authority_snapshots(self) -> Dict[str, Dict[str, Any]]:
         """Read-only last POSITION_AUTHORITY_EVALUATED payloads keyed by normalized instrument (MES, MYM, …)."""
@@ -896,15 +977,15 @@ class WatchdogStateManager:
     def update_identity_invariants(
         self,
         pass_value: bool,
-        violations: List[str],
+        violations: Any,
         canonical_instrument: str,
         execution_instrument: str,
-        stream_ids: List[str],
+        stream_ids: Any,
         checked_at_utc: datetime
     ):
         """PHASE 3.1: Update identity invariants status."""
         self._last_identity_invariants_pass = pass_value
-        self._last_identity_violations = violations.copy()
+        self._last_identity_violations = _coerce_string_list(violations)
         
         # Convert UTC to Chicago time
         try:
@@ -1296,6 +1377,18 @@ class WatchdogStateManager:
     def record_protective_order_submitted(self, intent_id: str, timestamp_utc: datetime):
         """Record protective order submission."""
         self._protective_events[intent_id].add(timestamp_utc.isoformat())
+
+    def get_active_intents_missing_protective_ack(self) -> Set[str]:
+        """Return active filled intent ids with no watchdog stop-protection acknowledgement."""
+        missing: Set[str] = set()
+        for intent_id, exposure in self._intent_exposures.items():
+            if exposure.state != "ACTIVE":
+                continue
+            if not exposure.entry_filled_at_utc:
+                continue
+            if len(self._protective_events.get(intent_id, set())) <= 0:
+                missing.add(intent_id)
+        return missing
     
     def record_execution_blocked(self, timestamp_utc: datetime):
         """Record execution blocked event."""
@@ -1416,9 +1509,23 @@ class WatchdogStateManager:
             timestamp_utc: UTC timestamp when failure occurred
             note: Additional note about the failure
         """
+        if isinstance(errors, str):
+            normalized_errors = [errors]
+        elif isinstance(errors, (list, tuple, set)):
+            normalized_errors = [str(e) for e in errors]
+        else:
+            normalized_errors = [str(errors)] if errors is not None else []
+
+        if isinstance(execution_instruments, str):
+            normalized_execution_instruments = [execution_instruments]
+        elif isinstance(execution_instruments, (list, tuple, set)):
+            normalized_execution_instruments = [str(i) for i in execution_instruments]
+        else:
+            normalized_execution_instruments = [str(execution_instruments)] if execution_instruments is not None else []
+
         failure_info = ExecutionPolicyFailureInfo(
-            errors=errors.copy(),
-            execution_instruments=execution_instruments.copy(),
+            errors=normalized_errors.copy(),
+            execution_instruments=normalized_execution_instruments.copy(),
             failed_at_utc=timestamp_utc,
             note=note
         )
@@ -1429,8 +1536,8 @@ class WatchdogStateManager:
             self._execution_policy_failures.pop(0)  # Remove oldest
         
         logger.warning(
-            f"Execution policy validation failure recorded: {len(errors)} error(s), "
-            f"execution_instruments={execution_instruments}, failed_at={timestamp_utc.isoformat()}"
+            f"Execution policy validation failure recorded: {len(normalized_errors)} error(s), "
+            f"execution_instruments={normalized_execution_instruments}, failed_at={timestamp_utc.isoformat()}"
         )
 
     def update_robot_execution_policy_hash(self, execution_policy_hash: Optional[str], timestamp_utc: datetime):
@@ -3028,10 +3135,15 @@ class WatchdogStateManager:
         """Compute unprotected positions derived field."""
         unprotected = []
         now = datetime.now(timezone.utc)
+        active_exposure_instruments = set()
         
         for intent_id, exposure in self._intent_exposures.items():
             if exposure.state != "ACTIVE":
                 continue
+            entry_qty = int(getattr(exposure, "entry_filled_qty", 0) or 0)
+            exit_qty = int(getattr(exposure, "exit_filled_qty", 0) or 0)
+            if entry_qty > exit_qty:
+                active_exposure_instruments.add(_normalize_position_authority_key(exposure.instrument))
             
             # Check if protective orders were submitted
             protective_acknowledged = len(self._protective_events.get(intent_id, set())) > 0
@@ -3047,6 +3159,29 @@ class WatchdogStateManager:
                         "entry_filled_at_chicago": exposure.entry_filled_at_utc.astimezone(CHICAGO_TZ).isoformat(),
                         "unprotected_duration_seconds": int(timeout_seconds)
                     })
+
+        for instrument_key, snapshot in self._position_authority_by_instrument.items():
+            broker_qty = _coerce_int_or_none(snapshot.get("broker_qty"))
+            if broker_qty is None or broker_qty == 0:
+                continue
+            norm_key = _normalize_position_authority_key(instrument_key)
+            if norm_key in active_exposure_instruments:
+                continue
+            unprotected.append({
+                "intent_id": None,
+                "stream": None,
+                "instrument": snapshot.get("instrument") or instrument_key,
+                "direction": "UNKNOWN",
+                "entry_filled_at_chicago": None,
+                "unprotected_duration_seconds": 0,
+                "classification": "UNTRACKED_BROKER_EXPOSURE",
+                "reason": "broker_position_without_active_journal_or_intent",
+                "broker_qty": broker_qty,
+                "authority_state": snapshot.get("authority_state"),
+                "journal_open_qty": snapshot.get("journal_open_qty"),
+                "real_open_qty": snapshot.get("real_open_qty"),
+                "recovery_open_qty": snapshot.get("recovery_open_qty"),
+            })
         
         return unprotected
 

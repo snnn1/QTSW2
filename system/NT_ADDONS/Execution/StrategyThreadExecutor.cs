@@ -284,6 +284,7 @@ public sealed class StrategyThreadExecutor
     private readonly ConcurrentQueue<INtAction> _urgentQueue = new();
     private readonly ConcurrentQueue<INtAction> _queue = new();
     private readonly HashSet<string> _pendingCorrelationIds = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _pendingMarketReentryIntentKeys = new(StringComparer.OrdinalIgnoreCase);
     private readonly object _pendingLock = new();
     private readonly RobotLogger _log;
     private readonly Func<DateTimeOffset> _utcNow;
@@ -301,6 +302,7 @@ public sealed class StrategyThreadExecutor
     public bool EnqueueNtAction(INtAction action, out bool droppedAsDuplicate)
     {
         droppedAsDuplicate = false;
+        var marketReentryIntentKey = GetMarketReentryIntentKey(action);
         lock (_pendingLock)
         {
             if (_pendingCorrelationIds.Contains(action.CorrelationId))
@@ -318,7 +320,27 @@ public sealed class StrategyThreadExecutor
                     }));
                 return false;
             }
+
+            if (marketReentryIntentKey != null && _pendingMarketReentryIntentKeys.Contains(marketReentryIntentKey))
+            {
+                droppedAsDuplicate = true;
+                _log.Write(RobotEvents.EngineBase(_utcNow(), tradingDate: "", eventType: "NT_ACTION_DUPLICATE_DROPPED", state: "ENGINE",
+                    new
+                    {
+                        correlation_id = action.CorrelationId,
+                        action_type = action.ActionType,
+                        intent_id = action.IntentId,
+                        instrument_key = action.InstrumentKey,
+                        reentry_intent_key = marketReentryIntentKey,
+                        reason = action.Reason,
+                        note = "Idempotency: duplicate pending market reentry intent dropped"
+                    }));
+                return false;
+            }
+
             _pendingCorrelationIds.Add(action.CorrelationId);
+            if (marketReentryIntentKey != null)
+                _pendingMarketReentryIntentKeys.Add(marketReentryIntentKey);
         }
 
         var urgent = action is NtCancelOrdersCommand c && c.PreferUrgentDrain;
@@ -434,7 +456,12 @@ public sealed class StrategyThreadExecutor
             finally
             {
                 lock (_pendingLock)
+                {
                     _pendingCorrelationIds.Remove(action.CorrelationId);
+                    var completedReentryIntentKey = GetMarketReentryIntentKey(action);
+                    if (completedReentryIntentKey != null)
+                        _pendingMarketReentryIntentKeys.Remove(completedReentryIntentKey);
+                }
             }
 
             if (pauseAfterMarketReentry)
@@ -461,4 +488,19 @@ public sealed class StrategyThreadExecutor
     public int UrgentPendingCount => _urgentQueue.Count;
 
     public int NormalPendingCount => _queue.Count;
+
+    private static string? GetMarketReentryIntentKey(INtAction action)
+    {
+        if (action is not NtSubmitMarketReentryCommand cmd)
+            return null;
+
+        var intentId = (cmd.IntentId ?? cmd.Command.ReentryIntentId ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(intentId))
+            return null;
+
+        var instrument = (cmd.InstrumentKey ?? cmd.Command.ExecutionInstrument ?? cmd.Command.Instrument ?? "").Trim().ToUpperInvariant();
+        return string.IsNullOrWhiteSpace(instrument)
+            ? $"MARKET_REENTRY|{intentId}"
+            : $"MARKET_REENTRY|{instrument}|{intentId}";
+    }
 }

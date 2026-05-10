@@ -78,6 +78,8 @@ public static class IntentLifecycleValidator
             // IEA SubmitEntryIntentCommand may apply SUBMIT_ENTRY before adapter boundary; stream path applies at submit.
             (IntentLifecycleState.ENTRY_SUBMITTED, IntentLifecycleTransition.SUBMIT_ENTRY) => true,
             (IntentLifecycleState.ENTRY_WORKING, IntentLifecycleTransition.SUBMIT_ENTRY) => true,
+            (IntentLifecycleState.ENTRY_PARTIALLY_FILLED, IntentLifecycleTransition.SUBMIT_ENTRY) => true,
+            (IntentLifecycleState.ENTRY_FILLED, IntentLifecycleTransition.SUBMIT_ENTRY) => true,
             (IntentLifecycleState.ENTRY_FILLED, IntentLifecycleTransition.ENTRY_FILLED) => true,
             (IntentLifecycleState.ENTRY_PARTIALLY_FILLED, IntentLifecycleTransition.ENTRY_PARTIALLY_FILLED) => true,
             (IntentLifecycleState.ENTRY_PARTIALLY_FILLED, IntentLifecycleTransition.PROTECTIVES_PLACED) => true,

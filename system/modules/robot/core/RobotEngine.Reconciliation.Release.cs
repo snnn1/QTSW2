@@ -170,6 +170,11 @@ public sealed partial class RobotEngine
                         broker_position_qty = input.BrokerPositionQty,
                         broker_working_count = input.BrokerWorkingCount,
                         journal_open_qty = input.JournalOpenQty,
+                        ownership_snapshot_available = input.OwnershipSnapshotAvailable,
+                        ownership_gross_open_qty = input.OwnershipGrossOpenQty,
+                        ownership_signed_net_qty = input.OwnershipSignedNetQty,
+                        ownership_active_slot_count = input.OwnershipActiveSlotCount,
+                        ownership_orphan_slot_count = input.OwnershipOrphanSlotCount,
                         iea_trusted_working_count = input.IeaOwnedPlusAdoptedWorking,
                         pending_candidate_count = input.PendingAdoptionCandidateCount,
                         release_ready = result.ReleaseReady,
@@ -220,6 +225,9 @@ public sealed partial class RobotEngine
         else
             input.IeaOwnedPlusAdoptedWorking = useIea ? -1 : 0;
 
+        var releaseOwnershipKey = ieaResolved?.ExecutionInstrumentKey ?? inst;
+        ApplyReleaseOwnershipSnapshot(input, TryGetReleaseOwnershipSnapshot(releaseOwnershipKey));
+
         var journalOpenQtyBeforePreSum =
             _executionJournal.GetOpenJournalStructuralStateForInstrument(inst, canonical).OpenQtySum;
         var integrityResult = RunEnsureJournalIntegrity(inst, snap, utcNow, markEnsuredForInvariant: true,
@@ -233,12 +241,13 @@ public sealed partial class RobotEngine
         var suppressBrokerFlatJournalClose =
             HasPendingFlattenLifecycle(inst) ||
             pendingIeAWorkload != 0 ||
-            brokerJournalAlignmentActive;
+            brokerJournalAlignmentActive ||
+            HasReleaseOwnershipGrossOpen(input);
 
         if (input.BrokerPositionQty == 0 && input.BrokerWorkingCount == 0)
         {
             brokerFlatJournalClosedCount = _executionJournal.ReconcileBrokerFlatJournalRowsForRelease(
-                ieaResolved?.ExecutionInstrumentKey ?? inst,
+                releaseOwnershipKey,
                 canonical,
                 input.BrokerPositionQty,
                 input.BrokerWorkingCount,
@@ -251,14 +260,14 @@ public sealed partial class RobotEngine
                     td,
                     streamId,
                     intentId,
-                    ieaResolved?.ExecutionInstrumentKey ?? inst,
+                    releaseOwnershipKey,
                     remaining,
                     utcNow,
                     "Release-readiness broker-flat journal reconciliation mirrored into ownership ledger"));
             if (!suppressBrokerFlatJournalClose && pendingIeAWorkload == 0)
             {
                 residualBrokerFlatJournalClosedCount = _executionJournal.ReconcileBrokerFlatJournalRowsForRelease(
-                    ieaResolved?.ExecutionInstrumentKey ?? inst,
+                    releaseOwnershipKey,
                     canonical,
                     input.BrokerPositionQty,
                     input.BrokerWorkingCount,
@@ -272,7 +281,7 @@ public sealed partial class RobotEngine
                         td,
                         streamId,
                         intentId,
-                        ieaResolved?.ExecutionInstrumentKey ?? inst,
+                        releaseOwnershipKey,
                         remaining,
                         utcNow,
                         "Residual broker-flat cleanup journal reconciliation mirrored into ownership ledger"));
@@ -304,6 +313,11 @@ public sealed partial class RobotEngine
                     journal_alignment_write_count = journalAlignmentWriteCount,
                     broker_flat_journal_closed_count = brokerFlatJournalClosedCount,
                     residual_broker_flat_journal_closed_count = residualBrokerFlatJournalClosedCount,
+                    ownership_snapshot_available = input.OwnershipSnapshotAvailable,
+                    ownership_gross_open_qty = input.OwnershipGrossOpenQty,
+                    ownership_signed_net_qty = input.OwnershipSignedNetQty,
+                    ownership_active_slot_count = input.OwnershipActiveSlotCount,
+                    ownership_orphan_slot_count = input.OwnershipOrphanSlotCount,
                     recovered_intent_writes = recoveredIntentWrites,
                     journal_open_qty_after_pre_sum_chain = journalOpenQty,
                     note =
@@ -413,6 +427,10 @@ public sealed partial class RobotEngine
         else if (useIea)
             ieaTrusted = -1;
 
+        var ownershipProbeInput = new StateConsistencyReleaseEvaluationInput();
+        ApplyReleaseOwnershipSnapshot(ownershipProbeInput,
+            TryGetReleaseOwnershipSnapshot(ieaResolved?.ExecutionInstrumentKey ?? inst));
+
         var (journalQty, journalIntentHash) =
             _executionJournal.GetOpenJournalStructuralStateForInstrument(inst, canonical);
 
@@ -441,12 +459,53 @@ public sealed partial class RobotEngine
             PendingCandidateCount = pending,
             IeaTrustedWorkingCount = ieaTrusted,
             UseIea = useIea,
+            OwnershipSnapshotAvailable = ownershipProbeInput.OwnershipSnapshotAvailable,
+            OwnershipGrossOpenQty = ownershipProbeInput.OwnershipGrossOpenQty,
+            OwnershipSignedNetQty = ownershipProbeInput.OwnershipSignedNetQty,
+            OwnershipActiveSlotCount = ownershipProbeInput.OwnershipActiveSlotCount,
+            OwnershipOrphanSlotCount = ownershipProbeInput.OwnershipOrphanSlotCount,
             BlockingAdoptionIntentSetHash = blockingHash,
             RegistryMismatchTrustedIntentSetHash = registryHash,
             JournalOpenIntentSetHash = journalIntentHash
         };
         return true;
     }
+
+    private InstrumentOwnershipSnapshot? TryGetReleaseOwnershipSnapshot(string instrument)
+    {
+        if (!FeatureFlags.CanonicalOwnershipLedgerEnabled || _ownershipLedger == null ||
+            string.IsNullOrWhiteSpace(instrument))
+            return null;
+
+        try
+        {
+            return _ownershipLedger.GetOwnershipSnapshot(OwnershipAccountKey, instrument.Trim());
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static void ApplyReleaseOwnershipSnapshot(StateConsistencyReleaseEvaluationInput input,
+        InstrumentOwnershipSnapshot? snapshot)
+    {
+        if (snapshot == null)
+            return;
+
+        input.OwnershipSnapshotAvailable = true;
+        input.OwnershipSignedNetQty = snapshot.LedgerSignedNetQty;
+        input.OwnershipActiveSlotCount = snapshot.ActiveSlotCount;
+        input.OwnershipOrphanSlotCount = snapshot.OrphanSlotCount;
+        input.OwnershipGrossOpenQty = snapshot.Slots
+            .Where(s => s.State != SlotState.Closed && s.Remaining > 0)
+            .Sum(s => Math.Abs(s.Remaining));
+    }
+
+    private static bool HasReleaseOwnershipGrossOpen(StateConsistencyReleaseEvaluationInput input) =>
+        input.OwnershipGrossOpenQty > 0 ||
+        input.OwnershipActiveSlotCount > 0 ||
+        input.OwnershipOrphanSlotCount > 0;
 
     private void LogReleaseSuppressionDecisionIfDiag(string instrument, bool skipped, string internalReason,
         in ReleaseReadinessSuppressionProbe probe, long activityGeneration)
@@ -467,7 +526,12 @@ public sealed partial class RobotEngine
                 activity_generation = activityGeneration,
                 pending_candidate_count = probe.PendingCandidateCount,
                 broker_position_qty = probe.BrokerPositionQty,
-                journal_open_qty = probe.JournalOpenQty
+                journal_open_qty = probe.JournalOpenQty,
+                ownership_snapshot_available = probe.OwnershipSnapshotAvailable,
+                ownership_gross_open_qty = probe.OwnershipGrossOpenQty,
+                ownership_signed_net_qty = probe.OwnershipSignedNetQty,
+                ownership_active_slot_count = probe.OwnershipActiveSlotCount,
+                ownership_orphan_slot_count = probe.OwnershipOrphanSlotCount
             }));
     }
 
@@ -636,7 +700,12 @@ public sealed partial class RobotEngine
                 utcNow);
         }
 
-        if (result.BrokerWorkingCountAfter == 0)
+        var gateOwnershipInput = new StateConsistencyReleaseEvaluationInput();
+        ApplyReleaseOwnershipSnapshot(gateOwnershipInput,
+            TryGetReleaseOwnershipSnapshot(ieaAfterProbe?.ExecutionInstrumentKey ?? inst));
+        var gateOwnershipGrossOpen = HasReleaseOwnershipGrossOpen(gateOwnershipInput);
+
+        if (result.BrokerWorkingCountAfter == 0 && !gateOwnershipGrossOpen)
         {
             _executionJournal.ReconcileBrokerFlatJournalRowsForRelease(
                 ieaAfterProbe?.ExecutionInstrumentKey ?? inst,
@@ -656,6 +725,20 @@ public sealed partial class RobotEngine
                     remaining,
                     utcNow,
                     "Gate-recovery broker-flat journal reconciliation mirrored into ownership ledger"));
+        }
+        else if (result.BrokerWorkingCountAfter == 0 && gateOwnershipGrossOpen)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, "", "GATE_RECOVERY_BROKER_FLAT_JOURNAL_CLOSURE_SUPPRESSED", "ENGINE",
+                new
+                {
+                    instrument = inst,
+                    ownership_snapshot_available = gateOwnershipInput.OwnershipSnapshotAvailable,
+                    ownership_gross_open_qty = gateOwnershipInput.OwnershipGrossOpenQty,
+                    ownership_signed_net_qty = gateOwnershipInput.OwnershipSignedNetQty,
+                    ownership_active_slot_count = gateOwnershipInput.OwnershipActiveSlotCount,
+                    ownership_orphan_slot_count = gateOwnershipInput.OwnershipOrphanSlotCount,
+                    note = "Broker-net flat is not clean-flat while gross ownership slots remain open; journal closure suppressed"
+                }));
         }
 
         var readiness = EvaluateStateConsistencyReleaseReadiness(inst, snapAfter, utcNow, forceFullEvaluation: true);

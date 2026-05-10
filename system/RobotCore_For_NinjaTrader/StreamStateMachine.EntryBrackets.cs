@@ -403,6 +403,21 @@ public sealed partial class StreamStateMachine
     {
         if (_entryOrderRecoveryState.Action == EntryOrderRecoveryAction.None)
             return false;
+        if (utcNow < SlotTimeUtc)
+        {
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "ENTRY_ORDER_ACTION_DEFERRED_BEFORE_SLOT_TIME", State.ToString(),
+                new
+                {
+                    stream_id = Stream,
+                    trading_date = TradingDate,
+                    now_utc = utcNow.ToString("o"),
+                    slot_time_utc = SlotTimeUtc.ToString("o"),
+                    recovery_action = _entryOrderRecoveryState.Action.ToString(),
+                    note = "Pending entry-order recovery is retained but cannot execute before the slot time."
+                }));
+            return false;
+        }
         if (Committed || State != StreamState.RANGE_LOCKED || _journal.ExecutionInterruptedByClose || _entryDetected || utcNow >= MarketCloseUtc)
         {
             _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
@@ -1249,6 +1264,17 @@ public sealed partial class StreamStateMachine
             return (false, "BREAKOUT_LEVELS_MISSING", new { _breakoutLevelsMissing = true, note = "Stream gated from entry until breakout levels are computed" });
         }
 
+        if (utcNow < SlotTimeUtc)
+        {
+            return (false, "BEFORE_SLOT_TIME", new
+            {
+                now_utc = utcNow.ToString("o"),
+                slot_time_utc = SlotTimeUtc.ToString("o"),
+                slot_time_chicago = SlotTimeChicago,
+                note = "Entry brackets cannot be submitted before the stream slot time. This blocks replay rewind/restart restoration from submitting future RANGE_LOCKED state early."
+            });
+        }
+
         if (_executionAdapter == null || _executionJournal == null || _riskGate == null)
         {
             return (false, "NULL_DEPENDENCIES", new { execution_adapter_null = _executionAdapter == null, execution_journal_null = _executionJournal == null, risk_gate_null = _riskGate == null });
@@ -1259,6 +1285,15 @@ public sealed partial class StreamStateMachine
             return (false, "EXECUTION_CONTEXT_NOT_READY", new
             {
                 note = "NT context not wired or SIM not verified — bracket submission deferred (startup/readiness contract)"
+            });
+        }
+
+        if (_engine != null && !_engine.IsBrokerOrderSubmissionAllowed)
+        {
+            return (false, "BROKER_SUBMIT_NOT_REALTIME", new
+            {
+                execution_mode = _executionMode.ToString(),
+                note = "SIM/LIVE broker entry submission is blocked until the NinjaTrader strategy reaches Realtime."
             });
         }
 
@@ -1889,16 +1924,47 @@ public sealed partial class StreamStateMachine
                 return;
             }
 
+            if (longSubmit.Action == BreakoutEntrySubmitAction.Market &&
+                shortSubmit.Action == BreakoutEntrySubmitAction.Market)
+            {
+                MarkPostLockBreakoutFromRejectedSide(true, true);
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "ENTRY_BREAKOUT_TOO_FAR_REJECTED", State.ToString(),
+                    new
+                    {
+                        stream = Stream,
+                        bid,
+                        ask,
+                        brk_long = brkLong,
+                        brk_short = brkShort,
+                        long_decision = longDecision,
+                        short_decision = shortDecision,
+                        tolerance_ticks = toleranceTicks,
+                        note = "Both breakout sides were marketable at bracket submit; treating as ambiguous/missed setup."
+                    }));
+                LogSlotEndSummary(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", false, false,
+                    "Range locked; both breakout sides were marketable before entry could be safely submitted");
+                _ = Commit(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", "NO_TRADE_BREAKOUT_ALREADY_OCCURRED");
+                return;
+            }
+
             OrderSubmissionResult longRes;
             OrderSubmissionResult shortRes;
             if (longSubmit.Action == BreakoutEntrySubmitAction.Market)
-                longRes = _executionAdapter.SubmitEntryOrder(longIntentId, ExecutionInstrument, "Long", null, _orderQuantity, "MARKET", ocoGroup, utcNow);
-            else
-                longRes = _executionAdapter.SubmitStopEntryOrder(longIntentId, ExecutionInstrument, "Long", brkLong, _orderQuantity, ocoGroup, utcNow);
-            if (shortSubmit.Action == BreakoutEntrySubmitAction.Market)
-                shortRes = _executionAdapter.SubmitEntryOrder(shortIntentId, ExecutionInstrument, "Short", null, _orderQuantity, "MARKET", ocoGroup, utcNow);
-            else
+            {
                 shortRes = _executionAdapter.SubmitStopEntryOrder(shortIntentId, ExecutionInstrument, "Short", brkShort, _orderQuantity, ocoGroup, utcNow);
+                longRes = _executionAdapter.SubmitEntryOrder(longIntentId, ExecutionInstrument, "Long", null, _orderQuantity, "MARKET", ocoGroup, utcNow);
+            }
+            else if (shortSubmit.Action == BreakoutEntrySubmitAction.Market)
+            {
+                longRes = _executionAdapter.SubmitStopEntryOrder(longIntentId, ExecutionInstrument, "Long", brkLong, _orderQuantity, ocoGroup, utcNow);
+                shortRes = _executionAdapter.SubmitEntryOrder(shortIntentId, ExecutionInstrument, "Short", null, _orderQuantity, "MARKET", ocoGroup, utcNow);
+            }
+            else
+            {
+                longRes = _executionAdapter.SubmitStopEntryOrder(longIntentId, ExecutionInstrument, "Long", brkLong, _orderQuantity, ocoGroup, utcNow);
+                shortRes = _executionAdapter.SubmitStopEntryOrder(shortIntentId, ExecutionInstrument, "Short", brkShort, _orderQuantity, ocoGroup, utcNow);
+            }
 
             // Persist to execution journal for idempotency (record both attempts)
             // PHASE 2: Journal uses ExecutionInstrument for execution tracking

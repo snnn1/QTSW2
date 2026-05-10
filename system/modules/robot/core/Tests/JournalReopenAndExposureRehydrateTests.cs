@@ -21,6 +21,8 @@ public static class JournalReopenAndExposureRehydrateTests
         if (!c.Pass) return (false, $"multiplier_hydrate: {c.Error}");
         var d = RehydrateAllowsExitWithoutNoExposure();
         if (!d.Pass) return (false, $"rehydrate: {d.Error}");
+        var e = BrokerFlatCompletedCarryoverReopensFromWorkingOrderIntent();
+        if (!e.Pass) return (false, $"carryover_reopen: {e.Error}");
         return (true, null);
     }
 
@@ -117,6 +119,73 @@ public static class JournalReopenAndExposureRehydrateTests
             if (after == null) return (false, "deserialized null");
             if (after.ExitFilledQuantityTotal != 1)
                 return (false, $"partial exit should be preserved, got exit {after.ExitFilledQuantityTotal}");
+            return (true, null);
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(tempRoot))
+                    Directory.Delete(tempRoot, true);
+            }
+            catch { /* best-effort */ }
+        }
+    }
+
+    private static (bool Pass, string? Error) BrokerFlatCompletedCarryoverReopensFromWorkingOrderIntent()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"CarryoverReopen_{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            var journalDir = RobotRunArtifactPaths.StateExecutionJournals(tempRoot);
+            Directory.CreateDirectory(journalDir);
+            const string intentId = "carryover-intent";
+            var path = Path.Combine(journalDir, $"2026-05-07_NG2_{intentId}.json");
+            var seed = new ExecutionJournalEntry
+            {
+                IntentId = intentId,
+                TradingDate = "2026-05-07",
+                Stream = "NG2",
+                Instrument = "MNG",
+                EntrySubmitted = true,
+                EntryFilled = true,
+                EntryFilledQuantityTotal = 2,
+                ExitFilledQuantityTotal = 2,
+                TradeCompleted = true,
+                CompletionReason = CompletionReasons.RECONCILIATION_BROKER_FLAT,
+                Direction = "Long",
+                CompletedAtUtc = "2026-05-08T00:49:40+00:00",
+                ExitOrderType = CompletionReasons.RECONCILIATION_BROKER_FLAT,
+                ExitFilledAtUtc = "2026-05-08T00:49:40+00:00"
+            };
+            File.WriteAllText(path, JsonUtil.Serialize(seed));
+
+            var log = new RobotLogger(tempRoot);
+            var journal = new ExecutionJournal(tempRoot, log);
+            var reopened = journal.ReopenBrokerFlatCompletedJournalRowsForCarryover(
+                "MNG",
+                "NG",
+                new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase) { [intentId] = 2 },
+                DateTimeOffset.Parse("2026-05-08T14:00:00+00:00"),
+                "unit_test");
+
+            if (reopened != 1)
+                return (false, $"expected one broker-flat journal row reopened, got {reopened}");
+
+            var after = JsonUtil.Deserialize<ExecutionJournalEntry>(File.ReadAllText(path));
+            if (after == null) return (false, "deserialized null");
+            if (after.TradeCompleted)
+                return (false, "TradeCompleted should be false after carryover reopen");
+            if (after.ExitFilledQuantityTotal != 0)
+                return (false, $"expected exit qty 0, got {after.ExitFilledQuantityTotal}");
+            if (after.CompletionReason != null)
+                return (false, $"expected completion reason cleared, got {after.CompletionReason}");
+            if (after.ExitOrderType != null)
+                return (false, $"expected exit order type cleared, got {after.ExitOrderType}");
+            var candidates = journal.GetAdoptionCandidateIntentIdsForInstrument("MNG", "NG");
+            if (!candidates.Contains(intentId))
+                return (false, "reopened carryover row should be adoption candidate");
             return (true, null);
         }
         finally

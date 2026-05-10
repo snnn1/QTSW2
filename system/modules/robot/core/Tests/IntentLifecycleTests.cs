@@ -29,6 +29,14 @@ public static class IntentLifecycleTests
         if (!ValidTransition(IntentLifecycleState.ENTRY_SUBMITTED, IntentLifecycleTransition.ENTRY_FILLED, IntentLifecycleState.ENTRY_FILLED))
             return (false, "ENTRY_SUBMITTED -> ENTRY_FILLED should yield ENTRY_FILLED");
 
+        var marketFillRaceState = IntentLifecycleState.CREATED;
+        var (submitValid, submittedState) = IntentLifecycleValidator.TryGetTransition(marketFillRaceState, IntentLifecycleTransition.SUBMIT_ENTRY);
+        if (!submitValid || submittedState != IntentLifecycleState.ENTRY_SUBMITTED)
+            return (false, "Market reentry race setup should move CREATED -> ENTRY_SUBMITTED before Account.Submit");
+        var (fastFillValid, fastFillState) = IntentLifecycleValidator.TryGetTransition(submittedState, IntentLifecycleTransition.ENTRY_FILLED);
+        if (!fastFillValid || fastFillState != IntentLifecycleState.ENTRY_FILLED)
+            return (false, "Fast market fill after pre-submit transition should move ENTRY_SUBMITTED -> ENTRY_FILLED");
+
         if (!ValidTransition(IntentLifecycleState.ENTRY_WORKING, IntentLifecycleTransition.ENTRY_PARTIALLY_FILLED, IntentLifecycleState.ENTRY_PARTIALLY_FILLED))
             return (false, "ENTRY_WORKING -> ENTRY_PARTIALLY_FILLED should yield ENTRY_PARTIALLY_FILLED");
 
@@ -62,6 +70,9 @@ public static class IntentLifecycleTests
         // --- Invalid transitions ---
         if (!InvalidTransition(IntentLifecycleState.CREATED, IntentLifecycleTransition.INTENT_COMPLETED))
             return (false, "CREATED -> INTENT_COMPLETED should be invalid");
+
+        if (!InvalidTransition(IntentLifecycleState.CREATED, IntentLifecycleTransition.ENTRY_FILLED))
+            return (false, "CREATED -> ENTRY_FILLED should remain invalid; submit must lead fast fills");
 
         if (!InvalidTransition(IntentLifecycleState.ENTRY_WORKING, IntentLifecycleTransition.SUBMIT_ENTRY))
             return (false, "ENTRY_WORKING -> SUBMIT_ENTRY should be invalid");
@@ -124,6 +135,10 @@ public static class IntentLifecycleTests
             return (false, "ENTRY_SUBMITTED + SUBMIT_ENTRY replay should be idempotent (IEA + adapter boundary)");
         if (!IntentLifecycleValidator.IsIdempotentIntentReplay(IntentLifecycleState.ENTRY_WORKING, IntentLifecycleTransition.SUBMIT_ENTRY))
             return (false, "ENTRY_WORKING + SUBMIT_ENTRY replay should be idempotent after ack-before-submit");
+        if (!IntentLifecycleValidator.IsIdempotentIntentReplay(IntentLifecycleState.ENTRY_PARTIALLY_FILLED, IntentLifecycleTransition.SUBMIT_ENTRY))
+            return (false, "ENTRY_PARTIALLY_FILLED + SUBMIT_ENTRY replay should be idempotent after fill-before-submit");
+        if (!IntentLifecycleValidator.IsIdempotentIntentReplay(IntentLifecycleState.ENTRY_FILLED, IntentLifecycleTransition.SUBMIT_ENTRY))
+            return (false, "ENTRY_FILLED + SUBMIT_ENTRY replay should be idempotent after fill-before-submit");
         if (!IntentLifecycleValidator.IsIdempotentIntentReplay(IntentLifecycleState.ENTRY_PARTIALLY_FILLED, IntentLifecycleTransition.PROTECTIVES_PLACED))
             return (false, "Partial-fill protective placement should not be logged as invalid before final fill");
         if (IntentLifecycleValidator.IsIdempotentIntentReplay(IntentLifecycleState.CREATED, IntentLifecycleTransition.ENTRY_FILLED))

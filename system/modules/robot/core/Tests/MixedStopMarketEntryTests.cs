@@ -134,9 +134,14 @@ public static class MixedStopMarketEntryTests
                 WorkingOrders = new List<WorkingOrderSnapshot>()
             };
 
-            var executed = sm.ExecutePendingRecoveryAction(snap, DateTimeOffset.UtcNow);
+            var testUtc = EligibleTestUtc();
+            var audit = sm.AuditAndClassifyEntryOrders(snap, testUtc);
+            if (!audit.NeedsResubmit)
+                return (false, $"Long MARKET + short STOP: expected audit to request resubmit, got {audit}");
+
+            var executed = sm.ExecutePendingRecoveryAction(snap, testUtc);
             if (!executed)
-                return (false, "Long MARKET + short STOP: expected ExecutePendingRecoveryAction=true");
+                return (false, IneligibleMessage(sm, "Long MARKET + short STOP", testUtc));
 
             var recorded = adapter.GetRecorded();
             if (recorded.Count != 2)
@@ -146,6 +151,10 @@ public static class MixedStopMarketEntryTests
             var shortSub = recorded.FirstOrDefault(r => r.Direction == "Short");
             if (longSub == null || shortSub == null)
                 return (false, "Long MARKET + short STOP: missing Long or Short submission");
+
+            if (recorded[0].Direction != "Short" || recorded[0].Method != "SubmitStopEntryOrder" ||
+                recorded[1].Direction != "Long" || recorded[1].Method != "SubmitEntryOrder")
+                return (false, "Long MARKET + short STOP: passive short STOP must be submitted before market long");
 
             if (longSub.Method != "SubmitEntryOrder" || longSub.EntryOrderType != "MARKET")
                 return (false, $"Long MARKET + short STOP: Long should be SubmitEntryOrder(MARKET), got {longSub.Method}/{longSub.EntryOrderType}");
@@ -186,9 +195,14 @@ public static class MixedStopMarketEntryTests
                 WorkingOrders = new List<WorkingOrderSnapshot>()
             };
 
-            var executed = sm.ExecutePendingRecoveryAction(snap, DateTimeOffset.UtcNow);
+            var testUtc = EligibleTestUtc();
+            var audit = sm.AuditAndClassifyEntryOrders(snap, testUtc);
+            if (!audit.NeedsResubmit)
+                return (false, $"Short MARKET + long STOP: expected audit to request resubmit, got {audit}");
+
+            var executed = sm.ExecutePendingRecoveryAction(snap, testUtc);
             if (!executed)
-                return (false, "Short MARKET + long STOP: expected ExecutePendingRecoveryAction=true");
+                return (false, IneligibleMessage(sm, "Short MARKET + long STOP", testUtc));
 
             var recorded = adapter.GetRecorded();
             if (recorded.Count != 2)
@@ -198,6 +212,10 @@ public static class MixedStopMarketEntryTests
             var shortSub = recorded.FirstOrDefault(r => r.Direction == "Short");
             if (longSub == null || shortSub == null)
                 return (false, "Short MARKET + long STOP: missing Long or Short submission");
+
+            if (recorded[0].Direction != "Long" || recorded[0].Method != "SubmitStopEntryOrder" ||
+                recorded[1].Direction != "Short" || recorded[1].Method != "SubmitEntryOrder")
+                return (false, "Short MARKET + long STOP: passive long STOP must be submitted before market short");
 
             if (shortSub.Method != "SubmitEntryOrder" || shortSub.EntryOrderType != "MARKET")
                 return (false, $"Short MARKET + long STOP: Short should be SubmitEntryOrder(MARKET), got {shortSub.Method}/{shortSub.EntryOrderType}");
@@ -237,9 +255,14 @@ public static class MixedStopMarketEntryTests
                 WorkingOrders = new List<WorkingOrderSnapshot>()
             };
 
-            var executed = sm.ExecutePendingRecoveryAction(snap, DateTimeOffset.UtcNow);
+            var testUtc = EligibleTestUtc();
+            var audit = sm.AuditAndClassifyEntryOrders(snap, testUtc);
+            if (!audit.NeedsResubmit)
+                return (false, $"Heavy cross rejection: expected audit to request resubmit, got {audit}");
+
+            var executed = sm.ExecutePendingRecoveryAction(snap, testUtc);
             if (!executed)
-                return (false, "Heavy cross rejection: expected ExecutePendingRecoveryAction=true");
+                return (false, IneligibleMessage(sm, "Heavy cross rejection", testUtc));
 
             var recorded = adapter.GetRecorded();
             if (recorded.Count != 0)
@@ -310,4 +333,14 @@ public static class MixedStopMarketEntryTests
 
         return (sm, adapter);
     }
+
+    private static DateTimeOffset EligibleTestUtc()
+    {
+        var today = DateTime.UtcNow.Date;
+        return new DateTimeOffset(today.Year, today.Month, today.Day, 14, 0, 0, TimeSpan.Zero);
+    }
+
+    private static string IneligibleMessage(StreamStateMachine sm, string scenario, DateTimeOffset testUtc)
+        => $"{scenario}: expected ExecutePendingRecoveryAction=true; state={sm.State}; committed={sm.Committed}; " +
+           $"expired={sm.IsPostLockBreakoutSetupExpired()}; test_utc={testUtc:o}; market_close_utc={sm.MarketCloseUtc:o}";
 }

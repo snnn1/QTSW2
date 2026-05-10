@@ -45,7 +45,8 @@ public sealed class ReconciliationRepairExecutor
                 continue;
             }
 
-            if (verdict.MismatchTier == MismatchTier.Convergence && verdict.BrokerQty == 0)
+            if (verdict.MismatchTier == MismatchTier.Convergence && verdict.BrokerQty == 0 &&
+                verdict.JournalOpenQty == 0 && verdict.ActiveSlotCount == 0 && verdict.OrphanSlotCount == 0)
             {
                 var closed = TryCloseOrphanedJournalsWhenBrokerFlat(verdict.Instrument, utcNow);
                 if (closed > 0)

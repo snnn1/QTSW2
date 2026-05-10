@@ -154,6 +154,8 @@ internal sealed class CapturingExecutionAdapter : IExecutionAdapter
     };
 
     public List<string> CancelledOrderIds { get; } = new();
+    public (string IntentId, string Instrument, string Direction, decimal StopPrice, int Quantity)? LastProtectiveStop { get; private set; }
+    public (string IntentId, string Instrument, string Direction, decimal TargetPrice, int Quantity)? LastTargetOrder { get; private set; }
 
     public CapturingExecutionAdapter(RobotLogger log)
     {
@@ -201,9 +203,16 @@ internal sealed class CapturingExecutionAdapter : IExecutionAdapter
     public OrderSubmissionResult SubmitStopEntryOrder(string intentId, string instrument, string direction, decimal stopPrice, int quantity, string? ocoGroup, DateTimeOffset utcNow)
         => OrderSubmissionResult.SuccessResult(null, utcNow, utcNow);
     public OrderSubmissionResult SubmitProtectiveStop(string intentId, string instrument, string direction, decimal stopPrice, int quantity, string? ocoGroup, DateTimeOffset utcNow)
-        => OrderSubmissionResult.SuccessResult(null, utcNow, utcNow);
+    {
+        LastProtectiveStop = (intentId, instrument, direction, stopPrice, quantity);
+        return OrderSubmissionResult.SuccessResult(null, utcNow, utcNow);
+    }
+
     public OrderSubmissionResult SubmitTargetOrder(string intentId, string instrument, string direction, decimal targetPrice, int quantity, string? ocoGroup, DateTimeOffset utcNow)
-        => OrderSubmissionResult.SuccessResult(null, utcNow, utcNow);
+    {
+        LastTargetOrder = (intentId, instrument, direction, targetPrice, quantity);
+        return OrderSubmissionResult.SuccessResult(null, utcNow, utcNow);
+    }
     public OrderModificationResult ModifyStopToBreakEven(string intentId, string instrument, decimal beStopPrice, DateTimeOffset utcNow)
         => OrderModificationResult.SuccessResult(utcNow);
     public FlattenResult Flatten(string intentId, string instrument, DateTimeOffset utcNow)

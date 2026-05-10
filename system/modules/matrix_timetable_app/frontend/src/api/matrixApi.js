@@ -487,6 +487,92 @@ export async function previewExecutionTimetable({
 }
 
 /**
+ * Build a run-scoped multi-day Playback scenario bundle.
+ * This does not publish timetable_current.json or timetable_replay_current.json.
+ */
+export async function buildPlaybackScenario({
+  startDate,
+  endDate,
+  includeWeekends = false,
+  runId = null,
+  scenarioId = null,
+  streamFilters,
+} = {}) {
+  const payload = {
+    start_date: startDate ?? null,
+    end_date: endDate ?? null,
+    include_weekends: Boolean(includeWeekends),
+    run_id: runId,
+    scenario_id: scenarioId,
+  }
+  if (streamFilters != null && typeof streamFilters === 'object') {
+    const apiFilters = streamFiltersForExecutionApi(streamFilters)
+    if (Object.keys(apiFilters).length > 0) {
+      payload.stream_filters = apiFilters
+    }
+  }
+  const response = await fetch(`${API_BASE}/timetable/playback-scenario`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(payload)
+  })
+
+  const payloadText = await response.text()
+  if (!response.ok) {
+    let detail = payloadText
+    try {
+      const j = JSON.parse(payloadText)
+      detail = errorMessageFromPayload(j) || payloadText
+    } catch {
+      /* use raw */
+    }
+    throw new Error(
+      detail
+        ? `Failed to build Playback scenario: ${detail}`
+        : `Failed to build Playback scenario (${response.status}). Empty body - see backend logs.`
+    )
+  }
+
+  if (!payloadText.trim()) {
+    throw new Error('Playback scenario build: success response had empty body')
+  }
+  return JSON.parse(payloadText)
+}
+
+/**
+ * Clear the operator-selected multi-day Playback scenario pointer.
+ * This does not delete run-scoped scenario artifacts.
+ */
+export async function clearPlaybackScenario() {
+  const response = await fetch(`${API_BASE}/timetable/playback-scenario/current`, {
+    method: 'DELETE',
+  })
+
+  const payloadText = await response.text()
+  if (!response.ok) {
+    let detail = payloadText
+    try {
+      const j = JSON.parse(payloadText)
+      detail = errorMessageFromPayload(j) || payloadText
+    } catch {
+      /* use raw */
+    }
+    throw new Error(
+      detail
+        ? `Failed to clear Playback scenario: ${detail}`
+        : `Failed to clear Playback scenario (${response.status}). Empty body - see backend logs.`
+    )
+  }
+
+  if (!payloadText.trim()) {
+    throw new Error('Playback scenario clear: success response had empty body')
+  }
+  return JSON.parse(payloadText)
+}
+
+/**
  * Reload latest matrix file from disk (without rebuilding)
  * This immediately reflects the current disk state.
  */

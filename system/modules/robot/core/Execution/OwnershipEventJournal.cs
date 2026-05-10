@@ -164,7 +164,7 @@ public sealed class OwnershipEventJournal
             var json = JsonSerializer.Serialize(queued.Record, OwnershipEventRecordJsonCtx.Default.OwnershipEventRecord);
             lock (_fileWriteLock)
             {
-                File.AppendAllText(filePath, json + Environment.NewLine);
+                AppendLineWithRetry(filePath, json);
             }
             if (sw.ElapsedMilliseconds >= 500)
             {
@@ -184,6 +184,35 @@ public sealed class OwnershipEventJournal
             _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "OWNERSHIP_EVENT_JOURNAL_WRITE_ERROR", "ENGINE",
                 new { error = ex.Message, kind = queued.Record.Kind.ToString(), instrument = queued.Record.Instrument }));
         }
+    }
+
+    private static void AppendLineWithRetry(string filePath, string json)
+    {
+        Exception? last = null;
+        var delaysMs = new[] { 0, 5, 15, 30 };
+        foreach (var delayMs in delaysMs)
+        {
+            if (delayMs > 0)
+                Thread.Sleep(delayMs);
+
+            try
+            {
+                using var stream = new FileStream(filePath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+                using var writer = new StreamWriter(stream);
+                writer.WriteLine(json);
+                return;
+            }
+            catch (IOException ex)
+            {
+                last = ex;
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                last = ex;
+            }
+        }
+
+        throw last ?? new IOException("Ownership event journal append failed.");
     }
 
     /// <summary>

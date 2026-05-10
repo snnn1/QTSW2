@@ -4583,16 +4583,47 @@ public sealed class StreamStateMachine
                 return;
             }
 
+            if (longSubmit.Action == BreakoutEntrySubmitAction.Market &&
+                shortSubmit.Action == BreakoutEntrySubmitAction.Market)
+            {
+                MarkPostLockBreakoutFromRejectedSide(true, true);
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "ENTRY_BREAKOUT_TOO_FAR_REJECTED", State.ToString(),
+                    new
+                    {
+                        stream = Stream,
+                        bid,
+                        ask,
+                        brk_long = brkLong,
+                        brk_short = brkShort,
+                        long_decision = longDecision,
+                        short_decision = shortDecision,
+                        tolerance_ticks = toleranceTicks,
+                        note = "Both breakout sides were marketable at bracket submit; treating as ambiguous/missed setup."
+                    }));
+                LogSlotEndSummary(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", false, false,
+                    "Range locked; both breakout sides were marketable before entry could be safely submitted");
+                _ = Commit(utcNow, "NO_TRADE_BREAKOUT_ALREADY_OCCURRED", "NO_TRADE_BREAKOUT_ALREADY_OCCURRED");
+                return;
+            }
+
             OrderSubmissionResult longRes;
             OrderSubmissionResult shortRes;
             if (longSubmit.Action == BreakoutEntrySubmitAction.Market)
-                longRes = _executionAdapter.SubmitEntryOrder(longIntentId, ExecutionInstrument, "Long", null, _orderQuantity, "MARKET", ocoGroup, utcNow);
-            else
-                longRes = _executionAdapter.SubmitStopEntryOrder(longIntentId, ExecutionInstrument, "Long", brkLong, _orderQuantity, ocoGroup, utcNow);
-            if (shortSubmit.Action == BreakoutEntrySubmitAction.Market)
-                shortRes = _executionAdapter.SubmitEntryOrder(shortIntentId, ExecutionInstrument, "Short", null, _orderQuantity, "MARKET", ocoGroup, utcNow);
-            else
+            {
                 shortRes = _executionAdapter.SubmitStopEntryOrder(shortIntentId, ExecutionInstrument, "Short", brkShort, _orderQuantity, ocoGroup, utcNow);
+                longRes = _executionAdapter.SubmitEntryOrder(longIntentId, ExecutionInstrument, "Long", null, _orderQuantity, "MARKET", ocoGroup, utcNow);
+            }
+            else if (shortSubmit.Action == BreakoutEntrySubmitAction.Market)
+            {
+                longRes = _executionAdapter.SubmitStopEntryOrder(longIntentId, ExecutionInstrument, "Long", brkLong, _orderQuantity, ocoGroup, utcNow);
+                shortRes = _executionAdapter.SubmitEntryOrder(shortIntentId, ExecutionInstrument, "Short", null, _orderQuantity, "MARKET", ocoGroup, utcNow);
+            }
+            else
+            {
+                longRes = _executionAdapter.SubmitStopEntryOrder(longIntentId, ExecutionInstrument, "Long", brkLong, _orderQuantity, ocoGroup, utcNow);
+                shortRes = _executionAdapter.SubmitStopEntryOrder(shortIntentId, ExecutionInstrument, "Short", brkShort, _orderQuantity, ocoGroup, utcNow);
+            }
 
             // Persist to execution journal for idempotency (record both attempts)
             // PHASE 2: Journal uses ExecutionInstrument for execution tracking
@@ -7748,6 +7779,23 @@ public sealed class StreamStateMachine
             .Where(id => !string.IsNullOrWhiteSpace(id))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
+        var cancelIntentIds = new List<string>();
+        var primaryEntryCancelIntentId = longCount > 0
+            ? longIntentId
+            : shortCount > 0
+                ? shortIntentId
+                : longIntentId;
+        if (!string.IsNullOrWhiteSpace(primaryEntryCancelIntentId))
+            cancelIntentIds.Add(primaryEntryCancelIntentId);
+        foreach (var pendingEntry in pendingJournalEntries)
+        {
+            if (string.IsNullOrWhiteSpace(pendingEntry.IntentId) ||
+                string.Equals(pendingEntry.IntentId, longIntentId, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(pendingEntry.IntentId, shortIntentId, StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!cancelIntentIds.Contains(pendingEntry.IntentId, StringComparer.OrdinalIgnoreCase))
+                cancelIntentIds.Add(pendingEntry.IntentId);
+        }
 
         var shouldCancelNow = !_lastForcedFlattenPreEntryCancelUtc.HasValue ||
                               (utcNow - _lastForcedFlattenPreEntryCancelUtc.Value).TotalSeconds >= 5.0;
@@ -7758,20 +7806,15 @@ public sealed class StreamStateMachine
             {
                 if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
                 {
-                    if (orderIds.Count > 0)
+                    var routedCancelCount = _executionAdapter.RequestSessionCloseCancelIntents(cancelIntentIds, ExecutionInstrument, utcNow);
+                    if (routedCancelCount > 0)
                     {
-                        _executionAdapter.CancelOrders(orderIds, utcNow);
                         cancelAccepted = true;
                     }
-                    cancelAccepted = simAdapter.CancelIntentOrders(longIntentId, utcNow);
-                    cancelAccepted = simAdapter.CancelIntentOrders(shortIntentId, utcNow) || cancelAccepted;
-                    foreach (var pendingEntry in pendingJournalEntries)
+                    else
                     {
-                        if (string.IsNullOrWhiteSpace(pendingEntry.IntentId) ||
-                            string.Equals(pendingEntry.IntentId, longIntentId, StringComparison.OrdinalIgnoreCase) ||
-                            string.Equals(pendingEntry.IntentId, shortIntentId, StringComparison.OrdinalIgnoreCase))
-                            continue;
-                        cancelAccepted = simAdapter.CancelIntentOrders(pendingEntry.IntentId, utcNow) || cancelAccepted;
+                        foreach (var cancelIntentId in cancelIntentIds)
+                            cancelAccepted = simAdapter.CancelIntentOrders(cancelIntentId, utcNow) || cancelAccepted;
                     }
                 }
                 else if (orderIds.Count > 0)
@@ -7808,6 +7851,8 @@ public sealed class StreamStateMachine
                 ["pending_intent_ids"] = pendingJournalEntries.Select(e => e.IntentId).ToList(),
                 ["instrument_working_count"] = instrumentWorkingCount,
                 ["broker_order_ids"] = orderIds,
+                ["cancel_intent_ids"] = cancelIntentIds,
+                ["entry_oco_cancel_strategy"] = "cancel_one_entry_oco_side_and_allow_broker_oco_sibling_cancel",
                 ["cancel_accepted"] = cancelAccepted,
                 ["note"] = "Pre-entry forced flatten found live entry brackets; terminal no-trade commit deferred until broker working orders are gone."
             });
@@ -8407,8 +8452,16 @@ public sealed class StreamStateMachine
                 // Pre-entry: cancel long/short entry bracket intents (OriginalIntentId empty when no fill)
                 var longIntentId = ComputeIntentId("Long", _brkLongRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_LONG");
                 var shortIntentId = ComputeIntentId("Short", _brkShortRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_SHORT");
-                try { simAdapter.CancelIntentOrders(longIntentId, utcNow); } catch { /* Log error but continue */ }
-                try { simAdapter.CancelIntentOrders(shortIntentId, utcNow); } catch { /* Log error but continue */ }
+                try
+                {
+                    var routedCancelCount = _executionAdapter.RequestSessionCloseCancelIntents(new[] { longIntentId, shortIntentId }, ExecutionInstrument, utcNow);
+                    if (routedCancelCount <= 0)
+                    {
+                        try { simAdapter.CancelIntentOrders(longIntentId, utcNow); } catch { /* Log error but continue */ }
+                        try { simAdapter.CancelIntentOrders(shortIntentId, utcNow); } catch { /* Log error but continue */ }
+                    }
+                }
+                catch { /* Log error but continue */ }
             }
             if (_journal.ReentryFilled && !string.IsNullOrWhiteSpace(_journal.ReentryIntentId))
             {
@@ -8618,9 +8671,10 @@ public sealed class StreamStateMachine
         var direction = originalEntry.Direction ?? "Long";
         var quantity = originalEntry.EntryFilledQuantityTotal;
         var reentryEntryPrice = originalEntry.EntryPrice;
-        var reentryStopPrice = originalEntry.StopPrice;
+        var reentryStopPrice = ResolveReentryStopPrice(originalEntry);
         var reentryTargetPrice = originalEntry.TargetPrice;
         var reentryBeTrigger = originalEntry.BETriggerPrice;
+        var carryForwardBreakEven = IsReentryBreakEvenCarryForward(originalEntry);
 
         if (quantity <= 0)
         {
@@ -8711,7 +8765,10 @@ public sealed class StreamStateMachine
                 original_intent_id = _journal.OriginalIntentId,
                 direction = direction ?? "NULL",
                 quantity = quantity,
-                stop_price = originalEntry.StopPrice,
+                stop_price = reentryStopPrice,
+                original_stop_price = originalEntry.StopPrice,
+                break_even_carry_forward = carryForwardBreakEven,
+                break_even_stop_price = originalEntry.BEStopPrice,
                 target_price = originalEntry.TargetPrice,
                 entry_price = originalEntry.EntryPrice,
                 command_id = cmd.CommandId,
@@ -8901,7 +8958,8 @@ public sealed class StreamStateMachine
         if (string.IsNullOrEmpty(originalStream)) originalStream = Stream;
         
         var originalEntry = _executionJournal.GetEntry(_journal.OriginalIntentId, originalTradingDate, originalStream);
-        if (originalEntry == null || !originalEntry.StopPrice.HasValue || !originalEntry.TargetPrice.HasValue)
+        var stopPrice = originalEntry == null ? null : ResolveReentryStopPrice(originalEntry);
+        if (originalEntry == null || !stopPrice.HasValue || !originalEntry.TargetPrice.HasValue)
         {
             _ = Commit(utcNow, "REENTRY_PROTECTION_FAILED_CANNOT_LOAD_BRACKET", "REENTRY_PROTECTION_FAILED");
             LogHealth("CRITICAL", "REENTRY_PROTECTION_FAILED", $"Re-entry protection failed: Cannot load bracket levels for intent {_journal.OriginalIntentId}",
@@ -8909,7 +8967,8 @@ public sealed class StreamStateMachine
             return;
         }
         
-        var stopPrice = originalEntry.StopPrice.Value;
+        var resolvedStopPrice = stopPrice.Value;
+        var carriedBreakEven = IsReentryBreakEvenCarryForward(originalEntry);
         var targetPrice = originalEntry.TargetPrice.Value;
         var direction = originalEntry.Direction ?? "Long";
         var quantity = originalEntry.EntryFilledQuantityTotal;
@@ -8918,7 +8977,7 @@ public sealed class StreamStateMachine
         // Submit protective bracket via execution adapter
         if (_executionAdapter != null)
         {
-            var stopResult = _executionAdapter.SubmitProtectiveStop(reentryIntentId, ExecutionInstrument ?? Instrument, direction, stopPrice, quantity, null, utcNow);
+            var stopResult = _executionAdapter.SubmitProtectiveStop(reentryIntentId, ExecutionInstrument ?? Instrument, direction, resolvedStopPrice, quantity, null, utcNow);
             var targetResult = _executionAdapter.SubmitTargetOrder(reentryIntentId, ExecutionInstrument ?? Instrument, direction, targetPrice, quantity, null, utcNow);
             _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                 "REENTRY_PROTECTIVES_SUBMITTED", State.ToString(),
@@ -8927,12 +8986,27 @@ public sealed class StreamStateMachine
                     reentry_intent_id = reentryIntentId,
                     stop_success = stopResult.Success,
                     target_success = targetResult.Success,
-                    stop_price = stopPrice,
+                    stop_price = resolvedStopPrice,
+                    original_stop_price = originalEntry.StopPrice,
+                    break_even_carry_forward = carriedBreakEven,
+                    break_even_stop_price = originalEntry.BEStopPrice,
                     target_price = targetPrice
                 }));
 
             if (stopResult.Success && targetResult.Success)
             {
+                if (carriedBreakEven && _executionJournal != null)
+                {
+                    _executionJournal.RecordBEModification(
+                        reentryIntentId,
+                        TradingDate ?? originalTradingDate ?? "",
+                        Stream ?? originalStream ?? "",
+                        resolvedStopPrice,
+                        utcNow,
+                        previousStopPrice: ResolveReentryPreviousStopPrice(originalEntry),
+                        beTriggerPrice: originalEntry.BETriggerPrice,
+                        entryPrice: originalEntry.EntryPrice);
+                }
                 _journal.ProtectionSubmitted = true;
                 _journals.Save(_journal);
             }
@@ -9004,6 +9078,27 @@ public sealed class StreamStateMachine
                 original_intent_id = _journal.OriginalIntentId,
                 note = "Re-entry protection accepted - slot resumed normal operation"
             }));
+    }
+
+    private static bool IsReentryBreakEvenCarryForward(ExecutionJournalEntry originalEntry) =>
+        originalEntry.BEModified && originalEntry.BEStopPrice.HasValue;
+
+    private static decimal? ResolveReentryStopPrice(ExecutionJournalEntry originalEntry) =>
+        IsReentryBreakEvenCarryForward(originalEntry)
+            ? originalEntry.BEStopPrice
+            : originalEntry.StopPrice;
+
+    private static decimal? ResolveReentryPreviousStopPrice(ExecutionJournalEntry originalEntry)
+    {
+        if (originalEntry.PreviousStopPrice.HasValue)
+            return originalEntry.PreviousStopPrice;
+        if (originalEntry.StopPrice.HasValue && originalEntry.BEStopPrice.HasValue &&
+            originalEntry.StopPrice.Value != originalEntry.BEStopPrice.Value)
+        {
+            return originalEntry.StopPrice;
+        }
+
+        return null;
     }
 
     /// <summary>

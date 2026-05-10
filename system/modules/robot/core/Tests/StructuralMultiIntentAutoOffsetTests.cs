@@ -20,6 +20,12 @@ public static class StructuralMultiIntentAutoOffsetTests
         var e = VerifyMismatchClassificationMatchesAuditScenario();
         if (e != null) return (false, e);
 
+        e = VerifyBrokerNetFlatGrossOpenClassifiesAsHedged();
+        if (e != null) return (false, e);
+
+        e = VerifyExplainedHedgedNetFlatGrossOpenPolicy();
+        if (e != null) return (false, e);
+
         e = VerifyJournalGrossNetOppositeFromDisk();
         if (e != null) return (false, e);
 
@@ -38,6 +44,9 @@ public static class StructuralMultiIntentAutoOffsetTests
         e = VerifyBrokerSnapshotPositionAggregation();
         if (e != null) return (false, e);
 
+        e = VerifyReconciliationClassifierSumsDuplicateBrokerRows();
+        if (e != null) return (false, e);
+
         return (true, null);
     }
 
@@ -54,6 +63,46 @@ public static class StructuralMultiIntentAutoOffsetTests
             localWorkingOrderCount: 0);
         if (mt != MismatchType.STRUCTURAL_MULTI_INTENT)
             return $"Audit scenario: expected STRUCTURAL_MULTI_INTENT, got {mt}";
+        return null;
+    }
+
+    /// <summary>Broker-net flat with valid opposing gross streams is hedged gross-open, not stale JOURNAL_AHEAD.</summary>
+    private static string? VerifyBrokerNetFlatGrossOpenClassifiesAsHedged()
+    {
+        var mt = MismatchClassification.Classify(
+            brokerQtyAbs: 0,
+            grossJournalQty: 4,
+            netBrokerQty: 0,
+            netJournalQty: 0,
+            opposingMultiIntentOpen: true,
+            brokerWorkingOrderCount: 4,
+            localWorkingOrderCount: 4);
+        if (mt != MismatchType.HEDGED_NET_FLAT_GROSS_OPEN)
+            return $"Broker-net-flat gross-open: expected HEDGED_NET_FLAT_GROSS_OPEN, got {mt}";
+        return null;
+    }
+
+    private static string? VerifyExplainedHedgedNetFlatGrossOpenPolicy()
+    {
+        if (!MismatchClassification.IsExplainedHedgedNetFlatGrossOpen(
+                brokerQtyAbs: 0,
+                grossJournalQty: 4,
+                netBrokerQty: 0,
+                netJournalQty: 0,
+                opposingMultiIntentOpen: true,
+                brokerWorkingOrderCount: 4,
+                localWorkingOrderCount: 4))
+            return "Explained hedged net-flat gross-open should be recognized when working orders match";
+
+        if (MismatchClassification.IsExplainedHedgedNetFlatGrossOpen(0, 4, 0, 0, true, 0, 0))
+            return "Unprotected hedged net-flat gross-open must not be treated as explained";
+
+        if (MismatchClassification.IsExplainedHedgedNetFlatGrossOpen(0, 4, 0, 0, true, 4, 2))
+            return "Working-order mismatch must not be treated as explained hedged gross exposure";
+
+        if (MismatchClassification.IsExplainedHedgedNetFlatGrossOpen(0, 4, 0, 0, false, 4, 4))
+            return "Single-direction broker-net-flat gross-open must not be treated as explained hedged exposure";
+
         return null;
     }
 
@@ -241,5 +290,49 @@ public static class StructuralMultiIntentAutoOffsetTests
             return $"Single-row +2: expected abs=2 net=2, got abs={absSum} net={net}";
 
         return null;
+    }
+
+    private static string? VerifyReconciliationClassifierSumsDuplicateBrokerRows()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "QTSW2_recon_classifier_rows_" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            Directory.CreateDirectory(root);
+            var log = new RobotLogger(root);
+            var ledger = new InstrumentOwnershipLedger(log);
+            var account = "Playback101";
+            var utc = DateTimeOffset.Parse("2026-04-27T22:53:57Z");
+            ledger.RecordMappedEntryFill(account, "MNG", "intent-long", "NG1", SlotDirection.Long, 2, utc, 1);
+            ledger.RecordMappedEntryFill(account, "MNG", "intent-short", "NG2", SlotDirection.Short, 2, utc.AddMilliseconds(1), 2);
+
+            var classifier = new ReconciliationClassifier(ledger, log);
+            var broker = new AccountSnapshot
+            {
+                Positions = new List<PositionSnapshot>
+                {
+                    new() { Instrument = "MNG", Quantity = 2 },
+                    new() { Instrument = "MNG", Quantity = -2 }
+                },
+                WorkingOrders = new List<WorkingOrderSnapshot>()
+            };
+
+            var verdict = classifier.Classify(broker, account, new[] { "MNG" }, utc).Single();
+            if (verdict.BrokerQty != 0)
+                return $"ReconciliationClassifier: expected summed broker net 0, got {verdict.BrokerQty}";
+            if (verdict.BrokerSignedQty != 0)
+                return $"ReconciliationClassifier: expected signed broker net 0, got {verdict.BrokerSignedQty}";
+            if (verdict.LedgerQty != 0)
+                return $"ReconciliationClassifier: expected ledger signed net 0, got {verdict.LedgerQty}";
+            if (verdict.JournalOpenQty != 4)
+                return $"ReconciliationClassifier: expected ledger gross open 4, got {verdict.JournalOpenQty}";
+            if (verdict.ActiveSlotCount != 2)
+                return $"ReconciliationClassifier: expected 2 active slots, got {verdict.ActiveSlotCount}";
+
+            return null;
+        }
+        finally
+        {
+            try { Directory.Delete(root, true); } catch { /* ignore */ }
+        }
     }
 }

@@ -135,6 +135,23 @@ public sealed partial class StreamStateMachine
             .Where(id => !string.IsNullOrWhiteSpace(id))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
+        var cancelIntentIds = new List<string>();
+        var primaryEntryCancelIntentId = longCount > 0
+            ? longIntentId
+            : shortCount > 0
+                ? shortIntentId
+                : longIntentId;
+        if (!string.IsNullOrWhiteSpace(primaryEntryCancelIntentId))
+            cancelIntentIds.Add(primaryEntryCancelIntentId);
+        foreach (var pendingEntry in pendingJournalEntries)
+        {
+            if (string.IsNullOrWhiteSpace(pendingEntry.IntentId) ||
+                string.Equals(pendingEntry.IntentId, longIntentId, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(pendingEntry.IntentId, shortIntentId, StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!cancelIntentIds.Contains(pendingEntry.IntentId, StringComparer.OrdinalIgnoreCase))
+                cancelIntentIds.Add(pendingEntry.IntentId);
+        }
 
         var shouldCancelNow = !_lastForcedFlattenPreEntryCancelUtc.HasValue ||
                               (utcNow - _lastForcedFlattenPreEntryCancelUtc.Value).TotalSeconds >= 5.0;
@@ -145,20 +162,15 @@ public sealed partial class StreamStateMachine
             {
                 if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
                 {
-                    if (orderIds.Count > 0)
+                    var routedCancelCount = _executionAdapter.RequestSessionCloseCancelIntents(cancelIntentIds, ExecutionInstrument, utcNow);
+                    if (routedCancelCount > 0)
                     {
-                        _executionAdapter.CancelOrders(orderIds, utcNow);
                         cancelAccepted = true;
                     }
-                    cancelAccepted = simAdapter.CancelIntentOrders(longIntentId, utcNow);
-                    cancelAccepted = simAdapter.CancelIntentOrders(shortIntentId, utcNow) || cancelAccepted;
-                    foreach (var pendingEntry in pendingJournalEntries)
+                    else
                     {
-                        if (string.IsNullOrWhiteSpace(pendingEntry.IntentId) ||
-                            string.Equals(pendingEntry.IntentId, longIntentId, StringComparison.OrdinalIgnoreCase) ||
-                            string.Equals(pendingEntry.IntentId, shortIntentId, StringComparison.OrdinalIgnoreCase))
-                            continue;
-                        cancelAccepted = simAdapter.CancelIntentOrders(pendingEntry.IntentId, utcNow) || cancelAccepted;
+                        foreach (var cancelIntentId in cancelIntentIds)
+                            cancelAccepted = simAdapter.CancelIntentOrders(cancelIntentId, utcNow) || cancelAccepted;
                     }
                 }
                 else if (orderIds.Count > 0)
@@ -195,6 +207,8 @@ public sealed partial class StreamStateMachine
                 ["pending_intent_ids"] = pendingJournalEntries.Select(e => e.IntentId).ToList(),
                 ["instrument_working_count"] = instrumentWorkingCount,
                 ["broker_order_ids"] = orderIds,
+                ["cancel_intent_ids"] = cancelIntentIds,
+                ["entry_oco_cancel_strategy"] = "cancel_one_entry_oco_side_and_allow_broker_oco_sibling_cancel",
                 ["cancel_accepted"] = cancelAccepted,
                 ["note"] = "Pre-entry forced flatten found live entry brackets; terminal no-trade commit deferred until broker working orders are gone."
             });
@@ -804,8 +818,16 @@ public sealed partial class StreamStateMachine
                 // Pre-entry: cancel long/short entry bracket intents (OriginalIntentId empty when no fill)
                 var longIntentId = ComputeIntentId("Long", _brkLongRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_LONG");
                 var shortIntentId = ComputeIntentId("Short", _brkShortRounded.Value, SlotTimeUtc, "ENTRY_STOP_BRACKET_SHORT");
-                try { simAdapter.CancelIntentOrders(longIntentId, utcNow); } catch { /* Log error but continue */ }
-                try { simAdapter.CancelIntentOrders(shortIntentId, utcNow); } catch { /* Log error but continue */ }
+                try
+                {
+                    var routedCancelCount = _executionAdapter.RequestSessionCloseCancelIntents(new[] { longIntentId, shortIntentId }, ExecutionInstrument, utcNow);
+                    if (routedCancelCount <= 0)
+                    {
+                        try { simAdapter.CancelIntentOrders(longIntentId, utcNow); } catch { /* Log error but continue */ }
+                        try { simAdapter.CancelIntentOrders(shortIntentId, utcNow); } catch { /* Log error but continue */ }
+                    }
+                }
+                catch { /* Log error but continue */ }
             }
             if (_journal.ReentryFilled && !string.IsNullOrWhiteSpace(_journal.ReentryIntentId))
             {

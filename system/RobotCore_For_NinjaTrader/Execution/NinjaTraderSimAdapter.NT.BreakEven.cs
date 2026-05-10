@@ -515,10 +515,12 @@ public sealed partial class NinjaTraderSimAdapter
             var stopResult = SubmitProtectiveStop(intentId, instrument, direction, beStopQuantized, quantity, newOcoGroup, utcNow);
             if (!stopResult.Success)
             {
+                var flattenQueued = TryEnqueueEmergencyFlattenProtective(instrument, utcNow);
                 _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "BE_REPLACE_STOP_FAIL", new
                 {
                     error = stopResult.ErrorMessage,
-                    note = "BE replace: stop submit failed after cancel"
+                    emergency_flatten_queued = flattenQueued,
+                    note = "BE replace: stop submit failed after cancel; emergency flatten queued because the position may be unprotected."
                 }));
                 return OrderModificationResult.FailureResult(stopResult.ErrorMessage ?? "BE stop submit failed", utcNow);
             }

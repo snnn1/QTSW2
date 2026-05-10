@@ -175,7 +175,21 @@ public static class SiblingProtectiveCancelQueueTests
             if (trace4.Count != 2 || trace4[1] != "REENTRY:r2")
                 return (false, $"second reentry must execute after first protection accepted: {string.Join(" | ", trace4)}");
 
-            if (exec.PendingCount != 0 || exec2.PendingCount != 0 || exec3.PendingCount != 0 || exec4.PendingCount != 0)
+            // 5) Fast playback can request the same reentry intent repeatedly while a prior
+            // command is pending/deferred. Only one command for that intent may sit in the queue.
+            var trace5 = new List<string>();
+            var exec5 = new StrategyThreadExecutor(log, () => utc);
+            if (!exec5.EnqueueNtAction(ReentryAction("dup-r1", "intent-dup", utc), out var dupA) || dupA)
+                return (false, "first duplicate-intent reentry enqueue");
+            if (exec5.EnqueueNtAction(ReentryAction("dup-r2", "intent-dup", utc), out var dupB) || !dupB)
+                return (false, "second duplicate-intent reentry must be dropped while first is pending");
+            if (exec5.PendingCount != 1)
+                return (false, $"duplicate-intent queue should contain only one action, pending={exec5.PendingCount}");
+            exec5.DrainNtActions(new RecordingExecutor(trace5));
+            if (trace5.Count != 1 || trace5[0] != "REENTRY:dup-r1")
+                return (false, $"duplicate-intent drain should execute only first action: {string.Join(" | ", trace5)}");
+
+            if (exec.PendingCount != 0 || exec2.PendingCount != 0 || exec3.PendingCount != 0 || exec4.PendingCount != 0 || exec5.PendingCount != 0)
                 return (false, "queues must be empty after drain");
 
             return (true, null);

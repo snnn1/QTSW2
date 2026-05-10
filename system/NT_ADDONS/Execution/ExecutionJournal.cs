@@ -19,6 +19,7 @@ public static class ReleaseBlockingExclusionReasons
     public const string NOT_IN_REGISTRY = "NOT_IN_REGISTRY";
     public const string DIRECTION_MISMATCH = "DIRECTION_MISMATCH";
     public const string LIVE_TAGGED_UNFILLED_ENTRY = "LIVE_TAGGED_UNFILLED_ENTRY";
+    public const string REGISTRY_TRUSTED_ACTIVE_EXPOSURE = "REGISTRY_TRUSTED_ACTIVE_EXPOSURE";
     /// <summary>Direction matches broker but row has no open qty and is not tied to live tag/registry working state.</summary>
     public const string NON_LIVE_STALE_ADOPTION = "NON_LIVE_STALE_ADOPTION";
     public const string OTHER = "OTHER";
@@ -55,6 +56,8 @@ public readonly struct RecoveredIntentUpsertResult
 /// </remarks>
 public sealed class ExecutionJournal
 {
+    private static readonly TimeSpan JournalEventOrderSkewTolerance = TimeSpan.FromMilliseconds(1000);
+
     private readonly string _journalDir;
     private readonly RobotLogger _log;
     private readonly Dictionary<string, ExecutionJournalEntry> _cache = new();
@@ -590,7 +593,8 @@ public sealed class ExecutionJournal
             entry.EntryFilledObservedAtUtc = utcNow.ToString("o");
             if (!string.IsNullOrEmpty(entry.EntrySubmittedAtUtc) &&
                 TryParseJournalIsoUtc(entry.EntrySubmittedAtUtc, out var subCanon) &&
-                utcNow < subCanon)
+                utcNow < subCanon &&
+                (subCanon - utcNow) > JournalEventOrderSkewTolerance)
             {
                 _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_EVENT_ORDER_VIOLATION", "ENGINE",
                     new
@@ -840,7 +844,8 @@ public sealed class ExecutionJournal
             entry.EntryFilledObservedAtUtc = utcNow.ToString("o");
             if (!string.IsNullOrEmpty(entry.EntrySubmittedAtUtc) &&
                 TryParseJournalIsoUtc(entry.EntrySubmittedAtUtc, out var subCanonR) &&
-                utcNow < subCanonR)
+                utcNow < subCanonR &&
+                (subCanonR - utcNow) > JournalEventOrderSkewTolerance)
             {
                 _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_EVENT_ORDER_VIOLATION", "ENGINE",
                     new
@@ -1191,7 +1196,9 @@ public sealed class ExecutionJournal
 
             HydrateCanonicalTimestampsFromLegacy(entry);
             entry.ExitFilledObservedAtUtc = utcNow.ToString("o");
-            if (TryParseJournalIsoUtc(entry.EntryFilledAtUtc, out var entryFillCanon) && utcNow < entryFillCanon)
+            if (TryParseJournalIsoUtc(entry.EntryFilledAtUtc, out var entryFillCanon) &&
+                utcNow < entryFillCanon &&
+                (entryFillCanon - utcNow) > JournalEventOrderSkewTolerance)
             {
                 _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_EVENT_ORDER_VIOLATION", "ENGINE",
                     new
@@ -2455,6 +2462,13 @@ public sealed class ExecutionJournal
                 continue;
             }
 
+            var remainingOpen = GetEntryRemainingOpenQuantity(entry);
+            if (remainingOpen > 0 && tagSet.Contains(intentId) && regSet.Contains(intentId))
+            {
+                decisions.Add((intentId, false, ReleaseBlockingExclusionReasons.REGISTRY_TRUSTED_ACTIVE_EXPOSURE));
+                continue;
+            }
+
             if (IsExposureRelevantAdoptionCandidateForRelease(
                     entry,
                     intentId,
@@ -2466,7 +2480,7 @@ public sealed class ExecutionJournal
                 continue;
             }
 
-            var rem = GetEntryRemainingOpenQuantity(entry);
+            var rem = remainingOpen;
             var bSign = BrokerPositionSign(brokerPositionQtySigned);
             var jSign = DirectionSignFromJournalDirection(entry.Direction);
             string exReason;

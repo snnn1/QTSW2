@@ -154,6 +154,42 @@ public sealed class ReconciliationRunner
         return false;
     }
 
+    private (int GrossOpenQty, int ActiveSlotCount, int OrphanSlotCount) SumOwnershipOpenForCanonicalFamily(
+        string canonicalFamilyKey)
+    {
+        if (_ownershipLedger == null)
+            return (0, 0, 0);
+
+        try
+        {
+            var account = ResolveOwnershipAccountKey();
+            var gross = 0;
+            var active = 0;
+            var orphan = 0;
+            foreach (var snapshot in _ownershipLedger.SnapshotAll(account))
+            {
+                if (string.IsNullOrWhiteSpace(snapshot.ExecutionInstrumentKey))
+                    continue;
+
+                var snapFamily = BrokerFlatFamilyKey(snapshot.ExecutionInstrumentKey);
+                if (!string.Equals(snapFamily, canonicalFamilyKey, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                gross += snapshot.Slots
+                    .Where(s => s.State != SlotState.Closed && s.Remaining > 0)
+                    .Sum(s => Math.Abs(s.Remaining));
+                active += snapshot.ActiveSlotCount;
+                orphan += snapshot.OrphanSlotCount;
+            }
+
+            return (gross, active, orphan);
+        }
+        catch
+        {
+            return (0, 0, 0);
+        }
+    }
+
     /// <summary>
     /// Run once on Realtime transition (NT context ready).
     /// </summary>
@@ -652,12 +688,14 @@ public sealed class ReconciliationRunner
                 familyKeys.Add(BrokerFlatFamilyKey(k));
         }
 
-        var familyClosureReadiness = new Dictionary<string, (int BrokerAbs, bool HasWorking)>(StringComparer.OrdinalIgnoreCase);
+        var familyClosureReadiness = new Dictionary<string, (int BrokerAbs, bool HasWorking, int OwnershipGrossOpenQty, int OwnershipActiveSlotCount, int OwnershipOrphanSlotCount)>(StringComparer.OrdinalIgnoreCase);
         foreach (var familyKey in familyKeys)
         {
             var brokerAbs = SumBrokerAbsForCanonicalFamily(familyKey, positions);
             var hasWorkingOrdersScoped = HasWorkingOrdersForCanonicalFamily(familyKey, workingOrders);
-            familyClosureReadiness[familyKey] = (brokerAbs, hasWorkingOrdersScoped);
+            var ownershipOpen = SumOwnershipOpenForCanonicalFamily(familyKey);
+            familyClosureReadiness[familyKey] = (brokerAbs, hasWorkingOrdersScoped,
+                ownershipOpen.GrossOpenQty, ownershipOpen.ActiveSlotCount, ownershipOpen.OrphanSlotCount);
         }
 
         foreach (var kvp in openByInstrument)
@@ -701,6 +739,23 @@ public sealed class ReconciliationRunner
                         open_journal_count = entries.Count,
                         note =
                             "Broker flat in scope but working orders exist on execution/canonical instrument scope; defer RECONCILIATION_BROKER_FLAT journal closure"
+                    }));
+                continue;
+            }
+
+            if (fr.OwnershipGrossOpenQty > 0 || fr.OwnershipActiveSlotCount > 0 || fr.OwnershipOrphanSlotCount > 0)
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, entries[0].TradingDate, "RECONCILIATION_SKIPPED_OWNERSHIP_GROSS_OPEN", "ENGINE",
+                    new
+                    {
+                        instrument,
+                        broker_flat_family_key = familyKey,
+                        open_journal_count = entries.Count,
+                        ownership_gross_open_qty = fr.OwnershipGrossOpenQty,
+                        ownership_active_slot_count = fr.OwnershipActiveSlotCount,
+                        ownership_orphan_slot_count = fr.OwnershipOrphanSlotCount,
+                        note =
+                            "Broker-net flat is not clean-flat while ownership has gross/open slots; defer RECONCILIATION_BROKER_FLAT journal closure"
                     }));
                 continue;
             }

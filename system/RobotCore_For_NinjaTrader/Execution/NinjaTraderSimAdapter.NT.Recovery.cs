@@ -518,6 +518,37 @@ public sealed partial class NinjaTraderSimAdapter
         var coordInst = GetFlattenCoordinationInstanceId();
         var coordAcct = GetCoordinationAccountName();
         var canonicalKey = BrokerPositionResolver.NormalizeCanonicalKey(cmd.Instrument);
+        var targetExecKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(coordAcct, cmd.Instrument, null);
+        if (_useInstrumentExecutionAuthority &&
+            _iea != null &&
+            !string.IsNullOrWhiteSpace(targetExecKey) &&
+            !string.Equals(targetExecKey, "UNKNOWN", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(targetExecKey, execKey, StringComparison.OrdinalIgnoreCase))
+        {
+            var accepted = TryEnqueueNtActionOnInstrumentOwner(
+                cmd,
+                cmd.Instrument ?? "",
+                utcNow,
+                out var routeAttempted,
+                abortCurrentCoordinationOwnerFirst: true);
+            var eventType = accepted ? "NT_ACTION_ROUTED_TO_INSTRUMENT_OWNER" : "FLATTEN_SECONDARY_INSTANCE_SKIPPED";
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: eventType, state: accepted ? "ENGINE" : "WARN",
+                new
+                {
+                    account = coordAcct,
+                    canonical_broker_key = canonicalKey,
+                    target_execution_instrument_key = targetExecKey,
+                    current_execution_instrument_key = execKey,
+                    current_instance_id = coordInst,
+                    host_chart_instrument = GetHostChartInstrumentName(),
+                    correlation_id = cmd.CorrelationId,
+                    route_attempted = routeAttempted,
+                    route_accepted = accepted,
+                    reason = "execute_phase_wrong_execution_instrument_forwarded"
+                }));
+            if (accepted || routeAttempted)
+                return;
+        }
         if (!string.IsNullOrEmpty(canonicalKey) &&
             !FlattenCoordinationTracker.Shared.IsActiveFlattenOwner(coordAcct, cmd.Instrument, coordInst))
         {
@@ -998,6 +1029,7 @@ public sealed partial class NinjaTraderSimAdapter
                     EpisodeId = pendingEpisodeId,
                     Source = "ADAPTER_VERIFY"
                 });
+                _iea?.ReleaseFlattenLatch(instrumentKey, InstrumentExecutionAuthority.FlattenLatchState.Resolved, utcNow);
                 try
                 {
                     var uDone = _executionJournal.CompleteOpenUntrackedFillRecoveryForInstrument(

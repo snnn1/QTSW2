@@ -78,6 +78,12 @@ public sealed class ReplayExecutor : IIEAOrderExecutor
     public IReadOnlyCollection<string> GetAdoptionCandidateIntentIds(string? executionInstrument) =>
         Array.Empty<string>();
 
+    public int ReopenBrokerFlatCompletedJournalsForCarryover(
+        string? executionInstrument,
+        IReadOnlyDictionary<string, int> workingIntentOpenQtyByIntent,
+        DateTimeOffset utcNow,
+        string triggerSource) => 0;
+
     public (string JournalDir, int FileCount, bool DirectoryExists) GetJournalDiagnostics(string? executionInstrument) =>
         ("", 0, false);
 

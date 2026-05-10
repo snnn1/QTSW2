@@ -285,6 +285,135 @@ public sealed partial class ExecutionJournal
     }
 
     /// <summary>
+    /// Restart recovery repair: if live QTSW2 working orders still reference an intent that was completed as
+    /// RECONCILIATION_BROKER_FLAT, restore that row to open so carryover exposure remains owned and adoptable.
+    /// This is intentionally intent-specific; it never treats broker net flat as stream lifecycle proof.
+    /// </summary>
+    public int ReopenBrokerFlatCompletedJournalRowsForCarryover(
+        string executionInstrumentPrimary,
+        string? canonicalInstrument,
+        IReadOnlyDictionary<string, int> workingIntentOpenQtyByIntent,
+        DateTimeOffset utcNow,
+        string? triggerSource = null)
+    {
+        var executionKey = executionInstrumentPrimary?.Trim() ?? "";
+        if (string.IsNullOrWhiteSpace(executionKey) ||
+            workingIntentOpenQtyByIntent == null ||
+            workingIntentOpenQtyByIntent.Count == 0)
+            return 0;
+
+        var evidence = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (var kvp in workingIntentOpenQtyByIntent)
+        {
+            var intentId = kvp.Key?.Trim() ?? "";
+            if (string.IsNullOrWhiteSpace(intentId) || kvp.Value <= 0)
+                continue;
+            evidence[intentId] = Math.Max(evidence.TryGetValue(intentId, out var existing) ? existing : 0, kvp.Value);
+        }
+
+        if (evidence.Count == 0)
+            return 0;
+
+        string[] files;
+        try
+        {
+            files = Directory.GetFiles(_journalDir, "*.json");
+        }
+        catch
+        {
+            return 0;
+        }
+
+        var reopened = 0;
+        foreach (var path in files)
+        {
+            try
+            {
+                var fileName = Path.GetFileNameWithoutExtension(path);
+                var parts = fileName.Split('_');
+                if (parts.Length < 3) continue;
+                if (!TryParseIntentIdFromJournalFileName(fileName, out var intentId)) continue;
+                if (!evidence.TryGetValue(intentId, out var liveWorkingQty) || liveWorkingQty <= 0) continue;
+
+                lock (_lock)
+                {
+                    var json = ReadJournalFileWithRetry(path);
+                    if (json == null) continue;
+                    var entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                    if (entry == null) continue;
+                    if (!entry.EntrySubmitted || !entry.EntryFilled || !entry.TradeCompleted) continue;
+                    if (entry.EntryFilledQuantityTotal <= 0) continue;
+                    if (IsUntrackedFillRecoveryMarker(entry) || IsRecoveredIntegrityJournalEntry(entry)) continue;
+                    if (!JournalInstrumentMatchesExecutionKey(entry.Instrument, executionKey, canonicalInstrument)) continue;
+
+                    var priorCompletionReason = entry.CompletionReason;
+                    var priorExitOrderType = entry.ExitOrderType;
+                    var wasBrokerFlat =
+                        string.Equals(priorCompletionReason, CompletionReasons.RECONCILIATION_BROKER_FLAT, StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(priorExitOrderType, CompletionReasons.RECONCILIATION_BROKER_FLAT, StringComparison.OrdinalIgnoreCase);
+                    if (!wasBrokerFlat) continue;
+
+                    var tradingDate = !string.IsNullOrWhiteSpace(entry.TradingDate) ? entry.TradingDate! : parts[0];
+                    var stream = !string.IsNullOrWhiteSpace(entry.Stream)
+                        ? entry.Stream
+                        : string.Join("_", parts.Skip(1).Take(parts.Length - 2));
+                    if (string.IsNullOrWhiteSpace(tradingDate) || string.IsNullOrWhiteSpace(stream)) continue;
+
+                    var priorCompletedAtUtc = entry.CompletedAtUtc;
+                    var priorExitQty = entry.ExitFilledQuantityTotal;
+                    var restoredOpenQty = Math.Min(entry.EntryFilledQuantityTotal, liveWorkingQty);
+                    if (restoredOpenQty <= 0) continue;
+
+                    entry.TradingDate = tradingDate;
+                    entry.Stream = stream;
+                    entry.ExitFilledQuantityTotal = Math.Max(0, entry.EntryFilledQuantityTotal - restoredOpenQty);
+                    if (entry.ExitFilledQuantityTotal == 0)
+                    {
+                        entry.ExitAvgFillPrice = null;
+                        entry.ExitFillNotional = null;
+                        entry.ExitFilledAtUtc = null;
+                        entry.ExitFilledObservedAtUtc = null;
+                    }
+                    entry.ExitOrderType = null;
+                    entry.TradeCompleted = false;
+                    entry.CompletedAtUtc = null;
+                    entry.CompletionReason = null;
+                    entry.RealizedPnLPoints = null;
+                    entry.RealizedPnLGross = null;
+                    entry.RealizedPnLNet = null;
+
+                    var key = $"{tradingDate}_{stream}_{intentId}";
+                    _cache[key] = entry;
+                    SaveJournal(path, entry);
+                    BumpReleaseSuppressionActivity();
+                    reopened++;
+
+                    _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "EXECUTION_JOURNAL_BROKER_FLAT_REOPENED_FOR_CARRYOVER", "ENGINE",
+                        new
+                        {
+                            intent_id = intentId,
+                            stream,
+                            instrument = entry.Instrument,
+                            execution_instrument = executionKey,
+                            canonical_instrument = canonicalInstrument,
+                            live_working_qty = liveWorkingQty,
+                            restored_open_qty = restoredOpenQty,
+                            prior_exit_qty = priorExitQty,
+                            new_exit_qty = entry.ExitFilledQuantityTotal,
+                            prior_completion_reason = priorCompletionReason,
+                            prior_completed_at_utc = priorCompletedAtUtc,
+                            trigger_source = triggerSource ?? "RestartAdoptionCarryoverRepair",
+                            note = "Reopened broker-flat-completed journal because current QTSW2 working orders prove carried robot-owned exposure"
+                        }));
+                }
+            }
+            catch { /* skip corrupt or concurrently-mutated files */ }
+        }
+
+        return reopened;
+    }
+
+    /// <summary>
     /// <para><b>Pending adoption candidate</b> (recovery): journal row with EntrySubmitted &amp;&amp; !TradeCompleted for this instrument
     /// scope — see <see cref="GetAdoptionCandidateIntentIdsForInstrument"/>.</para>
     /// <para><b>Stale journal intent (release)</b>: pending row with no material open quantity, broker flat for the instrument,
@@ -410,6 +539,13 @@ public sealed partial class ExecutionJournal
                 continue;
             }
 
+            var remainingOpen = GetEntryRemainingOpenQuantity(entry);
+            if (remainingOpen > 0 && tagSet.Contains(intentId) && regSet.Contains(intentId))
+            {
+                decisions.Add((intentId, false, ReleaseBlockingExclusionReasons.REGISTRY_TRUSTED_ACTIVE_EXPOSURE));
+                continue;
+            }
+
             if (IsExposureRelevantAdoptionCandidateForRelease(
                     entry,
                     intentId,
@@ -421,7 +557,7 @@ public sealed partial class ExecutionJournal
                 continue;
             }
 
-            var rem = GetEntryRemainingOpenQuantity(entry);
+            var rem = remainingOpen;
             var bSign = BrokerPositionSign(brokerPositionQtySigned);
             var jSign = DirectionSignFromJournalDirection(entry.Direction);
             string exReason;

@@ -228,6 +228,27 @@ export interface OutOfTimetableActiveStream {
   exit_filled_qty: number;
 }
 
+/** Prior-date nonterminal stream lifecycle retained across timetable rollover. */
+export interface CarriedActiveLifecycle {
+  row_kind?: 'carried_lifecycle_exposure' | string;
+  trading_date: string;
+  current_trading_date?: string;
+  stream: string;
+  instrument: string;
+  execution_instrument?: string | null;
+  session?: string | null;
+  state: string;
+  committed: boolean;
+  commit_reason?: string | null;
+  slot_time_chicago?: string | null;
+  state_entry_time_utc?: string | null;
+  current_timetable_lane_present?: boolean;
+  same_stream_deferred_reason?: string | null;
+  operator_classification?: string | null;
+  note?: string | null;
+  position_authority?: PositionAuthoritySnapshot | null;
+}
+
 /** Expected vs actual: robot reported slot ended without trade (SLOT_END_SUMMARY). */
 export interface ExecutionExpectationGap {
   stream_id: string;
@@ -260,6 +281,7 @@ export interface StreamStatesResponse {
   state_reference_utc?: string;
   timestamp_chicago: string;
   streams: StreamState[];
+  carried_active_lifecycles?: CarriedActiveLifecycle[];
   /** Present on current API; missing on older backends — treat as []. */
   out_of_timetable_active_streams?: OutOfTimetableActiveStream[];
   /** Timetable streams with explicit slot-end “no trade” vs planned slot (see backend doc). */

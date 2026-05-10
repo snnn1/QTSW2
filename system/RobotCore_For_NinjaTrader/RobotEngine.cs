@@ -153,6 +153,44 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
         }
     }
 
+    private bool BrokerOrderSubmissionRequiresRealtime =>
+        _executionMode == ExecutionMode.SIM || _executionMode == ExecutionMode.LIVE;
+
+    public bool IsBrokerOrderSubmissionAllowed
+    {
+        get
+        {
+            lock (_engineLock)
+            {
+                return !BrokerOrderSubmissionRequiresRealtime || _brokerOrderSubmissionAllowed;
+            }
+        }
+    }
+
+    public void MarkBrokerOrderSubmissionAllowed(DateTimeOffset utcNow, string reason)
+    {
+        lock (_engineLock)
+        {
+            if (!BrokerOrderSubmissionRequiresRealtime)
+                return;
+            if (_brokerOrderSubmissionAllowed)
+                return;
+
+            _brokerOrderSubmissionAllowed = true;
+            _brokerOrderSubmissionAllowedAtUtc = utcNow;
+            _brokerOrderSubmissionAllowedReason = string.IsNullOrWhiteSpace(reason) ? "UNKNOWN" : reason;
+
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "BROKER_ORDER_SUBMISSION_ALLOWED", state: "ENGINE",
+                new
+                {
+                    reason = _brokerOrderSubmissionAllowedReason,
+                    allowed_at_utc = _brokerOrderSubmissionAllowedAtUtc.Value.ToString("o"),
+                    execution_mode = _executionMode.ToString(),
+                    note = "SIM/LIVE broker entry submissions are now allowed because the strategy reached Realtime."
+                }));
+        }
+    }
+
     /// <summary>
     /// Get execution instrument (e.g., MNQ, MGC) for IEA routing and BE monitoring.
     /// Resolves chart instrument to execution instrument via policy: CL→MCL, NQ→MNQ, etc.
@@ -189,10 +227,24 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
     /// Normal SIM loads <c>state/stream_journals</c> for restart recovery.
     /// </summary>
     private readonly bool _ignoreExistingStreamJournals;
+    private readonly bool _requestedIgnoreExistingStreamJournals;
     /// <summary>NinjaTrader-only: account name contained "Playback" at engine construction — for startup diagnostics.</summary>
     private readonly bool _playbackAccountDetected;
+    private PlaybackScenarioManifest? _playbackScenario;
+    private bool _playbackScenarioActive;
+    private string? _playbackScenarioActiveDate;
+    private string? _playbackScenarioExpectedTimetableHash;
+    private bool _playbackScenarioFailClosed;
+    private string? _playbackScenarioFailureReason;
     /// <summary>NinjaTrader playback: set before <see cref="Start"/> so timetable/stream initialization uses chart time instead of wall clock.</summary>
     private DateTimeOffset? _playbackStartTimeUtc;
+    /// <summary>
+    /// SIM/LIVE entry submission is blocked until the hosting NinjaTrader strategy reaches Realtime.
+    /// Historical startup may hydrate state, but must not place broker orders.
+    /// </summary>
+    private bool _brokerOrderSubmissionAllowed;
+    private DateTimeOffset? _brokerOrderSubmissionAllowedAtUtc;
+    private string? _brokerOrderSubmissionAllowedReason;
 
     // Session start time per instrument (from TradingHours, fallback to 17:00 CST)
     private readonly Dictionary<string, string> _sessionStartTimes = new Dictionary<string, string>();
@@ -474,8 +526,28 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
         _persistenceBase = projectRoot;
         EngineCpuProfile.SetRoot(projectRoot);
         _executionMode = executionMode;
-        _ignoreExistingStreamJournals = ignoreExistingStreamJournals;
+        _requestedIgnoreExistingStreamJournals = ignoreExistingStreamJournals;
         _playbackAccountDetected = playbackAccountDetected;
+        var playbackScenarioConfigured = PlaybackScenarioManifest.HasConfigured(projectRoot);
+        var playbackScenarioAllowed = executionMode == ExecutionMode.SIM && (playbackAccountDetected || ignoreExistingStreamJournals);
+        if (playbackScenarioConfigured && !playbackScenarioAllowed)
+        {
+            throw new InvalidOperationException("Playback scenario config is allowed only for SIM Playback-account execution.");
+        }
+        PlaybackScenarioManifest? playbackScenario = null;
+        string? playbackScenarioError = null;
+        if (playbackScenarioAllowed && PlaybackScenarioManifest.TryLoadConfigured(projectRoot, out playbackScenario, out playbackScenarioError))
+        {
+            if (!string.IsNullOrWhiteSpace(customTimetablePath))
+                throw new InvalidOperationException("Playback scenario config and custom timetable path cannot both be set.");
+            _playbackScenario = playbackScenario;
+            _playbackScenarioActive = playbackScenario != null;
+        }
+        else if (!string.IsNullOrWhiteSpace(playbackScenarioError))
+        {
+            throw new InvalidOperationException(playbackScenarioError);
+        }
+        _ignoreExistingStreamJournals = ignoreExistingStreamJournals && !_playbackScenarioActive;
         _executionInstrument = instrument;
         _masterInstrumentName = masterInstrumentName; // Store MasterInstrument.Name for explicit canonical matching
 
@@ -492,7 +564,7 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
 
         // Run-authoritative robot JSONL: isolated playback defers physical init until Start() → runs/<run_id>/logs/robot (never projectRoot/logs/robot).
         var effectiveLogDir = RobotRunArtifactPaths.LogsRobot(_persistenceBase);
-        var deferPlaybackRobotLogs = executionMode == ExecutionMode.SIM && ignoreExistingStreamJournals;
+        var deferPlaybackRobotLogs = IsIsolatedPlaybackPersistenceRequested();
         string? warning = null;
         if (!deferPlaybackRobotLogs)
         {
@@ -582,11 +654,27 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
     /// <param name="assignmentSource">Diagnostic: GENERATED_NEW, ENV_SHARED, ENV_INVALID_REGENERATED, or LIVE_UNIQUE.</param>
     private void AssignRunIdAtSessionStart(out string assignmentSource)
     {
-        var isolatedPlayback = _executionMode == ExecutionMode.SIM && _ignoreExistingStreamJournals;
+        var isolatedPlayback = IsIsolatedPlaybackPersistenceRequested();
         if (!isolatedPlayback)
         {
             _runId = Guid.NewGuid().ToString("N");
             assignmentSource = "LIVE_UNIQUE";
+            return;
+        }
+
+        var scenarioRunId = _playbackScenarioActive ? SanitizeRunIdForPath(_playbackScenario?.run_id) : "";
+        if (scenarioRunId.Length > 0)
+        {
+            _runId = scenarioRunId;
+            try
+            {
+                Environment.SetEnvironmentVariable("QTSW2_RUN_ID", _runId);
+            }
+            catch
+            {
+                /* best-effort */
+            }
+            assignmentSource = "PLAYBACK_SCENARIO";
             return;
         }
 
@@ -632,7 +720,7 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
 
     private string ComputeNextPersistenceBase(out bool isolatedPlayback)
     {
-        isolatedPlayback = _executionMode == ExecutionMode.SIM && _ignoreExistingStreamJournals;
+        isolatedPlayback = IsIsolatedPlaybackPersistenceRequested();
         if (!isolatedPlayback)
             return _root;
         var folder = string.IsNullOrWhiteSpace(_runId) ? "unknown_run" : _runId.Trim();
@@ -1137,6 +1225,9 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
             new
             {
                 PLAYBACK_DETECTED = _playbackAccountDetected,
+                PLAYBACK_SCENARIO_ACTIVE = _playbackScenarioActive,
+                PLAYBACK_SCENARIO_ID = _playbackScenario?.scenario_id,
+                REQUESTED_IGNORE_EXISTING_JOURNALS = _requestedIgnoreExistingStreamJournals,
                 IGNORE_EXISTING_JOURNALS = _ignoreExistingStreamJournals,
                 PLAYBACK_ANCHOR_UTC = _playbackStartTimeUtc.HasValue ? _playbackStartTimeUtc.Value.ToString("o") : null
             }));
@@ -1493,6 +1584,14 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
             {
                 foreach (var s in _streams.Values)
                     s.HandleExecutionTradeCompleted(intentId, completedUtc, completionReason);
+
+                if (_executionAdapter is NinjaTraderSimAdapter simAdapter)
+                {
+                    var reason = string.IsNullOrWhiteSpace(completionReason)
+                        ? "REENTRY_INTENT_TERMINAL"
+                        : $"REENTRY_INTENT_TERMINAL:{completionReason}";
+                    simAdapter.ReleaseMarketReentryExecutionLatchForTerminalIntent(intentId, completedUtc, reason);
+                }
             });
 
             // Create intent exposure coordinator
@@ -1718,7 +1817,8 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
                     _releaseReconRedundancy.NotifyExecutionActivity();
                     _mismatchCoordinator?.NotifyExecutionTrigger(inst, utc, d);
                     _mismatchCoordinator?.NotifyReconciliationAuditWake();
-                    TryEnsureJournalIntegrityAfterExecutionActivity(inst, utc, d);
+                    if (ShouldRunImmediateJournalIntegrityForExecutionTrigger(d))
+                        TryEnsureJournalIntegrityAfterExecutionActivity(inst, utc, d);
                 });
                 simP2.SetInstrumentMismatchGateEngagedCallback(inst =>
                     _mismatchCoordinator != null && _mismatchCoordinator.IsInstrumentBlockedByMismatch(inst));
@@ -1739,6 +1839,7 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
         }
 
         // Timetable disk I/O happens outside the engine lock; application happens under the lock.
+        ApplyPlaybackScenarioTimetableOrThrow(utcNow, "ENGINE_START");
         var parsed = PollAndParseTimetable(utcNow);
 
         lock (_engineLock)
@@ -1811,16 +1912,44 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
             }
         }
 
-        // CRITICAL: During Historical, skip timetable poll entirely - we're replaying bars, no config changes.
-        // This avoids ~400 file reads + SHA256 + JSON parse per strategy during Historical.
         var nowWall = DateTimeOffset.UtcNow;
-        var shouldPoll = !isHistorical && _timetablePoller.ShouldPoll(nowWall);
-        var parsed = shouldPoll ? PollAndParseTimetable(nowWall) : default;
+        if (_playbackScenarioActive && IsPlaybackScenarioPreStartEvent(utcNow, out var preStartDate, out var firstScenarioDate))
+        {
+            lock (_engineLock)
+            {
+                _lastTickUtc = utcNow;
+                _lastEngineTickUtc = utcNow;
+                _healthMonitor?.UpdateEngineTick(utcNow, nowWall);
+                LogPlaybackScenarioPreStartEventIgnored(utcNow, "EVENT_CLOCK_TICK", preStartDate, firstScenarioDate);
+            }
+            return;
+        }
+
+        // CRITICAL: During ordinary Historical playback, skip timetable poll entirely - we're replaying bars, no config changes.
+        // Explicit multi-day playback scenarios are the exception: the event clock is allowed to switch to the next
+        // run-scoped replay timetable when the CME session date advances.
+        var scenarioSwitchApplied = false;
+        if (_playbackScenarioActive)
+            scenarioSwitchApplied = TryActivatePlaybackScenarioTimetable(utcNow, force: false, "EVENT_CLOCK_TICK", out _);
+
+        if (_playbackScenarioFailClosed)
+        {
+            lock (_engineLock)
+            {
+                StandDownForPlaybackScenarioFailure(utcNow);
+            }
+            return;
+        }
+
+        var shouldPoll = _playbackScenarioActive
+            ? scenarioSwitchApplied
+            : !isHistorical && _timetablePoller.ShouldPoll(nowWall);
+        var parsed = shouldPoll ? PollAndParseTimetable(_playbackScenarioActive ? utcNow : nowWall) : default;
 
         var preLockMs = swPreLock?.ElapsedMilliseconds ?? 0;
 
         // Diagnostic: log once per engine when we skip poll during Historical (confirms fix is deployed)
-        if (isHistorical && !_loggedHistoricalPollSkip)
+        if (isHistorical && !_playbackScenarioActive && !_loggedHistoricalPollSkip)
         {
             _loggedHistoricalPollSkip = true;
             LogEvent(RobotEvents.EngineBase(nowWall, tradingDate: TradingDateString, eventType: "HISTORICAL_POLL_SKIP_ACTIVE", state: "ENGINE",
@@ -1951,12 +2080,25 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
                 // PHASE 3: Update health monitor with timetable poll timestamp
                 _healthMonitor?.UpdateTimetablePoll(utcNow);
 
-                ReloadTimetableIfChanged(utcNow, force: false, parsed.Poll, parsed.Timetable, parsed.ParseException);
+                ReloadTimetableIfChanged(utcNow, force: scenarioSwitchApplied, parsed.Poll, parsed.Timetable, parsed.ParseException);
             }
 
             timetableReloadMs = shouldPoll ? (wTimetableStream?.ElapsedMilliseconds ?? 0) : 0;
             if (cpuProf && wTimetableStream != null)
                 wTimetableStream.Restart();
+
+            if (scenarioSwitchApplied)
+            {
+                RehydrateOpenIntentExposuresFromJournal(utcNow);
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "PLAYBACK_SCENARIO_ROLLOVER_GUARD_ACTIVE", state: "ENGINE",
+                    new
+                    {
+                        scenario_id = _playbackScenario?.scenario_id,
+                        scenario_date = _playbackScenarioActiveDate,
+                        note = "Day rollover applied; skipping stream tick once so journal/ownership/timetable state settles before new submits."
+                    }));
+                return;
+            }
 
             // SLOT EXPIRY: Run stream.Tick BEFORE forced flatten so slot expiry (at NextSlotTimeUtc)
             // can run and commit streams before forced flatten. Otherwise forced flatten would
@@ -2244,6 +2386,17 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
         }
     }
 
+
+    internal static bool ShouldRunImmediateJournalIntegrityForExecutionTrigger(MismatchExecutionTriggerDetails details)
+    {
+        if (details.Equals(default))
+            return true;
+
+        return details.FillDelta != 0 ||
+               details.InstrumentPositionQty.HasValue ||
+               details.EntryToProtectivesTransition ||
+               details.WorkingOrderSubmitTransition;
+    }
 
 
 

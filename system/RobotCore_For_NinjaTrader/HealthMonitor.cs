@@ -97,6 +97,8 @@ public sealed partial class HealthMonitor
     private static readonly HashSet<string> ALLOWED_CRITICAL_EVENT_TYPES = new(StringComparer.OrdinalIgnoreCase)
     {
         "EXECUTION_GATE_INVARIANT_VIOLATION",
+        "EXECUTION_POLICY_VALIDATION_FAILED",
+        "IEA_ENQUEUE_FAILURE_INSTRUMENT_BLOCKED",
         "DISCONNECT_FAIL_CLOSED_ENTERED",
         "DISCONNECT_RECOVERY_COMPLETE",
         "SLOT_FAILED_RUNTIME",

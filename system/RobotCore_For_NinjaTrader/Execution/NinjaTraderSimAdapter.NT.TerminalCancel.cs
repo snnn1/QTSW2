@@ -254,73 +254,6 @@ public sealed partial class NinjaTraderSimAdapter
                     }));
             }
 
-            // CRITICAL FIX: Defensively cancel opposite entry stop order to prevent re-entry
-            // This handles cases where cancellation is called but opposite entry wasn't explicitly cancelled
-            if (IntentMap.TryGetValue(intentId, out var cancelledIntent))
-            {
-                // Find the opposite entry intent for this stream
-                var oppositeDirection = cancelledIntent.Direction == "Long" ? "Short" : "Long";
-                string? oppositeIntentId = null;
-
-                foreach (var kvp in IntentMap)
-                {
-                    var otherIntent = kvp.Value;
-                    if (otherIntent.Stream == cancelledIntent.Stream &&
-                        otherIntent.TradingDate == cancelledIntent.TradingDate &&
-                        otherIntent.Direction == oppositeDirection &&
-                        otherIntent.TriggerReason != null &&
-                        (otherIntent.TriggerReason.Contains("ENTRY_STOP_BRACKET_LONG") ||
-                         otherIntent.TriggerReason.Contains("ENTRY_STOP_BRACKET_SHORT")))
-                    {
-                        // Check if opposite entry hasn't filled yet
-                        var oppositeEntryFilled = false;
-                        if (_executionJournal != null && !string.IsNullOrEmpty(otherIntent.TradingDate) && !string.IsNullOrEmpty(otherIntent.Stream))
-                        {
-                            var oppositeEntry = _executionJournal.GetEntry(kvp.Key, otherIntent.TradingDate, otherIntent.Stream);
-                            oppositeEntryFilled = oppositeEntry != null && (oppositeEntry.EntryFilled || oppositeEntry.EntryFilledQuantityTotal > 0);
-                        }
-
-                        if (!oppositeEntryFilled)
-                        {
-                            oppositeIntentId = kvp.Key;
-                            break;
-                        }
-                    }
-                }
-
-                // Cancel opposite entry if found and not filled
-                if (oppositeIntentId != null && oppositeIntentId != intentId)
-                {
-                    try
-                    {
-                        var oppositeCancelled = CancelIntentOrdersReal(oppositeIntentId, utcNow);
-                        if (oppositeCancelled)
-                        {
-                            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "OPPOSITE_ENTRY_CANCELLED_DEFENSIVELY", state: "ENGINE",
-                                new
-                                {
-                                    cancelled_intent_id = intentId,
-                                    opposite_intent_id = oppositeIntentId,
-                                    stream = cancelledIntent.Stream,
-                                    note = "Defensively cancelled opposite entry stop order when cancelling intent to prevent re-entry"
-                                }));
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        // Log but don't fail - defensive cancellation failure is not critical
-                        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "OPPOSITE_ENTRY_CANCEL_DEFENSIVE_FAILED", state: "ENGINE",
-                            new
-                            {
-                                cancelled_intent_id = intentId,
-                                opposite_intent_id = oppositeIntentId,
-                                error = ex.Message,
-                                note = "Failed to defensively cancel opposite entry - may cause re-entry"
-                            }));
-                    }
-                }
-            }
-
             return true; // Success (even if no orders to cancel)
         }
         catch (Exception ex)
@@ -359,8 +292,14 @@ public sealed partial class NinjaTraderSimAdapter
     {
         if (System.Threading.Volatile.Read(ref _sessionMismatchBlocked) != 0)
         {
-            RecordSessionIdentityBlockAttempt();
-            return FlattenResult.FailureResult("SESSION_IDENTITY_LATCHED", utcNow);
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SESSION_IDENTITY_FLATTEN_ALLOWED_WHILE_LATCHED", state: "ENGINE",
+                new
+                {
+                    intent_id = intentId,
+                    instrument,
+                    submit_path = "flatten_intent_real",
+                    note = "Session identity latch remains armed for opening submits, but flatten is exposure-reducing."
+                }));
         }
         PurgePendingBEForIntent(intentId, utcNow, instrument, "flatten");
         if (!string.IsNullOrEmpty(intentId) && intentId != "NT_FLATTEN" && intentId != "EMERGENCY_BLOCK")

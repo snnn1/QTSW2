@@ -293,6 +293,7 @@ public sealed partial class RobotEngine
 
         // Lock trading date if not already set
         bool dateWasLocked = false;
+        bool timetableDateRolledForward = false;
         if (!_activeTradingDate.HasValue)
         {
             if (timetable.metadata?.replay != true)
@@ -331,15 +332,21 @@ public sealed partial class RobotEngine
                 var previousLocked = _activeTradingDate.Value;
                 _activeTradingDate = timetableTradingDate.Value;
                 var clearedStreams = _streams.Count;
-                _streams.Clear();
+                var retainedStreams = 0;
+                var retention = RetainTimetableRolloverStreams(previousLocked, _activeTradingDate.Value, utcNow);
+                retainedStreams = retention.Retained;
+                clearedStreams = retention.Removed;
+                timetableDateRolledForward = true;
                 LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate.Value.ToString("yyyy-MM-dd"), eventType: "TRADING_DATE_ROLLED_FORWARD", state: "ENGINE",
                     new
                     {
                         previous_trading_date = previousLocked.ToString("yyyy-MM-dd"),
                         new_trading_date = _activeTradingDate.Value.ToString("yyyy-MM-dd"),
                         streams_cleared = clearedStreams,
+                        streams_retained = retainedStreams,
+                        playback_scenario = _playbackScenarioActive,
                         timetable_path = _timetablePath,
-                        note = "Timetable advanced to a later session day - adopting new trading_date and clearing streams for rebuild"
+                        note = "Timetable advanced to a later session day - retaining nonterminal stream lifecycles and allowing eligible new-day stream ids to be created."
                     }));
             }
             else
@@ -448,7 +455,7 @@ public sealed partial class RobotEngine
             // Apply timetable updates (e.g. NG 09:30 -> 11:00 slot change) but block adding NEW streams.
             // Matrix app auto-update can overwrite timetable mid-day; we allow slot-time updates for existing
             // streams but prevent new stream creation. See docs/robot/incidents/2026-03-04_TIMETABLE_OVERRIDE_INVESTIGATION.md
-            ApplyTimetable(timetable, utcNow, allowNewStreams: false);
+            ApplyTimetable(timetable, utcNow, allowNewStreams: timetableDateRolledForward, deferNonTerminalExistingStreams: timetableDateRolledForward);
         }
         else
         {
@@ -468,7 +475,7 @@ public sealed partial class RobotEngine
         // (simplified to only monitor connection loss and data loss)
     }
 
-    private void ApplyTimetable(TimetableContract timetable, DateTimeOffset utcNow, bool allowNewStreams = true)
+    private void ApplyTimetable(TimetableContract timetable, DateTimeOffset utcNow, bool allowNewStreams = true, bool deferNonTerminalExistingStreams = false)
     {
         // Trading date must be locked before streams can be created
         if (_spec is null || _time is null || _lastTimetableHash is null || !_activeTradingDate.HasValue)
@@ -927,6 +934,24 @@ public sealed partial class RobotEngine
                     continue;
                 }
 
+                if (deferNonTerminalExistingStreams && sm.HasTimetableRolloverRetentionEvidence)
+                {
+                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
+                        "TIMETABLE_STREAM_DEFERRED_PRIOR_LIFECYCLE_ACTIVE", "ENGINE", new
+                        {
+                            reason = "PRIOR_LIFECYCLE_ACTIVE",
+                            stream_id = streamId,
+                            new_timetable_trading_date = tradingDateStr,
+                            retained_lifecycle_trading_date = sm.TradingDate,
+                            retained_state = sm.State.ToString(),
+                            retained_committed = sm.Committed,
+                            retained_slot_status = sm.SlotStatus.ToString(),
+                            retained_execution_interrupted_by_close = sm.ExecutionInterruptedByClose,
+                            note = "New-day row for this stream id was deferred because one matrix lane supports one active lifecycle at a time."
+                        }));
+                    continue;
+                }
+
                 // Apply updates only for uncommitted streams
                 if (string.IsNullOrWhiteSpace(directive.slot_time))
                 {
@@ -1117,6 +1142,21 @@ public sealed partial class RobotEngine
                         slot_time = slotTimeChicago
                     }));
 
+                if (deferNonTerminalExistingStreams)
+                {
+                    LogEvent(RobotEvents.Base(_time, utcNow, tradingDateStr, streamId, canonicalInstrument, session, slotTimeChicago, slotTimeUtc,
+                        "TIMETABLE_ROLLOVER_NEW_STREAM_CREATED", "ENGINE", new
+                        {
+                            stream_id = streamId,
+                            trading_date = tradingDateStr,
+                            execution_instrument = newSm.ExecutionInstrument,
+                            canonical_instrument = newSm.CanonicalInstrument,
+                            session = session,
+                            slot_time = slotTimeChicago,
+                            note = "New-day stream created after timetable rollover because no nonterminal lifecycle used this stream id."
+                        }));
+                }
+
                 // PHASE 4: Set alert callback for high-priority alerts only (RANGE_INVALIDATED)
                 // Non-critical alerts (gaps, pre-hydration, state transitions) are logged only, not notified
                 var notificationService = GetNotificationService();
@@ -1195,11 +1235,10 @@ public sealed partial class RobotEngine
         if (skippedCount > 0 || committedDirectiveSkips > 0 || blockedNewStreamMidSession > 0)
         {
             var expectedAnchorFilter =
-                acceptedCount > 0
+                !string.IsNullOrWhiteSpace(_executionInstrument)
                 && skippedCount > 0
                 && committedDirectiveSkips == 0
                 && blockedNewStreamMidSession == 0
-                && !string.IsNullOrWhiteSpace(_executionInstrument)
                 && skippedReasons.Count == 1
                 && skippedReasons.TryGetValue("CANONICAL_MISMATCH", out var anchorFilteredCount)
                 && anchorFilteredCount == skippedCount;

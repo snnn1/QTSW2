@@ -184,6 +184,8 @@ public sealed partial class NinjaTraderSimAdapter
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 
+        bool registeredEntryBeforeSubmit = false;
+
         try
         {
             // STEP 2: Create NT Order using real API
@@ -685,6 +687,19 @@ public sealed partial class NinjaTraderSimAdapter
             // Registry/adoption scans run on wall clock; arm this bounded convergence window on the same clock.
             QuantExecutionControlStore.NotifyWorkingOrderSubmitTransition(instrument, 1, DateTimeOffset.UtcNow);
 
+            var (tradingDate, stream, intentEntryPrice, intentStopPrice, intentTargetPrice, intentDirection, _) = GetIntentInfo(intentId);
+            var intentBeTrigger = _intentMap.TryGetValue(intentId, out var submissionIntent)
+                ? submissionIntent.BeTrigger
+                : null;
+            var finalEntryPrice = intentEntryPrice ?? entryPrice;
+            var finalDirection = intentDirection ?? direction;
+            // Playback market orders can fill synchronously during Account.Submit; the registry/FSM must lead that callback.
+            var preSubmitOrderId = order.OrderId;
+            registeredEntryBeforeSubmit = !string.IsNullOrEmpty(preSubmitOrderId);
+            if (registeredEntryBeforeSubmit)
+                _iea?.RegisterOrder(preSubmitOrderId, intentId, instrument, stream, OrderRole.ENTRY, OrderOwnershipStatus.OWNED, "SubmitEntryOrder", orderInfo, utcNow);
+            _iea?.TryTransitionIntentLifecycle(intentId, IntentLifecycleTransition.SUBMIT_ENTRY, null, utcNow);
+
             // Real NT API: Submit order
             // Submit may return Order[] or void - use dynamic to handle both
             dynamic dynAccountSubmit = account;
@@ -730,6 +745,9 @@ public sealed partial class NinjaTraderSimAdapter
                     }
                 }
                 var (tradingDate9, stream9, _, _, _, _, _) = GetIntentInfo(intentId);
+                var rejectedOrderId = order.OrderId;
+                if (registeredEntryBeforeSubmit && !string.IsNullOrEmpty(rejectedOrderId))
+                    _iea?.UpdateOrderLifecycle(rejectedOrderId, OrderLifecycleState.REJECTED, utcNow);
                 _executionJournal.RecordRejection(intentId, tradingDate9, stream9, $"ENTRY_SUBMIT_FAILED: {error}", utcNow, 
                     orderType: "ENTRY", rejectedPrice: entryPrice, rejectedQuantity: quantity);
                 _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_FAIL", new
@@ -744,19 +762,14 @@ public sealed partial class NinjaTraderSimAdapter
             }
 
             // Journal: ENTRY_SUBMITTED (store expected entry price for slippage calculation)
-            var (tradingDate, stream, intentEntryPrice, intentStopPrice, intentTargetPrice, intentDirection, _) = GetIntentInfo(intentId);
-            var intentBeTrigger = _intentMap.TryGetValue(intentId, out var submissionIntent)
-                ? submissionIntent.BeTrigger
-                : null;
-            var finalEntryPrice = intentEntryPrice ?? entryPrice;
-            var finalDirection = intentDirection ?? direction;
-            
             _executionJournal.RecordSubmission(intentId, tradingDate, stream, instrument, "ENTRY", order.OrderId, acknowledgedAt, 
                 expectedEntryPrice: entryPrice, entryPrice: finalEntryPrice, stopPrice: intentStopPrice, 
                 targetPrice: intentTargetPrice, beTriggerPrice: intentBeTrigger, direction: finalDirection, ocoGroup: ocoGroup);
 
-            orderInfo.OrderId = order.OrderId ?? orderInfo.OrderId;
-            _iea?.RegisterOrder(order.OrderId, intentId, instrument, stream, OrderRole.ENTRY, OrderOwnershipStatus.OWNED, "SubmitEntryOrder", orderInfo, utcNow);
+            var acknowledgedOrderId = order.OrderId;
+            orderInfo.OrderId = acknowledgedOrderId ?? orderInfo.OrderId;
+            if (!registeredEntryBeforeSubmit && !string.IsNullOrEmpty(acknowledgedOrderId))
+                _iea?.RegisterOrder(acknowledgedOrderId!, intentId, instrument, stream, OrderRole.ENTRY, OrderOwnershipStatus.OWNED, "SubmitEntryOrder", orderInfo, utcNow);
             // Execution boundary: SUBMIT_ENTRY must precede ORDER_ACKNOWLEDGED → ENTRY_ACCEPTED (validator: ENTRY_SUBMITTED only).
             _iea?.TryTransitionIntentLifecycle(intentId, IntentLifecycleTransition.SUBMIT_ENTRY, null, acknowledgedAt);
 

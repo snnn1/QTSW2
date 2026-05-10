@@ -12,6 +12,7 @@ public enum JournalParityStatus
 {
     PARITY_OK,
     PARITY_PENDING_ALIGNMENT,
+    HEDGED_NET_FLAT_GROSS_OPEN,
     POSITION_MISMATCH,
     WORKING_ORDER_MISMATCH,
     UNKNOWN_ORDER_PRESENT,
@@ -48,9 +49,14 @@ public sealed class JournalParityResult
 
     public bool IsPendingAlignment => Status == JournalParityStatus.PARITY_PENDING_ALIGNMENT;
 
-    /// <summary>Live paths treat pending alignment like OK for flatten / structural submit gates (not for strict post-audit PARITY_OK).</summary>
+    /// <summary>
+    /// Live paths treat pending alignment and coherent hedged net-flat/gross-open state like OK for flatten /
+    /// structural submit gates. Clean-flat release still uses broker, journal, ownership, and working-order inputs.
+    /// </summary>
     public bool IsOkOrPendingAlignment =>
-        Status == JournalParityStatus.PARITY_OK || Status == JournalParityStatus.PARITY_PENDING_ALIGNMENT;
+        Status == JournalParityStatus.PARITY_OK ||
+        Status == JournalParityStatus.PARITY_PENDING_ALIGNMENT ||
+        Status == JournalParityStatus.HEDGED_NET_FLAT_GROSS_OPEN;
 }
 
 public enum JournalReconstructionReasonCode
@@ -210,6 +216,35 @@ public static class JournalParityChecker
                 journal.HasOpposingDirectionOpenIntentsFromMap(openByInstrument, inst, canonical);
             var structuralMatchesSignedMagnitude =
                 posDiff == Math.Abs(signedDelta);
+
+            if (brokerPos == 0 &&
+                journalOpen > 0 &&
+                signedBroker == 0 &&
+                signedJournal == 0 &&
+                journalOpposingIntents)
+            {
+                return unexplainedW > 0
+                    ? new JournalParityResult
+                    {
+                        Status = JournalParityStatus.WORKING_ORDER_MISMATCH,
+                        BrokerPositionQty = brokerPos,
+                        JournalOpenQty = journalOpen,
+                        UnexplainedPositionQty = 0,
+                        UnexplainedWorkingOrders = unexplainedW,
+                        OrphanOrdersDetected = 0,
+                        SnapshotAgeMs = ageMs
+                    }
+                    : new JournalParityResult
+                    {
+                        Status = JournalParityStatus.HEDGED_NET_FLAT_GROSS_OPEN,
+                        BrokerPositionQty = brokerPos,
+                        JournalOpenQty = journalOpen,
+                        UnexplainedPositionQty = 0,
+                        UnexplainedWorkingOrders = 0,
+                        OrphanOrdersDetected = 0,
+                        SnapshotAgeMs = ageMs
+                    };
+            }
 
             if (!brokerHedgedSameInstrument && !journalOpposingIntents && structuralMatchesSignedMagnitude &&
                 TryClassifyPendingAlignment(inst, journal, signedDelta, brokerPos, journalOpen, ageMs,
@@ -487,7 +522,8 @@ public static class JournalIntegrityGuarantee
         });
         RecordPositionAuthorityCountersAndMaybeEmitSummary(positionAuthority, logEngine, utcNow);
 
-        if (initial.Status == JournalParityStatus.PARITY_PENDING_ALIGNMENT)
+        if (initial.Status == JournalParityStatus.PARITY_PENDING_ALIGNMENT ||
+            initial.Status == JournalParityStatus.HEDGED_NET_FLAT_GROSS_OPEN)
         {
             AttemptByInstrument.TryRemove(inst, out _);
             return new JournalIntegrityEnsureResult

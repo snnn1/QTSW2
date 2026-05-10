@@ -132,7 +132,7 @@ public sealed partial class MismatchEscalationCoordinator
         DateTimeOffset utcNow)
     {
         if (wasBlocked == state.Blocked) return;
-        NoteMismatchEvalAuthorityPublished(inst);
+        NoteMismatchEvalAuthorityPublished(inst, state.Blocked);
         _onMismatchExecutionBlockAuthorityChanged?.Invoke(
             inst,
             state.Blocked,

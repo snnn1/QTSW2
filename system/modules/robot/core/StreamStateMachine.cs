@@ -69,6 +69,27 @@ public sealed partial class StreamStateMachine
     public SlotStatus SlotStatus => _journal.SlotStatus;
     public bool IsActiveInterruptedBySessionClose =>
         _journal.SlotStatus == SlotStatus.ACTIVE && _journal.ExecutionInterruptedByClose && !_journal.Committed;
+    public bool HasPlaybackCarryoverEvidence =>
+        !_journal.Committed &&
+        _journal.SlotStatus == SlotStatus.ACTIVE &&
+        (_journal.ExecutionInterruptedByClose ||
+         _journal.EntryDetected ||
+         !string.IsNullOrWhiteSpace(_journal.OriginalIntentId) ||
+         !string.IsNullOrWhiteSpace(_journal.ReentryIntentId) ||
+         _journal.ReentrySubmitPending ||
+         _journal.ReentrySubmitted ||
+         _journal.ReentryFilled ||
+         _journal.ProtectionSubmitted ||
+         _journal.ProtectionAccepted);
+    public bool HasTimetableRolloverRetentionEvidence =>
+        !_journal.Committed ||
+        _journal.SlotStatus == SlotStatus.ACTIVE ||
+        _journal.ExecutionInterruptedByClose ||
+        _journal.ReentrySubmitPending ||
+        _journal.ReentrySubmitted ||
+        _journal.ReentryFilled ||
+        _journal.ProtectionSubmitted ||
+        _journal.ProtectionAccepted;
     public bool RangeInvalidated => _rangeInvalidated; // Expose range invalidation status for engine-level tracking
     public string TradingDate => _journal.TradingDate;
 
@@ -259,6 +280,7 @@ public sealed partial class StreamStateMachine
     private DateTimeOffset? _lastBarBufferedStateIndependentUtc = null; // Rate-limit BAR_BUFFERED_STATE_INDEPENDENT (once per stream per 5 minutes)
     private DateTimeOffset? _lastPreHydrationHandlerTraceUtc = null; // Rate-limit PRE_HYDRATION_HANDLER_TRACE (once per stream per 5 minutes)
     private DateTimeOffset? _lastArmedWaitingForBarsLogUtc = null; // Rate-limit ARMED_WAITING_FOR_BARS (once per stream per 5 minutes)
+    private DateTimeOffset? _lastRangeLockedPreSlotWaitLogUtc = null; // Rate-limit RANGE_LOCKED_PRE_SLOT_WAIT (once per stream per 30 minutes)
     // Assertion flags (once per stream per day)
     private bool _rangeIntentAssertEmitted = false; // RANGE_INTENT_ASSERT emitted
     private bool _firstBarAcceptedAssertEmitted = false; // RANGE_FIRST_BAR_ACCEPTED emitted
@@ -779,7 +801,7 @@ public sealed partial class StreamStateMachine
         return true;
     }
 
-    public void UpdateTradingDate(DateOnly newTradingDate, DateTimeOffset utcNow)
+    public void UpdateTradingDate(DateOnly newTradingDate, DateTimeOffset utcNow, bool allowCarryForwardActive = false)
     {
         // Update trading_date and recompute all UTC times based on new date
         // NOTE: This method should only be called during initialization or historical replay.
@@ -800,7 +822,7 @@ public sealed partial class StreamStateMachine
             {
                 // Check if this is initialization (empty journal) vs mid-session change
                 // If state is beyond PRE_HYDRATION, this is a mid-session change attempt
-                if (State != StreamState.PRE_HYDRATION)
+                if (State != StreamState.PRE_HYDRATION && !allowCarryForwardActive)
                 {
                     LogHealth("WARN", "TRADING_DATE_CHANGE_BLOCKED", $"Trading date change blocked - date is immutable after initialization",
                         new
@@ -811,6 +833,17 @@ public sealed partial class StreamStateMachine
                             note = "Trading date is locked and cannot be changed mid-session"
                         });
                     return; // Block mid-session trading date changes
+                }
+                else if (State != StreamState.PRE_HYDRATION && allowCarryForwardActive)
+                {
+                    LogHealth("INFO", "TIMETABLE_TRADING_DATE_CARRY_FORWARD_ALLOWED", "Timetable rollover allowed active stream date carry-forward",
+                        new
+                        {
+                            previous_trading_date = previousTradingDateStr,
+                            attempted_new_trading_date = newTradingDateStr,
+                            current_state = State.ToString(),
+                            note = "Allowed only for timetable rollover retention of a nonterminal stream lifecycle."
+                        });
                 }
             }
         }
@@ -919,12 +952,20 @@ public sealed partial class StreamStateMachine
                 ForcedFlattenTimestamp = previousJournal.ForcedFlattenTimestamp,
                 OriginalIntentId = previousJournal.OriginalIntentId,
                 ReentryIntentId = previousJournal.ReentryIntentId,
+                ReentrySubmitPending = previousJournal.ReentrySubmitPending,
+                ReentrySubmitPendingAtUtc = previousJournal.ReentrySubmitPendingAtUtc,
+                ReentrySubmitLastFailureUtc = previousJournal.ReentrySubmitLastFailureUtc,
+                ReentrySubmitFailureCount = previousJournal.ReentrySubmitFailureCount,
+                LastReentrySubmitError = previousJournal.LastReentrySubmitError,
                 ReentrySubmitted = previousJournal.ReentrySubmitted,
                 ReentryFilled = previousJournal.ReentryFilled,
                 ProtectionSubmitted = previousJournal.ProtectionSubmitted,
                 ProtectionAccepted = previousJournal.ProtectionAccepted,
                 NextSlotTimeUtc = previousJournal.NextSlotTimeUtc,
-                PriorJournalKey = $"{previousTradingDateStr}_{Stream}" // Reference to previous day's journal
+                PriorJournalKey = $"{previousTradingDateStr}_{Stream}", // Reference to previous day's journal
+                RecoveryAction = previousJournal.RecoveryAction,
+                RecoveryActionReason = previousJournal.RecoveryActionReason,
+                RecoveryActionIssuedUtc = previousJournal.RecoveryActionIssuedUtc
             };
         }
         else

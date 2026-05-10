@@ -78,6 +78,10 @@ if (argsList.Contains("--help") || argsList.Contains("-h"))
 // --test RECONCILIATION_PENDING_IEA_COOLDOWN: repeated unchanged pending IEA work triggers gate-recovery backoff instead of hot-loop snapshots
 // --test REENTRY_MARKET_CLOSE_COMMIT: market-close stream commit must use current reentry intent completion, not any historical completed row in the stream
 // --test MARKET_REENTRY_SUBMIT_PATH: reentry submit may pass recovery gate while normal entry remains denied
+// --test EXECUTION_TRIGGER_JOURNAL_INTEGRITY: order-state-only execution triggers wake mismatch audit without immediate NT account snapshot
+// --test SESSION_CLOSE_OWNER_ROUTING: session-close flatten must enqueue on the target execution-instrument owner
+// --test PLAYBACK_SCENARIO: explicit multi-day playback manifest + carryover journal rollover contract
+// --test STARTUP_BROKER_SUBMIT_GATE: SIM/LIVE entry submits require strategy Realtime gate
 var testIndex = argsList.IndexOf("--test");
 if (testIndex >= 0 && testIndex + 1 < argsList.Count)
 {
@@ -98,6 +102,12 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
     {
         var (pass, err) = ForcedFlattenPolicyTests.RunForcedFlattenPolicyTests();
         Console.WriteLine(pass ? "PASS: Forced flatten policy tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("SESSION_CLOSE_OWNER_ROUTING", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = SessionCloseInstrumentOwnerRoutingTests.RunSessionCloseInstrumentOwnerRoutingTests();
+        Console.WriteLine(pass ? "PASS: Session-close instrument owner routing tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
     else if (testName.Equals("IEA_FLATTEN", StringComparison.OrdinalIgnoreCase))
@@ -304,6 +314,12 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
         Console.WriteLine(pass ? "PASS: Execution event ordering tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
+    else if (testName.Equals("EXECUTION_TRIGGER_JOURNAL_INTEGRITY", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = ExecutionTriggerJournalIntegrityTests.RunExecutionTriggerJournalIntegrityTests();
+        Console.WriteLine(pass ? "PASS: Execution trigger journal-integrity gate tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
     else if (testName.Equals("SIBLING_PROTECTIVE_CANCEL_QUEUE", StringComparison.OrdinalIgnoreCase))
     {
         var (pass, err) = SiblingProtectiveCancelQueueTests.RunAll();
@@ -435,6 +451,18 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
     {
         var (pass, err) = StreamJournalPlaybackBypassTests.RunAll();
         Console.WriteLine(pass ? "PASS: Stream journal playback bypass tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("PLAYBACK_SCENARIO", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = PlaybackScenarioTests.RunAll();
+        Console.WriteLine(pass ? "PASS: Playback scenario tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("STARTUP_BROKER_SUBMIT_GATE", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = StartupBrokerSubmitRealtimeGateTests.RunAll();
+        Console.WriteLine(pass ? "PASS: Startup broker submit gate tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
     else if (testName.Equals("CHAOS", StringComparison.OrdinalIgnoreCase))

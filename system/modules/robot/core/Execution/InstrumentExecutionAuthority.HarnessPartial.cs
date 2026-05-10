@@ -107,6 +107,7 @@ public sealed partial class InstrumentExecutionAuthority
                     break;
                 case SubmitMarketReentryCommand reentry:
                     EnsureIntentLifecycleCreated(reentry.ReentryIntentId ?? "");
+                    TryTransitionIntentLifecycle(reentry.ReentryIntentId ?? "", IntentLifecycleTransition.SUBMIT_ENTRY, command.CommandId, command.TimestampUtc);
                     break;
             }
         }, "ExecutionCommandHarness");

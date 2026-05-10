@@ -1115,9 +1115,11 @@ namespace NinjaTrader.NinjaScript.Strategies
                     { "account", Account?.Name ?? "UNKNOWN" },
                     { "remaining_active_strategy_instances", remainingActiveInstances },
                     { "write_run_summary", writeRunSummary },
+                    { "engine_stop_snapshot_requested", true },
+                    { "authoritative_state_snapshot_trigger", "EngineStop" },
                     { "platform_disable_signal", false },
                     { "termination_classification", "STATE_TERMINATED" },
-                    { "note", "NinjaTrader State.Terminated lifecycle; normal during playback/shutdown. STRATEGY_DISABLED_BY_NINJATRADER is reserved for explicit platform-disable evidence." }
+                    { "note", "NinjaTrader State.Terminated lifecycle; normal during playback/shutdown. Engine.Stop emits an EngineStop authoritative-state snapshot before summary write. STRATEGY_DISABLED_BY_NINJATRADER is reserved for explicit platform-disable evidence." }
                 });
                 _engine?.Stop(writeRunSummary: writeRunSummary, stopSource: "strategy_terminated");
             }

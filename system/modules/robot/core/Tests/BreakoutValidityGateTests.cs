@@ -108,7 +108,7 @@ public static class BreakoutValidityGateTests
                 Positions = new List<PositionSnapshot> { new() { Instrument = "ES", Quantity = 0 } },
                 WorkingOrders = new List<WorkingOrderSnapshot>()
             };
-            var executed = sm.ExecutePendingRecoveryAction(snap, DateTimeOffset.UtcNow);
+            var executed = sm.ExecutePendingRecoveryAction(snap, sm.SlotTimeUtc.AddMinutes(1));
             if (executed)
                 return (false, "Long bar touch: expected ExecutePendingRecoveryAction=false after commit");
             return (true, null);
@@ -142,7 +142,7 @@ public static class BreakoutValidityGateTests
                 Positions = new List<PositionSnapshot> { new() { Instrument = "ES", Quantity = 0 } },
                 WorkingOrders = new List<WorkingOrderSnapshot>()
             };
-            var executed = sm.ExecutePendingRecoveryAction(snap, DateTimeOffset.UtcNow);
+            var executed = sm.ExecutePendingRecoveryAction(snap, sm.SlotTimeUtc.AddMinutes(1));
             if (executed)
                 return (false, "Short bar touch: expected ExecutePendingRecoveryAction=false after commit");
             return (true, null);
@@ -176,10 +176,10 @@ public static class BreakoutValidityGateTests
                 WorkingOrders = new List<WorkingOrderSnapshot>()
             };
 
-            var executed = sm.ExecutePendingRecoveryAction(snap, DateTimeOffset.UtcNow);
+            var executed = sm.ExecutePendingRecoveryAction(snap, sm.SlotTimeUtc.AddMinutes(1));
             // With NullExecutionAdapter base, SubmitStopEntryOrder is DRYRUN - succeeds
             if (!executed)
-                return (false, "Within tolerance: expected ExecutePendingRecoveryAction=true (allowed)");
+                return (false, DescribeRecoveryExpectationFailure("Within tolerance", sm, tempRoot));
             return (true, null);
         }
         finally
@@ -211,9 +211,9 @@ public static class BreakoutValidityGateTests
                 WorkingOrders = new List<WorkingOrderSnapshot>()
             };
 
-            var executed = sm.ExecutePendingRecoveryAction(snap, DateTimeOffset.UtcNow);
+            var executed = sm.ExecutePendingRecoveryAction(snap, sm.SlotTimeUtc.AddMinutes(1));
             if (!executed)
-                return (false, "Snapshot-only cross: expected recovery submit (bar path clean)");
+                return (false, DescribeRecoveryExpectationFailure("Snapshot-only cross", sm, tempRoot));
             return (true, null);
         }
         finally
@@ -241,10 +241,10 @@ public static class BreakoutValidityGateTests
                 WorkingOrders = new List<WorkingOrderSnapshot>()
             };
 
-            sm.ExecutePendingRecoveryAction(snap, DateTimeOffset.UtcNow);
+            sm.ExecutePendingRecoveryAction(snap, sm.SlotTimeUtc.AddMinutes(1));
 
             // Second call: no pending action, should return false immediately
-            var executed2 = sm.ExecutePendingRecoveryAction(snap, DateTimeOffset.UtcNow);
+            var executed2 = sm.ExecutePendingRecoveryAction(snap, sm.SlotTimeUtc.AddMinutes(2));
             if (executed2)
                 return (false, "Blocked clears: second call should return false (no pending action)");
             return (true, null);
@@ -359,5 +359,28 @@ public static class BreakoutValidityGateTests
             return (null, adapter);
 
         return (sm, adapter);
+    }
+
+    private static string DescribeRecoveryExpectationFailure(string scenario, StreamStateMachine sm, string tempRoot)
+    {
+        var recentLog = "";
+        try
+        {
+            var logsDir = Path.Combine(tempRoot, "logs", "robot");
+            if (Directory.Exists(logsDir))
+            {
+                foreach (var file in Directory.GetFiles(logsDir, "*.jsonl", SearchOption.AllDirectories))
+                    recentLog += File.ReadAllText(file);
+                if (recentLog.Length > 600)
+                    recentLog = recentLog.Substring(recentLog.Length - 600);
+            }
+        }
+        catch
+        {
+            recentLog = "<log read failed>";
+        }
+
+        return $"{scenario}: expected recovery submit; state={sm.State}; committed={sm.Committed}; " +
+               $"slot={sm.SlotTimeUtc:o}; market_close={sm.MarketCloseUtc:o}; recent_log={recentLog}";
     }
 }

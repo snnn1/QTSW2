@@ -7,6 +7,27 @@ namespace QTSW2.Robot.Core.Execution;
 public static class MismatchClassification
 {
     /// <summary>
+    /// True when the broker presents a net-flat instrument row while journal/ownership still have
+    /// valid opposing gross exposure and the live working-order count agrees with local authority.
+    /// This is not clean-flat release evidence; it is coherent gross-active exposure.
+    /// </summary>
+    public static bool IsExplainedHedgedNetFlatGrossOpen(
+        int brokerQtyAbs,
+        int grossJournalQty,
+        int netBrokerQty,
+        int netJournalQty,
+        bool opposingMultiIntentOpen,
+        int brokerWorkingOrderCount,
+        int localWorkingOrderCount) =>
+        opposingMultiIntentOpen &&
+        brokerQtyAbs == 0 &&
+        grossJournalQty > 0 &&
+        netBrokerQty == 0 &&
+        netJournalQty == 0 &&
+        brokerWorkingOrderCount > 0 &&
+        brokerWorkingOrderCount == localWorkingOrderCount;
+
+    /// <summary>
     /// Classify using gross journal, broker abs sum, and signed nets. Replaces single POSITION_QTY_MISMATCH with
     /// net vs gross distinctions; see <see cref="MismatchType.NET_POSITION_MISMATCH"/>.
     /// </summary>
@@ -30,6 +51,10 @@ public static class MismatchClassification
 
         if (brokerWorkingOrderCount > 0 && localWorkingOrderCount == 0)
             return MismatchType.ORDER_REGISTRY_MISSING;
+
+        if (opposingMultiIntentOpen && brokerQtyAbs == 0 && grossJournalQty > 0 &&
+            netBrokerQty == 0 && netJournalQty == 0)
+            return MismatchType.HEDGED_NET_FLAT_GROSS_OPEN;
 
         if (brokerQtyAbs != 0 && grossJournalQty == 0)
             return MismatchType.BROKER_AHEAD;

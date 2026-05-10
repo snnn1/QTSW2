@@ -157,6 +157,17 @@ public sealed class NinjaTraderLiveAdapter : IExecutionAdapter
     }
 
     public bool TryEnqueueEmergencyFlattenProtective(string instrument, DateTimeOffset utcNow) => false;
+
+    public FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow)
+    {
+        // LIVE adapter is a stub in NT_ADDONS; return null so callers use the existing fallback path.
+        return null;
+    }
+
+    public int RequestSessionCloseCancelIntents(IEnumerable<string> intentIds, string instrument, DateTimeOffset utcNow)
+    {
+        return 0;
+    }
     
     public AccountSnapshot GetAccountSnapshot(DateTimeOffset utcNow)
     {

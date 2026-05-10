@@ -18,6 +18,11 @@ public readonly struct ReleaseReadinessSuppressionProbe
     public int PendingCandidateCount { get; init; }
     /// <summary>Adoptable-only pending count (aligned with <see cref="StateConsistencyReleaseEvaluationInput.AdoptablePendingAdoptionCandidateCount"/>).</summary>
     public int AdoptablePendingCandidateCount { get; init; }
+    public bool OwnershipSnapshotAvailable { get; init; }
+    public int OwnershipGrossOpenQty { get; init; }
+    public int OwnershipSignedNetQty { get; init; }
+    public int OwnershipActiveSlotCount { get; init; }
+    public int OwnershipOrphanSlotCount { get; init; }
     public int IeaTrustedWorkingCount { get; init; }
     public bool UseIea { get; init; }
     /// <summary>64-bit deterministic surrogate; not cryptographic. Mixed with set cardinality internally.</summary>
@@ -154,6 +159,11 @@ public sealed class ReleaseReconciliationRedundancySuppression
             p.JournalOpenQty,
             p.PendingCandidateCount,
             p.AdoptablePendingCandidateCount,
+            p.OwnershipSnapshotAvailable ? 1 : 0,
+            p.OwnershipGrossOpenQty,
+            p.OwnershipSignedNetQty,
+            p.OwnershipActiveSlotCount,
+            p.OwnershipOrphanSlotCount,
             p.IeaTrustedWorkingCount,
             p.UseIea ? 1 : 0,
             p.BlockingAdoptionIntentSetHash,
@@ -168,6 +178,11 @@ public sealed class ReleaseReconciliationRedundancySuppression
             i.JournalOpenQty,
             i.PendingAdoptionCandidateCount,
             i.AdoptablePendingAdoptionCandidateCount,
+            i.OwnershipSnapshotAvailable ? 1 : 0,
+            i.OwnershipGrossOpenQty,
+            i.OwnershipSignedNetQty,
+            i.OwnershipActiveSlotCount,
+            i.OwnershipOrphanSlotCount,
             i.IeaOwnedPlusAdoptedWorking,
             i.UseInstrumentExecutionAuthority ? 1 : 0,
             i.BlockingAdoptionIntentSetHash,
@@ -187,6 +202,11 @@ public sealed class ReleaseReconciliationRedundancySuppression
             input.JournalOpenQty,
             input.PendingAdoptionCandidateCount,
             input.AdoptablePendingAdoptionCandidateCount,
+            input.OwnershipSnapshotAvailable ? 1 : 0,
+            input.OwnershipGrossOpenQty,
+            input.OwnershipSignedNetQty,
+            input.OwnershipActiveSlotCount,
+            input.OwnershipOrphanSlotCount,
             input.IeaOwnedPlusAdoptedWorking,
             input.BlockingAdoptionIntentSetHash,
             input.RegistryMismatchTrustedIntentSetHash,
@@ -229,6 +249,13 @@ public sealed class ReleaseReconciliationRedundancySuppression
         if (Math.Abs(probe.BrokerPositionQty - probe.JournalOpenQty) > 0)
         {
             reason = "forced_eval_position_qty_mismatch";
+            return false;
+        }
+
+        if (probe.OwnershipGrossOpenQty > 0 || probe.OwnershipActiveSlotCount > 0 ||
+            probe.OwnershipOrphanSlotCount > 0)
+        {
+            reason = "forced_eval_ownership_gross_open";
             return false;
         }
 
@@ -341,7 +368,13 @@ public sealed class ReleaseReconciliationRedundancySuppression
     {
         var inst = input.Instrument?.Trim() ?? "";
         return string.Join("|", inst, input.BrokerPositionQty, input.BrokerWorkingCount, input.JournalOpenQty,
-            input.PendingAdoptionCandidateCount, input.IeaOwnedPlusAdoptedWorking,
+            input.PendingAdoptionCandidateCount,
+            input.OwnershipSnapshotAvailable ? 1 : 0,
+            input.OwnershipGrossOpenQty,
+            input.OwnershipSignedNetQty,
+            input.OwnershipActiveSlotCount,
+            input.OwnershipOrphanSlotCount,
+            input.IeaOwnedPlusAdoptedWorking,
             input.BlockingAdoptionIntentSetHash, input.RegistryMismatchTrustedIntentSetHash, input.JournalOpenIntentSetHash);
     }
 
@@ -382,12 +415,21 @@ public sealed class ReleaseReconciliationRedundancySuppression
             SnapshotSufficient = r.SnapshotSufficient,
             DiagnosticBrokerPositionQty = r.DiagnosticBrokerPositionQty,
             DiagnosticJournalOpenQty = r.DiagnosticJournalOpenQty,
+            DiagnosticOwnershipSnapshotAvailable = r.DiagnosticOwnershipSnapshotAvailable,
+            DiagnosticOwnershipGrossOpenQty = r.DiagnosticOwnershipGrossOpenQty,
+            DiagnosticOwnershipSignedNetQty = r.DiagnosticOwnershipSignedNetQty,
+            DiagnosticOwnershipActiveSlotCount = r.DiagnosticOwnershipActiveSlotCount,
+            DiagnosticOwnershipOrphanSlotCount = r.DiagnosticOwnershipOrphanSlotCount,
             DiagnosticBrokerWorkingCount = r.DiagnosticBrokerWorkingCount,
             DiagnosticIeaOwnedPlusAdoptedWorking = r.DiagnosticIeaOwnedPlusAdoptedWorking,
             DiagnosticPendingAdoptionCandidateCount = r.DiagnosticPendingAdoptionCandidateCount,
             DiagnosticAdoptDecisionCount = r.DiagnosticAdoptDecisionCount,
+            DiagnosticPendingExecutionWorkload = r.DiagnosticPendingExecutionWorkload,
             BlockerInvariantViolation = r.BlockerInvariantViolation,
-            ResolvedBlockers = r.ResolvedBlockers
+            ResolvedBlockers = r.ResolvedBlockers,
+            LegacyClassifierGap = r.LegacyClassifierGap,
+            ResidualCleanupOnly = r.ResidualCleanupOnly,
+            ResidualCleanupClass = r.ResidualCleanupClass
         };
     }
 

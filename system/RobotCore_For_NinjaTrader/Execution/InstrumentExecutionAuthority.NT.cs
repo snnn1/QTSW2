@@ -817,18 +817,23 @@ public sealed partial class InstrumentExecutionAuthority
     {
         if (Executor == null)
             return;
+
+        if (TryMarkAndCheckDuplicate(execution, order))
+        {
+            Log?.Write(RobotEvents.ExecutionBase(NowEvent(), "", ExecutionInstrumentKey, "EXECUTION_DUPLICATE_SKIPPED_PRE_IEA_QUEUE", new
+            {
+                execution_id = SafeReadExecutionId(execution) ?? "",
+                broker_order_id = SafeReadOrderId(order),
+                fill_qty = SafeReadExecutionQuantity(execution),
+                iea_instance_id = InstanceId,
+                note = "Duplicate NinjaTrader execution callback skipped before IEA worker enqueue."
+            }));
+            return;
+        }
+
         EnqueueRecoveryEssential(() =>
         {
-            var fillQtyWorker = 0;
-            try
-            {
-                dynamic ex = execution;
-                fillQtyWorker = (int)(ex.Quantity ?? 0);
-            }
-            catch
-            {
-                /* ignore */
-            }
+            var fillQtyWorker = SafeReadExecutionQuantity(execution);
 
             IeExecutionLatencyTrace.Write("IEA_WORKER_EXEC_BEGIN", order, execution, ExecutionInstrumentKey,
                 InstanceId.ToString(), fillQtyWorker);
@@ -852,6 +857,21 @@ public sealed partial class InstrumentExecutionAuthority
     {
         if (Executor == null || snapshot == null)
             return;
+
+        if (TryMarkAndCheckDuplicate(snapshot))
+        {
+            Log?.Write(RobotEvents.ExecutionBase(NowEvent(), snapshot.IntentId ?? "", snapshot.Instrument ?? ExecutionInstrumentKey, "EXECUTION_DUPLICATE_SKIPPED_PRE_IEA_QUEUE", new
+            {
+                execution_id = snapshot.ExecutionId ?? "",
+                broker_order_id = snapshot.BrokerOrderId ?? "",
+                fill_qty = snapshot.FillQuantity,
+                iea_instance_id = InstanceId,
+                snapshot_path = true,
+                note = "Duplicate NinjaTrader execution snapshot skipped before IEA worker enqueue."
+            }));
+            return;
+        }
+
         EnqueueRecoveryEssential(() =>
         {
             IeExecutionLatencyTrace.WriteResolved("IEA_WORKER_EXEC_BEGIN", snapshot.BrokerOrderId, snapshot.IntentId,
@@ -872,8 +892,7 @@ public sealed partial class InstrumentExecutionAuthority
     {
         try
         {
-            dynamic dynExec = execution;
-            var qty = (int)(dynExec.Quantity ?? 0);
+            var qty = SafeReadExecutionQuantity(execution);
             if (qty != 0) return true; // Fill
             dynamic dynOrder = order;
             var state = (dynOrder.OrderState ?? "").ToString();
@@ -1925,13 +1944,50 @@ public sealed partial class InstrumentExecutionAuthority
             (o.OrderState == OrderState.Working || o.OrderState == OrderState.Accepted) &&
             BrokerOrderMatchesExecutionInstrument(o));
         var qtsw2SameInstrumentWorking = 0;
+        var workingQtyByDecodedIntent = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         foreach (Order o in accountOrders)
         {
             if (o.OrderState != OrderState.Working && o.OrderState != OrderState.Accepted) continue;
             var tagProbe = Executor.GetOrderTag(o);
             if (string.IsNullOrEmpty(tagProbe) || !tagProbe.StartsWith("QTSW2:", StringComparison.OrdinalIgnoreCase)) continue;
             if (BrokerOrderMatchesExecutionInstrument(o))
+            {
                 qtsw2SameInstrumentWorking++;
+                var decodedIntent = RobotOrderIds.DecodeIntentId(tagProbe);
+                if (!string.IsNullOrWhiteSpace(decodedIntent))
+                {
+                    var outstandingQty = Math.Max(0, o.Quantity - o.Filled);
+                    if (outstandingQty <= 0)
+                        outstandingQty = Math.Max(0, o.Quantity);
+                    if (outstandingQty > 0)
+                    {
+                        workingQtyByDecodedIntent.TryGetValue(decodedIntent, out var existingQty);
+                        workingQtyByDecodedIntent[decodedIntent] = Math.Max(existingQty, outstandingQty);
+                    }
+                }
+            }
+        }
+
+        if (workingQtyByDecodedIntent.Count > 0)
+        {
+            var reopened = Executor.ReopenBrokerFlatCompletedJournalsForCarryover(
+                ExecutionInstrumentKey,
+                workingQtyByDecodedIntent,
+                NowEvent(),
+                "IEAAdoptionWorkingOrderCarryover");
+            if (reopened > 0)
+            {
+                activeIntentIds = Executor.GetAdoptionCandidateIntentIds(ExecutionInstrumentKey);
+                LogIeaEngine(NowEvent(), "ADOPTION_CARRYOVER_JOURNAL_REOPENED", new
+                {
+                    reopened_journal_count = reopened,
+                    working_intent_count = workingQtyByDecodedIntent.Count,
+                    candidate_intent_count_after_reopen = activeIntentIds.Count,
+                    execution_instrument_key = ExecutionInstrumentKey,
+                    iea_instance_id = InstanceId,
+                    note = "Live QTSW2 working orders restored broker-flat-completed journal rows before adoption classification"
+                });
+            }
         }
         swPh.Stop();
         tel.PrecountMs = swPh.ElapsedMilliseconds;
@@ -2590,25 +2646,83 @@ public sealed partial class InstrumentExecutionAuthority
     internal bool TryMarkAndCheckDuplicate(object execution, object order)
     {
         if (execution == null || order == null) return false;
+        var execId = SafeReadExecutionId(execution);
+        var orderId = SafeReadOrderId(order);
+        var ticks = SafeReadExecutionTicks(execution);
+        var qty = SafeReadExecutionQuantity(execution);
+        var mpos = SafeReadExecutionMarketPosition(execution);
+        return TryMarkAndCheckDuplicateCore(execId, orderId, ticks, qty, mpos);
+    }
+
+    private static int SafeReadExecutionQuantity(object execution)
+    {
+        if (execution == null) return 0;
         try
         {
             dynamic dynExec = execution;
-            dynamic dynOrder = order;
-            var execId = dynExec.ExecutionId as string;
-            var orderId = (dynOrder.OrderId ?? "").ToString();
-            var time = dynExec.Time;
-            long ticks = 0;
-            if (time != null)
-            {
-                if (time is DateTime dt) ticks = dt.Ticks;
-                else if (time is DateTimeOffset dto) ticks = dto.UtcTicks;
-                else try { ticks = ((dynamic)time).Ticks; } catch { }
-            }
-            var qty = (int)(dynExec.Quantity ?? 0);
-            var mpos = (dynExec.MarketPosition?.ToString() ?? "");
-            return TryMarkAndCheckDuplicateCore(execId, orderId, ticks, qty, mpos);
+            object? raw = dynExec.Quantity;
+            if (raw == null) return 0;
+            return Convert.ToInt32(raw);
         }
-        catch { return false; }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    private static string? SafeReadExecutionId(object execution)
+    {
+        try
+        {
+            dynamic dynExec = execution;
+            return dynExec.ExecutionId as string;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string SafeReadOrderId(object order)
+    {
+        try
+        {
+            dynamic dynOrder = order;
+            return (dynOrder.OrderId ?? "").ToString();
+        }
+        catch
+        {
+            return "";
+        }
+    }
+
+    private static long SafeReadExecutionTicks(object execution)
+    {
+        try
+        {
+            dynamic dynExec = execution;
+            var time = dynExec.Time;
+            if (time is DateTime dt) return dt.Ticks;
+            if (time is DateTimeOffset dto) return dto.UtcTicks;
+            try { return ((dynamic)time).Ticks; } catch { return 0; }
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    private static string SafeReadExecutionMarketPosition(object execution)
+    {
+        try
+        {
+            dynamic dynExec = execution;
+            return dynExec.MarketPosition?.ToString() ?? "";
+        }
+        catch
+        {
+            return "";
+        }
     }
 
     internal bool TryMarkAndCheckDuplicate(ExecutionUpdateSnapshot snapshot)

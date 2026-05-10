@@ -36,6 +36,8 @@
   </ItemGroup>
   <ItemGroup>
     <!-- Shared types from modules/robot/core (NT project targets net48, core targets net8) -->
+    <Compile Include="..\modules\robot\core\PlaybackScenarioManifest.cs" Link="PlaybackScenarioManifest.cs" />
+    <Compile Include="..\modules\robot\core\RobotEngine.PlaybackScenario.cs" Link="RobotEngine.PlaybackScenario.cs" />
     <Compile Include="..\modules\robot\core\RobotRunArtifactPaths.cs" Link="RobotRunArtifactPaths.cs" />
     <Compile Include="..\modules\robot\core\RunDirectoryNaming.cs" Link="RunDirectoryNaming.cs" />
     <Compile Include="..\modules\robot\core\RunRootArtifacts.cs" Link="RunRootArtifacts.cs" />

@@ -104,7 +104,7 @@ async def get_run_summary(
         root = resolve_active_persistence_base()
     if root is None:
         return {"available": False, "reason": "NO_ACTIVE_RUN_ROOT"}
-    data = read_run_summary_json(root)
+    data = read_run_summary_json(root, augment_platform=True)
     if data is None:
         return {"available": False, "reason": "RUN_SUMMARY_MISSING"}
     return data

@@ -13,6 +13,8 @@ namespace QTSW2.Robot.Core.Execution;
 
 public sealed partial class ExecutionJournal
 {
+    private static readonly TimeSpan JournalEventOrderSkewTolerance = TimeSpan.FromMilliseconds(1000);
+
     public static string ComputeIntentId(
         string tradingDate,
         string stream,
@@ -313,7 +315,8 @@ public sealed partial class ExecutionJournal
             entry.EntryFilledObservedAtUtc = utcNow.ToString("o");
             if (!string.IsNullOrEmpty(entry.EntrySubmittedAtUtc) &&
                 TryParseJournalIsoUtc(entry.EntrySubmittedAtUtc, out var subCanon) &&
-                utcNow < subCanon)
+                utcNow < subCanon &&
+                (subCanon - utcNow) > JournalEventOrderSkewTolerance)
             {
                 _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_EVENT_ORDER_VIOLATION", "ENGINE",
                     new
@@ -563,7 +566,8 @@ public sealed partial class ExecutionJournal
             entry.EntryFilledObservedAtUtc = utcNow.ToString("o");
             if (!string.IsNullOrEmpty(entry.EntrySubmittedAtUtc) &&
                 TryParseJournalIsoUtc(entry.EntrySubmittedAtUtc, out var subCanonR) &&
-                utcNow < subCanonR)
+                utcNow < subCanonR &&
+                (subCanonR - utcNow) > JournalEventOrderSkewTolerance)
             {
                 _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_EVENT_ORDER_VIOLATION", "ENGINE",
                     new
@@ -919,7 +923,9 @@ public sealed partial class ExecutionJournal
 
             HydrateCanonicalTimestampsFromLegacy(entry);
             entry.ExitFilledObservedAtUtc = utcNow.ToString("o");
-            if (TryParseJournalIsoUtc(entry.EntryFilledAtUtc, out var entryFillCanon) && utcNow < entryFillCanon)
+            if (TryParseJournalIsoUtc(entry.EntryFilledAtUtc, out var entryFillCanon) &&
+                utcNow < entryFillCanon &&
+                (entryFillCanon - utcNow) > JournalEventOrderSkewTolerance)
             {
                 _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_EVENT_ORDER_VIOLATION", "ENGINE",
                     new

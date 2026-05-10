@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from ..alert_ledger import AlertLedger, generate_alert_id
+from ..config import NOTIFICATIONS_CONFIG_PATH, NOTIFICATIONS_SECRETS_PATH
 from .pushover_client import pushover_send
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,11 @@ ALERT_TYPE_LABELS = {
     "POTENTIAL_ORPHAN_POSITION": "Potential Orphan Position",
     "CONFIRMED_ORPHAN_POSITION": "Confirmed Orphan Position",
     "LOG_FILE_STALLED": "Log File Stalled",
+    "RECOVERY_LOOP_DETECTED": "Recovery Loop Detected",
+    "FEED_INGESTION_DELAY": "Feed Ingestion Delay",
+    "WATCHDOG_LOOP_SLOW": "Watchdog Loop Slow",
+    "ANOMALY_RATE_EXCEEDED": "Anomaly Rate Exceeded",
+    "ORDER_STUCK_DETECTED": "Order Stuck Detected",
     # Phase 4: Incident-based alerts
     "INCIDENT_CONNECTION_LOST": "Connection Lost (Incident)",
     "INCIDENT_ENGINE_STALLED": "Engine Stalled (Incident)",
@@ -35,6 +41,8 @@ ALERT_TYPE_LABELS = {
     "INCIDENT_EXECUTION_POLICY_VALIDATION_FAILED": "Execution Policy Validation Failed (Incident)",
     "INCIDENT_EXECUTION_JOURNAL_CORRUPTION": "Execution Journal Corruption (Incident)",
     "INCIDENT_EXECUTION_JOURNAL_ERROR": "Execution Journal Error (Incident)",
+    "INCIDENT_RECONCILIATION_GATE_FAIL_CLOSED": "Reconciliation Gate Fail-Closed (Incident)",
+    "INCIDENT_ADOPTION_GRACE_EXPIRED": "Adoption Grace Expired (Incident)",
     "TIMETABLE_DRIFT": "Timetable drift (robot vs system)",
     "SESSION_FLATTEN_NOT_CONFIRMED_CRITICAL": "Session flatten not broker-confirmed after close",
     "SESSION_FLATTEN_AT_RISK_WARNING": "Session flatten at risk (within 60s of close, not confirmed)",
@@ -45,6 +53,7 @@ ALERT_TYPE_LABELS = {
 SEVERITY_PRIORITY = {
     "critical": 2,
     "high": 1,
+    "medium": 1,
     "warning": 1,
     "info": 0,
 }
@@ -59,8 +68,8 @@ class NotificationService:
         secrets_path: Optional[Path] = None,
         ledger: Optional[AlertLedger] = None,
     ):
-        self._config_path = config_path or (Path(__file__).parent.parent.parent / "configs" / "watchdog" / "notifications.json")
-        self._secrets_path = secrets_path or (Path(__file__).parent.parent.parent / "configs" / "watchdog" / "notifications.secrets.json")
+        self._config_path = config_path or NOTIFICATIONS_CONFIG_PATH
+        self._secrets_path = secrets_path or NOTIFICATIONS_SECRETS_PATH
         self._ledger = ledger or AlertLedger()
         self._config: Dict[str, Any] = {}
         self._secrets: Dict[str, Any] = {}
@@ -69,6 +78,7 @@ class NotificationService:
         self._worker_task: Optional[asyncio.Task] = None
         self._running = False
         self._last_delivery_by_key: Dict[str, datetime] = {}
+        self._last_enqueue_by_key: Dict[str, datetime] = {}
         self._alerts_this_hour: deque = deque(maxlen=100)
         self._load_config()
 
@@ -127,21 +137,31 @@ class NotificationService:
         if not self._enabled:
             return
 
-        # Deduplication disabled: every raise_alert() sends (fail-loud for live trading)
-
         # Rate limit: max alerts per hour
         rate_limits = self._config.get("rate_limits", {})
         max_per_hour = rate_limits.get("max_alerts_per_hour", 20)
         now = datetime.now(timezone.utc)
+        active = self._ledger.get_active_alert(dedupe_key)
+        if active:
+            self._ledger.update_active_alert_last_seen(dedupe_key, context)
+            if min_resend_interval_seconds > 0:
+                last_enqueue = self._last_enqueue_by_key.get(dedupe_key)
+                if last_enqueue and (now - last_enqueue).total_seconds() < min_resend_interval_seconds:
+                    return
+
         hour_ago = now - timedelta(hours=1)
         recent = sum(1 for t in self._alerts_this_hour if t > hour_ago)
         if recent >= max_per_hour:
             logger.warning(f"Alert rate limit reached ({max_per_hour}/hour), dropping {alert_type}")
             return
 
-        # New alert: append to ledger, enqueue
-        alert_id = generate_alert_id()
-        self._ledger.append_alert(alert_id, alert_type, severity, context, dedupe_key)
+        if active:
+            alert_id = active.get("alert_id")
+            first_seen_utc = active.get("first_seen_utc", now.isoformat())
+        else:
+            alert_id = generate_alert_id()
+            first_seen_utc = now.isoformat()
+            self._ledger.append_alert(alert_id, alert_type, severity, context, dedupe_key)
 
         try:
             self._queue.put_nowait({
@@ -150,9 +170,10 @@ class NotificationService:
                 "severity": severity,
                 "context": context,
                 "dedupe_key": dedupe_key,
-                "first_seen_utc": now.isoformat(),
+                "first_seen_utc": first_seen_utc,
                 "last_seen_utc": now.isoformat(),
             })
+            self._last_enqueue_by_key[dedupe_key] = now
         except asyncio.QueueFull:
             logger.warning("Notification queue full, dropping new alert")
 
@@ -210,6 +231,7 @@ class NotificationService:
     def resolve_alert(self, dedupe_key: str) -> None:
         """Mark alert as resolved. Removes from active set, appends resolution record."""
         self._ledger.resolve_alert(dedupe_key)
+        self._last_enqueue_by_key.pop(dedupe_key, None)
 
     def send_restored_notification(self, title: str, message: str) -> None:
         """

@@ -63,6 +63,105 @@ def _timetable_json_source(timetable: Dict[str, Any]) -> Optional[str]:
     return s or None
 
 
+def _read_json_object(path: Path) -> Optional[Dict[str, Any]]:
+    if not path.is_file():
+        return None
+    try:
+        with path.open(encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _date_from_run_summary(context: WatchdogRunContext) -> Optional[str]:
+    summary = _read_json_object(context.persistence_base / "summary.json")
+    if not summary:
+        return None
+    for key in ("trading_date", "date", "session_trading_date"):
+        value = str(summary.get(key) or "").strip()
+        if value:
+            return value[:10]
+    return None
+
+
+def _date_from_runtime_clock(context: WatchdogRunContext) -> Optional[str]:
+    clock = _read_json_object(context.persistence_base / "state" / "runtime_clock.json")
+    if not clock:
+        return None
+    for key in ("active_session_trading_date", "session_trading_date", "scenario_date", "trading_date", "date"):
+        value = str(clock.get(key) or "").strip()
+        if not value:
+            continue
+        candidate = value[:10]
+        try:
+            datetime.strptime(candidate, "%Y-%m-%d")
+            return candidate
+        except ValueError:
+            continue
+    return None
+
+
+def _latest_date_from_run_journals(context: WatchdogRunContext) -> Optional[str]:
+    candidates: List[str] = []
+    for base in (context.slot_journals_dir, context.execution_journals_dir):
+        if not base.is_dir():
+            continue
+        for path in base.glob("*.json"):
+            prefix = path.name[:10]
+            try:
+                datetime.strptime(prefix, "%Y-%m-%d")
+            except ValueError:
+                continue
+            candidates.append(prefix)
+    return max(candidates) if candidates else None
+
+
+def _scenario_timetable_path(context: Optional[WatchdogRunContext]) -> Optional[Path]:
+    if context is None or not context.is_run_scoped:
+        return None
+    scenario_dir = context.persistence_base / "playback_scenario"
+    manifest = _read_json_object(scenario_dir / "playback_scenario.json")
+    if not manifest:
+        return None
+    timetables = manifest.get("timetables")
+    if not isinstance(timetables, dict):
+        return None
+    dates = [str(d).strip() for d in manifest.get("dates", []) if str(d).strip()]
+    runtime_clock_date = _date_from_runtime_clock(context)
+    active_date = runtime_clock_date or _date_from_run_summary(context) or _latest_date_from_run_journals(context)
+    if active_date not in timetables:
+        if runtime_clock_date:
+            logger.warning(
+                "WATCHDOG_SCENARIO_RUNTIME_CLOCK_INVALID: active_session_trading_date=%s "
+                "missing_from_manifest=True scenario_dir=%s",
+                runtime_clock_date,
+                scenario_dir,
+            )
+            return scenario_dir / "timetables" / f"timetable_{runtime_clock_date}.json"
+        active_date = dates[0] if dates else next(iter(timetables.keys()), None)
+    if not active_date:
+        return None
+    entry = timetables.get(active_date)
+    if not isinstance(entry, dict):
+        return None
+    raw_path = str(entry.get("path") or "").strip()
+    if not raw_path:
+        return None
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = scenario_dir / path
+    try:
+        path = path.resolve()
+    except OSError:
+        return None
+    if path.is_file():
+        return path
+    if runtime_clock_date and active_date == runtime_clock_date:
+        return path
+    return None
+
+
 def resolve_watchdog_timetable_path(context: Optional[WatchdogRunContext] = None) -> Path:
     """
     Resolve the timetable file the watchdog should observe for the active context.
@@ -71,6 +170,10 @@ def resolve_watchdog_timetable_path(context: Optional[WatchdogRunContext] = None
     the robot's playback default. Live/sim-at-root contexts continue to use
     ``timetable_current.json``.
     """
+    scenario_path = _scenario_timetable_path(context)
+    if scenario_path is not None:
+        return scenario_path
+
     timetable_dir = QTSW2_ROOT / "data" / "timetable"
     if context_prefers_replay_timetable(context):
         replay_current = timetable_dir / "timetable_replay_current.json"

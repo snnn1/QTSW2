@@ -11,6 +11,8 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .config import ALERT_LEDGER_PATH
+
 logger = logging.getLogger(__name__)
 
 # Default retention: 30 days (debugging, reliability review, missed-trade investigation)
@@ -21,7 +23,7 @@ class AlertLedger:
     """Append-only alert ledger with resolution records and retention."""
 
     def __init__(self, ledger_path: Optional[Path] = None, retention_days: int = DEFAULT_RETENTION_DAYS):
-        self._ledger_path = ledger_path or (Path(__file__).parent.parent.parent / "data" / "watchdog" / "alert_ledger.jsonl")
+        self._ledger_path = ledger_path or ALERT_LEDGER_PATH
         self._retention_days = retention_days
         self._active_alerts: Dict[str, Dict[str, Any]] = {}  # dedupe_key -> alert record
         self._rehydrate_active_alerts()
@@ -44,6 +46,8 @@ class AlertLedger:
                     try:
                         rec = json.loads(line)
                     except json.JSONDecodeError:
+                        continue
+                    if not isinstance(rec, dict):
                         continue
                     if rec.get("event") == "resolved":
                         dedupe_key = rec.get("dedupe_key")

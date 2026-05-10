@@ -5,7 +5,7 @@
   },
   "suppress_robot_overlap": {
     "CONNECTION_LOST_SUSTAINED": true,
-    "ROBOT_HEARTBEAT_LOST": true
+    "ROBOT_HEARTBEAT_LOST": false
   },
   "channels": {
     "pushover": {

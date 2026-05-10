@@ -172,9 +172,14 @@ function AppContent() {
   const [timetableManualPublishBanner, setTimetableManualPublishBanner] = useState(null)
   /** Historical mode only: explicit session calendar date for preview-only inspection. */
   const [timetableGenerateDate, setTimetableGenerateDate] = useState('')
+  /** Multi-day Playback scenario range. */
+  const [playbackScenarioStartDate, setPlaybackScenarioStartDate] = useState('')
+  const [playbackScenarioEndDate, setPlaybackScenarioEndDate] = useState('')
+  const [playbackScenarioResult, setPlaybackScenarioResult] = useState(null)
+  const [playbackScenarioClearing, setPlaybackScenarioClearing] = useState(false)
   /** Timetable mode: live publishes current authority; historical previews an as-of session date. */
   const [timetableMode, setTimetableMode] = useState(() => {
-    return readStoredChoice('matrix_timetable_mode', ['live', 'historical'], 'live')
+    return readStoredChoice('matrix_timetable_mode', ['live', 'historical', 'playback_multi'], 'live')
   })
   /** GET /api/timetable/current only — Trading Timetable grid has no worker/matrix fallback. */
   const [timetableApiStatus, setTimetableApiStatus] = useState({ loading: false, error: null })
@@ -186,6 +191,10 @@ function AppContent() {
     return readStoredBoolean('matrix_show_blocked_timetable', true)
   })
   const hasValidHistoricalDate = /^\d{4}-\d{2}-\d{2}$/.test(timetableGenerateDate.trim())
+  const hasValidPlaybackScenarioRange =
+    /^\d{4}-\d{2}-\d{2}$/.test(playbackScenarioStartDate.trim()) &&
+    /^\d{4}-\d{2}-\d{2}$/.test(playbackScenarioEndDate.trim()) &&
+    playbackScenarioEndDate.trim() >= playbackScenarioStartDate.trim()
 
   // Matrix controller hook - handles all matrix orchestration
   const {
@@ -247,11 +256,36 @@ function AppContent() {
 
   const handleManualPublishExecutionTimetable = useCallback(async () => {
     setTimetableManualPublishBanner(null)
+    setPlaybackScenarioResult(null)
     setTimetableManualPublishLoading(true)
     try {
       let appliedDoc = null
       let bannerText = ''
-      if (timetableMode === 'historical') {
+      if (timetableMode === 'playback_multi') {
+        const start = playbackScenarioStartDate.trim()
+        const end = playbackScenarioEndDate.trim()
+        if (
+          !/^\d{4}-\d{2}-\d{2}$/.test(start) ||
+          !/^\d{4}-\d{2}-\d{2}$/.test(end) ||
+          end < start
+        ) {
+          throw new Error('Multi-day Playback requires a valid start/end date range (YYYY-MM-DD).')
+        }
+        const res = await matrixApi.buildPlaybackScenario({
+          startDate: start,
+          endDate: end,
+          includeWeekends: false,
+          streamFilters,
+        })
+        setPlaybackScenarioResult(res)
+        appliedDoc = await matrixApi.previewExecutionTimetable({
+          tradingDate: start,
+          mode: 'historical',
+          streamFilters,
+        })
+        const count = Number.isFinite(Number(res?.timetable_count)) ? Number(res.timetable_count) : '-'
+        bannerText = `Built multi-day Playback scenario ${res?.scenario_id || ''} for ${start} -> ${end}. Days: ${count}. Pointer: ${res?.config_pointer_path || '-'}`
+      } else if (timetableMode === 'historical') {
         const d = timetableGenerateDate.trim()
         if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) {
           throw new Error('Historical mode requires a valid session date (YYYY-MM-DD).')
@@ -316,7 +350,33 @@ function AppContent() {
     } finally {
       setTimetableManualPublishLoading(false)
     }
-  }, [streamFilters, workerApplyExecutionTimetableFromApi, timetableGenerateDate, timetableMode])
+  }, [
+    streamFilters,
+    workerApplyExecutionTimetableFromApi,
+    timetableGenerateDate,
+    timetableMode,
+    playbackScenarioStartDate,
+    playbackScenarioEndDate,
+  ])
+
+  const handleClearPlaybackScenario = useCallback(async () => {
+    setPlaybackScenarioClearing(true)
+    try {
+      const res = await matrixApi.clearPlaybackScenario()
+      setPlaybackScenarioResult(null)
+      setTimetableManualPublishBanner({
+        type: 'ok',
+        text: `Cleared multi-day Playback scenario pointer: ${res?.config_pointer_path || 'configs/robot/playback_scenario_current.json'}. Restart NinjaTrader to restore normal playback if it already loaded a scenario.`
+      })
+    } catch (err) {
+      setTimetableManualPublishBanner({
+        type: 'err',
+        text: err?.message || 'Failed to clear multi-day Playback scenario pointer.'
+      })
+    } finally {
+      setPlaybackScenarioClearing(false)
+    }
+  }, [])
 
   /** Timetable tab: rows come only from timetable API payloads (live current or historical preview). */
   const timetableRowsForDisplay = useMemo(() => {
@@ -333,12 +393,25 @@ function AppContent() {
     }))
   }, [workerExecutionTimetable])
   const displayedTradingDay = useMemo(() => {
+    if (
+      timetableMode === 'playback_multi' &&
+      /^\d{4}-\d{2}-\d{2}$/.test(playbackScenarioStartDate.trim())
+    ) {
+      const parsed = parseYYYYMMDD(playbackScenarioStartDate.trim())
+      if (parsed) return applyCmeWeekendTradingDay(parsed)
+    }
     if (timetableMode === 'historical' && hasValidHistoricalDate) {
       const parsed = parseYYYYMMDD(timetableGenerateDate.trim())
       if (parsed) return applyCmeWeekendTradingDay(parsed)
     }
     return currentTradingDay
-  }, [currentTradingDay, hasValidHistoricalDate, timetableGenerateDate, timetableMode])
+  }, [
+    currentTradingDay,
+    hasValidHistoricalDate,
+    playbackScenarioStartDate,
+    timetableGenerateDate,
+    timetableMode,
+  ])
   
   // Save auto-update preference to localStorage
   useEffect(() => {
@@ -366,6 +439,10 @@ function AppContent() {
   useEffect(() => {
     localStorage.setItem('matrix_timetable_mode', timetableMode)
   }, [timetableMode])
+
+  useEffect(() => {
+    setPlaybackScenarioResult(null)
+  }, [timetableMode, playbackScenarioStartDate, playbackScenarioEndDate])
   
   // Stats visibility per stream
   // Full-dataset stats from backend (calculated from all rows, not just loaded subset)
@@ -2952,12 +3029,29 @@ function AppContent() {
             mode: 'historical',
             streamFilters,
           })
+        } else if (
+          timetableMode === 'playback_multi' &&
+          hasValidPlaybackScenarioRange
+        ) {
+          tt = await matrixApi.previewExecutionTimetable({
+            tradingDate: playbackScenarioStartDate.trim(),
+            mode: 'historical',
+            streamFilters,
+          })
         } else if (timetableMode === 'historical') {
           workerApplyExecutionTimetableFromApi(null)
           setTimetableSourceMeta(null)
           setTimetableApiStatus({
             loading: false,
             error: 'Historical mode requires a valid session date',
+          })
+          return
+        } else if (timetableMode === 'playback_multi') {
+          workerApplyExecutionTimetableFromApi(null)
+          setTimetableSourceMeta(null)
+          setTimetableApiStatus({
+            loading: false,
+            error: 'Multi-day Playback requires a valid start/end date range',
           })
           return
         } else {
@@ -3002,6 +3096,9 @@ function AppContent() {
     workerApplyExecutionTimetableFromApi,
     timetableMode,
     timetableGenerateDate,
+    playbackScenarioStartDate,
+    playbackScenarioEndDate,
+    hasValidPlaybackScenarioRange,
     streamFilters,
   ])
 
@@ -3315,6 +3412,17 @@ function AppContent() {
                       >
                         Historical
                       </button>
+                      <button
+                        type="button"
+                        onClick={() => setTimetableMode('playback_multi')}
+                        className={`px-3 py-1.5 font-medium border-l border-gray-600 ${
+                          timetableMode === 'playback_multi'
+                            ? 'bg-sky-800 text-white'
+                            : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
+                        }`}
+                      >
+                        Multi-Day Playback
+                      </button>
                     </div>
                     <button
                       onClick={() => setShowBlockedTimetableRows(!showBlockedTimetableRows)}
@@ -3323,63 +3431,114 @@ function AppContent() {
                     >
                       {showBlockedTimetableRows ? '✓' : ''} Blocked
                     </button>
-                    <label
-                      className={`flex items-center gap-2 text-xs ${
-                        timetableMode === 'live' ? 'text-gray-500' : 'text-gray-400'
-                      }`}
-                    >
-                      <span>Session date</span>
-                      <input
-                        type="date"
-                        value={timetableGenerateDate}
-                        onChange={(e) => setTimetableGenerateDate(e.target.value)}
-                        disabled={timetableMode === 'live'}
-                        className={`bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm text-gray-200 ${
-                          timetableMode === 'live' ? 'opacity-45 cursor-not-allowed' : ''
+                    {timetableMode === 'playback_multi' ? (
+                      <>
+                        <label className="flex items-center gap-2 text-xs text-gray-400">
+                          <span>Start</span>
+                          <input
+                            type="date"
+                            value={playbackScenarioStartDate}
+                            onChange={(e) => setPlaybackScenarioStartDate(e.target.value)}
+                            className="bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm text-gray-200"
+                            title="First session date in the multi-day Playback scenario."
+                          />
+                        </label>
+                        <label className="flex items-center gap-2 text-xs text-gray-400">
+                          <span>End</span>
+                          <input
+                            type="date"
+                            value={playbackScenarioEndDate}
+                            onChange={(e) => setPlaybackScenarioEndDate(e.target.value)}
+                            className="bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm text-gray-200"
+                            title="Last session date in the multi-day Playback scenario."
+                          />
+                        </label>
+                      </>
+                    ) : (
+                      <label
+                        className={`flex items-center gap-2 text-xs ${
+                          timetableMode === 'live' ? 'text-gray-500' : 'text-gray-400'
                         }`}
-                        title={
-                          timetableMode === 'live'
-                            ? 'Disabled in Live mode - publish uses effective_session_trading_date from GET /api/timetable/current.'
-                            : 'Required for Historical mode - publish writes timetable_replay_current.json for playback.'
-                        }
-                      />
-                    </label>
+                      >
+                        <span>Session date</span>
+                        <input
+                          type="date"
+                          value={timetableGenerateDate}
+                          onChange={(e) => setTimetableGenerateDate(e.target.value)}
+                          disabled={timetableMode === 'live'}
+                          className={`bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm text-gray-200 ${
+                            timetableMode === 'live' ? 'opacity-45 cursor-not-allowed' : ''
+                          }`}
+                          title={
+                            timetableMode === 'live'
+                              ? 'Disabled in Live mode - publish uses effective_session_trading_date from GET /api/timetable/current.'
+                              : 'Required for Historical mode - publish writes timetable_replay_current.json for playback.'
+                          }
+                        />
+                      </label>
+                    )}
                     <button
                       type="button"
                       onClick={handleManualPublishExecutionTimetable}
                       disabled={
                         timetableManualPublishLoading ||
                         masterLoading ||
-                        (timetableMode === 'historical' && !hasValidHistoricalDate)
+                        (timetableMode === 'historical' && !hasValidHistoricalDate) ||
+                        (timetableMode === 'playback_multi' && !hasValidPlaybackScenarioRange)
                       }
                       className="px-4 py-2 rounded font-medium text-sm bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed"
                       title={
                         timetableMode === 'live'
                           ? 'POST /api/timetable/execution - publishes the live timetable.'
-                          : 'POST /api/timetable/execution - publishes timetable_replay_current.json for playback.'
+                          : timetableMode === 'historical'
+                            ? 'POST /api/timetable/execution - publishes timetable_replay_current.json for playback.'
+                            : 'POST /api/timetable/playback-scenario - builds a multi-day Playback manifest without publishing live authority.'
                       }
                     >
                       {timetableManualPublishLoading
                         ? timetableMode === 'live'
                           ? 'Publishing...'
-                          : 'Publishing replay...'
+                          : timetableMode === 'historical'
+                            ? 'Publishing replay...'
+                            : 'Building scenario...'
                         : timetableMode === 'live'
                           ? 'Publish timetable'
-                          : 'Publish replay'}
+                          : timetableMode === 'historical'
+                            ? 'Publish replay'
+                            : 'Build scenario'}
                     </button>
+                    {timetableMode === 'playback_multi' ? (
+                      <button
+                        type="button"
+                        onClick={handleClearPlaybackScenario}
+                        disabled={playbackScenarioClearing}
+                        className="px-4 py-2 rounded font-medium text-sm bg-gray-800 hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                        title="DELETE /api/timetable/playback-scenario/current - clears the robot startup pointer without deleting scenario artifacts."
+                      >
+                        {playbackScenarioClearing ? 'Clearing...' : 'Clear scenario'}
+                      </button>
+                    ) : null}
                   </div>
                   <div
                     className="mt-1 px-3 py-2 rounded border border-dashed border-gray-600 bg-gray-950/90 font-mono text-[11px] sm:text-xs text-gray-300 leading-snug"
-                    title="Mode summary: Live publishes timetable_current.json; Historical publishes timetable_replay_current.json for playback from the matrix row as-of the chosen session date."
+                    title="Mode summary: Live publishes timetable_current.json; Historical publishes timetable_replay_current.json; Multi-Day Playback builds a run-scoped scenario manifest."
                   >
                     <div>
                       <span className="text-gray-500">Mode:</span>{' '}
                       <span
                         className={
-                          timetableMode === 'live' ? 'text-emerald-400 font-semibold' : 'text-amber-400 font-semibold'
+                          timetableMode === 'live'
+                            ? 'text-emerald-400 font-semibold'
+                            : timetableMode === 'historical'
+                              ? 'text-amber-400 font-semibold'
+                              : 'text-sky-400 font-semibold'
                         }
                       >
-                        {timetableMode === 'live' ? 'LIVE' : 'HISTORICAL'}
+                        {timetableMode === 'live'
+                          ? 'LIVE'
+                          : timetableMode === 'historical'
+                            ? 'HISTORICAL'
+                            : 'MULTI-DAY PLAYBACK'}
                       </span>
                     </div>
                     <div>
@@ -3390,21 +3549,41 @@ function AppContent() {
                             timetableSourceMeta?.session_trading_date ||
                             timetableSourceMeta?.trading_date ||
                             '-'
-                          : hasValidHistoricalDate
-                            ? timetableGenerateDate.trim()
-                            : '-'}
+                          : timetableMode === 'historical'
+                            ? hasValidHistoricalDate
+                              ? timetableGenerateDate.trim()
+                              : '-'
+                            : hasValidPlaybackScenarioRange
+                              ? `${playbackScenarioStartDate.trim()} -> ${playbackScenarioEndDate.trim()}`
+                              : '-'}
                       </span>
                     </div>
                     <div>
                       <span className="text-gray-500">Matrix row source:</span>{' '}
                       <span
                         className={
-                          timetableMode === 'live' ? 'text-emerald-400 font-semibold' : 'text-amber-400 font-semibold'
+                          timetableMode === 'live'
+                            ? 'text-emerald-400 font-semibold'
+                            : timetableMode === 'historical'
+                              ? 'text-amber-400 font-semibold'
+                              : 'text-sky-400 font-semibold'
                         }
                       >
-                        {timetableMode === 'live' ? 'LATEST' : 'AS-OF'}
+                        {timetableMode === 'live'
+                          ? 'LATEST'
+                          : timetableMode === 'historical'
+                            ? 'AS-OF'
+                            : 'AS-OF EACH DAY'}
                       </span>
                     </div>
+                    {playbackScenarioResult?.manifest_path ? (
+                      <div className="break-all">
+                        <span className="text-gray-500">Scenario:</span>{' '}
+                        <span className="text-sky-300">
+                          {playbackScenarioResult.config_pointer_path || playbackScenarioResult.manifest_path}
+                        </span>
+                      </div>
+                    ) : null}
                   </div>
                 </div>
                 <div className="text-center">
@@ -3474,7 +3653,11 @@ function AppContent() {
                 <code className="text-gray-400">POST /api/timetable/execution</code>;{' '}
                 <span className="text-amber-400/90">Historical</span> mode publishes{' '}
                 <code className="text-gray-400">timetable_replay_current.json</code> for playback and then refreshes the grid with{' '}
-                <code className="text-gray-400">POST /api/timetable/preview</code>, so it does not overwrite the live timetable.
+                <code className="text-gray-400">POST /api/timetable/preview</code>.{' '}
+                <span className="text-sky-400/90">Multi-Day Playback</span> mode builds a run-scoped{' '}
+                <code className="text-gray-400">playback_scenario.json</code> with{' '}
+                <code className="text-gray-400">POST /api/timetable/playback-scenario</code>, writes{' '}
+                <code className="text-gray-400">configs/robot/playback_scenario_current.json</code>, and does not overwrite live authority.
               </div>
               {timetableManualPublishBanner ? (
                 <div
@@ -3485,6 +3668,29 @@ function AppContent() {
                   }`}
                 >
                   {timetableManualPublishBanner.text}
+                </div>
+              ) : null}
+              {playbackScenarioResult?.manifest_path ? (
+                <div className="mb-4 px-4 py-3 rounded border border-sky-800 bg-sky-950/40 text-sm text-sky-100">
+                  <div className="font-semibold text-sky-300">Multi-day Playback scenario built</div>
+                  <div className="mt-1 font-mono text-xs break-all">
+                    Config pointer: {playbackScenarioResult.config_pointer_path || '-'}
+                  </div>
+                  <div className="mt-1 font-mono text-xs break-all">
+                    Manifest: {playbackScenarioResult.manifest_path}
+                  </div>
+                  <div className="mt-1 font-mono text-xs break-all">
+                    Manifest SHA-256: {playbackScenarioResult.manifest_sha256 || '-'}
+                  </div>
+                  <div className="mt-1 font-mono text-xs break-all">
+                    Run ID: {playbackScenarioResult.run_id || '-'}
+                  </div>
+                  <div className="mt-1 font-mono text-xs break-all">
+                    Env fallback: {playbackScenarioResult.powershell_session_command}
+                  </div>
+                  <div className="mt-1 text-xs text-sky-200/80">
+                    Restart NinjaTrader so the robot reads the scenario pointer. Use Clear scenario to restore normal playback.
+                  </div>
                 </div>
               ) : null}
               

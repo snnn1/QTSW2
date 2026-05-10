@@ -41,6 +41,9 @@ public sealed partial class RobotEngine
     private readonly Dictionary<string, DateTimeOffset> _lastBarDateMismatchDetailLogUtc =
         new Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase);
     private const double BarDateMismatchDetailLogIntervalMinutes = 30.0;
+    private readonly Dictionary<string, DateTimeOffset> _lastBarNoStreamsLogUtc =
+        new Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase);
+    private const double BarNoStreamsLogIntervalMinutes = 30.0;
 
     /// <summary>
     /// Mark BarsRequest as pending for an instrument.
@@ -147,6 +150,24 @@ public sealed partial class RobotEngine
             try
             {
             if (_spec is null || _time is null) return;
+
+        if (IsPlaybackScenarioPreStartEvent(barUtc, out var preStartDate, out var firstScenarioDate))
+        {
+            if (ShouldLogBarDateMismatchDetail(instrument, "PLAYBACK_SCENARIO_PRESTART_BAR", utcNow))
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: firstScenarioDate, eventType: "PLAYBACK_SCENARIO_PRESTART_BAR_IGNORED", state: "ENGINE",
+                    new
+                    {
+                        instrument,
+                        event_session_date = preStartDate,
+                        first_scenario_date = firstScenarioDate,
+                        bar_timestamp_utc = barUtc.ToString("o"),
+                        current_time_utc = utcNow.ToString("o"),
+                        note = "Pre-scenario historical bar ignored during explicit multi-day playback startup."
+                    }));
+            }
+            return;
+        }
 
         // CRITICAL: Reject future bars and validate bar timing
         // FIX #2: For OnBarClose sources, bars are already closed, so we don't need strict age requirements
@@ -460,14 +481,23 @@ public sealed partial class RobotEngine
         // Only process bars if streams exist (they should exist after EnsureStreamsCreated)
         if (_streams.Count == 0)
         {
-            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "BAR_RECEIVED_NO_STREAMS", state: "ENGINE",
-                new
-                {
-                    instrument = instrument,
-                    execution_instrument_full_name = instrument, // Full contract name from NinjaTrader (e.g., "MES 03-26")
-                    bar_timestamp_utc = barUtc.ToString("o"),
-                    note = "Bar received but streams not yet created - this should not happen"
-                }));
+            var anchorIdle = IsExecutionAnchorIdleForCurrentTimetable(instrument);
+            if (ShouldLogNoStreamsBar(instrument, utcNow))
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+                    eventType: anchorIdle ? "BAR_RECEIVED_NO_STREAMS_ANCHOR_IDLE" : "BAR_RECEIVED_NO_STREAMS",
+                    state: "ENGINE",
+                    new
+                    {
+                        instrument = instrument,
+                        execution_instrument_full_name = instrument, // Full contract name from NinjaTrader (e.g., "MES 03-26")
+                        bar_timestamp_utc = barUtc.ToString("o"),
+                        anchor_idle = anchorIdle,
+                        note = anchorIdle
+                            ? "Bar received by a NinjaTrader strategy instance whose execution anchor has no enabled rows in the current timetable."
+                            : "Bar received but streams not yet created - this should not happen"
+                    }));
+            }
             return;
         }
 
@@ -552,6 +582,52 @@ public sealed partial class RobotEngine
                 }
             }
         } // Close lock (_engineLock)
+    }
+
+    private bool ShouldLogNoStreamsBar(string instrument, DateTimeOffset utcNow)
+    {
+        var key = $"{instrument}:{TradingDateString}";
+        if (_lastBarNoStreamsLogUtc.TryGetValue(key, out var last) &&
+            (utcNow - last).TotalMinutes < BarNoStreamsLogIntervalMinutes)
+        {
+            return false;
+        }
+
+        _lastBarNoStreamsLogUtc[key] = utcNow;
+        return true;
+    }
+
+    private bool IsExecutionAnchorIdleForCurrentTimetable(string barInstrument)
+    {
+        if (_lastTimetable?.streams == null || string.IsNullOrWhiteSpace(_executionInstrument))
+            return false;
+
+        var anchorSource = !string.IsNullOrWhiteSpace(_masterInstrumentName)
+            ? _masterInstrumentName
+            : _executionInstrument;
+        var anchorCanonical = GetCanonicalInstrument(anchorSource ?? "");
+        var barCanonical = GetCanonicalInstrument(barInstrument);
+        if (string.IsNullOrWhiteSpace(anchorCanonical) ||
+            !string.Equals(anchorCanonical, barCanonical, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        foreach (var stream in _lastTimetable.streams)
+        {
+            if (!stream.enabled)
+                continue;
+
+            var timetableInstrument = stream.instrument;
+            if (string.IsNullOrWhiteSpace(timetableInstrument))
+                timetableInstrument = TimetableStream.DeriveInstrumentFromStreamId(stream.stream ?? "");
+
+            var timetableCanonical = GetCanonicalInstrument(timetableInstrument ?? "");
+            if (string.Equals(timetableCanonical, anchorCanonical, StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+
+        return true;
     }
 
     /// <summary>

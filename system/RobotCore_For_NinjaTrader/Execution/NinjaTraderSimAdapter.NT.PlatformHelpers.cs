@@ -794,8 +794,13 @@ public sealed partial class NinjaTraderSimAdapter
 
         if (System.Threading.Volatile.Read(ref _sessionMismatchBlocked) != 0)
         {
-            RecordSessionIdentityBlockAttempt();
-            return FlattenResult.FailureResult("SESSION_IDENTITY_LATCHED", utcNow);
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "SESSION_IDENTITY_FLATTEN_ALLOWED_WHILE_LATCHED", state: "ENGINE",
+                new
+                {
+                    instrument,
+                    submit_path = "emergency_flatten_direct",
+                    note = "Session identity latch remains armed for opening submits, but emergency flatten is exposure-reducing."
+                }));
         }
 
         if (!TryExecutionSafetyFlattenGuard(instrument, null, utcNow, "EMERGENCY_FLATTEN_DIRECT", null, out _))

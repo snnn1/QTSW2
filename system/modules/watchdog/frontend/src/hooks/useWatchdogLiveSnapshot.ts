@@ -6,6 +6,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { fetchWatchdogStatus, fetchStreamStates, fetchSlotLifecycle, type SlotLifecycleSlot } from '../services/watchdogApi'
 import { usePollingInterval } from './usePollingInterval'
 import type {
+  CarriedActiveLifecycle,
   ExecutionExpectationGap,
   FlattenLookupMetrics,
   OutOfTimetableActiveStream,
@@ -18,6 +19,7 @@ const POLL_MS = 5000
 export function useWatchdogLiveSnapshot(runRoot?: string | null) {
   const [status, setStatus] = useState<WatchdogStatus | null>(null)
   const [streams, setStreams] = useState<StreamState[]>([])
+  const [carriedActiveLifecycles, setCarriedActiveLifecycles] = useState<CarriedActiveLifecycle[]>([])
   const [timetableUnavailable, setTimetableUnavailable] = useState(false)
   const [outOfTimetableActiveStreams, setOutOfTimetableActiveStreams] = useState<OutOfTimetableActiveStream[]>([])
   const [executionExpectationGaps, setExecutionExpectationGaps] = useState<ExecutionExpectationGap[]>([])
@@ -50,6 +52,7 @@ export function useWatchdogLiveSnapshot(runRoot?: string | null) {
 
     if (ss.data) {
       setStreams(ss.data.streams ?? [])
+      setCarriedActiveLifecycles(ss.data.carried_active_lifecycles ?? [])
       setOutOfTimetableActiveStreams(ss.data.out_of_timetable_active_streams ?? [])
       setExecutionExpectationGaps(ss.data.execution_expectation_gaps ?? [])
       setFlattenLookupMetrics(ss.data.flatten_lookup_metrics ?? null)
@@ -58,6 +61,7 @@ export function useWatchdogLiveSnapshot(runRoot?: string | null) {
       setStreamsError(null)
     } else {
       setStreamsError(ss.error ?? 'Stream states request failed')
+      setCarriedActiveLifecycles([])
       setOutOfTimetableActiveStreams([])
       setExecutionExpectationGaps([])
       setFlattenLookupMetrics(null)
@@ -80,6 +84,7 @@ export function useWatchdogLiveSnapshot(runRoot?: string | null) {
   useEffect(() => {
     setStatus(null)
     setStreams([])
+    setCarriedActiveLifecycles([])
     setTimetableUnavailable(false)
     setOutOfTimetableActiveStreams([])
     setExecutionExpectationGaps([])
@@ -96,6 +101,7 @@ export function useWatchdogLiveSnapshot(runRoot?: string | null) {
   return {
     status,
     streams,
+    carriedActiveLifecycles,
     outOfTimetableActiveStreams,
     executionExpectationGaps,
     flattenLookupMetrics,

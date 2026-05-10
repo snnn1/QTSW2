@@ -1356,6 +1356,27 @@ public sealed partial class StreamStateMachine
     {
         EnsureCommittedForPostLockExcursion(utcNow);
 
+        if (utcNow < SlotTimeUtc)
+        {
+            var shouldLog = !_lastRangeLockedPreSlotWaitLogUtc.HasValue ||
+                            (utcNow - _lastRangeLockedPreSlotWaitLogUtc.Value).TotalMinutes >= 30.0;
+            if (shouldLog)
+            {
+                _lastRangeLockedPreSlotWaitLogUtc = utcNow;
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "RANGE_LOCKED_PRE_SLOT_WAIT", State.ToString(),
+                    new
+                    {
+                        stream_id = Stream,
+                        trading_date = TradingDate,
+                        now_utc = utcNow.ToString("o"),
+                        slot_time_utc = SlotTimeUtc.ToString("o"),
+                        note = "RANGE_LOCKED state exists before slot time, usually from playback rewind/restart restoration. Side effects are deferred until slot time."
+                    }));
+            }
+            return;
+        }
+
         // Phase B: Execute pending recovery action (invariant-based model)
         if (_entryOrderRecoveryState.IsPending && _executionAdapter != null)
         {
@@ -1380,7 +1401,7 @@ public sealed partial class StreamStateMachine
         // - Entry not detected
         // - Before market close
         // - Range and breakout levels are available
-        if (!_stopBracketsSubmittedAtLock && !_entryDetected && utcNow < MarketCloseUtc &&
+        if (!_stopBracketsSubmittedAtLock && !_entryDetected && utcNow >= SlotTimeUtc && utcNow < MarketCloseUtc &&
             RangeHigh.HasValue && RangeLow.HasValue &&
             _brkLongRounded.HasValue && _brkShortRounded.HasValue)
         {

@@ -414,10 +414,57 @@ public sealed partial class RobotEngine
     /// </summary>
     public void LogEngineEvent(DateTimeOffset utcNow, string eventType, object? data = null)
     {
+        if (string.Equals(eventType, "REALTIME_STATE_REACHED", StringComparison.OrdinalIgnoreCase) &&
+            ShouldAllowBrokerSubmissionFromRealtimeEvent(data))
+        {
+            MarkBrokerOrderSubmissionAllowed(utcNow, "REALTIME_STATE_REACHED");
+        }
+
         lock (_engineLock)
         {
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: eventType, state: "ENGINE", data));
         }
+    }
+
+    private static bool ShouldAllowBrokerSubmissionFromRealtimeEvent(object? data)
+    {
+        if (TryGetBoolPayloadValue(data, "init_failed", out var initFailed) && initFailed)
+            return false;
+        if (TryGetBoolPayloadValue(data, "engine_ready", out var engineReady) && !engineReady)
+            return false;
+        return true;
+    }
+
+    private static bool TryGetBoolPayloadValue(object? data, string key, out bool value)
+    {
+        value = false;
+        if (data is IReadOnlyDictionary<string, object> readOnly &&
+            readOnly.TryGetValue(key, out var readOnlyRaw))
+        {
+            return TryConvertBool(readOnlyRaw, out value);
+        }
+        if (data is IDictionary<string, object> dictionary &&
+            dictionary.TryGetValue(key, out var raw))
+        {
+            return TryConvertBool(raw, out value);
+        }
+        return false;
+    }
+
+    private static bool TryConvertBool(object? raw, out bool value)
+    {
+        value = false;
+        if (raw is bool boolValue)
+        {
+            value = boolValue;
+            return true;
+        }
+        if (raw is string text && bool.TryParse(text, out var parsed))
+        {
+            value = parsed;
+            return true;
+        }
+        return false;
     }
 
     private bool _robotBuildSignatureEmitted;

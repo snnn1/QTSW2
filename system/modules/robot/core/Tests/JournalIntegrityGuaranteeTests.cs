@@ -33,6 +33,9 @@ public static class JournalIntegrityGuaranteeTests
             e = Case_PositionMismatch();
             if (e != null) return (false, e);
             JournalIntegrityGuarantee.ResetAttemptsForTests();
+            e = Case_HedgedNetFlatGrossOpen_IsCoherentNotPositionMismatch();
+            if (e != null) return (false, e);
+            JournalIntegrityGuarantee.ResetAttemptsForTests();
             e = Case_WorkingMismatch_NoIea();
             if (e != null) return (false, e);
             JournalIntegrityGuarantee.ResetAttemptsForTests();
@@ -197,6 +200,35 @@ public static class JournalIntegrityGuaranteeTests
         var r = JournalParityChecker.CheckJournalParity("ES", snap, tmp.Journal, reg, "ES", utc);
         if (r.Status != JournalParityStatus.POSITION_MISMATCH || r.UnexplainedPositionQty <= 0)
             return "broker qty with empty journal should be POSITION_MISMATCH";
+        return null;
+    }
+
+    private static string? Case_HedgedNetFlatGrossOpen_IsCoherentNotPositionMismatch()
+    {
+        var utc = DateTimeOffset.Parse("2099-01-10T12:00:00Z");
+        var td = "2099-01-10";
+        using var tmp = NewTempJournal();
+        WriteMinimalNonRecoveredOpenRow(tmp.ProjectRoot, td, "NG1", "long-1", "MNG", 2, "Long");
+        WriteMinimalNonRecoveredOpenRow(tmp.ProjectRoot, td, "NG2", "short-1", "MNG", 2, "Short");
+        var snap = new AccountSnapshot
+        {
+            Positions = new List<PositionSnapshot>(),
+            WorkingOrders = new List<WorkingOrderSnapshot>()
+        };
+        var reg = new TestRegistryView(false, 0);
+
+        var r = JournalParityChecker.CheckJournalParity("MNG", snap, tmp.Journal, reg, "MNG", utc);
+        if (r.Status != JournalParityStatus.HEDGED_NET_FLAT_GROSS_OPEN)
+            return $"hedged_net_flat: expected HEDGED_NET_FLAT_GROSS_OPEN, got {r.Status}";
+        if (!r.IsOkOrPendingAlignment || r.UnexplainedPositionQty != 0 || r.JournalOpenQty != 4)
+            return "hedged_net_flat: expected coherent noncritical gross-open parity result";
+
+        var res = JournalIntegrityGuarantee.EnsureJournalIntegrity("MNG", snap, tmp.Journal, reg,
+            "MNG", "MNG", Array.Empty<string>(), null, null, utc,
+            (_, _, _) => { }, allowReconstruction: true, tradingDateForJournal: td);
+        if (res.Outcome != JournalIntegrityPhaseOutcome.Ok ||
+            res.InitialCheck.Status != JournalParityStatus.HEDGED_NET_FLAT_GROSS_OPEN)
+            return "hedged_net_flat: integrity should not repair or escalate coherent gross-open/net-flat state";
         return null;
     }
 

@@ -30,6 +30,12 @@ public static class RobotRunArtifactPaths
     public static string StateExecutionJournals(string persistenceBase)
         => Path.Combine(persistenceBase ?? "", "state", "execution_journals");
 
+    public static string StateDir(string persistenceBase)
+        => Path.Combine(persistenceBase ?? "", "state");
+
+    public static string RuntimeClockFile(string persistenceBase)
+        => Path.Combine(StateDir(persistenceBase), "runtime_clock.json");
+
     /// <summary>Directory for canonical execution event JSONL for one trading date: .../events/execution_events/{td}/</summary>
     public static string EventsExecutionEventsTradingDate(string persistenceBase, string tradingDate)
     {

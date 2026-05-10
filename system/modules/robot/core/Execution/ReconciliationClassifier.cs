@@ -46,7 +46,8 @@ public sealed class ReconciliationClassifier
             {
                 var instKey = pos.Instrument?.Trim() ?? "";
                 if (string.IsNullOrEmpty(instKey)) continue;
-                brokerQtyByInstrument[instKey] = pos.Quantity;
+                brokerQtyByInstrument[instKey] =
+                    brokerQtyByInstrument.TryGetValue(instKey, out var existing) ? existing + pos.Quantity : pos.Quantity;
             }
         }
 

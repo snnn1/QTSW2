@@ -229,6 +229,60 @@ def test_execution_mode_as_of_session_ignores_future_trade_date_row():
     assert by_s["ES1"].get("block_reason") is None
 
 
+def test_execution_mode_same_day_time_change_does_not_replace_actual_slot():
+    """Historical/replay for the row's own date must use Time; Time Change is next-date intent."""
+    eng = TimetableEngine(project_root=str(QTSW2_ROOT))
+    d_session = pd.Timestamp("2026-04-27")
+    rows = []
+    for sid in eng.streams:
+        sess = "S1" if sid.endswith("1") else "S2"
+        rows.append(
+            {
+                "Stream": sid,
+                "trade_date": d_session,
+                "Session": sess,
+                "Time": "07:30" if sid == "YM1" else matrix_time_valid_for_execution(eng, sid),
+                "Time Change": "09:00" if sid == "YM1" else "",
+                "final_allowed": True,
+                "filter_reasons": "",
+            }
+        )
+    df = pd.DataFrame(rows)
+    streams = eng._build_streams_execution_mode(
+        df, date_cls(2026, 4, 27), "2026-04-27", {}, matrix_as_of_session=True
+    )
+    by_s = {x["stream"]: x for x in streams}
+    assert by_s["YM1"]["enabled"] is True, by_s["YM1"]
+    assert by_s["YM1"]["slot_time"] == "07:30", by_s["YM1"]
+
+
+def test_execution_mode_prior_day_time_change_applies_to_next_session():
+    """A prior row's Time Change becomes the slot for a later historical/replay session."""
+    eng = TimetableEngine(project_root=str(QTSW2_ROOT))
+    d_prior = pd.Timestamp("2026-04-27")
+    rows = []
+    for sid in eng.streams:
+        sess = "S1" if sid.endswith("1") else "S2"
+        rows.append(
+            {
+                "Stream": sid,
+                "trade_date": d_prior,
+                "Session": sess,
+                "Time": "07:30" if sid == "YM1" else matrix_time_valid_for_execution(eng, sid),
+                "Time Change": "09:00" if sid == "YM1" else "",
+                "final_allowed": True,
+                "filter_reasons": "",
+            }
+        )
+    df = pd.DataFrame(rows)
+    streams = eng._build_streams_execution_mode(
+        df, date_cls(2026, 4, 28), "2026-04-28", {}, matrix_as_of_session=True
+    )
+    by_s = {x["stream"]: x for x in streams}
+    assert by_s["YM1"]["enabled"] is True, by_s["YM1"]
+    assert by_s["YM1"]["slot_time"] == "09:00", by_s["YM1"]
+
+
 def test_execution_mode_as_of_no_prior_row_uses_existing_disable_path():
     """As-of with no row on/before session day → no slot / matrix gate via existing paths."""
     eng = TimetableEngine(project_root=str(QTSW2_ROOT))

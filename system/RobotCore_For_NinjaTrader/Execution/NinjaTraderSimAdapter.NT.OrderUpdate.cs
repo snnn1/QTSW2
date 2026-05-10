@@ -1219,7 +1219,14 @@ public sealed partial class NinjaTraderSimAdapter
                 else if (time is DateTimeOffset dto) ticks = dto.UtcTicks;
                 else try { ticks = ((dynamic)time).Ticks; } catch { }
             }
-            var qty = (int)(execution.Quantity ?? 0);
+            var qty = 0;
+            try
+            {
+                object? rawQty = execution.Quantity;
+                if (rawQty != null)
+                    qty = Convert.ToInt32(rawQty);
+            }
+            catch { }
             var mpos = (execution.MarketPosition?.ToString() ?? "");
             return !string.IsNullOrEmpty(execId) ? execId : $"{orderId}|{ticks}|{qty}|{mpos}|{orderId}";
         }

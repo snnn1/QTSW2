@@ -27,13 +27,14 @@ import os
 import re
 import sys
 import json
+import hashlib
 import subprocess
 import asyncio
 import threading
 import time
 from pathlib import Path
 from typing import Optional, Dict, List, Any, Tuple, Literal
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from contextlib import asynccontextmanager
 import uuid
 
@@ -922,6 +923,17 @@ class TimetablePreviewRequest(BaseModel):
     stream_filters: Optional[Dict[str, Any]] = None
 
 
+class PlaybackScenarioBuildRequest(BaseModel):
+    """Build a run-scoped multi-day Playback scenario manifest from the in-memory matrix."""
+
+    start_date: str = Field(..., min_length=10, description="First session calendar date YYYY-MM-DD")
+    end_date: str = Field(..., min_length=10, description="Last session calendar date YYYY-MM-DD")
+    include_weekends: bool = False
+    run_id: Optional[str] = None
+    scenario_id: Optional[str] = None
+    stream_filters: Optional[Dict[str, Any]] = None
+
+
 class ContentHashRequest(BaseModel):
     """Canonical timetable hash (sorted JSON) for Matrix UI publish debouncing."""
 
@@ -1405,6 +1417,280 @@ async def timetable_preview(request: TimetablePreviewRequest):
         "timetable_hash": out.timetable_hash,
         "streams": out.streams,
     }
+
+
+def _parse_scenario_day(raw: str, field_name: str) -> date:
+    value = (raw or "").strip()
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", value):
+        raise ValueError(f"{field_name} must be YYYY-MM-DD")
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be a valid calendar date") from exc
+
+
+def _iter_playback_scenario_days(start: date, end: date, include_weekends: bool) -> List[date]:
+    if end < start:
+        raise ValueError("end_date must be >= start_date")
+    days: List[date] = []
+    cur = start
+    while cur <= end:
+        if include_weekends or cur.weekday() < 5:
+            days.append(cur)
+        cur += timedelta(days=1)
+    if not days:
+        raise ValueError("date range produced no playback scenario days")
+    if len(days) > 15:
+        raise ValueError("playback scenario range is capped at 15 selected days per build")
+    return days
+
+
+def _safe_playback_scenario_id(raw: Optional[str], fallback: str) -> str:
+    value = (raw or "").strip() or fallback
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+    value = value.strip("._-")
+    if not value:
+        return fallback
+    return value[:96]
+
+
+def _write_pretty_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=False, default=str) + "\n", encoding="utf-8")
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _hash_matrix_dataframe(matrix_df: pd.DataFrame) -> str:
+    try:
+        stable_df = matrix_df.sort_index(axis=1)
+        payload = stable_df.to_json(orient="split", date_format="iso", default_handler=str)
+    except Exception:
+        payload = matrix_df.astype(str).to_json(orient="split")
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+@app.post("/api/timetable/playback-scenario")
+async def build_playback_scenario(request: PlaybackScenarioBuildRequest):
+    """
+    Build a multi-day NinjaTrader Playback scenario bundle.
+
+    This is intentionally separate from /api/timetable/execution: it writes only
+    run-scoped scenario files plus configs/robot/playback_scenario_current.json
+    and does not mutate live or replay-current timetable authority. NinjaTrader
+    must be restarted so the robot reads the config pointer at startup.
+    """
+    try:
+        start = _parse_scenario_day(request.start_date, "start_date")
+        end = _parse_scenario_day(request.end_date, "end_date")
+        days = _iter_playback_scenario_days(start, end, request.include_weekends)
+
+        sys.path.insert(0, str(_SYSTEM_ROOT))
+        from modules.matrix.file_manager import (
+            get_current_master_matrix_df,
+            get_current_master_matrix_meta,
+        )
+        from modules.timetable.timetable_engine import (
+            TimetableEngine,
+            TimetableExecutionPreviewResult,
+        )
+
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        default_run_id = f"playback_scenario_{start:%Y%m%d}_{end:%Y%m%d}_{stamp}"
+        run_id = _safe_playback_scenario_id(request.run_id, default_run_id)
+        scenario_id = _safe_playback_scenario_id(request.scenario_id, run_id)
+        scenario_dir = QTSW2_ROOT / "runs" / run_id / "playback_scenario"
+        timetable_dir = scenario_dir / "timetables"
+
+        def _build_sync():
+            matrix_df = get_current_master_matrix_df()
+            if matrix_df is None:
+                raise RuntimeError(
+                    "TIMETABLE_NO_IN_MEMORY_MATRIX: No in-memory master matrix available. "
+                    "Build or reload the matrix in this dashboard process before building a Playback scenario."
+                )
+            if matrix_df.empty:
+                raise ValueError("Master matrix is empty in memory - build or reload the matrix first.")
+
+            matrix_meta = get_current_master_matrix_meta()
+            matrix_hash = _hash_matrix_dataframe(matrix_df)
+            matrix_snapshot = (
+                matrix_meta.get("source_path")
+                or matrix_meta.get("snapshot_id")
+                or matrix_meta.get("source_name")
+                or "in_memory_master_matrix"
+            )
+            engine = TimetableEngine(
+                master_matrix_dir=str(QTSW2_ROOT / "data" / "master_matrix"),
+                analyzer_runs_dir=str(QTSW2_ROOT / "data" / "analyzed"),
+                project_root=str(QTSW2_ROOT),
+            )
+
+            timetables: Dict[str, Dict[str, str]] = {}
+            generated_days: List[str] = []
+            for day in days:
+                day_str = day.isoformat()
+                preview = engine.write_execution_timetable_from_master_matrix(
+                    matrix_df,
+                    trade_date=day_str,
+                    execution_mode=True,
+                    preview_only=True,
+                    stream_filters=request.stream_filters,
+                    mode="historical",
+                    publish_context={
+                        "source": "matrix_ui_playback_scenario",
+                        "scenario_id": scenario_id,
+                        "matrix_source": str(matrix_snapshot),
+                        "caller": "POST /api/timetable/playback-scenario",
+                    },
+                )
+                if preview is None or not isinstance(preview, TimetableExecutionPreviewResult):
+                    raise RuntimeError(f"no timetable streams produced for {day_str}")
+
+                created_utc = datetime.now(timezone.utc).isoformat()
+                doc = {
+                    "as_of": created_utc,
+                    "session_trading_date": day_str,
+                    "trading_date": day_str,
+                    "timezone": "America/Chicago",
+                    "source": "playback_scenario",
+                    "timetable_hash": preview.timetable_hash,
+                    "previous_hash": None,
+                    "version_timestamp": created_utc,
+                    "metadata": {
+                        "replay": True,
+                        "scenario_id": scenario_id,
+                        "matrix_snapshot": str(matrix_snapshot),
+                        "matrix_sha256": matrix_hash,
+                        "matrix_meta": matrix_meta,
+                    },
+                    "streams": preview.streams,
+                }
+                out_path = timetable_dir / f"timetable_{day_str}.json"
+                _write_pretty_json(out_path, doc)
+                timetables[day_str] = {
+                    "path": out_path.relative_to(scenario_dir).as_posix(),
+                    "hash": _sha256_file(out_path),
+                    "timetable_hash": preview.timetable_hash,
+                }
+                generated_days.append(day_str)
+
+            created_utc = datetime.now(timezone.utc).isoformat()
+            manifest = {
+                "scenario_id": scenario_id,
+                "mode": "multi_day_carryover",
+                "run_id": run_id,
+                "matrix_snapshot": str(matrix_snapshot),
+                "matrix_sha256": matrix_hash,
+                "created_utc": created_utc,
+                "dates": generated_days,
+                "state_policy": {
+                    "persistence": "isolated_run_root",
+                    "stream_journals": "load_and_carry_forward",
+                    "day_switch": "event_clock_cme_18ct",
+                },
+                "timetables": timetables,
+            }
+            manifest_path = scenario_dir / "playback_scenario.json"
+            _write_pretty_json(manifest_path, manifest)
+            manifest_sha256 = _sha256_file(manifest_path)
+
+            pointer_path = QTSW2_ROOT / "configs" / "robot" / "playback_scenario_current.json"
+            pointer = {
+                "mode": "multi_day_carryover",
+                "scenario_id": scenario_id,
+                "run_id": run_id,
+                "manifest_path": str(manifest_path),
+                "manifest_sha256": manifest_sha256,
+                "created_utc": created_utc,
+                "source": "matrix_ui_playback_scenario",
+                "restart_ninjatrader_required": True,
+                "note": (
+                    "Robot reads this pointer at startup when QTSW2_PLAYBACK_SCENARIO "
+                    "is not set. Clear it to restore normal single-day playback."
+                ),
+            }
+            _write_pretty_json(pointer_path, pointer)
+
+            ps_manifest = str(manifest_path).replace("'", "''")
+            return {
+                "status": "built",
+                "scenario_id": scenario_id,
+                "run_id": run_id,
+                "start_date": generated_days[0],
+                "end_date": generated_days[-1],
+                "dates": generated_days,
+                "timetable_count": len(generated_days),
+                "manifest_path": str(manifest_path),
+                "manifest_sha256": manifest_sha256,
+                "scenario_dir": str(scenario_dir),
+                "config_pointer_path": str(pointer_path),
+                "config_pointer_sha256": _sha256_file(pointer_path),
+                "robot_config_source": "configs/robot/playback_scenario_current.json",
+                "matrix_snapshot": str(matrix_snapshot),
+                "matrix_sha256": matrix_hash,
+                "env_var_name": "QTSW2_PLAYBACK_SCENARIO",
+                "env_var_value": str(manifest_path),
+                "powershell_session_command": f"$env:QTSW2_PLAYBACK_SCENARIO='{ps_manifest}'",
+                "powershell_user_command": (
+                    "[Environment]::SetEnvironmentVariable("
+                    f"'QTSW2_PLAYBACK_SCENARIO', '{ps_manifest}', 'User')"
+                ),
+                "powershell_clear_user_command": (
+                    "[Environment]::SetEnvironmentVariable('QTSW2_PLAYBACK_SCENARIO', $null, 'User')"
+                ),
+                "restart_ninjatrader_required": True,
+                "proof_level": "source-only",
+            }
+
+        result = await asyncio.to_thread(_build_sync)
+        logging.info(
+            "PLAYBACK_SCENARIO_BUILT scenario_id=%s run_id=%s days=%d manifest=%s",
+            result["scenario_id"],
+            result["run_id"],
+            result["timetable_count"],
+            result["manifest_path"],
+        )
+        return result
+    except RuntimeError as e:
+        if "TIMETABLE_NO_IN_MEMORY_MATRIX" in str(e):
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Playback scenario build failed: {str(e)}") from e
+
+
+@app.delete("/api/timetable/playback-scenario/current")
+async def clear_playback_scenario_current():
+    """
+    Clear the operator-selected multi-day Playback scenario pointer.
+
+    This does not remove run-scoped scenario artifacts and does not mutate live or
+    replay timetable authority. NinjaTrader must be restarted after clearing if
+    it already loaded a scenario in-process.
+    """
+    pointer_path = QTSW2_ROOT / "configs" / "robot" / "playback_scenario_current.json"
+    try:
+        existed = pointer_path.exists()
+        if existed:
+            pointer_path.unlink()
+        return {
+            "status": "cleared",
+            "removed": existed,
+            "config_pointer_path": str(pointer_path),
+            "restart_ninjatrader_required": True,
+            "proof_level": "source-only",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to clear Playback scenario pointer: {str(e)}") from e
 
 
 @app.post("/api/timetable/content_hash")

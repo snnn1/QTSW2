@@ -854,6 +854,8 @@ public sealed partial class NinjaTraderSimAdapter
                 note = "Timed-out session-close flatten later completed; broker-flat proof will clear the reentry latch."
             }));
 
+        _iea?.ReleaseFlattenLatch(exposureInstrument, InstrumentExecutionAuthority.FlattenLatchState.Resolved, utcNow);
+
         try
         {
             _onSessionCloseFlattenConfirmedLateCallback?.Invoke(completionIntentId, exposureInstrument, utcNow);

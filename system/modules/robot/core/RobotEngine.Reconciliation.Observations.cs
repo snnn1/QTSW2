@@ -294,37 +294,27 @@ public sealed partial class RobotEngine
             }
 
             // Abs sums are not canonical for safety — use signed nets for net truth. See MismatchObservation.BrokerQty / NetBrokerQty.
+            var effectiveLocalWorking = localWorking < 0 ? 0 : localWorking;
+
+            if (MismatchClassification.IsExplainedHedgedNetFlatGrossOpen(
+                    brokerQty,
+                    effectiveJournalQty,
+                    netBrokerQty,
+                    effectiveNetJournalQty,
+                    opposingMultiIntent,
+                    brokerWorking,
+                    effectiveLocalWorking))
+            {
+                _ieaUnavailableDegradedSuppressByInstrument.Remove(inst);
+                continue;
+            }
+
             var aggregatesAligned = brokerQty == effectiveJournalQty && netBrokerQty == effectiveNetJournalQty && brokerWorking == localWorking;
             if (aggregatesAligned)
             {
                 _ieaUnavailableDegradedSuppressByInstrument.Remove(inst);
-                var hedgedNetFlatGrossOpen = netJournalQty == 0 && journalQty > 0;
-                if (hedgedNetFlatGrossOpen)
-                {
-                    list.Add(new MismatchObservation
-                    {
-                        Instrument = inst,
-                        MismatchType = MismatchType.HEDGED_NET_FLAT_GROSS_OPEN,
-                        Present = true,
-                        Summary =
-                            $"hedged_net_flat_gross_open broker_qty_abs={brokerQty} gross_journal={journalQty} net_broker={netBrokerQty} net_journal={netJournalQty} broker_working={brokerWorking} local_working={localWorking}",
-                        BrokerQty = brokerQty,
-                        LocalQty = journalQty,
-                        NetBrokerQty = netBrokerQty,
-                        NetJournalQty = netJournalQty,
-                        BrokerWorkingOrderCount = brokerWorking,
-                        LocalWorkingOrderCount = localWorking < 0 ? 0 : localWorking,
-                        JournalOpenEntryCount = journalWorking,
-                        IntentIdsCsv = BuildIntentIdsCsvFromOpenJournal(openByInst, inst, canonicalForJournalAgg),
-                        ObservedUtc = utcNow,
-                        Severity = "WARN"
-                    });
-                }
-
                 continue;
             }
-
-            var effectiveLocalWorking = localWorking < 0 ? 0 : localWorking;
 
             // ORDER_REGISTRY_MISSING recovery: attempt adoption before fail-closed
             if (brokerWorking > 0 && effectiveLocalWorking == 0 && useIea && ieaForInstrument != null)

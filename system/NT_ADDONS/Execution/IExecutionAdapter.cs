@@ -124,6 +124,18 @@ public interface IExecutionAdapter
 
     /// <summary>Enqueue protective emergency flatten without blocking; returns false when unsupported (e.g. LIVE stub).</summary>
     bool TryEnqueueEmergencyFlattenProtective(string instrument, DateTimeOffset utcNow);
+
+    /// <summary>
+    /// Session-close flatten: enqueue cancel+flatten work onto the strategy thread.
+    /// Broker-flat confirmation is delivered by the downstream fill/reconciliation path.
+    /// </summary>
+    FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow);
+
+    /// <summary>
+    /// Session-close cancel-only companion for sibling intents before a single broker-level flatten.
+    /// Implementations must enqueue onto the strategy thread and return without touching NT synchronously.
+    /// </summary>
+    int RequestSessionCloseCancelIntents(IEnumerable<string> intentIds, string instrument, DateTimeOffset utcNow);
     
     /// <summary>
     /// Get account snapshot (positions and working orders) for recovery reconciliation.

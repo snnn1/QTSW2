@@ -8,6 +8,8 @@ using QTSW2.Robot.Core.Execution;
 
 public sealed partial class RobotEngine
 {
+    private readonly object _ownershipClassAFileWriteLock = new();
+
     /// <summary>
     /// After trading date is locked and streams exist, rebuild <see cref="InstrumentIntentCoordinator"/> rows
     /// from open journal files so exit fills on reconnect hit a real exposure object (see INTENT_EXIT_FILL_NO_EXPOSURE).
@@ -413,13 +415,46 @@ public sealed partial class RobotEngine
                 utc = evt.Utc.ToString("o"),
                 detail = evt.Detail
             });
-            System.IO.File.AppendAllText(filePath, json + Environment.NewLine);
+            lock (_ownershipClassAFileWriteLock)
+            {
+                AppendClassAJsonLineWithRetry(filePath, json);
+            }
         }
         catch (Exception ex)
         {
             _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, "", "OWNERSHIP_CLASS_A_PERSIST_ERROR", "ENGINE",
                 new { error = ex.Message }));
         }
+    }
+
+    private static void AppendClassAJsonLineWithRetry(string filePath, string json)
+    {
+        Exception? last = null;
+        var delaysMs = new[] { 0, 5, 15, 30, 75 };
+        foreach (var delayMs in delaysMs)
+        {
+            if (delayMs > 0)
+                System.Threading.Thread.Sleep(delayMs);
+
+            try
+            {
+                using var stream = new System.IO.FileStream(filePath, System.IO.FileMode.Append,
+                    System.IO.FileAccess.Write, System.IO.FileShare.ReadWrite);
+                using var writer = new System.IO.StreamWriter(stream);
+                writer.WriteLine(json);
+                return;
+            }
+            catch (System.IO.IOException ex)
+            {
+                last = ex;
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                last = ex;
+            }
+        }
+
+        throw last ?? new System.IO.IOException("Ownership class A append failed.");
     }
 
     /// <summary>

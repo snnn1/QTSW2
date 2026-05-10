@@ -84,6 +84,15 @@ public sealed partial class NinjaTraderSimAdapter
             cmd.CorrelationId);
     }
 
+    internal void ReleaseMarketReentryExecutionLatchForTerminalIntent(string intentId, DateTimeOffset utcNow, string reason)
+    {
+        if (string.IsNullOrWhiteSpace(intentId))
+            return;
+
+        ReleaseMarketReentryExecutionLatch(intentId, null, utcNow,
+            string.IsNullOrWhiteSpace(reason) ? "REENTRY_INTENT_TERMINAL" : reason);
+    }
+
     private static bool MarketReentryLatchMatches(MarketReentryExecutionLatch active, string intentId, string? correlationId)
     {
         return (!string.IsNullOrEmpty(intentId) && string.Equals(active.IntentId, intentId, StringComparison.OrdinalIgnoreCase))
@@ -428,7 +437,8 @@ public sealed partial class NinjaTraderSimAdapter
 
     bool IIEAOrderExecutor.TryQueueProtectiveForRecovery(string intentId, Intent intent, int totalFilledQuantity, DateTimeOffset utcNow)
     {
-        if (Volatile.Read(ref _sessionMismatchBlocked) != 0)
+        if (Volatile.Read(ref _sessionMismatchBlocked) != 0 &&
+            !IsSessionIdentityCarryoverActionAllowed(intentId, intent.Instrument ?? "", "recovery", intent, utcNow, out _))
             return false;
         if (_isRecoveryExecutionAllowedCallback == null || _isRecoveryExecutionAllowedCallback())
             return false;
@@ -441,7 +451,8 @@ public sealed partial class NinjaTraderSimAdapter
     /// </summary>
     private void QueueProtectiveForRecovery(string intentId, Intent intent, int totalFilledQuantity, DateTimeOffset utcNow)
     {
-        if (Volatile.Read(ref _sessionMismatchBlocked) != 0)
+        if (Volatile.Read(ref _sessionMismatchBlocked) != 0 &&
+            !IsSessionIdentityCarryoverActionAllowed(intentId, intent.Instrument ?? "", "recovery", intent, utcNow, out _))
             return;
         lock (_pendingRecoveryLock)
         {
@@ -472,7 +483,8 @@ public sealed partial class NinjaTraderSimAdapter
         {
             var elapsed = (utcNow - pending.QueuedAtUtc).TotalSeconds;
 
-            if (Volatile.Read(ref _sessionMismatchBlocked) != 0)
+            if (Volatile.Read(ref _sessionMismatchBlocked) != 0 &&
+                !IsSessionIdentityCarryoverActionAllowed(pending.IntentId, pending.Intent.Instrument ?? "", "recovery", pending.Intent, utcNow, out _))
                 continue;
 
             // Stage 3: Fail-safe timer — flatten if protectives cannot be placed within timeout

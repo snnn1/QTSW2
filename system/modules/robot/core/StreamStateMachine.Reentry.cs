@@ -200,9 +200,10 @@ public sealed partial class StreamStateMachine
         var direction = originalEntry.Direction ?? "Long";
         var quantity = originalEntry.EntryFilledQuantityTotal;
         var reentryEntryPrice = originalEntry.EntryPrice;
-        var reentryStopPrice = originalEntry.StopPrice;
+        var reentryStopPrice = ResolveReentryStopPrice(originalEntry);
         var reentryTargetPrice = originalEntry.TargetPrice;
         var reentryBeTrigger = originalEntry.BETriggerPrice;
+        var carryForwardBreakEven = IsReentryBreakEvenCarryForward(originalEntry);
 
         if (quantity <= 0)
         {
@@ -295,7 +296,10 @@ public sealed partial class StreamStateMachine
                 original_intent_id = _journal.OriginalIntentId,
                 direction = direction ?? "NULL",
                 quantity = quantity,
-                stop_price = originalEntry.StopPrice,
+                stop_price = reentryStopPrice,
+                original_stop_price = originalEntry.StopPrice,
+                break_even_carry_forward = carryForwardBreakEven,
+                break_even_stop_price = originalEntry.BEStopPrice,
                 target_price = originalEntry.TargetPrice,
                 entry_price = originalEntry.EntryPrice,
                 command_id = cmd.CommandId,
@@ -485,7 +489,8 @@ public sealed partial class StreamStateMachine
         if (string.IsNullOrEmpty(originalStream)) originalStream = Stream;
         
         var originalEntry = _executionJournal.GetEntry(_journal.OriginalIntentId, originalTradingDate, originalStream);
-        if (originalEntry == null || !originalEntry.StopPrice.HasValue || !originalEntry.TargetPrice.HasValue)
+        var stopPrice = originalEntry == null ? null : ResolveReentryStopPrice(originalEntry);
+        if (originalEntry == null || !stopPrice.HasValue || !originalEntry.TargetPrice.HasValue)
         {
             _ = Commit(utcNow, "REENTRY_PROTECTION_FAILED_CANNOT_LOAD_BRACKET", "REENTRY_PROTECTION_FAILED");
             LogHealth("CRITICAL", "REENTRY_PROTECTION_FAILED", $"Re-entry protection failed: Cannot load bracket levels for intent {_journal.OriginalIntentId}",
@@ -493,7 +498,8 @@ public sealed partial class StreamStateMachine
             return;
         }
         
-        var stopPrice = originalEntry.StopPrice.Value;
+        var resolvedStopPrice = stopPrice.Value;
+        var carriedBreakEven = IsReentryBreakEvenCarryForward(originalEntry);
         var targetPrice = originalEntry.TargetPrice.Value;
         var direction = originalEntry.Direction ?? "Long";
         var quantity = originalEntry.EntryFilledQuantityTotal;
@@ -502,7 +508,7 @@ public sealed partial class StreamStateMachine
         // Submit protective bracket via execution adapter
         if (_executionAdapter != null)
         {
-            var stopResult = _executionAdapter.SubmitProtectiveStop(reentryIntentId, ExecutionInstrument ?? Instrument, direction, stopPrice, quantity, null, utcNow);
+            var stopResult = _executionAdapter.SubmitProtectiveStop(reentryIntentId, ExecutionInstrument ?? Instrument, direction, resolvedStopPrice, quantity, null, utcNow);
             var targetResult = _executionAdapter.SubmitTargetOrder(reentryIntentId, ExecutionInstrument ?? Instrument, direction, targetPrice, quantity, null, utcNow);
             _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
                 "REENTRY_PROTECTIVES_SUBMITTED", State.ToString(),
@@ -511,12 +517,27 @@ public sealed partial class StreamStateMachine
                     reentry_intent_id = reentryIntentId,
                     stop_success = stopResult.Success,
                     target_success = targetResult.Success,
-                    stop_price = stopPrice,
+                    stop_price = resolvedStopPrice,
+                    original_stop_price = originalEntry.StopPrice,
+                    break_even_carry_forward = carriedBreakEven,
+                    break_even_stop_price = originalEntry.BEStopPrice,
                     target_price = targetPrice
                 }));
 
             if (stopResult.Success && targetResult.Success)
             {
+                if (carriedBreakEven && _executionJournal != null)
+                {
+                    _executionJournal.RecordBEModification(
+                        reentryIntentId,
+                        TradingDate ?? originalTradingDate ?? "",
+                        Stream ?? originalStream ?? "",
+                        resolvedStopPrice,
+                        utcNow,
+                        previousStopPrice: ResolveReentryPreviousStopPrice(originalEntry),
+                        beTriggerPrice: originalEntry.BETriggerPrice,
+                        entryPrice: originalEntry.EntryPrice);
+                }
                 _journal.ProtectionSubmitted = true;
                 _journals.Save(_journal);
             }
@@ -590,6 +611,27 @@ public sealed partial class StreamStateMachine
             }));
     }
 
+    private static bool IsReentryBreakEvenCarryForward(ExecutionJournalEntry originalEntry) =>
+        originalEntry.BEModified && originalEntry.BEStopPrice.HasValue;
+
+    private static decimal? ResolveReentryStopPrice(ExecutionJournalEntry originalEntry) =>
+        IsReentryBreakEvenCarryForward(originalEntry)
+            ? originalEntry.BEStopPrice
+            : originalEntry.StopPrice;
+
+    private static decimal? ResolveReentryPreviousStopPrice(ExecutionJournalEntry originalEntry)
+    {
+        if (originalEntry.PreviousStopPrice.HasValue)
+            return originalEntry.PreviousStopPrice;
+        if (originalEntry.StopPrice.HasValue && originalEntry.BEStopPrice.HasValue &&
+            originalEntry.StopPrice.Value != originalEntry.BEStopPrice.Value)
+        {
+            return originalEntry.StopPrice;
+        }
+
+        return null;
+    }
+
     /// <summary>
     /// Close the stream journal when the reentry execution journal reaches terminal completion.
     /// </summary>
@@ -597,6 +639,39 @@ public sealed partial class StreamStateMachine
     {
         if (_journal.Committed || string.IsNullOrWhiteSpace(intentId))
             return;
+
+        if (string.Equals(_journal.OriginalIntentId, intentId, StringComparison.OrdinalIgnoreCase) &&
+            _journal.ExecutionInterruptedByClose &&
+            !_journal.ReentrySubmitted &&
+            !_journal.ReentryFilled &&
+            !_journal.ProtectionSubmitted &&
+            !_journal.ProtectionAccepted)
+        {
+            if (IsSessionCloseFlattenCompletionReason(completionReason))
+                return;
+
+            var staleReentryIntentId = _journal.ReentryIntentId;
+            _journal.ReentryIntentId = null;
+            _journal.ReentrySubmitPending = false;
+            _journal.ReentrySubmitPendingAtUtc = null;
+            _journal.ReentrySubmitFailureCount = 0;
+            _journal.ExecutionInterruptedByClose = false;
+            _journal.LastUpdateUtc = utcNow.ToString("o");
+            _journals.Save(_journal);
+
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "SESSION_CLOSE_INTERRUPTED_ORIGINAL_COMPLETED_NO_REENTRY", State.ToString(),
+                new
+                {
+                    original_intent_id = intentId,
+                    stale_reentry_intent_id = staleReentryIntentId ?? "",
+                    completion_reason = completionReason ?? "",
+                    note = "Original intent completed normally after a session-close interruption; stale reentry lifecycle cleared and stream committed per intent."
+                }));
+
+            _ = Commit(utcNow, "TRADE_COMPLETED_AFTER_SESSION_CLOSE_INTERRUPT", "TRADE_COMPLETED");
+            return;
+        }
 
         if (!string.Equals(_journal.ReentryIntentId, intentId, StringComparison.OrdinalIgnoreCase))
             return;
@@ -610,5 +685,14 @@ public sealed partial class StreamStateMachine
             : "REENTRY_TRADE_COMPLETED";
 
         _ = Commit(utcNow, reason, "TRADE_COMPLETED");
+    }
+
+    private static bool IsSessionCloseFlattenCompletionReason(string? completionReason)
+    {
+        if (string.IsNullOrWhiteSpace(completionReason))
+            return false;
+
+        return string.Equals(completionReason, "FLATTEN", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(completionReason, CompletionReasons.RECONCILIATION_BROKER_FLAT, StringComparison.OrdinalIgnoreCase);
     }
 }

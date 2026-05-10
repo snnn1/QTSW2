@@ -1389,14 +1389,16 @@ class EventProcessor:
             broker_order_id = data.get("broker_order_id") or event.get("broker_order_id")
             if broker_order_id:
                 order_type = str(data.get("order_type", "entry") or "entry").upper()
-                if "TARGET" in order_type:
+                if order_type.startswith("ENTRY"):
+                    role = "entry"
+                elif "TARGET" in order_type:
                     role = "target"
                 elif "STOP" in order_type or "PROTECTIVE" in order_type:
                     role = "stop"
                 else:
                     role = "entry"
                 intent_id_submit = (data.get("intent_id") or event.get("intent_id") or "").strip()
-                if role in ("stop", "target") and intent_id_submit:
+                if role == "stop" and intent_id_submit:
                     self._state_manager.record_protective_order_submitted(intent_id_submit, timestamp_utc)
                 self._state_manager.record_order_submitted(
                     broker_order_id=broker_order_id,

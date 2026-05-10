@@ -661,6 +661,15 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
             cmd.CorrelationId);
     }
 
+    internal void ReleaseMarketReentryExecutionLatchForTerminalIntent(string intentId, DateTimeOffset utcNow, string reason)
+    {
+        if (string.IsNullOrWhiteSpace(intentId))
+            return;
+
+        ReleaseMarketReentryExecutionLatch(intentId, null, utcNow,
+            string.IsNullOrWhiteSpace(reason) ? "REENTRY_INTENT_TERMINAL" : reason);
+    }
+
     private static bool MarketReentryLatchMatches(MarketReentryExecutionLatch active, string intentId, string? correlationId)
     {
         return (!string.IsNullOrEmpty(intentId) && string.Equals(active.IntentId, intentId, StringComparison.OrdinalIgnoreCase))
@@ -1740,13 +1749,99 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
     /// </summary>
     public FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow)
     {
-        if (_ntActionQueue == null || !(this is INtActionExecutor)) return null;
+        if (!(this is INtActionExecutor)) return null;
         var cidCancel = $"SESSION_CLOSE_CANCEL:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
         var cidFlatten = $"SESSION_CLOSE_FLATTEN:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
-        _ntActionQueue.EnqueueNtAction(new NtCancelOrdersCommand(cidCancel, intentId, instrument, false, "FORCED_FLATTEN_CANCEL", utcNow), out _);
-        EnqueueNtActionInternal(new NtFlattenInstrumentCommand(cidFlatten, intentId, instrument, "SESSION_FORCED_FLATTEN", utcNow,
-            DestructiveActionSource.MANUAL, DestructiveTriggerReason.MANUAL));
+
+        var cancel = new NtCancelOrdersCommand(cidCancel, intentId, instrument, false,
+            "FORCED_FLATTEN_CANCEL", utcNow, preferUrgentDrain: true);
+        if (!TryEnqueueNtActionOnInstrumentOwner(cancel, instrument, utcNow, out _))
+        {
+            if (_ntActionQueue == null) return null;
+            _ntActionQueue.EnqueueNtAction(cancel, out _);
+        }
+
+        var flatten = new NtFlattenInstrumentCommand(cidFlatten, intentId, instrument, "SESSION_FORCED_FLATTEN", utcNow,
+            DestructiveActionSource.MANUAL, DestructiveTriggerReason.MANUAL, preferUrgentDrain: true);
+        if (!TryEnqueueNtActionOnInstrumentOwner(flatten, instrument, utcNow, out _))
+        {
+            if (_ntActionQueue == null) return null;
+            EnqueueNtActionInternal(flatten);
+        }
         return FlattenResult.FailureResult("SESSION_CLOSE_FLATTEN_ENQUEUED", utcNow);
+    }
+
+    /// <summary>
+    /// Queue cancel-only session-close cleanup for sibling intents. Used when one broker-level flatten
+    /// closes aggregate exposure but several stream intents may own protective orders.
+    /// </summary>
+    public int RequestSessionCloseCancelIntents(IEnumerable<string> intentIds, string instrument, DateTimeOffset utcNow)
+    {
+        if (!(this is INtActionExecutor)) return 0;
+
+        var count = 0;
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var raw in intentIds ?? Array.Empty<string>())
+        {
+            var intentId = raw?.Trim() ?? "";
+            if (string.IsNullOrEmpty(intentId) || !seen.Add(intentId))
+                continue;
+
+            var cid = $"SESSION_CLOSE_CANCEL:{intentId}:{utcNow:yyyyMMddHHmmssfff}:{count}";
+            var cancel = new NtCancelOrdersCommand(cid, intentId, instrument, false,
+                "FORCED_FLATTEN_CANCEL", utcNow, preferUrgentDrain: true);
+            if (!TryEnqueueNtActionOnInstrumentOwner(cancel, instrument, utcNow, out _))
+            {
+                if (_ntActionQueue == null)
+                    continue;
+                _ntActionQueue.EnqueueNtAction(cancel, out _);
+            }
+            count++;
+        }
+
+        return count;
+    }
+
+    private bool TryEnqueueNtActionOnInstrumentOwner(INtAction action, string instrument, DateTimeOffset utcNow, out bool routeAttempted, bool abortCurrentCoordinationOwnerFirst = false)
+    {
+        routeAttempted = false;
+        if (!_useInstrumentExecutionAuthority || action == null || string.IsNullOrWhiteSpace(instrument))
+            return false;
+
+        var account = !string.IsNullOrWhiteSpace(_ieaAccountName) ? _ieaAccountName! : GetCoordinationAccountName();
+        if (string.IsNullOrWhiteSpace(account))
+            return false;
+
+        var execKey = ExecutionInstrumentResolver.ResolveExecutionInstrumentKey(account, instrument, null);
+        if (string.IsNullOrWhiteSpace(execKey) || string.Equals(execKey, "UNKNOWN", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (!InstrumentExecutionAuthorityRegistry.TryGet(account, execKey, out var ownerIea) || ownerIea?.Executor == null)
+            return false;
+
+        routeAttempted = true;
+        if (abortCurrentCoordinationOwnerFirst && action is NtFlattenInstrumentCommand && !ReferenceEquals(ownerIea, _iea))
+            FlattenCoordinationTracker.Shared.NotifyFlattenAborted(account, instrument, GetFlattenCoordinationInstanceId(), utcNow);
+        var accepted = ownerIea.Executor.EnqueueNtAction(action);
+        if (!ReferenceEquals(ownerIea, _iea))
+        {
+            var eventType = accepted ? "NT_ACTION_ROUTED_TO_INSTRUMENT_OWNER" : "FLATTEN_SECONDARY_INSTANCE_SKIPPED";
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: eventType, state: accepted ? "ENGINE" : "WARN",
+                new
+                {
+                    account,
+                    action_type = action.ActionType,
+                    correlation_id = action.CorrelationId,
+                    instrument,
+                    target_execution_instrument_key = ownerIea.ExecutionInstrumentKey,
+                    target_iea_instance_id = ownerIea.InstanceId,
+                    current_execution_instrument_key = _iea?.ExecutionInstrumentKey ?? "",
+                    current_iea_instance_id = _iea?.InstanceId,
+                    route_accepted = accepted,
+                    reason = "session_close_action_forwarded_to_instrument_owner"
+                }));
+        }
+        return accepted;
     }
 
     /// <summary>

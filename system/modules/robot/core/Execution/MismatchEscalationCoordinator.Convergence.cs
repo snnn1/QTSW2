@@ -35,6 +35,7 @@ public sealed partial class MismatchEscalationCoordinator
     {
         public bool EpisodeExtended;
         public bool AuthorityPublished;
+        public bool AuthorityPublishedBlocked;
     }
 
     /// <summary>Per audit tick: instruments processed this cycle; used for convergence invariant logging.</summary>
@@ -161,12 +162,13 @@ public sealed partial class MismatchEscalationCoordinator
             EmitCanonical(inst, "RECONCILIATION_MISMATCH_FIRST_ESCALATION_SUPPRESSED_FOR_CONVERGENCE", utcNow, payload, "INFO");
     }
 
-    private void NoteMismatchEvalAuthorityPublished(string instrument)
+    private void NoteMismatchEvalAuthorityPublished(string instrument, bool publishedBlocked)
     {
         if (!_mismatchEvalInvariantCycleActive || string.IsNullOrWhiteSpace(instrument)) return;
         var key = instrument.Trim();
         if (!_mismatchEvalScratch.TryGetValue(key, out var row)) return;
         row.AuthorityPublished = true;
+        row.AuthorityPublishedBlocked = publishedBlocked;
     }
 
     private void NoteMismatchEvalEpisodeExtended(string instrument)
@@ -205,9 +207,10 @@ public sealed partial class MismatchEscalationCoordinator
         _mismatchEvalScratch.TryGetValue(inst, out var scratch);
         var episodeExtended = scratch?.EpisodeExtended ?? false;
         var authorityPublished = scratch?.AuthorityPublished ?? false;
+        var authorityPublishedBlocked = scratch?.AuthorityPublishedBlocked ?? false;
 
         var assertionApplicable = convergenceActive && canonicalProbeAvailable && canonicalExposureOk;
-        var invariantViolated = assertionApplicable && authorityPublished;
+        var invariantViolated = assertionApplicable && authorityPublished && authorityPublishedBlocked;
         var episodeExtendedWithoutPublicationDeferred = assertionApplicable && episodeExtended && !authorityPublished;
         if (invariantViolated)
             TestMismatchEvalInvariantViolationCount++;
@@ -225,6 +228,7 @@ public sealed partial class MismatchEscalationCoordinator
             episode_exists = episodeExists,
             episode_extended = episodeExtended,
             authority_published = authorityPublished,
+            authority_published_blocked = authorityPublishedBlocked,
             episode_extended_without_publication_deferred = episodeExtendedWithoutPublicationDeferred,
             assertion_applicable = assertionApplicable,
             convergence_invariant_ok = invariantOk,
@@ -247,7 +251,8 @@ public sealed partial class MismatchEscalationCoordinator
                     episode_exists = episodeExists,
                     episode_extended = episodeExtended,
                     authority_published = authorityPublished,
-                    expected_when_convergence_and_canonical_clean = "episode_extended=false and authority_published=false",
+                    authority_published_blocked = authorityPublishedBlocked,
+                    expected_when_convergence_and_canonical_clean = "episode_extended=false and authority_published_blocked=false",
                     run_id = _getRunIdForMismatchDiagnostics?.Invoke() ?? "",
                     ts_utc = utcNow.ToString("o")
                 }));

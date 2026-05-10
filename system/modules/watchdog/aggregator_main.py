@@ -29,6 +29,7 @@ from .timetable_poller import TimetablePoller, compute_timetable_trading_date, r
 from .market_calendar import get_market_state
 from .run_context import WatchdogRunContext, resolve_active_run_context
 from .config import (
+    QTSW2_ROOT,
     ORDER_STUCK_DETECTED_COOLDOWN_SECONDS,
     ALERT_STARTUP_GRACE_SECONDS,
     CONFIRMED_ORPHAN_HEARTBEAT_LOST_SECONDS,
@@ -59,6 +60,7 @@ from .config import (
 logger = logging.getLogger(__name__)
 
 CHICAGO_TZ = pytz.timezone("America/Chicago")
+PROTECTIVE_ACK_HYDRATE_TAIL_LINES = 60000
 
 
 def _watchdog_info_for_stream_today(
@@ -106,11 +108,18 @@ def _derive_stream_state_reference_utc(
     if current_trading_date == wall_trading_date:
         return None
 
+    try:
+        current_day = datetime.strptime(current_trading_date, "%Y-%m-%d").date()
+    except Exception:
+        current_day = None
+
     candidates: List[datetime] = []
     for stream in streams:
         if str(stream.get("trading_date") or "").strip() != current_trading_date:
             continue
-        for key in ("state_entry_time_utc", "range_locked_time_utc"):
+        for key in ("state_entry_time_utc", "range_locked_time_utc", "slot_time_utc"):
+            if key == "state_entry_time_utc" and not stream.get("state"):
+                continue
             raw = stream.get(key)
             if not raw:
                 continue
@@ -120,6 +129,12 @@ def _derive_stream_state_reference_utc(
                 continue
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
+            if current_day is not None:
+                parsed_chicago_day = parsed.astimezone(CHICAGO_TZ).date()
+                if parsed_chicago_day < current_day - timedelta(days=1):
+                    continue
+                if parsed_chicago_day > current_day + timedelta(days=1):
+                    continue
             candidates.append(parsed.astimezone(timezone.utc))
 
     if not candidates:
@@ -268,9 +283,12 @@ def _slot_missing_summary_expectation_gap(
     }
 
 
-# Execution policy path for canonical->execution instrument lookup
-_EXECUTION_POLICY_PATH = Path(__file__).parent.parent.parent / "configs" / "execution_policy.json"
+# Execution policy path for canonical->execution instrument lookup.
 _execution_instrument_cache: Optional[Dict[str, str]] = None
+
+
+def _execution_policy_path() -> Path:
+    return QTSW2_ROOT / "configs" / "execution_policy.json"
 
 
 def _canonical_instrument_root(instrument: str) -> str:
@@ -324,9 +342,10 @@ def _get_execution_instrument_for_canonical(canonical_instrument: str) -> Option
         return None
     try:
         if _execution_instrument_cache is None:
-            if not _EXECUTION_POLICY_PATH.exists():
+            policy_path = _execution_policy_path()
+            if not policy_path.exists():
                 return None
-            with open(_EXECUTION_POLICY_PATH, "r", encoding="utf-8") as f:
+            with open(policy_path, "r", encoding="utf-8") as f:
                 policy = json.load(f)
             markets = policy.get("canonical_markets", {})
             cache = {}
@@ -920,6 +939,7 @@ class WatchdogAggregator:
 
         logger.info("Hydrating intent exposures from execution journals")
         self._state_manager.hydrate_intent_exposures_from_journals(self._execution_journals_dir())
+        self._hydrate_protective_acknowledgements_from_feed()
 
         # Init engine tick from snapshot
         # Reject ticks that predate startup (_last_invalidate_utc) - tail has old events only.
@@ -1949,6 +1969,7 @@ class WatchdogAggregator:
                         dedupe_key=f"ORDER_STUCK_DETECTED:{stuck.get('broker_order_id', '')}",
                         min_resend_interval_seconds=ORDER_STUCK_DETECTED_COOLDOWN_SECONDS,
                     )
+        self._resolve_completed_order_stuck_alerts()
 
         # LOG_FILE_STALLED: feed file size unchanged for 60s (logging deadlock, file handle lost, NT not flushing)
         log_growth_monitor_file = self._frontend_feed_file()
@@ -2874,6 +2895,137 @@ class WatchdogAggregator:
             return self.get_session_flatten_state()
         return self._build_run_scoped_snapshot(context).get_session_flatten_state()
 
+    def _journal_intent_completed(self, intent_id: str) -> bool:
+        if not intent_id:
+            return False
+        try:
+            for path in self._execution_journals_dir().glob(f"*_{intent_id}.json"):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        payload = json.load(f)
+                    if bool(payload.get("TradeCompleted")):
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            return False
+        return False
+
+    @staticmethod
+    def _is_stop_protection_submit_event(event: Dict[str, Any]) -> bool:
+        event_type = str(event.get("event_type") or event.get("event") or "").strip()
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        if event_type in (
+            "PROTECTIVE_ORDERS_SUBMITTED",
+            "PROTECTIVE_ORDERS_SUBMITTED_FROM_RECOVERY_QUEUE",
+            "PROTECTIVES_PLACED",
+        ):
+            return True
+        if event_type != "ORDER_SUBMIT_SUCCESS":
+            return False
+
+        order_type = str(data.get("order_type") or event.get("order_type") or "").strip().upper()
+        if order_type.startswith("ENTRY"):
+            return False
+        if "TARGET" in order_type:
+            return False
+        return "PROTECTIVE" in order_type or "STOP" in order_type
+
+    def _hydrate_protective_acknowledgements_from_feed(self) -> int:
+        """
+        Rebuild watchdog stop-protection memory for active intents after reload.
+
+        Intent exposure is durable in execution journals, but protective acknowledgement is
+        feed-derived. This reads only a bounded tail and only marks stop protection, not
+        entry-stop or target-only events.
+        """
+        try:
+            missing = self._state_manager.get_active_intents_missing_protective_ack()
+        except Exception:
+            return 0
+        if not missing:
+            return 0
+
+        feed_file = self._frontend_feed_file()
+        if not feed_file.exists():
+            return 0
+
+        try:
+            lines, _, _ = _read_last_lines_with_metrics(
+                feed_file,
+                max(TAIL_LINE_COUNT, PROTECTIVE_ACK_HYDRATE_TAIL_LINES),
+            )
+        except Exception:
+            return 0
+
+        hydrated: Set[str] = set()
+        for raw in lines:
+            if not raw:
+                continue
+            try:
+                event = json.loads(raw)
+            except Exception:
+                continue
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            intent_id = str(data.get("intent_id") or event.get("intent_id") or "").strip()
+            if intent_id not in missing:
+                continue
+            if not self._is_stop_protection_submit_event(event):
+                continue
+            ts_raw = event.get("timestamp_utc") or event.get("ts_utc")
+            try:
+                ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+            except Exception:
+                ts = datetime.now(timezone.utc)
+            self._state_manager.record_protective_order_submitted(intent_id, ts)
+            hydrated.add(intent_id)
+
+        if hydrated:
+            logger.info(
+                "WATCHDOG_PROTECTIVE_ACK_HYDRATED_FROM_FEED count=%s intent_ids=%s",
+                len(hydrated),
+                sorted(hydrated)[:10],
+            )
+        return len(hydrated)
+
+    def _resolve_completed_order_stuck_alerts(self) -> None:
+        """
+        Resolve stuck-order alerts after the owning trade journal has completed.
+
+        The stuck detector intentionally emits once and clears pending-order memory to avoid alert
+        floods. Resolution therefore needs durable journal proof, not broker-net-flat alone.
+        """
+        ns = self._notification_service
+        if not ns:
+            return
+        try:
+            active = ns.get_ledger().get_active_alerts()
+        except Exception:
+            return
+        for alert in active:
+            if alert.get("alert_type") != "ORDER_STUCK_DETECTED":
+                continue
+            context = alert.get("context") or {}
+            candidates: Set[str] = set()
+            for key in ("intent_id", "intentId"):
+                value = context.get(key)
+                if value:
+                    candidates.add(str(value).strip())
+            sample = context.get("sample") if isinstance(context.get("sample"), dict) else {}
+            for key in ("intent_id", "intentId"):
+                value = sample.get(key)
+                if value:
+                    candidates.add(str(value).strip())
+            candidates = {item for item in candidates if item}
+            if not candidates:
+                continue
+            if all(self._journal_intent_completed(intent_id) for intent_id in candidates):
+                dedupe_key = alert.get("dedupe_key")
+                if dedupe_key:
+                    ns.resolve_alert(str(dedupe_key))
+
     def _session_flatten_ledger_singleton(self):
         """Shared ledger when NotificationService is unavailable (audit file still updated)."""
         led = getattr(self, "_session_flatten_fallback_ledger", None)
@@ -3039,6 +3191,7 @@ class WatchdogAggregator:
             # Phase 1: include active alerts for UI
             if self._notification_service:
                 try:
+                    self._resolve_completed_order_stuck_alerts()
                     ledger = self._notification_service.get_ledger()
                     status["active_alerts"] = ledger.get_active_alerts()
                 except Exception as e:
@@ -3145,6 +3298,8 @@ class WatchdogAggregator:
     def get_unprotected_positions(self) -> Dict:
         """Get current unprotected positions."""
         try:
+            self._state_manager.reconcile_intent_exposures_with_position_authority()
+            self._hydrate_protective_acknowledgements_from_feed()
             positions = self._state_manager.compute_unprotected_positions()
             return {
                 "timestamp_chicago": datetime.now(CHICAGO_TZ).isoformat(),
@@ -3172,6 +3327,8 @@ class WatchdogAggregator:
         so an old long-running session could win over a newer one, causing Live Events
         to show 30+ min stale data).
         """
+        if context is not None and context.is_run_scoped and context.run_id:
+            return context.run_id
         run_id = self._get_run_id_from_most_recent_feed_event(context)
         if run_id:
             return run_id
@@ -3239,6 +3396,7 @@ class WatchdogAggregator:
         state key); see ``_slot_missing_summary_expectation_gap``.
         """
         streams: List[Dict[str, Any]] = []
+        carried_active_lifecycles: List[Dict[str, Any]] = []
         out_of_timetable_active_streams: List[Dict[str, Any]] = []
         execution_expectation_gaps: List[Dict[str, Any]] = []
         timetable_unavailable = False
@@ -3258,6 +3416,7 @@ class WatchdogAggregator:
                     chicago_now = datetime.now(CHICAGO_TZ)
                     current_td_for_ranges = compute_timetable_trading_date(chicago_now)
                 self._state_manager.hydrate_intent_exposures_from_journals(context.execution_journals_dir)
+                self._state_manager.reconcile_intent_exposures_with_position_authority()
                 self._state_manager.hydrate_stream_states_from_slot_journals(context.slot_journals_dir)
                 self._state_manager.hydrate_range_data_from_ranges_file(
                     trading_date=current_td_for_ranges,
@@ -3286,6 +3445,37 @@ class WatchdogAggregator:
             
             # Get watchdog state data
             stream_states_dict = self._state_manager.get_stream_states()
+            for (td, sid), info in sorted(stream_states_dict.items()):
+                td_str = str(td or "").strip()
+                if not td_str or td_str == current_trading_date:
+                    continue
+                if not _is_trading_date_within_max_age(td_str, current_trading_date):
+                    continue
+                if bool(getattr(info, "committed", False)):
+                    continue
+                instrument = (getattr(info, "instrument", None) or _canonical_from_stream_id(sid) or "").strip()
+                row = {
+                    "row_kind": "carried_lifecycle_exposure",
+                    "trading_date": td_str,
+                    "current_trading_date": current_trading_date,
+                    "stream": sid,
+                    "instrument": instrument,
+                    "execution_instrument": getattr(info, "execution_instrument", None),
+                    "session": getattr(info, "session", None) or _session_from_stream_id(sid),
+                    "state": getattr(info, "state", ""),
+                    "committed": bool(getattr(info, "committed", False)),
+                    "commit_reason": getattr(info, "commit_reason", None),
+                    "slot_time_chicago": getattr(info, "slot_time_chicago", None),
+                    "state_entry_time_utc": getattr(info, "state_entry_time_utc", datetime.now(timezone.utc)).isoformat(),
+                    "current_timetable_lane_present": bool(enabled_streams and sid in enabled_streams),
+                    "same_stream_deferred_reason": (
+                        "PRIOR_LIFECYCLE_ACTIVE" if enabled_streams and sid in enabled_streams else None
+                    ),
+                    "operator_classification": "TRACKED_CARRIED_STREAM",
+                    "note": "Prior-date nonterminal stream remains tracked; do not treat it as unknown broker-ahead exposure.",
+                }
+                _attach_position_authority_to_stream_row(self._state_manager, row)
+                carried_active_lifecycles.append(row)
 
             # Row-level tradability: same execution_safe as GET /api/watchdog/status (includes process check)
             try:
@@ -3388,6 +3578,7 @@ class WatchdogAggregator:
                         canonical = getattr(watchdog_info, 'instrument', None) or instrument
                         exec_instr = _get_execution_instrument_for_canonical(canonical) or getattr(watchdog_info, 'execution_instrument', None)
                         _row = {
+                            "row_kind": "current_timetable_lane",
                             "trading_date": current_trading_date,
                             "stream": stream_id,
                             "instrument": canonical,
@@ -3442,6 +3633,7 @@ class WatchdogAggregator:
                     else:
                         exec_instr = _get_execution_instrument_for_canonical(instrument)
                         _row2 = {
+                            "row_kind": "current_timetable_lane",
                             "trading_date": current_trading_date,
                             "stream": stream_id,
                             "instrument": instrument,
@@ -3523,6 +3715,7 @@ class WatchdogAggregator:
             "timestamp_chicago": datetime.now(CHICAGO_TZ).isoformat(),
             "state_reference_utc": state_reference_utc,
             "streams": streams,
+            "carried_active_lifecycles": carried_active_lifecycles,
             "out_of_timetable_active_streams": out_of_timetable_active_streams,
             "execution_expectation_gaps": execution_expectation_gaps,
             "flatten_lookup_metrics": get_flatten_lookup_reason_counts(),
@@ -3790,6 +3983,7 @@ class WatchdogAggregator:
         if self._last_hydrate_utc is None or (now - self._last_hydrate_utc).total_seconds() >= 60:
             self._state_manager.hydrate_intent_exposures_from_journals(self._execution_journals_dir())
             self._last_hydrate_utc = now
+        self._state_manager.reconcile_intent_exposures_with_position_authority()
         intents = []
         try:
             exposures = self._state_manager.get_intent_exposures()

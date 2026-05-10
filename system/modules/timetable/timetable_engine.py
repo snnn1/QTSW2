@@ -268,6 +268,21 @@ def _execution_mode_row_get_time(series: pd.Series) -> Any:
     return None
 
 
+def _execution_mode_row_get_trade_date(series: pd.Series) -> Optional[date]:
+    if "trade_date" not in series.index:
+        return None
+    raw = series["trade_date"]
+    if not _execution_mode_matrix_cell_is_nonempty(raw):
+        return None
+    try:
+        ts = pd.to_datetime(raw, errors="coerce")
+    except Exception:
+        return None
+    if isinstance(ts, pd.Timestamp) and pd.notna(ts):
+        return ts.date()
+    return None
+
+
 def _execution_merged_stream_filters_nonempty(merged: Dict[str, Any]) -> bool:
     """True when merged execution config exists at all."""
     if not merged:
@@ -532,13 +547,15 @@ def get_execution_slot_from_latest_row(
     stream_id: str,
     session: str,
     session_time_slots: Dict[str, List[str]],
+    session_trading_date: Optional[date] = None,
 ) -> Tuple[str, bool]:
     """
     Latest matrix row -> ``slot_time`` display string and whether it is valid for execution.
 
-    **Time Change** (if non-empty and coercible) overrides **Time** when both are valid session times.
-    Valid means normalized HH:MM is in ``session_time_slots[session]``. Every slot listed for the
-    session is allowed for every instrument (matrix is the time authority; no hidden per-instrument lists).
+    ``Time`` is the row's own execution slot. ``Time Change`` is a next-row/next-session intent, so it
+    only overrides ``Time`` when the selected row's ``trade_date`` is before ``session_trading_date``.
+    Valid means normalized HH:MM is in ``session_time_slots[session]``. Every slot listed for the session
+    is allowed for every instrument (matrix is the time authority; no hidden per-instrument lists).
     """
     from modules.matrix.utils import normalize_time as _norm_slot
 
@@ -558,15 +575,31 @@ def get_execution_slot_from_latest_row(
 
     time_raw = _execution_mode_row_get_time(r)
     tc_raw = _execution_mode_row_get_time_change(r)
+    row_trade_date = _execution_mode_row_get_trade_date(r)
+    time_change_applies = (
+        session_trading_date is None
+        or row_trade_date is None
+        or row_trade_date < session_trading_date
+    )
     tc_parsed = _coerce_matrix_cell_to_slot_hhmm(tc_raw)
     t_parsed = _coerce_matrix_cell_to_slot_hhmm(time_raw)
     time_from_matrix = ""
     if _execution_mode_matrix_cell_is_nonempty(tc_raw):
-        if tc_parsed and _in_session_slots(tc_parsed):
+        if not time_change_applies:
+            logger.debug(
+                "TIME_CHANGE_DEFERRED stream=%s row_trade_date=%s session_trading_date=%s next_time=%s",
+                stream_id,
+                row_trade_date.isoformat() if row_trade_date else None,
+                session_trading_date.isoformat() if session_trading_date else None,
+                tc_parsed,
+            )
+        elif tc_parsed and _in_session_slots(tc_parsed):
             time_from_matrix = tc_parsed
             logger.info(
-                "TIME_CHANGE_APPLIED stream=%s matrix_row=latest new_time=%s",
+                "TIME_CHANGE_APPLIED stream=%s matrix_row=latest row_trade_date=%s session_trading_date=%s new_time=%s",
                 stream_id,
+                row_trade_date.isoformat() if row_trade_date else None,
+                session_trading_date.isoformat() if session_trading_date else None,
                 tc_parsed,
             )
         else:
@@ -2125,6 +2158,7 @@ class TimetableEngine:
                 stream_id,
                 session,
                 self.session_time_slots,
+                slot_date_obj,
             )
             enabled, block_reason, en_detail = get_execution_stream_enablement(
                 master_matrix_df,

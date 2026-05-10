@@ -22,6 +22,9 @@ function notableFlagLine(flags: EngineRunSummary['flags'] | undefined): string |
   if (flags.had_execution_block) parts.push('Execution block')
   if (flags.had_order_rejection) parts.push('Order rejection')
   if (flags.had_protective_failure) parts.push('Protective failure')
+  if (flags.had_crash_or_freeze_signal) parts.push('Crash/freeze signal')
+  if (flags.had_platform_disable_signal) parts.push('Platform disable')
+  if (flags.had_ninjatrader_platform_exception) parts.push('NinjaTrader platform exception')
   if (parts.length === 0) return null
   return parts.join(' • ')
 }

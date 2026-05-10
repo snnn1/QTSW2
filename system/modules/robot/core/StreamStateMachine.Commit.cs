@@ -65,14 +65,16 @@ public sealed partial class StreamStateMachine
         if (!string.IsNullOrWhiteSpace(_journal.ReentryIntentId))
         {
             if (_journal.ReentryFilled)
-                return _executionJournal.IsIntentCompleted(_journal.ReentryIntentId, TradingDate, Stream);
+                return TryGetLifecycleEntry(_journal.ReentryIntentId, out var reentryCompleted) &&
+                       reentryCompleted?.TradeCompleted == true;
 
             if (_journal.ReentrySubmitted || _journal.ReentrySubmitFailureCount > 0)
                 return false;
         }
 
         if (!string.IsNullOrWhiteSpace(_journal.OriginalIntentId))
-            return _executionJournal.IsIntentCompleted(_journal.OriginalIntentId, TradingDate, Stream);
+            return TryGetLifecycleEntry(_journal.OriginalIntentId, out var originalCompleted) &&
+                   originalCompleted?.TradeCompleted == true;
 
         return _executionJournal.HasCompletedTradeForStream(TradingDate, Stream);
     }
@@ -84,7 +86,7 @@ public sealed partial class StreamStateMachine
 
         if (!string.IsNullOrWhiteSpace(_journal.ReentryIntentId))
         {
-            var reentry = _executionJournal.GetEntry(_journal.ReentryIntentId, TradingDate, Stream);
+            TryGetLifecycleEntry(_journal.ReentryIntentId, out var reentry);
             if (reentry?.EntryFilled == true)
                 return true;
 
@@ -94,12 +96,75 @@ public sealed partial class StreamStateMachine
 
         if (!string.IsNullOrWhiteSpace(_journal.OriginalIntentId))
         {
-            var original = _executionJournal.GetEntry(_journal.OriginalIntentId, TradingDate, Stream);
+            TryGetLifecycleEntry(_journal.OriginalIntentId, out var original);
             if (original?.EntryFilled == true)
                 return true;
         }
 
         return _executionJournal.HasEntryFillForStream(TradingDate, Stream) || _entryDetected;
+    }
+
+    private bool TryGetLifecycleEntry(string? intentId, out ExecutionJournalEntry? entry)
+    {
+        entry = null;
+        if (_executionJournal == null || string.IsNullOrWhiteSpace(intentId))
+            return false;
+
+        foreach (var (td, stream) in EnumerateLifecycleJournalKeys())
+        {
+            entry = _executionJournal.GetEntry(intentId, td, stream);
+            if (entry != null)
+                return true;
+        }
+
+        return false;
+    }
+
+    private IEnumerable<(string TradingDate, string Stream)> EnumerateLifecycleJournalKeys()
+    {
+        yield return (TradingDate, Stream);
+
+        if (string.IsNullOrWhiteSpace(_journal.PriorJournalKey))
+            yield break;
+
+        var parts = _journal.PriorJournalKey.Split('_');
+        if (parts.Length < 2)
+            yield break;
+
+        var priorDate = parts[0];
+        var priorStream = string.Join("_", parts.Skip(1));
+        if (string.IsNullOrWhiteSpace(priorDate) || string.IsNullOrWhiteSpace(priorStream))
+            yield break;
+
+        if (!string.Equals(priorDate, TradingDate, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(priorStream, Stream, StringComparison.OrdinalIgnoreCase))
+        {
+            yield return (priorDate, priorStream);
+        }
+    }
+
+    private bool HasOpenLifecycleExposureOrPendingReentry()
+    {
+        if (!string.IsNullOrWhiteSpace(_journal.ReentryIntentId) &&
+            TryGetLifecycleEntry(_journal.ReentryIntentId, out var reentry) &&
+            reentry != null &&
+            !reentry.TradeCompleted &&
+            (reentry.EntrySubmitted || reentry.EntryFilled || reentry.EntryFilledQuantityTotal > 0))
+        {
+            return true;
+        }
+
+        if (!string.IsNullOrWhiteSpace(_journal.OriginalIntentId) &&
+            TryGetLifecycleEntry(_journal.OriginalIntentId, out var original) &&
+            original != null &&
+            !original.TradeCompleted &&
+            (original.EntrySubmitted || original.EntryFilled || original.EntryFilledQuantityTotal > 0))
+        {
+            return true;
+        }
+
+        return _journal.ExecutionInterruptedByClose ||
+               (HasAnyReentryLifecycle() && !IsReentryLifecycleCompleted());
     }
 
     private static bool IsCompletedFlattenTrade(ExecutionJournalEntry? entry)
@@ -244,7 +309,8 @@ public sealed partial class StreamStateMachine
         if (_executionJournal == null || string.IsNullOrWhiteSpace(_journal.ReentryIntentId))
             return false;
 
-        return _executionJournal.IsIntentCompleted(_journal.ReentryIntentId, TradingDate, Stream);
+        return TryGetLifecycleEntry(_journal.ReentryIntentId, out var reentry) &&
+               reentry?.TradeCompleted == true;
     }
 
     private void LogActiveReentryForcedFlattenSkipIfNeeded(DateTimeOffset utcNow)
@@ -300,6 +366,31 @@ public sealed partial class StreamStateMachine
 
         var rollback = CaptureJournalCommitRollback();
         var hasCompletedTradeForStream = HasCompletedTradeForCurrentStream();
+        if (commitReason == "STREAM_STAND_DOWN" && HasOpenLifecycleExposureOrPendingReentry())
+        {
+            _journal.Committed = false;
+            _journal.CommitReason = null;
+            _journal.SlotStatus = SlotStatus.ACTIVE;
+            _journal.LastUpdateUtc = utcNow.ToString("o");
+            _journals.Save(_journal);
+
+            _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "STREAM_STAND_DOWN_DEFERRED_OPEN_EXPOSURE", State.ToString(),
+                new
+                {
+                    original_intent_id = _journal.OriginalIntentId ?? "",
+                    reentry_intent_id = _journal.ReentryIntentId ?? "",
+                    execution_interrupted_by_close = _journal.ExecutionInterruptedByClose,
+                    reentry_submitted = _journal.ReentrySubmitted,
+                    reentry_filled = _journal.ReentryFilled,
+                    protection_submitted = _journal.ProtectionSubmitted,
+                    protection_accepted = _journal.ProtectionAccepted,
+                    prior_journal_key = _journal.PriorJournalKey ?? "",
+                    note = "Stand-down is not terminal while journal/reentry lifecycle evidence remains open."
+                }));
+            return false;
+        }
+
         if (hasCompletedTradeForStream &&
             (commitReason == "NO_TRADE_MARKET_CLOSE" || commitReason.Contains("NO_TRADE")))
         {
