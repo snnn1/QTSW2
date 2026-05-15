@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import sys
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from modules.watchdog.alert_ledger import AlertLedger
 from modules.watchdog.config import ALERT_LEDGER_PATH, NOTIFICATIONS_CONFIG_PATH, NOTIFICATIONS_SECRETS_PATH
+from modules.watchdog.incident_recorder import IncidentRecorder
 from modules.watchdog.notifications.notification_service import ALERT_TYPE_LABELS, NotificationService
 
 
@@ -64,6 +66,66 @@ def test_alert_ledger_ignores_non_object_records_during_rehydrate() -> None:
     ledger = AlertLedger(ledger_path=ledger_path)
 
     assert ledger.is_alert_active("ROBOT_HEARTBEAT_LOST") is True
+
+
+def test_alert_ledger_read_recent_folds_resolution_and_delivery_updates() -> None:
+    temp_dir = _workspace_temp_dir()
+    ledger = AlertLedger(ledger_path=temp_dir / "alert_ledger.jsonl")
+
+    ledger.append_alert(
+        "alert-order-stuck",
+        "ORDER_STUCK_DETECTED",
+        "medium",
+        {"sample": {"broker_order_id": "order-1"}},
+        "ORDER_STUCK_DETECTED_BATCH",
+    )
+    ledger.update_delivery(
+        "ORDER_STUCK_DETECTED_BATCH",
+        delivery_status="failed",
+        delivery_channel="pushover",
+        delivery_attempts=2,
+    )
+    ledger.resolve_alert("ORDER_STUCK_DETECTED_BATCH")
+
+    recent = ledger.read_recent()
+
+    assert len(recent) == 1
+    assert recent[0]["alert_id"] == "alert-order-stuck"
+    assert recent[0]["active"] is False
+    assert recent[0]["resolved_utc"]
+    assert recent[0]["delivery_status"] == "failed"
+    assert recent[0]["delivery_channel"] == "pushover"
+    assert recent[0]["delivery_attempts"] == 2
+    assert ledger.read_recent(active_only=True) == []
+
+
+def test_stale_active_incident_expires_without_new_notification() -> None:
+    temp_dir = _workspace_temp_dir()
+    recorder = IncidentRecorder(
+        incidents_path=temp_dir / "incidents.jsonl",
+        active_incidents_path=temp_dir / "active_incidents.json",
+    )
+    notifications = []
+    recorder.set_on_incident_callback(lambda record: notifications.append(record))
+    recorder.process_event(
+        {
+            "event_type": "FORCED_FLATTEN_TRIGGERED",
+            "timestamp_utc": "2026-05-01T12:00:00Z",
+            "data": {"instrument": "MNG"},
+        }
+    )
+
+    closed = recorder.reconcile_stale_active_incidents(
+        now=datetime(2026, 5, 3, 12, 0, 1, tzinfo=timezone.utc),
+        max_age_seconds=24 * 60 * 60,
+    )
+
+    assert len(closed) == 1
+    assert closed[0]["type"] == "FORCED_FLATTEN"
+    assert closed[0]["end_reason"] == "STALE_ACTIVE_INCIDENT_EXPIRED"
+    assert closed[0]["stale_active_incident"] is True
+    assert recorder.get_active_incidents() == {}
+    assert notifications == []
 
 
 def test_watchdog_alert_labels_cover_generated_alerts() -> None:

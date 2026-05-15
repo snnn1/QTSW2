@@ -154,6 +154,8 @@ internal sealed class CapturingExecutionAdapter : IExecutionAdapter
     };
 
     public List<string> CancelledOrderIds { get; } = new();
+    public List<(string IntentId, string Instrument, DateTimeOffset UtcNow)> FlattenRequests { get; } = new();
+    public List<(string IntentId, string Instrument, DateTimeOffset UtcNow)> SessionCloseFlattenRequests { get; } = new();
     public (string IntentId, string Instrument, string Direction, decimal StopPrice, int Quantity)? LastProtectiveStop { get; private set; }
     public (string IntentId, string Instrument, string Direction, decimal TargetPrice, int Quantity)? LastTargetOrder { get; private set; }
 
@@ -216,7 +218,10 @@ internal sealed class CapturingExecutionAdapter : IExecutionAdapter
     public OrderModificationResult ModifyStopToBreakEven(string intentId, string instrument, decimal beStopPrice, DateTimeOffset utcNow)
         => OrderModificationResult.SuccessResult(utcNow);
     public FlattenResult Flatten(string intentId, string instrument, DateTimeOffset utcNow)
-        => FlattenResult.SuccessResult(utcNow);
+    {
+        FlattenRequests.Add((intentId, instrument, utcNow));
+        return FlattenResult.SuccessResult(utcNow);
+    }
     public FlattenResult FlattenEmergency(string instrument, DateTimeOffset utcNow)
         => FlattenResult.SuccessResult(utcNow);
     public AccountSnapshot GetAccountSnapshot(DateTimeOffset utcNow)
@@ -233,7 +238,10 @@ internal sealed class CapturingExecutionAdapter : IExecutionAdapter
         }
     }
     public FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow)
-        => FlattenResult.SuccessResult(utcNow);
+    {
+        SessionCloseFlattenRequests.Add((intentId, instrument, utcNow));
+        return FlattenResult.SuccessResult(utcNow);
+    }
     public bool TryEnqueueEmergencyFlattenProtective(string instrument, DateTimeOffset utcNow) => true;
 
     public bool IsExecutionContextReady => true;

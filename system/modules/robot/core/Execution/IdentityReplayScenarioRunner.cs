@@ -5,6 +5,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using QTSW2.Robot.Contracts;
 
@@ -463,10 +464,18 @@ public static class IdentityReplayScenarioRunner
             var td = IdentityReplayScenarioDefinitions.DeterministicTradingDate;
             var stream = IdentityReplayScenarioDefinitions.HydrationTradeStream;
             var inst = IdentityReplayScenarioDefinitions.HydrationExecutionInstrument;
+            var beTrigger = IdentityReplayScenarioDefinitions.HydrationComputeBeTrigger(4500m, 4600m, "Long");
+            var ocoGroup = RobotOrderIds.EncodeEntryOco(td, stream, IdentityReplayScenarioDefinitions.HydrationSlotTimeChicago);
             var utc = DateTimeOffset.UtcNow;
 
             journal.RecordSubmission(originalId, td, stream, inst, "ENTRY", "broker-s8", utc,
-                expectedEntryPrice: 4500m, entryPrice: 4500m, stopPrice: 4400m, targetPrice: 4600m, direction: "Long");
+                expectedEntryPrice: 4500m,
+                entryPrice: 4500m,
+                stopPrice: 4400m,
+                targetPrice: 4600m,
+                beTriggerPrice: beTrigger,
+                direction: "Long",
+                ocoGroup: ocoGroup);
 
             journal.RecordEntryFill(originalId, td, stream, 4500m, 1, utc, 5m, "Long", inst, inst);
 
@@ -485,6 +494,26 @@ public static class IdentityReplayScenarioRunner
             if (!string.Equals(hydrated.ComputeIntentId(), originalId, StringComparison.Ordinal))
             {
                 error = $"{IdentityReplayScenarioNames.S8_FULL_HYDRATION_RECONSTRUCTION}: reconstructed id != original";
+                return false;
+            }
+
+            if (!string.Equals(hydrated.SlotTimeChicago, IdentityReplayScenarioDefinitions.HydrationSlotTimeChicago, StringComparison.Ordinal))
+            {
+                error = $"{IdentityReplayScenarioNames.S8_FULL_HYDRATION_RECONSTRUCTION}: hydrated slot {hydrated.SlotTimeChicago} != {IdentityReplayScenarioDefinitions.HydrationSlotTimeChicago}";
+                return false;
+            }
+
+            var activeBeIntents = adapter.GetActiveIntentsForBEMonitoring(inst);
+            if (!activeBeIntents.Any(x => string.Equals(x.intentId, originalId, StringComparison.Ordinal)))
+            {
+                error = $"{IdentityReplayScenarioNames.S8_FULL_HYDRATION_RECONSTRUCTION}: BE monitoring missing hydrated intent";
+                return false;
+            }
+
+            var openIntentIds = adapter.GetOpenIntentIdsForInstrument(inst);
+            if (!openIntentIds.Contains(originalId))
+            {
+                error = $"{IdentityReplayScenarioNames.S8_FULL_HYDRATION_RECONSTRUCTION}: open-intent visibility missing hydrated intent";
                 return false;
             }
 

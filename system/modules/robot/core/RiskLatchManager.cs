@@ -47,6 +47,35 @@ public sealed class RiskLatchManager
         !string.IsNullOrWhiteSpace(reason) &&
         reason.IndexOf(ObsoleteLegacyClassifierGapMarker, StringComparison.OrdinalIgnoreCase) >= 0;
 
+    public static bool IsAutoClearEligibleReason(string? reason)
+    {
+        var r = reason?.Trim() ?? "";
+        return r.StartsWith("FORCED_CONVERGENCE_FAILED:", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool ShouldAutoClearResolvedFlatLatch(
+        string? reason,
+        int accountQty,
+        int journalQty,
+        int brokerPositionQty,
+        int brokerWorkingCount,
+        int realOpenQty,
+        int recoveryOpenQty,
+        bool hasSupervisoryBlock,
+        bool hasProtectiveBlock = false,
+        bool hasMismatchBlock = false)
+    {
+        if (hasSupervisoryBlock)
+            return false;
+        if (hasProtectiveBlock || hasMismatchBlock)
+            return false;
+        if (accountQty != 0 || journalQty != 0 || brokerPositionQty != 0 || brokerWorkingCount != 0 ||
+            realOpenQty != 0 || recoveryOpenQty != 0)
+            return false;
+
+        return IsAutoClearEligibleReason(reason);
+    }
+
     public void Persist(string instrument, string reason)
     {
         if (string.IsNullOrWhiteSpace(instrument)) return;

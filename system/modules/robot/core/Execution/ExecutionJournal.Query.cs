@@ -157,6 +157,75 @@ public sealed partial class ExecutionJournal
             return null;
         }
     }
+
+    public (string TradingDate, string Stream, ExecutionJournalEntry Entry)? TryFindEntryByIntentId(string intentId)
+    {
+        if (string.IsNullOrWhiteSpace(intentId))
+            return null;
+
+        lock (_lock)
+        {
+            foreach (var kvp in _cache)
+            {
+                if (!TryParseJournalKeyParts(kvp.Key, out var cacheTradingDate, out var cacheStream, out var cacheIntentId))
+                    continue;
+                if (!string.Equals(cacheIntentId, intentId, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                return (cacheTradingDate, cacheStream, kvp.Value);
+            }
+
+            try
+            {
+                if (!Directory.Exists(_journalDir))
+                    return null;
+
+                foreach (var path in Directory.GetFiles(_journalDir, $"*_{intentId}.json"))
+                {
+                    var fileName = Path.GetFileNameWithoutExtension(path);
+                    if (!TryParseJournalKeyParts(fileName, out var tradingDate, out var stream, out var parsedIntentId))
+                        continue;
+                    if (!string.Equals(parsedIntentId, intentId, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    var json = ReadJournalFileWithRetry(path);
+                    if (json == null)
+                        continue;
+
+                    var entry = JsonUtil.Deserialize<ExecutionJournalEntry>(json);
+                    if (entry == null)
+                        continue;
+
+                    _cache[fileName] = entry;
+                    SyncAdoptionCandidateIndexForIntentLocked(intentId, entry);
+                    return (tradingDate, stream, entry);
+                }
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool TryParseJournalKeyParts(string fileNameWithoutExtension, out string tradingDate, out string stream, out string intentId)
+    {
+        tradingDate = "";
+        stream = "";
+        intentId = "";
+
+        var parts = fileNameWithoutExtension.Split('_');
+        if (parts.Length < 3)
+            return false;
+
+        tradingDate = parts[0];
+        intentId = parts[parts.Length - 1];
+        stream = string.Join("_", parts.Skip(1).Take(parts.Length - 2));
+        return !string.IsNullOrWhiteSpace(tradingDate) &&
+               !string.IsNullOrWhiteSpace(stream) &&
+               !string.IsNullOrWhiteSpace(intentId);
+    }
     
     private string GetJournalPath(string tradingDate, string stream, string intentId)
         => Path.Combine(_journalDir, $"{tradingDate}_{stream}_{intentId}.json");

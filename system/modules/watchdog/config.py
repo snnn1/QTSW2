@@ -295,6 +295,7 @@ LIVE_CRITICAL_EVENT_TYPES = {
     "RECONCILIATION_QTY_MISMATCH",  # Position drift (broker vs journal)
     # Position authority observability (read-only mirror of robot; no Watchdog decisions)
     "POSITION_AUTHORITY_EVALUATED",
+    "RELEASE_READINESS_INPUT_AUDIT",
     "EXPOSURE_INTEGRITY_VIOLATION",  # Intent vs broker mismatch (critical invariant)
     "ORDER_LIFECYCLE_TRANSITION_INVALID",  # Invalid order state transition
     # Forced flatten lifecycle (notification coverage fix)

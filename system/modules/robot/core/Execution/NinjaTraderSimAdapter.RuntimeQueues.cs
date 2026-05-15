@@ -539,16 +539,17 @@ public sealed partial class NinjaTraderSimAdapter
         }
     }
 
-    private void EnqueueNtActionInternal(INtAction action)
+    private bool EnqueueNtActionInternal(INtAction action)
     {
         if (action is NtFlattenInstrumentCommand flatCmd && !TryExecutionSafetyGateFlattenEnqueue(flatCmd, flatCmd.UtcNow))
-            return;
+            return false;
         if (action is NtFlattenInstrumentCommand fCmd && !TryCoordinationGateFlattenEnqueue(fCmd, out _))
-            return;
+            return false;
         if (action is NtSubmitProtectivesCommand protectives)
             NotifyProtectiveSubmitPendingForAction(protectives);
         if (_ntActionQueue != null)
-            _ntActionQueue.EnqueueNtAction(action, out _);
+            return _ntActionQueue.EnqueueNtAction(action, out _);
+        return false;
     }
 
     partial void OnVerifyPendingFlattens();

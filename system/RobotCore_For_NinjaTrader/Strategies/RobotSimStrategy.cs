@@ -1123,7 +1123,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                     { "termination_classification", "STATE_TERMINATED" },
                     { "note", "NinjaTrader State.Terminated lifecycle; normal during playback/shutdown. Engine.Stop emits an EngineStop authoritative-state snapshot before summary write. STRATEGY_DISABLED_BY_NINJATRADER is reserved for explicit platform-disable evidence." }
                 });
-                _engine?.Stop(writeRunSummary: writeRunSummary, stopSource: "strategy_terminated");
+                if (writeRunSummary)
+                    _engine?.StopAllProcessEnginesForCurrentRun(writeRunSummary: true, stopSource: "strategy_terminated_final");
+                else
+                    _engine?.Stop(writeRunSummary: false, stopSource: "strategy_terminated");
             }
         }
 

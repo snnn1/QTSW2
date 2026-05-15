@@ -7,7 +7,7 @@ set "PYTHONPATH=%CD%\system"
 set "BACKEND_PROBE_URL=http://127.0.0.1:8000/api/matrix/test"
 set "FRONTEND_DIR=%CD%\system\modules\matrix_timetable_app\frontend"
 set "FRONTEND_URL=http://localhost:5174/"
-set "FRONTEND_API_BASE=http://localhost:8000/api"
+set "FRONTEND_API_BASE=http://127.0.0.1:8000/api"
 
 echo [%TIME%] Repo: %CD%
 echo [%TIME%] PYTHONPATH=%PYTHONPATH%
@@ -21,7 +21,9 @@ powershell -NoProfile -Command ^
   "$conn = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; " ^
   "if (-not $conn) { exit 1 }; " ^
   "$cmd = ''; try { $proc = Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $conn.OwningProcess) -ErrorAction Stop; $cmd = [string]$proc.CommandLine } catch { }; " ^
+  "$name = ''; try { $gp = Get-Process -Id $conn.OwningProcess -ErrorAction Stop; $name = [string]$gp.ProcessName } catch { }; " ^
   "if ($cmd -match 'uvicorn.*modules\.dashboard\.backend\.main:app') { try { Stop-Process -Id $conn.OwningProcess -Force -ErrorAction Stop; Start-Sleep -Seconds 1; exit 2 } catch { exit 3 } }; " ^
+  "if ($cmd -eq '' -and $name -match '^python') { exit 3 }; " ^
   "exit 4"
 set "API_ACTION=%errorlevel%"
 
@@ -42,8 +44,8 @@ if "%API_ACTION%"=="2" (
 )
 
 if "%API_ACTION%"=="3" (
-  echo [%TIME%] Found an unresponsive Dashboard API on :8000 but could not stop it automatically.
-  echo [%TIME%] Close the old backend window, then rerun this launcher.
+  echo [%TIME%] Found an unresponsive Dashboard API on :8000, but the owning process could not be verified safely.
+  echo [%TIME%] Restart the Pipeline Dashboard API with launch\START_DASHBOARD_ADMIN.bat, then rerun this launcher.
   endlocal
   exit /b 1
 )
@@ -70,7 +72,7 @@ if errorlevel 1 (
 )
 
 echo [%TIME%] Starting Master Matrix frontend static server on :5174 ...
-start "Master Matrix UI (:5174)" cmd /k "cd /d ""%FRONTEND_DIR%"" && python -m http.server 5174 --bind 127.0.0.1 --directory dist"
+start "Master Matrix UI (:5174)" cmd /k "cd /d ""%FRONTEND_DIR%"" && python -m http.server 5174 --bind localhost --directory dist"
 
 timeout /t 5 /nobreak >nul
 echo [%TIME%] Opening %FRONTEND_URL%

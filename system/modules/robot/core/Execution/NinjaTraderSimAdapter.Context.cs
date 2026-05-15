@@ -94,6 +94,26 @@ public sealed partial class NinjaTraderSimAdapter
     /// <summary>Wires the unified execution authority for shadow/active evaluation.</summary>
     public void SetUnifiedExecutionAuthority(UnifiedExecutionAuthority? uea) => _unifiedAuthority = uea;
 
+    private ExecutionMode _authorityExecutionMode = ExecutionMode.DRYRUN;
+    private bool _authorityIsPlayback;
+    private bool _authorityIsMultiDayScenario;
+    private string _authorityPlaybackScenarioId = "";
+
+    /// <summary>Read-only context for authority frame snapshots.</summary>
+    public void SetAuthorityRuntimeContext(
+        ExecutionMode executionMode,
+        bool isPlayback,
+        bool isMultiDayScenario,
+        string? playbackScenarioId)
+    {
+        _authorityExecutionMode = executionMode;
+        _authorityIsPlayback = isPlayback;
+        _authorityIsMultiDayScenario = isMultiDayScenario;
+        _authorityPlaybackScenarioId = string.IsNullOrWhiteSpace(playbackScenarioId)
+            ? ""
+            : playbackScenarioId.Trim();
+    }
+
     /// <summary>Wires execution/fill activity to <see cref="MismatchEscalationCoordinator.NotifyExecutionTrigger"/> (optional).</summary>
     public void SetMismatchExecutionTriggerCallback(Action<string, DateTimeOffset, MismatchExecutionTriggerDetails>? callback) =>
         _onMismatchExecutionTrigger = callback;
@@ -123,6 +143,7 @@ public sealed partial class NinjaTraderSimAdapter
 
     /// <summary>RiskGate gate âˆ’1b: execution lock + path-aware policy (instrument, submit_path) â€” excludes mismatch authority.</summary>
     private Func<string, string?, bool>? _isInstrumentFrozenOrEpaBlocked;
+    private Func<string, string?, string?>? _getInstrumentFrozenOrEpaBlockReason;
 
     /// <summary>Authoritative engine session day (<see cref="RobotEngine.TradingDateString"/>). When null, session-identity gate is skipped (harness/tests).</summary>
     private Func<string?>? _getActiveTradingDateString;

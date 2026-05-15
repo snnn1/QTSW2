@@ -114,6 +114,8 @@ public sealed class AuthoritativeStateEmitter : IDisposable
 
         lock (_emitLock)
         {
+            if (_disposed) return;
+
             try
             {
                 var utcNow = DateTimeOffset.UtcNow;
@@ -291,6 +293,19 @@ public sealed class AuthoritativeStateEmitter : IDisposable
     public void Dispose()
     {
         _disposed = true;
-        _periodicTimer?.Dispose();
+        var timer = Interlocked.Exchange(ref _periodicTimer, null);
+        if (timer == null)
+            return;
+
+        try
+        {
+            using var disposed = new ManualResetEvent(false);
+            if (timer.Dispose(disposed))
+                disposed.WaitOne(TimeSpan.FromMilliseconds(500));
+        }
+        catch
+        {
+            try { timer.Dispose(); } catch { /* shutdown best effort */ }
+        }
     }
 }

@@ -778,8 +778,9 @@ public sealed partial class StreamStateMachine
         // Reentry: always flatten if reentry filled (reentry position may still be open at slot expiry)
         if (_executionAdapter != null)
         {
-            // Flatten original entry only if it was NOT already flattened by HandleForcedFlatten
-            if (!string.IsNullOrWhiteSpace(_journal.OriginalIntentId) && !_journal.ExecutionInterruptedByClose)
+            // Flatten original entry only if it is still open. A completed original may be
+            // followed by a linked reentry lifecycle that owns the live exposure.
+            if (ShouldFlattenOriginalIntentAtSlotExpiry())
             {
                 try
                 {
@@ -848,5 +849,22 @@ public sealed partial class StreamStateMachine
                 slot_status = _journal.SlotStatus.ToString(),
                 note = "Slot expired at next slot time"
             }));
+    }
+
+    private bool ShouldFlattenOriginalIntentAtSlotExpiry()
+    {
+        if (string.IsNullOrWhiteSpace(_journal.OriginalIntentId) || _journal.ExecutionInterruptedByClose)
+            return false;
+
+        if (TryGetLifecycleEntry(_journal.OriginalIntentId, out var original) && original != null)
+        {
+            if (original.TradeCompleted)
+                return false;
+
+            if (original.EntryFilled && ExecutionJournal.GetEntryRemainingOpenQuantity(original) <= 0)
+                return false;
+        }
+
+        return true;
     }
 }

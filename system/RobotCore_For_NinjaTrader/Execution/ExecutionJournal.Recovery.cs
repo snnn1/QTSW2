@@ -249,7 +249,7 @@ public sealed partial class ExecutionJournal
                     var (td, st, rid, ent) = recoveredTuples[i];
                     var pth = GetJournalPath(td, st, rid);
                     ent.TradeCompleted = true;
-                    ent.CompletionReason = CompletionReasons.RECONCILIATION_BROKER_FLAT;
+                    ent.CompletionReason = CompletionReasons.RECONCILIATION_POSITION_ALIGNMENT;
                     ent.CompletedAtUtc = uIso;
                     _cache[$"{td}_{st}_{rid}"] = ent;
                     SaveJournal(pth, ent);
@@ -265,7 +265,7 @@ public sealed partial class ExecutionJournal
                     var pth = GetJournalPath(t.Td, t.St, t.Iid);
                     ent.ExitFilledQuantityTotal = ent.EntryFilledQuantityTotal;
                     ent.TradeCompleted = true;
-                    ent.CompletionReason = CompletionReasons.RECONCILIATION_BROKER_FLAT;
+                    ent.CompletionReason = CompletionReasons.RECONCILIATION_RECOVERED_SUPERSEDED_BY_REAL;
                     ent.CompletedAtUtc = uIso;
                     _cache[$"{t.Td}_{t.St}_{t.Iid}"] = ent;
                     SaveJournal(pth, ent);
@@ -463,8 +463,7 @@ public sealed partial class ExecutionJournal
     {
         var exec = executionInstrumentPrimary.Trim();
         var canon = string.IsNullOrWhiteSpace(canonicalInstrument) ? exec : canonicalInstrument.Trim();
-        var uIso = utcNow.ToString("o");
-        var writes = 0;
+        var targets = new List<(string Td, string St, string Iid, int Rem)>();
         lock (_lock)
         {
             var openMap = GetOpenJournalEntriesByInstrument();
@@ -476,15 +475,37 @@ public sealed partial class ExecutionJournal
                     if (!IsRecoveredIntegrityJournalEntry(entry)) continue;
                     var rem = GetEntryRemainingOpenQuantity(entry);
                     if (rem <= 0) continue;
-                    var pth = GetJournalPath(td, st, iid);
-                    entry.ExitFilledQuantityTotal = entry.EntryFilledQuantityTotal;
-                    entry.TradeCompleted = true;
-                    entry.CompletionReason = CompletionReasons.RECONCILIATION_BROKER_FLAT;
-                    entry.CompletedAtUtc = uIso;
-                    _cache[$"{td}_{st}_{iid}"] = entry;
-                    SaveJournal(pth, entry);
-                    writes++;
+                    targets.Add((td, st, iid, rem));
                 }
+            }
+        }
+
+        var writes = 0;
+        foreach (var (td, st, iid, rem) in targets)
+        {
+            var brokerFlatAuthority = EvaluateBrokerFlatJournalCompletionAuthority(
+                "RecoveredIntegrityBrokerFlat",
+                exec,
+                canon,
+                td,
+                st,
+                iid,
+                utcNow,
+                brokerPositionQtyAbsAtDecision: 0,
+                brokerWorkingOrderCount: 0,
+                journalOpenQtyBeforeClose: rem);
+
+            if (RecordReconciliationComplete(
+                    td,
+                    st,
+                    iid,
+                    utcNow,
+                    brokerFlatAuthority,
+                    brokerPositionQtyAbsAtDecision: 0,
+                    journalOpenQtyBeforeClose: rem,
+                    triggerSource: "RecoveredIntegrityBrokerFlat"))
+            {
+                writes++;
             }
         }
 
@@ -842,11 +863,28 @@ public sealed partial class ExecutionJournal
     }
 
     private bool TryCompleteUntrackedFillRecoveryEntry(string tradingDate, string stream, string intentId,
-        DateTimeOffset utcNow, string completionReason)
+        DateTimeOffset utcNow, string completionReason, ExecutionAuthorityActionDecision brokerFlatAuthority)
     {
         if (string.IsNullOrWhiteSpace(tradingDate) || string.IsNullOrWhiteSpace(stream) || string.IsNullOrWhiteSpace(intentId))
             return false;
         if (!string.Equals(stream, UntrackedFillRecoveryStream, StringComparison.OrdinalIgnoreCase)) return false;
+        if (!IsAllowedBrokerFlatCompletionAuthority(brokerFlatAuthority))
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_COMPLETION_AUTHORITY_DENIED", "ENGINE",
+                new
+                {
+                    intent_id = intentId,
+                    stream,
+                    trading_date = tradingDate,
+                    completion_reason = completionReason,
+                    authority_gate = brokerFlatAuthority?.GateName ?? "NULL",
+                    authority_deny_reason = brokerFlatAuthority?.DenyReason ?? "AUTHORITY_NOT_ALLOWED",
+                    authority_frame_id = brokerFlatAuthority?.AuthorityFrame?.FrameId ?? "",
+                    trigger_source = "ExecutionJournal.CompleteUntrackedFillRecovery",
+                    note = "Untracked-fill recovery marker completion requires an allowed UEA JournalCompleteBrokerFlat decision."
+                }));
+            return false;
+        }
 
         lock (_lock)
         {
@@ -901,10 +939,21 @@ public sealed partial class ExecutionJournal
                  !string.Equals(key, canonicalInstrument, StringComparison.OrdinalIgnoreCase)))
                 continue;
 
-            foreach (var (tradingDate, stream, intentId, _) in kvp.Value)
+            foreach (var (tradingDate, stream, intentId, entry) in kvp.Value)
             {
                 if (!string.Equals(stream, UntrackedFillRecoveryStream, StringComparison.OrdinalIgnoreCase)) continue;
-                if (TryCompleteUntrackedFillRecoveryEntry(tradingDate, stream, intentId, utcNow, completionReason))
+                var brokerFlatAuthority = EvaluateBrokerFlatJournalCompletionAuthority(
+                    "ExecutionJournal.CompleteUntrackedFillRecovery",
+                    executionInstrument,
+                    canonicalInstrument,
+                    tradingDate,
+                    stream,
+                    intentId,
+                    utcNow,
+                    brokerPositionQtyAbsAtDecision: 0,
+                    brokerWorkingOrderCount: 0,
+                    journalOpenQtyBeforeClose: GetEntryRemainingOpenQuantity(entry));
+                if (TryCompleteUntrackedFillRecoveryEntry(tradingDate, stream, intentId, utcNow, completionReason, brokerFlatAuthority))
                     count++;
             }
         }

@@ -459,8 +459,6 @@ public sealed partial class RobotEngine
         if (Interlocked.Exchange(ref _playbackStallQuiesceForceFinalizeRequested, 1) != 0)
             return;
 
-        Interlocked.Exchange(ref _shutdownRequested, 1);
-        StopEngineHeartbeatTimer();
         LatchRunWideShutdownSignal(utcNow, "playback_stall_force_finalize", "playback_stall_quiesce");
 
         _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "ENGINE_PLAYBACK_STALL_QUIESCENCE_FORCE_FINALIZE", state: "ENGINE",
@@ -477,7 +475,7 @@ public sealed partial class RobotEngine
             }));
 
         TryWritePlaybackStallForcedRunSummary(utcNow);
-        Volatile.Write(ref _shutdownCompleted, 1);
+        QueuePlaybackStallProcessRunStop("playback_stall_force_finalize");
     }
 
     private void TryForcePlaybackStallLiveExposureFinalize(
@@ -497,8 +495,6 @@ public sealed partial class RobotEngine
         if (Interlocked.Exchange(ref _playbackStallQuiesceForceFinalizeRequested, 1) != 0)
             return;
 
-        Interlocked.Exchange(ref _shutdownRequested, 1);
-        StopEngineHeartbeatTimer();
         LatchRunWideShutdownSignal(utcNow, "playback_stall_live_exposure_timeout", "playback_stall_quiesce");
 
         _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
@@ -519,7 +515,33 @@ public sealed partial class RobotEngine
             }));
 
         TryWritePlaybackStallForcedRunSummary(utcNow);
-        Volatile.Write(ref _shutdownCompleted, 1);
+        QueuePlaybackStallProcessRunStop("playback_stall_live_exposure_timeout");
+    }
+
+    private void QueuePlaybackStallProcessRunStop(string stopSource)
+    {
+        RequestBackgroundShutdownQuiescence();
+        ThreadPool.QueueUserWorkItem(static state =>
+        {
+            var payload = ((RobotEngine Engine, string StopSource))state!;
+            try
+            {
+                payload.Engine.StopAllProcessEnginesForCurrentRun(
+                    writeRunSummary: true,
+                    stopSource: payload.StopSource);
+            }
+            catch
+            {
+                try
+                {
+                    payload.Engine.Stop(writeRunSummary: true, stopSource: payload.StopSource + "_fallback");
+                }
+                catch
+                {
+                    // Best-effort playback stall shutdown; never throw on thread pool.
+                }
+            }
+        }, (this, stopSource));
     }
 
     private void TryWritePlaybackStallForcedRunSummary(DateTimeOffset utcNow)

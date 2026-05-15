@@ -108,6 +108,19 @@ def test_connection_stable_derived_from_state():
     print("  [OK] connection_stable derived from derived_connection_state")
 
 
+def test_engine_alive_unknown_connection_is_not_displayed_as_lost():
+    """If engine ticks prove liveness and no disconnect exists, inferred Connected is STABLE."""
+    sm = WatchdogStateManager()
+    sm._last_engine_heartbeat = datetime.now(timezone.utc)
+    sm._last_engine_tick_utc = sm._last_engine_heartbeat
+
+    status = sm.compute_watchdog_status()
+
+    assert status["connection_status"] == "Connected"
+    assert status["derived_connection_state"] == "STABLE"
+    assert status["connection_stable"] is True
+
+
 def test_stable_since_after_last_lost():
     """STABLE requires _connection_stable_since_utc > _last_connection_lost_utc when both exist."""
     sm = WatchdogStateManager()
@@ -142,6 +155,7 @@ def run_all():
     test_recovery_then_disconnect_before_window_state_lost()
     test_multiple_disconnect_recover_cycles()
     test_connection_stable_derived_from_state()
+    test_engine_alive_unknown_connection_is_not_displayed_as_lost()
     test_stable_since_after_last_lost()
     test_lost_when_stable_since_before_last_lost()
     print("All tests passed.")

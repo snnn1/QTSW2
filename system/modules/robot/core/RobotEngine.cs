@@ -326,7 +326,10 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
     private readonly HashSet<(string, string)> _sessionCloseFallbackFailedEmittedKeys = new();
     private readonly object _sessionCloseGlobalSweepLock = new();
     private readonly HashSet<(string tradingDay, string instrument)> _sessionCloseGlobalSweepRequested = new();
+    private readonly Dictionary<(string tradingDay, string instrument), DateTimeOffset> _sessionCloseGlobalSweepLastRequestUtc = new();
     private readonly HashSet<(string tradingDay, string sessionClass, string instrument, string reason)> _sessionCloseGlobalSweepSkipLogged = new();
+    private const double SESSION_CLOSE_GLOBAL_SWEEP_RETRY_SECONDS = 30.0;
+    private const double SESSION_CLOSE_GLOBAL_SWEEP_STALE_WINDOW_SECONDS = 20.0 * 60.0;
 
     /// <summary>Watchdog session/flatten visibility: highest source wins per (tradingDay, sessionClass).</summary>
     private readonly Dictionary<(string tradingDay, string sessionClass), string> _sessionFlattenVisibilitySource = new();
@@ -351,6 +354,8 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
     // Instruments frozen due to RECONCILIATION_QTY_MISMATCH or FLATTEN_FAILED_PERSISTENT (block execution; allow range building)
     private readonly HashSet<string> _frozenInstruments = new(StringComparer.OrdinalIgnoreCase);
     private RiskLatchManager? _riskLatchManager;
+    private readonly Dictionary<string, DateTimeOffset> _riskLatchAutoClearSkippedThrottle = new(StringComparer.OrdinalIgnoreCase);
+    private const int RiskLatchAutoClearSkippedThrottleSeconds = 30;
 
     /// <summary>Suppresses redundant release-readiness evaluation and periodic reconciliation when inputs are stable.</summary>
     private readonly ReleaseReconciliationRedundancySuppression _releaseReconRedundancy = new();
@@ -421,12 +426,13 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
     private readonly Dictionary<string, DateTimeOffset> _recoveryAttemptLogThrottle = new Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase);
     private const int RecoveryAttemptLogThrottleSeconds = 60;
 
-    // Throttle RECONCILIATION_IEA_OWNED_WORKING_INVARIANT_BREACH per instrument (broker working > 0 but zero OWNED+ADOPTED live in registry)
+    // Throttle RECONCILIATION_IEA_OWNED_WORKING_INVARIANT_BREACH per instrument (broker working > 0 but zero mismatch-trusted live rows in registry)
     private readonly Dictionary<string, DateTimeOffset> _reconciliationBrokerWorkingOwnedInvariantThrottle = new Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase);
     private const int ReconciliationBrokerWorkingOwnedInvariantThrottleSeconds = 60;
 
     // Timer-based engine heartbeat (watchdog liveness when market closed, no ticks)
     private Timer? _engineHeartbeatTimer;
+    private int _engineHeartbeatCallbackThreadId;
     private int _shutdownRequested;
     private string? _heartbeatTradingDateCache; // Lock-free read from timer callback
     private int _engineHeartbeatWallTick;
@@ -446,6 +452,8 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
     private const int PlaybackStallQuiesceIeaStaleReleaseSeconds = 30;
     private const int PlaybackStallQuiesceLiveExposureForceFinalizeSeconds = 120;
     private int _shutdownCompleted;
+    private string? _pendingProcessRunStopCompletionSource;
+    private int _pendingProcessRunStopCompletionEngineCount;
 
     private DateTimeOffset _lastAuditMetricsEmitWallUtc = DateTimeOffset.MinValue;
     private const double AuditMetricsEmitWallIntervalSeconds = 10.0;
@@ -1236,6 +1244,7 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
         var keyEventWriter = new KeyEventWriter(_persistenceBase);
 #endif
         _log.SetRunId(_runId);
+        RegisterProcessEngineInstanceForRun();
         _runtimeAudit = new RuntimeAuditHub(_log, () => _runId ?? "");
         RuntimeAuditHubRef.Active = _runtimeAudit;
         _reconciliationConvergence = new ReconciliationConvergenceTracker(_log, () => _runId ?? "");
@@ -1608,6 +1617,11 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
             {
                 simAdapter.SetUseInstrumentExecutionAuthority(_executionPolicy?.UseInstrumentExecutionAuthority ?? false);
                 simAdapter.SetAggregationPolicy(_executionPolicy?.Aggregation);
+                simAdapter.SetAuthorityRuntimeContext(
+                    _executionMode,
+                    _isolatedPlaybackPersistence || _playbackAccountDetected,
+                    _playbackScenarioActive && (_playbackScenario?.dates?.Count ?? 0) > 1,
+                    _playbackScenario?.scenario_id);
                 simAdapter.SetEventWriter(_eventWriter);
 #if NINJATRADER
                 simAdapter.SetKeyEventWriter(keyEventWriter);
@@ -1679,6 +1693,7 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
                     isMismatchExecutionBlockedForSubmit: (inst, submitPath) =>
                         _mismatchCoordinator != null && _mismatchCoordinator.IsSubmitBlockedByMismatch(inst, submitPath),
                     isInstrumentFrozenOrEpaBlocked: IsInstrumentEpaAdapterSubmitBlocked,
+                    getInstrumentFrozenOrEpaBlockReason: GetInstrumentEpaAdapterSubmitBlockReason,
                     isPlaybackStallNtCallBlocked: () => IsPlaybackStallQuiescenceBlockingNtCalls());
 
                 // Wire coordinator to adapter
@@ -1719,9 +1734,13 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
                                     note = "Qty match — reconciliation episode cleared"
                                 }));
                         }
+                        TryAutoClearResolvedFlatRiskLatch(rInst, raq, rjq, resolvedUtc);
                     }
 
-                    // Intentionally no unfreeze here: reconciliation must not mutate execution latch state.
+                    TryAutoClearResolvedFlatRiskLatchesAbsentFromReconciliationPass(qtyByInstrument, resolvedUtc);
+
+                    // Reconciliation may only clear durable forced-convergence risk latches when a fresh
+                    // broker snapshot plus journal authority proves the instrument is clean flat.
                 },
                 reconciliationAccountName: () => _accountName,
                 reconciliationInstanceId: () => _reconciliationWriterInstanceId,
@@ -1805,6 +1824,11 @@ public sealed partial class RobotEngine : IExecutionRecoveryGuard
 
             if (_executionAdapter is NinjaTraderSimAdapter simP2)
             {
+                simP2.SetAuthorityRuntimeContext(
+                    _executionMode,
+                    _isolatedPlaybackPersistence || _playbackAccountDetected,
+                    _playbackScenarioActive && (_playbackScenario?.dates?.Count ?? 0) > 1,
+                    _playbackScenario?.scenario_id);
                 simP2.SetPendingFillBridge(_pendingFillBridge);
                 if (FeatureFlags.CanonicalOwnershipLedgerEnabled)
                 {

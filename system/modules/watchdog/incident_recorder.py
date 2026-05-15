@@ -9,7 +9,7 @@ Writes to data/watchdog/incidents.jsonl (append-only).
 """
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 from uuid import uuid4
@@ -17,6 +17,8 @@ from uuid import uuid4
 from .config import ACTIVE_INCIDENTS_FILE, INCIDENTS_FILE
 
 logger = logging.getLogger(__name__)
+
+STALE_ACTIVE_INCIDENT_MAX_AGE_SECONDS = 24 * 60 * 60
 
 # Incident start events -> incident type
 INCIDENT_START_EVENTS: Dict[str, str] = {
@@ -226,7 +228,7 @@ class IncidentRecorder:
         """Set callback invoked after each incident is written (Phase 4 alert integration)."""
         self._on_incident_callback = callback
 
-    def _write_incident(self, record: Dict) -> None:
+    def _write_incident(self, record: Dict, *, notify: bool = True) -> None:
         """Append incident to incidents.jsonl. Never throws."""
         try:
             self._incidents_path.parent.mkdir(parents=True, exist_ok=True)
@@ -235,7 +237,7 @@ class IncidentRecorder:
                 f.write(line)
             # Phase 4: Invoke alert engine callback if set
             cb = getattr(self, "_on_incident_callback", None)
-            if cb:
+            if notify and cb:
                 try:
                     cb(record)
                 except Exception as e:
@@ -243,9 +245,75 @@ class IncidentRecorder:
         except Exception as e:
             logger.debug(f"IncidentRecorder._write_incident failed: {e}")
 
+    def reconcile_stale_active_incidents(
+        self,
+        now: Optional[datetime] = None,
+        *,
+        max_age_seconds: int = STALE_ACTIVE_INCIDENT_MAX_AGE_SECONDS,
+    ) -> List[Dict]:
+        """
+        Close impossible stale active incidents.
+
+        Active incidents are persisted for restart safety, but if the recorder misses the
+        corresponding recovery event they can otherwise stay active for weeks and create a
+        false operator latch. Stale expiry is an audit repair only: it writes a completed
+        incident record with an explicit reason and does not send a fresh notification.
+        """
+        closed: List[Dict] = []
+        try:
+            if max_age_seconds <= 0:
+                return []
+            now_utc = now or datetime.now(timezone.utc)
+            if now_utc.tzinfo is None:
+                now_utc = now_utc.replace(tzinfo=timezone.utc)
+            cutoff = now_utc - timedelta(seconds=max_age_seconds)
+            stale_types = []
+            for incident_type, info in self._active_incidents.items():
+                start_ts = info.get("start_ts")
+                if start_ts is None:
+                    stale_types.append(incident_type)
+                    continue
+                if getattr(start_ts, "tzinfo", None) is None:
+                    start_ts = start_ts.replace(tzinfo=timezone.utc)
+                if start_ts < cutoff:
+                    stale_types.append(incident_type)
+
+            if not stale_types:
+                return []
+
+            for incident_type in stale_types:
+                active = self._active_incidents.pop(incident_type, None)
+                if not active:
+                    continue
+                start_ts = active.get("start_ts")
+                if start_ts is None:
+                    start_ts = cutoff
+                if getattr(start_ts, "tzinfo", None) is None:
+                    start_ts = start_ts.replace(tzinfo=timezone.utc)
+                duration_sec = max(0, int((now_utc - start_ts).total_seconds()))
+                record = {
+                    "incident_id": active.get("incident_id") or str(uuid4()),
+                    "type": incident_type,
+                    "severity": INCIDENT_SEVERITY.get(incident_type, "WARNING"),
+                    "start_ts": start_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "end_ts": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "duration_sec": duration_sec,
+                    "instruments": sorted(active.get("instruments", [])),
+                    "end_reason": "STALE_ACTIVE_INCIDENT_EXPIRED",
+                    "stale_active_incident": True,
+                }
+                self._write_incident(record, notify=False)
+                closed.append(record)
+
+            self._save_active_incidents()
+        except Exception as e:
+            logger.debug(f"IncidentRecorder.reconcile_stale_active_incidents failed: {e}")
+        return closed
+
     def get_active_incidents(self) -> Dict[str, Dict]:
         """Return copy of active incidents (for API)."""
         try:
+            self.reconcile_stale_active_incidents()
             return {k: dict(v) for k, v in self._active_incidents.items()}
         except Exception:
             return {}

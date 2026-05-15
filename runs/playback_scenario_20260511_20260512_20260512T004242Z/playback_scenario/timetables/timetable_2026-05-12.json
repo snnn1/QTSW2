@@ -1,0 +1,96 @@
+{
+  "as_of": "2026-05-12T00:42:42.829391+00:00",
+  "session_trading_date": "2026-05-12",
+  "trading_date": "2026-05-12",
+  "timezone": "America/Chicago",
+  "source": "playback_scenario",
+  "timetable_hash": "2c12d03f038037a66434afc8b9ec9a3227482c6115f07aa2fd86c110dc226e8d",
+  "previous_hash": null,
+  "version_timestamp": "2026-05-12T00:42:42.829391+00:00",
+  "metadata": {
+    "replay": true,
+    "scenario_id": "playback_scenario_20260511_20260512_20260512T004242Z",
+    "matrix_snapshot": "C:\\Users\\jakej\\QTSW2\\data\\master_matrix\\master_matrix_20260511_184333_29866n.parquet",
+    "matrix_sha256": "128f23af4ac9c4686f6e6b3e5371ef6f5fda4514124d6dbe000bc8db463f379b",
+    "matrix_meta": {
+      "source_kind": "disk",
+      "source_path": "C:\\Users\\jakej\\QTSW2\\data\\master_matrix\\master_matrix_20260511_184333_29866n.parquet",
+      "source_name": "master_matrix_20260511_184333_29866n.parquet",
+      "file_mtime": 1778525013.936553,
+      "snapshot_id": "master_matrix_20260511_184333_29866n.parquet",
+      "row_count": 29866
+    }
+  },
+  "streams": [
+    {
+      "stream": "ES2",
+      "slot_time": "11:00",
+      "enabled": true
+    },
+    {
+      "stream": "NQ2",
+      "slot_time": "11:00",
+      "enabled": true
+    },
+    {
+      "stream": "NG2",
+      "slot_time": "11:00",
+      "enabled": true
+    },
+    {
+      "stream": "YM2",
+      "slot_time": "11:00",
+      "enabled": true
+    },
+    {
+      "stream": "RTY2",
+      "slot_time": "11:00",
+      "enabled": true
+    },
+    {
+      "stream": "CL2",
+      "slot_time": "10:00",
+      "enabled": true
+    },
+    {
+      "stream": "GC2",
+      "slot_time": "09:30",
+      "enabled": true
+    },
+    {
+      "stream": "NG1",
+      "slot_time": "09:00",
+      "enabled": true
+    },
+    {
+      "stream": "YM1",
+      "slot_time": "09:00",
+      "enabled": true
+    },
+    {
+      "stream": "RTY1",
+      "slot_time": "09:00",
+      "enabled": true
+    },
+    {
+      "stream": "ES1",
+      "slot_time": "08:00",
+      "enabled": true
+    },
+    {
+      "stream": "CL1",
+      "slot_time": "08:00",
+      "enabled": true
+    },
+    {
+      "stream": "GC1",
+      "slot_time": "07:30",
+      "enabled": true
+    },
+    {
+      "stream": "NQ1",
+      "slot_time": "07:30",
+      "enabled": true
+    }
+  ]
+}

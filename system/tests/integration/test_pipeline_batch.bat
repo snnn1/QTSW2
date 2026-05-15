@@ -5,13 +5,13 @@ echo   PIPELINE TEST
 echo ============================================================
 echo.
 
-echo [1] Checking if backend is running on port 8001...
-netstat -ano | findstr :8001 | findstr LISTENING
+echo [1] Checking if dashboard backend is running on port 8000...
+netstat -ano | findstr :8000 | findstr LISTENING
 if %errorlevel% == 0 (
     echo   [OK] Backend is running
 ) else (
     echo   [ERROR] Backend is NOT running!
-    echo   Start it with: batch\START_DASHBOARD.bat
+    echo   Start it with: launch\START_DASHBOARD_ADMIN.bat
     pause
     exit /b 1
 )

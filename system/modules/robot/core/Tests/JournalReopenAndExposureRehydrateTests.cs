@@ -23,6 +23,8 @@ public static class JournalReopenAndExposureRehydrateTests
         if (!d.Pass) return (false, $"rehydrate: {d.Error}");
         var e = BrokerFlatCompletedCarryoverReopensFromWorkingOrderIntent();
         if (!e.Pass) return (false, $"carryover_reopen: {e.Error}");
+        var f = BrokerFlatCompletedCarryoverReopensFromStreamJournalEvidence();
+        if (!f.Pass) return (false, $"stream_carryover_reopen: {f.Error}");
         return (true, null);
     }
 
@@ -186,6 +188,94 @@ public static class JournalReopenAndExposureRehydrateTests
             var candidates = journal.GetAdoptionCandidateIntentIdsForInstrument("MNG", "NG");
             if (!candidates.Contains(intentId))
                 return (false, "reopened carryover row should be adoption candidate");
+            return (true, null);
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(tempRoot))
+                    Directory.Delete(tempRoot, true);
+            }
+            catch { /* best-effort */ }
+        }
+    }
+
+    private static (bool Pass, string? Error) BrokerFlatCompletedCarryoverReopensFromStreamJournalEvidence()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"CarryoverStreamReopen_{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            var journalDir = RobotRunArtifactPaths.StateExecutionJournals(tempRoot);
+            var streamJournalDir = RobotRunArtifactPaths.StateStreamJournals(tempRoot);
+            Directory.CreateDirectory(journalDir);
+            Directory.CreateDirectory(streamJournalDir);
+
+            const string intentId = "53b4c26ef93068e1";
+            var executionPath = Path.Combine(journalDir, $"2026-05-07_NG2_{intentId}.json");
+            var executionSeed = new ExecutionJournalEntry
+            {
+                IntentId = intentId,
+                TradingDate = "2026-05-07",
+                Stream = "NG2",
+                Instrument = "MNG",
+                EntrySubmitted = true,
+                EntryFilled = true,
+                EntryFilledQuantityTotal = 2,
+                ExitFilledQuantityTotal = 2,
+                TradeCompleted = true,
+                CompletionReason = CompletionReasons.RECONCILIATION_BROKER_FLAT,
+                Direction = "Long",
+                CompletedAtUtc = "2026-05-08T00:49:40+00:00",
+                ExitOrderType = CompletionReasons.RECONCILIATION_BROKER_FLAT,
+                ExitFilledAtUtc = "2026-05-08T00:49:40+00:00"
+            };
+            File.WriteAllText(executionPath, JsonUtil.Serialize(executionSeed));
+
+            var streamPath = Path.Combine(streamJournalDir, "2026-05-07_NG2.json");
+            var streamSeed = new StreamJournal
+            {
+                TradingDate = "2026-05-07",
+                Stream = "NG2",
+                Committed = false,
+                SlotStatus = SlotStatus.ACTIVE,
+                OriginalIntentId = "b5a9aa5158bc84df",
+                ReentryIntentId = intentId,
+                ReentrySubmitted = true,
+                ReentryFilled = true,
+                ProtectionSubmitted = true,
+                ProtectionAccepted = true
+            };
+            File.WriteAllText(streamPath, JsonUtil.Serialize(streamSeed));
+
+            var log = new RobotLogger(tempRoot);
+            var journal = new ExecutionJournal(tempRoot, log);
+            var reopened = journal.ReopenBrokerFlatCompletedJournalRowsForCarryoverFromStreamState(
+                "MNG",
+                "NG",
+                2,
+                "Long",
+                DateTimeOffset.Parse("2026-05-11T12:00:00+00:00"),
+                "unit_test");
+
+            if (reopened != 1)
+                return (false, $"expected one stream-evidenced carryover row reopened, got {reopened}");
+
+            var after = JsonUtil.Deserialize<ExecutionJournalEntry>(File.ReadAllText(executionPath));
+            if (after == null) return (false, "deserialized null");
+            if (after.TradeCompleted)
+                return (false, "TradeCompleted should be false after stream carryover reopen");
+            if (after.ExitFilledQuantityTotal != 0)
+                return (false, $"expected exit qty 0, got {after.ExitFilledQuantityTotal}");
+            if (after.CompletionReason != null)
+                return (false, $"expected completion reason cleared, got {after.CompletionReason}");
+            if (after.ExitOrderType != null)
+                return (false, $"expected exit order type cleared, got {after.ExitOrderType}");
+
+            var candidates = journal.GetAdoptionCandidateIntentIdsForInstrument("MNG", "NG");
+            if (!candidates.Contains(intentId))
+                return (false, "reopened stream carryover row should be adoption candidate");
             return (true, null);
         }
         finally

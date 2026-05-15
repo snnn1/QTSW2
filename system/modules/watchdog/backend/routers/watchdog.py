@@ -299,6 +299,22 @@ async def get_risk_gates(
         raise HTTPException(status_code=500, detail=f"Error getting risk gates: {str(e)}")
 
 
+@router.get("/risk-latches")
+async def get_risk_latches(
+    run_root: Optional[str] = Query(
+        None,
+        description="Optional peek: absolute run directory (must be under runs/ or data/playback/).",
+    ),
+):
+    """Get current durable robot instrument blocks from risk_latch_*.json files."""
+    try:
+        aggregator = get_aggregator()
+        return aggregator.get_risk_latches_for_context(_resolve_request_run_context(run_root))
+    except Exception as e:
+        logger.error(f"Error getting risk latches: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error getting risk latches: {str(e)}")
+
+
 @router.get("/unprotected-positions")
 async def get_unprotected_positions(
     run_root: Optional[str] = Query(

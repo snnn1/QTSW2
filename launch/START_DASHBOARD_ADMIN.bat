@@ -45,7 +45,7 @@ if "%API_ACTION%"=="2" (
 )
 
 echo Starting Dashboard API :8000 ^(modules.dashboard.backend.main:app^)...
-start "Dashboard API :8000 (Admin)" cmd /k "cd /d ""%ROOT%"" && set PYTHONPATH=%ROOT%\system && python -m uvicorn modules.dashboard.backend.main:app --host 127.0.0.1 --port 8000 --reload"
+start "Dashboard API :8000 (Admin)" cmd /k "cd /d ""%ROOT%"" && set PYTHONPATH=%ROOT%\system && python -m uvicorn modules.dashboard.backend.main:app --host 127.0.0.1 --port 8000"
 timeout /t 2 /nobreak >nul
 
 echo Opening browser: http://127.0.0.1:8000/pipeline

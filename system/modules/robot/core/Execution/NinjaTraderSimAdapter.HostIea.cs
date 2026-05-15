@@ -37,7 +37,8 @@ public sealed partial class NinjaTraderSimAdapter
         Func<string, string?, bool>? isMismatchExecutionBlockedForSubmit = null,
         Func<string, string?, bool>? isInstrumentFrozenOrEpaBlocked = null,
         Action<string, DateTimeOffset, bool, string?>? onReentrySubmitCompletedCallback = null,
-        Func<bool>? isPlaybackStallNtCallBlocked = null)
+        Func<bool>? isPlaybackStallNtCallBlocked = null,
+        Func<string, string?, string?>? getInstrumentFrozenOrEpaBlockReason = null)
     {
         _standDownStreamCallback = standDownStreamCallback;
         _getNotificationServiceCallback = getNotificationServiceCallback;
@@ -55,6 +56,7 @@ public sealed partial class NinjaTraderSimAdapter
         _isMismatchExecutionBlocked = isMismatchExecutionBlocked;
         _isMismatchExecutionBlockedForSubmit = isMismatchExecutionBlockedForSubmit;
         _isInstrumentFrozenOrEpaBlocked = isInstrumentFrozenOrEpaBlocked;
+        _getInstrumentFrozenOrEpaBlockReason = getInstrumentFrozenOrEpaBlockReason;
         _isPlaybackStallNtCallBlockedCallback = isPlaybackStallNtCallBlocked;
     }
 
@@ -590,7 +592,7 @@ public sealed partial class NinjaTraderSimAdapter
         var entryPrice = entry.EntryPrice ?? entry.FillPrice ?? 0;
         var stopPrice = entry.StopPrice ?? entryPrice;
         var targetPrice = entry.TargetPrice ?? entryPrice;
-        var beTrigger = ComputeBeTrigger(entryPrice, targetPrice, direction);
+        var beTrigger = entry.BETriggerPrice ?? ComputeBeTrigger(entryPrice, targetPrice, direction);
         var entryTimeUtc = DateTimeOffset.UtcNow;
         if (!string.IsNullOrEmpty(entry.EntryFilledAtUtc) && DateTimeOffset.TryParse(entry.EntryFilledAtUtc, out var parsed))
             entryTimeUtc = parsed;
@@ -636,6 +638,14 @@ public sealed partial class NinjaTraderSimAdapter
     {
         if (string.IsNullOrEmpty(ocoGroup)) return null;
         var parts = ocoGroup.Split(':');
+        if (parts.Length >= 7 &&
+            parts[0].Equals("QTSW2", StringComparison.OrdinalIgnoreCase) &&
+            parts[1].Equals("OCO_ENTRY", StringComparison.OrdinalIgnoreCase) &&
+            parts[4].Length == 2 &&
+            parts[5].Length == 2)
+        {
+            return parts[4] + ":" + parts[5];
+        }
         if (parts.Length >= 5 && parts[4].Length >= 5)
             return parts[4];
         return null;
@@ -749,8 +759,14 @@ public sealed partial class NinjaTraderSimAdapter
     public FlattenResult? RequestSessionCloseFlattenImmediate(string intentId, string instrument, DateTimeOffset utcNow)
     {
         if (!(this is INtActionExecutor)) return null;
-        var cidCancel = $"SESSION_CLOSE_CANCEL:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
         var cidFlatten = $"SESSION_CLOSE_FLATTEN:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
+        if (!TryExecutionSafetyFlattenGuard(instrument, intentId, utcNow, "SESSION_CLOSE_FLATTEN", cidFlatten, out _))
+            return FlattenResult.FailureResult("SESSION_CLOSE_FLATTEN_AUTHORITY_DENIED", utcNow);
+
+        if (!TryExecutionSafetyCancelAuthority(instrument, intentId, "SESSION_CLOSE_CANCEL", utcNow))
+            return FlattenResult.FailureResult("SESSION_CLOSE_CANCEL_AUTHORITY_DENIED", utcNow);
+
+        var cidCancel = $"SESSION_CLOSE_CANCEL:{intentId}:{utcNow:yyyyMMddHHmmssfff}";
 
         var cancel = new NtCancelOrdersCommand(cidCancel, intentId, instrument, false,
             "FORCED_FLATTEN_CANCEL", utcNow, preferUrgentDrain: true);
@@ -765,7 +781,8 @@ public sealed partial class NinjaTraderSimAdapter
         if (!TryEnqueueNtActionOnInstrumentOwner(flatten, instrument, utcNow, out _))
         {
             if (_ntActionQueue == null) return null;
-            EnqueueNtActionInternal(flatten);
+            if (!EnqueueNtActionInternal(flatten))
+                return null;
         }
         return FlattenResult.FailureResult("SESSION_CLOSE_FLATTEN_ENQUEUED", utcNow);
     }
@@ -784,6 +801,9 @@ public sealed partial class NinjaTraderSimAdapter
         {
             var intentId = raw?.Trim() ?? "";
             if (string.IsNullOrEmpty(intentId) || !seen.Add(intentId))
+                continue;
+
+            if (!TryExecutionSafetyCancelAuthority(instrument, intentId, "SESSION_CLOSE_CANCEL", utcNow))
                 continue;
 
             var cid = $"SESSION_CLOSE_CANCEL:{intentId}:{utcNow:yyyyMMddHHmmssfff}:{count}";
@@ -846,7 +866,7 @@ public sealed partial class NinjaTraderSimAdapter
     /// <summary>
     /// Protective / timer-path emergency flatten: enqueue EMERGENCY NtFlattenInstrumentCommand (strategy thread drain). Safe from any thread.
     /// </summary>
-    public void EnqueueEmergencyFlattenProtective(string instrument, DateTimeOffset utcNow)
+    public bool EnqueueEmergencyFlattenProtective(string instrument, DateTimeOffset utcNow)
     {
         var cmd = new NtFlattenInstrumentCommand(
             $"FLATTEN:EMERGENCY:{utcNow:yyyyMMddHHmmssfff}",
@@ -857,14 +877,13 @@ public sealed partial class NinjaTraderSimAdapter
             DestructiveActionSource.EMERGENCY,
             DestructiveTriggerReason.IEA_ENQUEUE_FAILURE,
             preferUrgentDrain: true);
-        EnqueueNtActionInternal(cmd);
+        return EnqueueNtActionInternal(cmd);
     }
 
     /// <inheritdoc />
     public bool TryEnqueueEmergencyFlattenProtective(string instrument, DateTimeOffset utcNow)
     {
-        EnqueueEmergencyFlattenProtective(instrument, utcNow);
-        return true;
+        return EnqueueEmergencyFlattenProtective(instrument, utcNow);
     }
 
     /// <summary>One best-effort re-enqueue after stale-owner TTL so takeover can admit a critical flatten.</summary>
@@ -900,7 +919,7 @@ public sealed partial class NinjaTraderSimAdapter
                     skippedCmd.ExplicitCancelBrokerOrderIds,
                     isVerifyRetryFlatten: false,
                     preferUrgentDrain: skippedCmd.PreferUrgentDrain);
-                EnqueueNtActionInternal(retry);
+                _ = EnqueueNtActionInternal(retry);
                 _log.Write(RobotEvents.EngineBase(utc, tradingDate: "", eventType: "FLATTEN_COORDINATION_CRITICAL_RETRY_ENQUEUED", state: "ENGINE",
                     new
                     {
@@ -925,8 +944,9 @@ public sealed partial class NinjaTraderSimAdapter
     /// <summary>Emergency flatten: enqueue-only (strategy thread must drain). Core build has no NT partial.</summary>
     public FlattenResult FlattenEmergency(string instrument, DateTimeOffset utcNow)
     {
-        EnqueueEmergencyFlattenProtective(instrument, utcNow);
-        return FlattenResult.FailureResult("Enqueued for strategy thread", utcNow);
+        if (EnqueueEmergencyFlattenProtective(instrument, utcNow))
+            return FlattenResult.FailureResult("Enqueued for strategy thread", utcNow);
+        return FlattenResult.FailureResult("Emergency flatten was not enqueued: authority denied or NT action queue unavailable", utcNow);
     }
 
     private static bool IsCriticalFlattenCommand(NtFlattenInstrumentCommand cmd)

@@ -784,7 +784,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
     private readonly Dictionary<string, DateTimeOffset> _recoveryAttemptLogThrottle = new Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase);
     private const int RecoveryAttemptLogThrottleSeconds = 60;
 
-    // Throttle RECONCILIATION_IEA_OWNED_WORKING_INVARIANT_BREACH per instrument (broker working > 0 but zero OWNED+ADOPTED live in registry)
+    // Throttle RECONCILIATION_IEA_OWNED_WORKING_INVARIANT_BREACH per instrument (broker working > 0 but zero mismatch-trusted live rows in registry)
     private readonly Dictionary<string, DateTimeOffset> _reconciliationBrokerWorkingOwnedInvariantThrottle = new Dictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase);
     private const int ReconciliationBrokerWorkingOwnedInvariantThrottleSeconds = 60;
 
@@ -4710,6 +4710,23 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         var robotWorkingCount = CountRobotTaggedBrokerWorkingForInstrument(snap, inst);
         if (brokerAbsQty <= 0 && robotWorkingCount <= 0)
             return;
+        if (!IsSessionCloseGlobalSweepInstrumentInEngineScope(inst, sessionClass, tradingDateStr))
+        {
+            TryLogSessionCloseGlobalSweepSkipped(tradingDateStr, sessionClass, inst, "OUTSIDE_ENGINE_SCOPE", utcNow,
+                new
+                {
+                    instrument = inst,
+                    canonical_instrument = canonical,
+                    session_class = sessionClass,
+                    broker_abs_qty = brokerAbsQty,
+                    broker_signed_qty = brokerSignedQty,
+                    robot_working_count = robotWorkingCount,
+                    engine_execution_instrument = _executionInstrument ?? "",
+                    engine_master_instrument = _masterInstrumentName ?? "",
+                    note = "This strategy instance observed shared account exposure for another engine scope; global sweep is scoped to the owning engine."
+                });
+            return;
+        }
         if (HasLocalActiveSessionCloseStreamForInstrument(inst, sessionClass))
             return;
 
@@ -4721,6 +4738,28 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
         }
         foreach (var intentId in CollectRobotTaggedIntentIdsForInstrument(snap, inst))
             intentIds.Add(intentId);
+
+        if (journalOpenQty <= 0 &&
+            TryGetActiveTrackedReentrySweepBlocker(inst, intentIds, out var trackedStreams, out var trackedSessions, out var trackedReentryIntentIds))
+        {
+            TryLogSessionCloseGlobalSweepSkipped(tradingDateStr, sessionClass, inst, "TRACKED_ACTIVE_REENTRY", utcNow,
+                new
+                {
+                    instrument = inst,
+                    canonical_instrument = canonical,
+                    session_class = sessionClass,
+                    broker_abs_qty = brokerAbsQty,
+                    broker_signed_qty = brokerSignedQty,
+                    robot_working_count = robotWorkingCount,
+                    journal_open_qty = journalOpenQty,
+                    intent_ids = intentIds.ToArray(),
+                    tracked_streams = trackedStreams,
+                    tracked_sessions = trackedSessions,
+                    tracked_reentry_intent_ids = trackedReentryIntentIds,
+                    note = "Broker exposure/working orders are explained by an active tracked reentry lifecycle; refusing session-close global sweep so a prior close event cannot flatten the resumed trade."
+                });
+            return;
+        }
 
         if (journalOpenQty <= 0 && intentIds.Count == 0)
         {
@@ -4889,6 +4928,88 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 string.Equals(s.Session, sessionClass, StringComparison.OrdinalIgnoreCase) &&
                 ExecutionInstrumentResolver.IsSameInstrument(s.ExecutionInstrument, instrument));
         }
+    }
+
+    private bool TryGetActiveTrackedReentrySweepBlocker(
+        string instrument,
+        IEnumerable<string> intentIds,
+        out string[] trackedStreams,
+        out string[] trackedSessions,
+        out string[] trackedReentryIntentIds)
+    {
+        var inst = instrument?.Trim() ?? "";
+        var intentSet = new HashSet<string>(
+            intentIds?.Where(id => !string.IsNullOrWhiteSpace(id)).Select(id => id.Trim()) ?? Array.Empty<string>(),
+            StringComparer.OrdinalIgnoreCase);
+        var streams = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        var sessions = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        var reentryIds = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        lock (_engineLock)
+        {
+            foreach (var stream in _streams.Values)
+            {
+                if (!stream.HasActiveReentryLifecycleEvidence)
+                    continue;
+                if (!ExecutionInstrumentResolver.IsSameInstrument(stream.ExecutionInstrument, inst))
+                    continue;
+
+                var reentryIntentId = stream.ReentryIntentId?.Trim() ?? "";
+                var originalIntentId = stream.OriginalIntentId?.Trim() ?? "";
+                var intentMatched = intentSet.Count == 0 ||
+                                    (!string.IsNullOrWhiteSpace(reentryIntentId) && intentSet.Contains(reentryIntentId)) ||
+                                    (!string.IsNullOrWhiteSpace(originalIntentId) && intentSet.Contains(originalIntentId));
+                if (!intentMatched)
+                    continue;
+
+                streams.Add(stream.Stream);
+                sessions.Add(stream.Session);
+                if (!string.IsNullOrWhiteSpace(reentryIntentId))
+                    reentryIds.Add(reentryIntentId);
+            }
+        }
+
+        trackedStreams = streams.ToArray();
+        trackedSessions = sessions.ToArray();
+        trackedReentryIntentIds = reentryIds.ToArray();
+        return trackedStreams.Length > 0;
+    }
+
+    private bool IsSessionCloseGlobalSweepInstrumentInEngineScope(string instrument, string sessionClass, string tradingDateStr)
+    {
+        var inst = instrument?.Trim() ?? "";
+        if (string.IsNullOrWhiteSpace(inst))
+            return false;
+
+        lock (_engineLock)
+        {
+            var hasExplicitScope =
+                !string.IsNullOrWhiteSpace(_executionInstrument) ||
+                !string.IsNullOrWhiteSpace(_masterInstrumentName) ||
+                _streams.Count > 0;
+
+            if (!hasExplicitScope)
+                return true;
+
+            if (!string.IsNullOrWhiteSpace(_executionInstrument) &&
+                ExecutionInstrumentResolver.IsSameInstrument(_executionInstrument, inst))
+                return true;
+
+            if (!string.IsNullOrWhiteSpace(_masterInstrumentName) &&
+                ExecutionInstrumentResolver.IsSameInstrument(_masterInstrumentName, inst))
+                return true;
+
+            return _streams.Values.Any(s =>
+                string.Equals(s.Session, sessionClass, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(s.TradingDate, tradingDateStr, StringComparison.Ordinal) &&
+                ExecutionInstrumentResolver.IsSameInstrument(s.ExecutionInstrument, inst));
+        }
+    }
+
+    internal void RunSessionCloseGlobalExposureSweepForTest(IExecutionAdapter adapter, string tradingDateStr, string sessionClass, DateTimeOffset utcNow)
+    {
+        _executionAdapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
+        RunSessionCloseGlobalExposureSweep(tradingDateStr, sessionClass, utcNow);
     }
 
     private int MarkSessionCloseInterruptedJournals(
@@ -8899,7 +9020,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                 _ieaUnavailableDegradedSuppressByInstrument.Remove(inst);
                 localWorking = ieaForInstrument.GetMismatchTrustedWorkingCount();
                 var ieaOwnedPlusAdoptedWorking = ieaForInstrument.GetOwnedPlusAdoptedWorkingCount();
-                if (brokerWorking > 0 && ieaOwnedPlusAdoptedWorking == 0)
+                if (brokerWorking > 0 && localWorking == 0)
                 {
                     var registryConvergenceActive =
                         PendingAlignmentAuthority.IsPendingAlignment(inst, utcNow) ||
@@ -8935,7 +9056,7 @@ public sealed class RobotEngine : IExecutionRecoveryGuard
                                 convergence_active = registryConvergenceActive,
                                 note = registryConvergenceActive
                                     ? "Broker reports working orders while IEA registry is settling inside a bounded order lifecycle convergence window."
-                                    : "Broker reports working orders but IEA registry has no OWNED/ADOPTED live (SUBMITTED/WORKING/PART_FILLED) rows — check ownership/lifecycle/adoption"
+                                    : "Broker reports working orders but IEA registry has no mismatch-trusted live (OWNED/ADOPTED/RECOVERABLE SUBMITTED/WORKING/PART_FILLED) rows - check ownership/lifecycle/adoption"
                             }));
                     }
                 }

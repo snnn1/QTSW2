@@ -66,6 +66,7 @@ public sealed partial class StreamStateMachine
     public string? CommitReason => _journal.CommitReason;
     public bool ExecutionInterruptedByClose => _journal.ExecutionInterruptedByClose;
     public string? OriginalIntentId => _journal.OriginalIntentId;
+    public string? ReentryIntentId => _journal.ReentryIntentId;
     public SlotStatus SlotStatus => _journal.SlotStatus;
     public bool IsActiveInterruptedBySessionClose =>
         _journal.SlotStatus == SlotStatus.ACTIVE && _journal.ExecutionInterruptedByClose && !_journal.Committed;
@@ -90,6 +91,15 @@ public sealed partial class StreamStateMachine
         _journal.ReentryFilled ||
         _journal.ProtectionSubmitted ||
         _journal.ProtectionAccepted;
+    public bool HasActiveReentryLifecycleEvidence =>
+        !_journal.Committed &&
+        _journal.SlotStatus == SlotStatus.ACTIVE &&
+        (!string.IsNullOrWhiteSpace(_journal.ReentryIntentId) ||
+         _journal.ReentrySubmitPending ||
+         _journal.ReentrySubmitted ||
+         _journal.ReentryFilled ||
+         _journal.ProtectionSubmitted ||
+         _journal.ProtectionAccepted);
     public bool RangeInvalidated => _rangeInvalidated; // Expose range invalidation status for engine-level tracking
     public string TradingDate => _journal.TradingDate;
 
@@ -180,6 +190,7 @@ public sealed partial class StreamStateMachine
     private readonly Func<string, bool>? _isIeaQueueHealthyForInstrument;
     private DateTimeOffset? _lastActiveReentryForcedFlattenSkipLogUtc;
     private string? _lastActiveReentryForcedFlattenSkipLogKey;
+    private string? _priorJournalTerminalMirrorCompletedKey;
     private const double ActiveReentryForcedFlattenSkipLogIntervalMinutes = 60.0;
 
     // Canonical event writer for replay reconstruction (forced flatten, slot expiry)
@@ -557,6 +568,15 @@ public sealed partial class StreamStateMachine
             _journal.NextSlotTimeUtc = existing.NextSlotTimeUtc ?? CalculateNextSlotTimeUtc(tradingDate, SlotTimeChicago, time);
             _journal.PriorJournalKey = existing.PriorJournalKey;
         }
+
+        if (_journal.Committed)
+        {
+            TryEnsureCarryForwardTerminalMirror(
+                initEventUtc,
+                _journal.CommitReason ?? "JOURNAL_ALREADY_COMMITTED",
+                "TRADE_COMPLETED",
+                _journal.SlotStatus);
+        }
         
         // Initialize state entry time tracking
         _stateEntryTimeUtc = initEventUtc;
@@ -642,7 +662,17 @@ public sealed partial class StreamStateMachine
                 }
             }
         }
-        
+
+        if (_journal.Committed)
+        {
+            State = StreamState.DONE;
+            TryEnsureCarryForwardTerminalMirror(
+                initEventUtc,
+                _journal.CommitReason ?? "JOURNAL_ALREADY_COMMITTED",
+                "TRADE_COMPLETED",
+                _journal.SlotStatus);
+        }
+
         // Log STREAM_INITIALIZED hydration event
         try
         {
@@ -871,6 +901,11 @@ public sealed partial class StreamStateMachine
             // Journal already exists and is committed - use it and mark as DONE
             _journal = existingJournal;
             State = StreamState.DONE;
+            TryEnsureCarryForwardTerminalMirror(
+                utcNow,
+                _journal.CommitReason ?? "JOURNAL_ALREADY_COMMITTED",
+                "TRADE_COMPLETED",
+                _journal.SlotStatus);
             
             // Only log rollover if it's forward progression (not backward/replay)
             if (!isBackwardDate)
@@ -1090,6 +1125,11 @@ public sealed partial class StreamStateMachine
 
         if (_journal.Committed)
         {
+            TryEnsureCarryForwardTerminalMirror(
+                utcNow,
+                _journal.CommitReason ?? "JOURNAL_ALREADY_COMMITTED",
+                "TRADE_COMPLETED",
+                _journal.SlotStatus);
             // Hard no re-arming
             State = StreamState.DONE;
             return;

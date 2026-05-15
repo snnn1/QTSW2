@@ -1,0 +1,29 @@
+{
+  "scenario_id": "playback_scenario_20260511_20260512_20260514T001923Z",
+  "mode": "multi_day_carryover",
+  "run_id": "playback_scenario_20260511_20260512_20260514T001923Z",
+  "matrix_snapshot": "data\\master_matrix\\master_matrix_20260514_001158_29894n.parquet",
+  "matrix_sha256": "d451362548f1abaf5a4d9ee2ac24029907f5b0c5d220b20ab19a2667fd9404f5",
+  "created_utc": "2026-05-14T00:19:23.842186+00:00",
+  "dates": [
+    "2026-05-11",
+    "2026-05-12"
+  ],
+  "state_policy": {
+    "persistence": "isolated_run_root",
+    "stream_journals": "load_and_carry_forward",
+    "day_switch": "event_clock_cme_18ct"
+  },
+  "timetables": {
+    "2026-05-11": {
+      "path": "timetables/timetable_2026-05-11.json",
+      "hash": "839e3f6acb72c173fd48680ba0d00bc343afa74953d59071918ecad50e8f6159",
+      "timetable_hash": "bd35f6ed763e6a3858b975d6984f9177d668b13feb994af36663a96fc2c0e306"
+    },
+    "2026-05-12": {
+      "path": "timetables/timetable_2026-05-12.json",
+      "hash": "512baa816f522812102877c9cedde74dc0de4ab580735f9323aa7f7b4bc0c10a",
+      "timetable_hash": "dc3393549c6e286169dba2b553931dd9c3096fef56e851dde19096507720f6d3"
+    }
+  }
+}

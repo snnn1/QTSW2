@@ -484,11 +484,58 @@ public sealed partial class NinjaTraderSimAdapter
             var filledTotal = orderInfo.FilledQuantity;
 
             var expectedQty = orderInfo.ExpectedQuantity > 0 ? orderInfo.ExpectedQuantity :
-                (_intentPolicy.TryGetValue(intentId, out var exp) ? exp.ExpectedQuantity : 0);
+                (IntentPolicy.TryGetValue(intentId, out var exp) ? exp.ExpectedQuantity : 0);
             var maxQty = orderInfo.MaxQuantity > 0 ? orderInfo.MaxQuantity :
-                (_intentPolicy.TryGetValue(intentId, out var exp2) ? exp2.MaxQuantity : 0);
-            var remainingQty = expectedQty - filledTotal;
-            var overfill = filledTotal > expectedQty;
+                (IntentPolicy.TryGetValue(intentId, out var exp2) ? exp2.MaxQuantity : 0);
+            var policySource = string.IsNullOrWhiteSpace(orderInfo.PolicySource) ? "UNKNOWN" : orderInfo.PolicySource;
+            if (expectedQty <= 0 && orderInfo.Quantity > 0)
+            {
+                expectedQty = orderInfo.Quantity;
+                maxQty = maxQty > 0 ? maxQty : orderInfo.Quantity;
+                policySource = "ORDER_INFO_FILL_FALLBACK";
+                orderInfo.ExpectedQuantity = expectedQty;
+                orderInfo.MaxQuantity = maxQty;
+                orderInfo.PolicySource = policySource;
+                orderInfo.CanonicalInstrument = string.IsNullOrWhiteSpace(orderInfo.CanonicalInstrument)
+                    ? context.CanonicalInstrument
+                    : orderInfo.CanonicalInstrument;
+                orderInfo.ExecutionInstrument = string.IsNullOrWhiteSpace(orderInfo.ExecutionInstrument)
+                    ? context.ExecutionInstrument
+                    : orderInfo.ExecutionInstrument;
+
+                if (!string.IsNullOrWhiteSpace(intentId))
+                {
+                    IntentPolicy[intentId] = new IntentPolicyExpectation
+                    {
+                        ExpectedQuantity = expectedQty,
+                        MaxQuantity = maxQty,
+                        PolicySource = policySource,
+                        CanonicalInstrument = orderInfo.CanonicalInstrument,
+                        ExecutionInstrument = orderInfo.ExecutionInstrument
+                    };
+                }
+
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument,
+                    "INTENT_POLICY_RESTORED_FROM_ORDER_INFO", new
+                    {
+                        intent_id = intentId,
+                        broker_order_id = order.OrderId ?? "",
+                        order_qty = orderInfo.Quantity,
+                        expected_qty = expectedQty,
+                        max_qty = maxQty,
+                        policy_source = policySource,
+                        reason = "Entry fill order row had broker quantity but no expected quantity policy."
+                    }));
+            }
+            else if (expectedQty > 0 && maxQty <= 0)
+            {
+                maxQty = expectedQty;
+                orderInfo.MaxQuantity = maxQty;
+            }
+
+            var quantityPolicyMissing = expectedQty <= 0 || maxQty <= 0;
+            var remainingQty = expectedQty > 0 ? expectedQty - filledTotal : -filledTotal;
+            var overfill = expectedQty > 0 && filledTotal > expectedQty;
 
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument,
                 "INTENT_FILL_UPDATE", new
@@ -499,10 +546,23 @@ public sealed partial class NinjaTraderSimAdapter
                     expected_qty = expectedQty,
                     max_qty = maxQty,
                     remaining_qty = remainingQty,
+                    quantity_policy_missing = quantityPolicyMissing,
+                    policy_source = policySource,
                     overfill = overfill
                 }));
 
-            if (overfill)
+            if (quantityPolicyMissing)
+            {
+                TriggerQuantityEmergency(intentId, "INTENT_QUANTITY_POLICY_MISSING", utcNow, new Dictionary<string, object>
+                {
+                    { "expected_qty", expectedQty },
+                    { "actual_filled_qty", filledTotal },
+                    { "last_fill_qty", fillQuantity },
+                    { "order_qty", orderInfo.Quantity },
+                    { "reason", "Entry fill has no expected quantity policy; journal the fill but block new risk." }
+                });
+            }
+            else if (overfill)
             {
                 TriggerQuantityEmergency(intentId, "INTENT_OVERFILL_EMERGENCY", utcNow, new Dictionary<string, object>
                 {

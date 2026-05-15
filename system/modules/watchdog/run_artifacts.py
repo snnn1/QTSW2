@@ -17,6 +17,7 @@ from .platform_diagnostics import augment_run_summary_with_platform_diagnostics
 logger = logging.getLogger(__name__)
 
 SUMMARY_FILE = "summary.json"
+AUTHORITY_SHUTDOWN_FRAME_FILE = "AUTHORITY_SHUTDOWN_FRAME.json"
 KEY_EVENTS_FILE = "KEY_EVENTS.jsonl"
 PLAYBACK_SCENARIO_POINTER_FILE = Path("configs") / "robot" / "playback_scenario_current.json"
 
@@ -215,10 +216,32 @@ def read_run_summary_json(root: Path, *, augment_platform: bool = False) -> Opti
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         if augment_platform and isinstance(data, dict):
-            return augment_run_summary_with_platform_diagnostics(data, root)
+            data = augment_run_summary_with_platform_diagnostics(data, root)
+        if isinstance(data, dict):
+            authority_frame = read_authority_shutdown_frame_json(root)
+            if authority_frame is not None:
+                data = dict(data)
+                data["authority_shutdown_frame_available"] = True
+                data["authority_shutdown_frame"] = authority_frame
+            elif "authority_shutdown_frame_available" not in data:
+                data = dict(data)
+                data["authority_shutdown_frame_available"] = False
         return data
     except (OSError, json.JSONDecodeError) as e:
         logger.warning("read_run_summary_json: %s", e)
+        return None
+
+
+def read_authority_shutdown_frame_json(root: Path) -> Optional[Dict[str, Any]]:
+    path = root / AUTHORITY_SHUTDOWN_FRAME_FILE
+    if not path.is_file():
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("read_authority_shutdown_frame_json: %s", e)
         return None
 
 

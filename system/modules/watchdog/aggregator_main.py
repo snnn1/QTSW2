@@ -24,7 +24,12 @@ import pytz
 from .event_feed import EventFeedGenerator
 from .event_processor import EventProcessor, get_flatten_lookup_reason_counts, stream_session_flatten_fields
 from modules.watchdog.aggregator.session_flatten_state import SessionFlattenStateTracker
-from .state_manager import WatchdogStateManager, CursorManager, _is_trading_date_within_max_age
+from .state_manager import (
+    WatchdogStateManager,
+    CursorManager,
+    _is_trading_date_within_max_age,
+    _position_authority_snapshot_is_clean_flat,
+)
 from .timetable_poller import TimetablePoller, compute_timetable_trading_date, resolve_watchdog_timetable_path
 from .market_calendar import get_market_state
 from .run_context import WatchdogRunContext, resolve_active_run_context
@@ -152,6 +157,279 @@ def _attach_position_authority_to_stream_row(state_manager: WatchdogStateManager
         row["position_authority"] = pa
 
 
+def _parse_event_timestamp_utc(event: Dict[str, Any]) -> Optional[datetime]:
+    raw = event.get("timestamp_utc") or event.get("ts_utc")
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _latest_position_authority_tail_payloads(
+    events: List[Dict[str, Any]],
+    *,
+    reject_at_or_before: Optional[datetime] = None,
+) -> List[Tuple[datetime, Dict[str, Any]]]:
+    """
+    Return the newest authority/working-order payload per raw instrument from a tail snapshot.
+
+    This is intentionally read-only observability. It keeps the operator display current even when
+    the cursor path is intentionally skipping full event processing or the tail snapshot has already
+    advanced past the cursor gap.
+    """
+    latest: Dict[str, Tuple[datetime, Dict[str, Any]]] = {}
+    for event in events:
+        event_type = event.get("event_type")
+        if event_type not in ("POSITION_AUTHORITY_EVALUATED", "RELEASE_READINESS_INPUT_AUDIT"):
+            continue
+        timestamp_utc = _parse_event_timestamp_utc(event)
+        if timestamp_utc is None:
+            continue
+        if reject_at_or_before is not None and timestamp_utc <= reject_at_or_before:
+            continue
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        instrument = data.get("instrument")
+        if instrument is None:
+            instrument = event.get("instrument")
+        if instrument is None or str(instrument).strip() == "":
+            continue
+        key = str(instrument).strip().upper()
+        payload = {
+            "instrument": str(instrument).strip(),
+            "broker_qty": data.get("broker_qty"),
+            "broker_position_qty": data.get("broker_position_qty"),
+            "real_open_qty": data.get("real_open_qty"),
+            "recovery_open_qty": data.get("recovery_open_qty"),
+            "journal_open_qty": data.get("journal_open_qty"),
+            "broker_working_count": data.get("broker_working_count"),
+            "iea_trusted_working_count": data.get("iea_trusted_working_count"),
+            "authority_state": data.get("authority_state"),
+            "source_event": event_type,
+        }
+        previous = latest.get(key)
+        if previous is None or timestamp_utc >= previous[0]:
+            latest[key] = (timestamp_utc, payload)
+    return [item for _key, item in latest.items()]
+
+
+def _normalize_watchdog_instrument_key(value: Any) -> str:
+    raw = str(value or "").strip().upper()
+    if not raw:
+        return ""
+    return raw.split()[0] if " " in raw else raw
+
+
+def _risk_latch_reason_auto_clear_eligible(reason: Any) -> bool:
+    return str(reason or "").strip().upper().startswith("FORCED_CONVERGENCE_FAILED:")
+
+
+def _risk_latch_block_scope(reason: Any) -> Dict[str, Any]:
+    # Durable forced-convergence latches are entry-risk blocks. Protective/cancel/flatten
+    # actions remain safety paths and must be judged by their own structural/overlay gates.
+    return {
+        "blocks_entries": True,
+        "blocks_reentry": True,
+        "blocks_protectives": False,
+        "blocks_cancel": False,
+        "blocks_flatten": False,
+        "scope_label": "entries/reentry",
+        "operator_action": (
+            "Wait for robot clean-flat verification or use explicit safe unfreeze after "
+            "broker, journal, ownership, working orders, mismatch, and IEA blocks are clear."
+        ),
+    }
+
+
+def _coerce_watchdog_int_or_none(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        text = str(value).strip()
+        if not text or text.lower() in ("none", "null", "nan"):
+            return None
+        return int(float(text))
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_risk_latch_clear_readiness(
+    latch: Dict[str, Any],
+    authority: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    reason_auto_clear = _risk_latch_reason_auto_clear_eligible(latch.get("reason"))
+    if not reason_auto_clear:
+        return {
+            "status": "explicit_unfreeze_required",
+            "reason_auto_clear_eligible": False,
+            "watchdog_clean_flat_candidate": False,
+            "robot_clear_candidate": False,
+            "clear_allowed": False,
+            "can_watchdog_clear": False,
+            "predicates": {},
+            "failed_predicates": ["reason_auto_clear_eligible"],
+            "robot_must_verify": [
+                "explicit operator unfreeze conditions",
+                "fresh broker snapshot",
+                "journal authority",
+            ],
+        }
+
+    if not authority:
+        return {
+            "status": "awaiting_position_authority",
+            "reason_auto_clear_eligible": True,
+            "watchdog_clean_flat_candidate": False,
+            "robot_clear_candidate": False,
+            "clear_allowed": False,
+            "can_watchdog_clear": False,
+            "predicates": {},
+            "failed_predicates": ["position_authority_available"],
+            "robot_must_verify": [
+                "fresh broker position qty",
+                "broker working-order count",
+                "journal open qty",
+                "real/recovery open qty",
+                "IEA supervisory block state",
+            ],
+        }
+
+    broker_qty = _coerce_watchdog_int_or_none(authority.get("broker_qty"))
+    real_open_qty = _coerce_watchdog_int_or_none(authority.get("real_open_qty"))
+    recovery_open_qty = _coerce_watchdog_int_or_none(authority.get("recovery_open_qty"))
+    journal_open_qty = _coerce_watchdog_int_or_none(authority.get("journal_open_qty"))
+    predicates = {
+        "broker_qty_flat": broker_qty == 0,
+        "real_open_qty_flat": real_open_qty == 0,
+        "recovery_open_qty_flat": recovery_open_qty in (None, 0),
+        "journal_open_qty_flat": journal_open_qty == 0,
+    }
+    failed_predicates = [key for key, passed in predicates.items() if not passed]
+    clean_flat_candidate = all(predicates.values())
+    return {
+        "status": (
+            "candidate_robot_verification_required"
+            if clean_flat_candidate
+            else "blocked_by_position_authority"
+        ),
+        "reason_auto_clear_eligible": True,
+        "watchdog_clean_flat_candidate": clean_flat_candidate,
+        "robot_clear_candidate": clean_flat_candidate,
+        "clear_allowed": False,
+        "can_watchdog_clear": False,
+        "predicates": predicates,
+        "failed_predicates": failed_predicates,
+        "robot_must_verify": [
+            "broker working-order count",
+            "IEA supervisory block state",
+            "fresh account snapshot at reconciliation time",
+        ],
+        "last_authority_ts_utc": authority.get("last_authority_ts_utc"),
+    }
+
+
+def _risk_latch_dirs_for_context(context: WatchdogRunContext) -> List[Path]:
+    dirs: List[Path] = []
+    candidates = [
+        context.persistence_base / "data" / "risk_latches",
+        context.project_root / "data" / "risk_latches",
+        QTSW2_ROOT / "data" / "risk_latches",
+    ]
+    seen: Set[str] = set()
+    for candidate in candidates:
+        try:
+            key = str(candidate.resolve())
+        except Exception:
+            key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        dirs.append(candidate)
+    return dirs
+
+
+def _read_risk_latch_files(context: WatchdogRunContext) -> List[Dict[str, Any]]:
+    latches: List[Dict[str, Any]] = []
+    seen_files: Set[str] = set()
+    for latch_dir in _risk_latch_dirs_for_context(context):
+        if not latch_dir.is_dir():
+            continue
+        for path in sorted(latch_dir.glob("risk_latch_*.json")):
+            try:
+                resolved = str(path.resolve())
+            except Exception:
+                resolved = str(path)
+            if resolved in seen_files:
+                continue
+            seen_files.add(resolved)
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            instrument = str(payload.get("Instrument") or payload.get("instrument") or "").strip()
+            if not instrument:
+                continue
+            reason = str(payload.get("Reason") or payload.get("reason") or "").strip()
+            blocked_at = str(payload.get("BlockedAtUtc") or payload.get("blocked_at_utc") or "").strip()
+            account = str(payload.get("Account") or payload.get("account") or "").strip()
+            row = {
+                "account": account,
+                "instrument": instrument,
+                "instrument_key": _normalize_watchdog_instrument_key(instrument),
+                "blocked_at_utc": blocked_at,
+                "reason": reason,
+                "file_path": resolved,
+                "source_root": str(latch_dir.parent.parent),
+                "clear_policy": (
+                    "auto_clear_when_clean_flat"
+                    if _risk_latch_reason_auto_clear_eligible(reason)
+                    else "explicit_unfreeze_required"
+                ),
+            }
+            row.update(_risk_latch_block_scope(reason))
+            latches.append(row)
+    return latches
+
+
+def _risk_latches_for_stream_row(
+    risk_latches: List[Dict[str, Any]],
+    row: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    keys: Set[str] = set()
+    for raw in (row.get("execution_instrument"), row.get("instrument")):
+        key = _normalize_watchdog_instrument_key(raw)
+        if key:
+            keys.add(key)
+    mapped = _get_execution_instrument_for_canonical(str(row.get("instrument") or ""))
+    mapped_key = _normalize_watchdog_instrument_key(mapped)
+    if mapped_key:
+        keys.add(mapped_key)
+    if not keys:
+        return []
+    return [
+        latch
+        for latch in risk_latches
+        if _normalize_watchdog_instrument_key(latch.get("instrument")) in keys
+        or _normalize_watchdog_instrument_key(latch.get("instrument_key")) in keys
+    ]
+
+
+def _attach_risk_latches_to_stream_row(
+    risk_latches: List[Dict[str, Any]],
+    row: Dict[str, Any],
+) -> None:
+    matches = _risk_latches_for_stream_row(risk_latches, row)
+    row["instrument_blocked"] = bool(matches)
+    row["instrument_blocks"] = matches
+    row["instrument_block_reason"] = matches[0].get("reason") if matches else None
+
+
 def _slot_end_no_trade_expectation_gap(
     watchdog_info: Any,
     current_trading_date: str,
@@ -257,6 +535,9 @@ def _slot_missing_summary_expectation_gap(
     info_today = stream_states_dict.get((current_trading_date, stream_id))
     if info_today is None:
         return None
+    state = str(getattr(info_today, "state", "") or "").upper()
+    if getattr(info_today, "committed", False) or state in {"DONE", "NO_TRADE", "INVALIDATED"}:
+        return None
     if getattr(info_today, "trade_executed", None) is not None:
         return None
     if not _chicago_now_past_timetable_slot(current_trading_date, slot_time_raw, now_chicago):
@@ -327,6 +608,296 @@ def _journal_trading_date_from_name(path: Path) -> Optional[str]:
     except ValueError:
         return None
     return trading_date
+
+
+def _journal_bool(payload: Dict[str, Any], *keys: str) -> bool:
+    for key in keys:
+        if key not in payload:
+            continue
+        value = payload.get(key)
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in ("true", "1", "yes"):
+            return True
+        if text in ("false", "0", "no", "", "none", "null"):
+            return False
+    return False
+
+
+def _journal_number(payload: Dict[str, Any], *keys: str) -> float:
+    for key in keys:
+        value = payload.get(key)
+        if value is None or value == "":
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def _journal_float_or_none(payload: Dict[str, Any], *keys: str) -> Optional[float]:
+    for key in keys:
+        value = payload.get(key)
+        if value is None or value == "":
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _journal_text(payload: Dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = payload.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _execution_journal_stream_from_path(path: Path) -> str:
+    parts = path.stem.split("_")
+    if len(parts) < 3:
+        return ""
+    return "_".join(parts[1:-1]).strip()
+
+
+def _execution_journal_truth_by_stream(
+    journals_dir: Optional[Path],
+    trading_date: str,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Read-only operator truth from execution journals for one trading date.
+
+    This does not change robot state. It prevents the stream feed from displaying stale
+    stream-journal phases when execution journals already prove either open filled exposure
+    or still-working unfilled entry brackets.
+    """
+    if not trading_date or journals_dir is None or not journals_dir.is_dir():
+        return {}
+
+    truth: Dict[str, Dict[str, Any]] = {}
+    resting_entry_types = {"ENTRY_STOP", "STOP_ENTRY", "ENTRY_LIMIT", "LIMIT_ENTRY"}
+    for path in sorted(journals_dir.glob(f"{trading_date}_*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(payload, dict):
+            continue
+
+        stream_id = _journal_text(payload, "Stream", "stream") or _execution_journal_stream_from_path(path)
+        if not stream_id:
+            continue
+
+        entry_submitted = _journal_bool(payload, "EntrySubmitted", "entry_submitted")
+        entry_filled = _journal_bool(payload, "EntryFilled", "entry_filled")
+        trade_completed = _journal_bool(payload, "TradeCompleted", "trade_completed")
+        rejected = _journal_bool(payload, "Rejected", "rejected")
+        entry_type = _journal_text(payload, "EntryOrderType", "entry_order_type").upper()
+        intent_id = _journal_text(payload, "IntentId", "intent_id") or path.stem.rsplit("_", 1)[-1]
+        entry_qty = _journal_number(payload, "EntryFilledQuantityTotal", "entry_filled_quantity_total", "FillQuantity")
+        exit_qty = _journal_number(payload, "ExitFilledQuantityTotal", "exit_filled_quantity_total")
+        remaining_qty = max(0.0, entry_qty - exit_qty)
+
+        summary = truth.setdefault(
+            stream_id,
+            {
+                "open_intents": [],
+                "resting_entry_intents": [],
+                "open_qty": 0.0,
+            },
+        )
+
+        base = {
+            "intent_id": intent_id,
+            "instrument": _journal_text(payload, "Instrument", "instrument"),
+            "direction": _journal_text(payload, "Direction", "direction"),
+            "order_type": entry_type,
+            "broker_order_id": _journal_text(payload, "BrokerOrderId", "broker_order_id"),
+            "journal_path": str(path),
+        }
+
+        if entry_filled and remaining_qty > 0 and not trade_completed:
+            row = dict(base)
+            row["remaining_qty"] = remaining_qty
+            row["entry_qty"] = entry_qty
+            row["exit_qty"] = exit_qty
+            row["entry_filled_at_utc"] = _journal_text(
+                payload,
+                "EntryFilledAtUtc",
+                "EntryFilledObservedAtUtc",
+                "EntryFilledAt",
+            )
+            summary["open_intents"].append(row)
+            summary["open_qty"] = float(summary.get("open_qty") or 0.0) + remaining_qty
+        elif entry_submitted and not entry_filled and not trade_completed and not rejected:
+            if not entry_type or entry_type in resting_entry_types:
+                row = dict(base)
+                row["entry_submitted_at_utc"] = _journal_text(
+                    payload,
+                    "EntrySubmittedAtUtc",
+                    "EntrySubmittedObservedAtUtc",
+                    "EntrySubmittedAt",
+                )
+                summary["resting_entry_intents"].append(row)
+
+    return {
+        stream_id: summary
+        for stream_id, summary in truth.items()
+        if summary.get("open_intents") or summary.get("resting_entry_intents")
+    }
+
+
+def _execution_journal_truth_explains_stream(truth: Optional[Dict[str, Any]]) -> bool:
+    return bool(truth and (truth.get("open_intents") or truth.get("resting_entry_intents")))
+
+
+def _apply_execution_journal_truth_to_stream_row(
+    row: Dict[str, Any],
+    truth: Optional[Dict[str, Any]],
+) -> None:
+    if not truth:
+        return
+
+    open_intents = list(truth.get("open_intents") or [])
+    resting_entry_intents = list(truth.get("resting_entry_intents") or [])
+    if not open_intents and not resting_entry_intents:
+        return
+
+    row["watchdog_state"] = row.get("state")
+    row["watchdog_committed"] = row.get("committed")
+    row["watchdog_commit_reason"] = row.get("commit_reason")
+    row["watchdog_slot_reason"] = row.get("slot_reason")
+    row["execution_truth_source"] = "execution_journal"
+
+    if open_intents:
+        row["state"] = "OPEN_TRACKED"
+        row["committed"] = False
+        row["commit_reason"] = None
+        row["slot_reason"] = None
+        row["trade_executed"] = True
+        row["operator_classification"] = "OPEN_TRACKED_EXPOSURE"
+        row["open_intent_count"] = len(open_intents)
+        row["open_qty"] = truth.get("open_qty")
+        row["open_intents"] = open_intents
+        return
+
+    row["state"] = "ENTRY_BRACKETS_WORKING"
+    row["committed"] = False
+    row["commit_reason"] = None
+    row["slot_reason"] = None
+    row["operator_classification"] = "RESTING_ENTRY_UNFILLED"
+    row["resting_entry_count"] = len(resting_entry_intents)
+    row["resting_entry_intents"] = resting_entry_intents
+
+
+def _empty_stream_pnl_row(stream_id: str) -> Dict[str, Any]:
+    return {
+        "stream": stream_id,
+        "realized_pnl": 0.0,
+        "open_positions": 0,
+        "total_costs_realized": 0.0,
+        "intent_count": 0,
+        "closed_count": 0,
+        "partial_count": 0,
+        "open_count": 0,
+        "pnl_confidence": "LOW",
+        "exit_type": None,
+        "entry_price": None,
+        "exit_price": None,
+        "source": "empty_default",
+    }
+
+
+def _fallback_stream_pnl_from_execution_journals(
+    journals_dir: Optional[Path],
+    trading_date: str,
+    stream: Optional[str] = None,
+    enabled_streams: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Low-authority stream-feed fallback when canonical ledger calculation is unavailable.
+
+    This intentionally uses execution journals only. It restores operator visibility for
+    open/resting streams without claiming authoritative realized P&L beyond journal RealizedPnL
+    fields. It is read-only and separate from robot execution authority.
+    """
+    rows_by_stream: Dict[str, Dict[str, Any]] = {}
+    if trading_date and journals_dir is not None and journals_dir.is_dir():
+        pattern = f"{trading_date}_{stream}_*.json" if stream else f"{trading_date}_*.json"
+        for path in sorted(journals_dir.glob(pattern)):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+
+            stream_id = _journal_text(payload, "Stream", "stream") or _execution_journal_stream_from_path(path)
+            if not stream_id or (stream and stream_id != stream):
+                continue
+
+            row = rows_by_stream.setdefault(stream_id, _empty_stream_pnl_row(stream_id))
+            row["source"] = "execution_journal_fallback"
+            row["intent_count"] += 1
+
+            entry_qty = _journal_number(payload, "EntryFilledQuantityTotal", "entry_filled_quantity_total", "FillQuantity")
+            exit_qty = _journal_number(payload, "ExitFilledQuantityTotal", "exit_filled_quantity_total")
+            remaining_qty = max(0.0, entry_qty - exit_qty)
+            trade_completed = _journal_bool(payload, "TradeCompleted", "trade_completed")
+            entry_price = _journal_float_or_none(
+                payload,
+                "EntryAvgFillPrice",
+                "FillPrice",
+                "ActualFillPrice",
+                "EntryPrice",
+                "entry_price",
+            )
+            exit_price = _journal_float_or_none(payload, "ExitAvgFillPrice", "exit_avg_fill_price")
+            realized_net = _journal_float_or_none(payload, "RealizedPnLNet", "realized_pnl_net")
+            realized_gross = _journal_float_or_none(payload, "RealizedPnLGross", "realized_pnl_gross")
+
+            if row.get("entry_price") is None and entry_price is not None:
+                row["entry_price"] = entry_price
+            if row.get("exit_price") is None and exit_price is not None:
+                row["exit_price"] = exit_price
+
+            if remaining_qty > 0:
+                row["open_positions"] += remaining_qty
+                if exit_qty > 0:
+                    row["partial_count"] += 1
+                else:
+                    row["open_count"] += 1
+            elif trade_completed:
+                row["closed_count"] += 1
+
+            if trade_completed and (realized_net is not None or realized_gross is not None):
+                row["realized_pnl"] += float(realized_net if realized_net is not None else realized_gross)
+                row["pnl_confidence"] = "MEDIUM"
+
+            exit_type = _journal_text(payload, "ExitOrderType", "CompletionReason", "completion_reason")
+            if row.get("exit_type") is None and exit_type:
+                row["exit_type"] = exit_type
+
+    if enabled_streams:
+        for stream_id in sorted(enabled_streams):
+            if stream is not None and stream_id != stream:
+                continue
+            rows_by_stream.setdefault(stream_id, _empty_stream_pnl_row(stream_id))
+
+    if stream:
+        return rows_by_stream.get(stream, _empty_stream_pnl_row(stream))
+
+    return {
+        "trading_date": trading_date,
+        "streams": list(rows_by_stream.values()),
+    }
 
 
 def _get_execution_instrument_for_canonical(canonical_instrument: str) -> Optional[str]:
@@ -1162,17 +1733,7 @@ class WatchdogAggregator:
                     seen = {s["stream"] for s in aggregated_streams}
                     for stream_id in enabled:
                         if stream_id not in seen:
-                            aggregated_streams.append({
-                                "stream": stream_id,
-                                "realized_pnl": 0.0,
-                                "open_positions": 0,
-                                "total_costs_realized": 0.0,
-                                "intent_count": 0,
-                                "closed_count": 0,
-                                "partial_count": 0,
-                                "open_count": 0,
-                                "pnl_confidence": "LOW",
-                            })
+                            aggregated_streams.append(_empty_stream_pnl_row(stream_id))
                             seen.add(stream_id)
                 
                 return {
@@ -1181,25 +1742,16 @@ class WatchdogAggregator:
                 }
         except Exception as e:
             logger.error(f"Error computing stream P&L: {e}", exc_info=True)
-            # Return safe defaults
-            if stream:
-                return {
-                    "trading_date": trading_date,
-                    "stream": stream,
-                    "realized_pnl": 0.0,
-                    "open_positions": 0,
-                    "total_costs_realized": 0.0,
-                    "intent_count": 0,
-                    "closed_count": 0,
-                    "partial_count": 0,
-                    "open_count": 0,
-                    "pnl_confidence": "LOW"
-                }
-            else:
-                return {
-                    "trading_date": trading_date,
-                    "streams": []
-                }
+            try:
+                enabled = self._state_manager.get_enabled_streams() or set()
+            except Exception:
+                enabled = set()
+            return _fallback_stream_pnl_from_execution_journals(
+                self._execution_journals_dir(),
+                trading_date,
+                stream,
+                set(enabled),
+            )
 
     def get_stream_pnl_for_context(
         self,
@@ -2190,6 +2742,19 @@ class WatchdogAggregator:
                 except Exception as e:
                     logger.warning(f"Failed to process bar event: {e}")
 
+            # Keep position-authority display fresh even if cursor/full ingest skips these events.
+            # This is observability only; it does not change watchdog gates or robot execution state.
+            position_authority_tail_refresh_count = 0
+            for timestamp_utc, payload in _latest_position_authority_tail_payloads(
+                parsed_events,
+                reject_at_or_before=last_inv,
+            ):
+                try:
+                    self._state_manager.record_position_authority_evaluated(payload, timestamp_utc)
+                    position_authority_tail_refresh_count += 1
+                except Exception as e:
+                    logger.warning(f"Failed to refresh position authority from tail: {e}")
+
             # Degradation mode: skip full event processing if loop too slow
             degraded = self._ingestion_telemetry.is_degraded()
             if degraded and not self._ingestion_degraded:
@@ -2256,6 +2821,7 @@ class WatchdogAggregator:
                 "parsed_event_count": len(parsed_events),
                 "cursor_events_built": len(cursor_events),
                 "process_event_calls": process_event_calls,
+                "position_authority_tail_refresh_count": position_authority_tail_refresh_count,
                 "ingest_degraded": degraded,
                 "tail_read_duration_ms": round(tail_read_duration_ms, 2),
             }
@@ -2912,6 +3478,35 @@ class WatchdogAggregator:
         return False
 
     @staticmethod
+    def _is_resting_entry_order_type(order_type: Any) -> bool:
+        normalized = str(order_type or "").strip().upper()
+        return normalized in ("ENTRY_STOP", "STOP_ENTRY", "ENTRY_LIMIT", "LIMIT_ENTRY") or (
+            normalized.startswith("ENTRY") and ("STOP" in normalized or "LIMIT" in normalized)
+        )
+
+    def _journal_intent_is_unfilled_resting_entry(self, intent_id: str) -> bool:
+        if not intent_id:
+            return False
+        try:
+            for path in self._execution_journals_dir().glob(f"*_{intent_id}.json"):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        payload = json.load(f)
+                    if bool(payload.get("TradeCompleted")):
+                        return False
+                    if bool(payload.get("EntryFilled")):
+                        return False
+                    if not bool(payload.get("EntrySubmitted")):
+                        continue
+                    if self._is_resting_entry_order_type(payload.get("EntryOrderType")):
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            return False
+        return False
+
+    @staticmethod
     def _is_stop_protection_submit_event(event: Dict[str, Any]) -> bool:
         event_type = str(event.get("event_type") or event.get("event") or "").strip()
         data = event.get("data") if isinstance(event.get("data"), dict) else {}
@@ -3022,6 +3617,11 @@ class WatchdogAggregator:
             if not candidates:
                 continue
             if all(self._journal_intent_completed(intent_id) for intent_id in candidates):
+                dedupe_key = alert.get("dedupe_key")
+                if dedupe_key:
+                    ns.resolve_alert(str(dedupe_key))
+                continue
+            if all(self._journal_intent_is_unfilled_resting_entry(intent_id) for intent_id in candidates):
                 dedupe_key = alert.get("dedupe_key")
                 if dedupe_key:
                     ns.resolve_alert(str(dedupe_key))
@@ -3209,6 +3809,9 @@ class WatchdogAggregator:
             status["enabled_streams_unknown"] = _esu
             status["timetable_unavailable"] = bool(_esu or _ens is None)
             status["position_authority_by_instrument"] = self._state_manager.get_position_authority_snapshots()
+            latch_payload = self.get_risk_latches()
+            status["active_risk_latches"] = latch_payload.get("risk_latches", [])
+            status["active_risk_latch_count"] = latch_payload.get("count", 0)
             return status
         except Exception as e:
             logger.error(f"Error computing watchdog status: {e}", exc_info=True)
@@ -3239,6 +3842,8 @@ class WatchdogAggregator:
                 "data_stall_detected": {},
                 "market_open": market_open,
                 "active_alerts": [],
+                "active_risk_latches": [],
+                "active_risk_latch_count": 0,
                 "timetable_source": None,
                 "enabled_streams_unknown": True,
                 "timetable_unavailable": True,
@@ -3267,6 +3872,38 @@ class WatchdogAggregator:
             "active_alerts": active,
             "recent": recent,
         }
+
+    def get_risk_latches(self, context: Optional[WatchdogRunContext] = None) -> Dict[str, Any]:
+        """
+        Read-only operator visibility for durable robot instrument blocks.
+
+        These files are execution-affecting state, not historical notifications. If present, they can
+        block new entries for the execution instrument until the robot proves clean-flat auto-clear or
+        an explicit safe unfreeze removes the latch.
+        """
+        resolved_context = context or self._refresh_run_context()
+        latches = _read_risk_latch_files(resolved_context)
+        for latch in latches:
+            instrument = latch.get("instrument") or ""
+            authority = self._state_manager.resolve_position_authority_for_stream_row(instrument, instrument)
+            latch["position_authority"] = authority
+            latch["clean_flat_candidate"] = bool(_position_authority_snapshot_is_clean_flat(authority))
+            latch["clear_readiness"] = _build_risk_latch_clear_readiness(latch, authority)
+        return {
+            "timestamp_chicago": datetime.now(CHICAGO_TZ).isoformat(),
+            "persistence_base": str(resolved_context.persistence_base),
+            "risk_latches": latches,
+            "count": len(latches),
+        }
+
+    def get_risk_latches_for_context(
+        self,
+        context: Optional[WatchdogRunContext] = None,
+    ) -> Dict[str, Any]:
+        if context is None or self._context_is_active(context):
+            return self.get_risk_latches(context)
+        snapshot = self._build_run_scoped_snapshot(context)
+        return snapshot.get_risk_latches(context)
 
     def get_risk_gate_status(self) -> Dict:
         """Get current risk gate status."""
@@ -3399,6 +4036,7 @@ class WatchdogAggregator:
         carried_active_lifecycles: List[Dict[str, Any]] = []
         out_of_timetable_active_streams: List[Dict[str, Any]] = []
         execution_expectation_gaps: List[Dict[str, Any]] = []
+        risk_latches: List[Dict[str, Any]] = []
         timetable_unavailable = False
         enabled_streams: Optional[Set[str]] = None
         
@@ -3434,9 +4072,16 @@ class WatchdogAggregator:
                     f"get_stream_states: trading_date not set in state manager, "
                     f"using computed fallback: {current_trading_date}"
                 )
+
+            context_for_truth = getattr(self, "_run_context", None)
+            execution_journal_truth = _execution_journal_truth_by_stream(
+                getattr(context_for_truth, "execution_journals_dir", None),
+                current_trading_date,
+            )
             
             # Get timetable stream metadata (instrument, session, slot_time)
             timetable_streams_metadata = self._state_manager.get_timetable_streams_metadata()
+            risk_latches = self.get_risk_latches().get("risk_latches", [])
             
             # CRITICAL: Use getter, never access _enabled_streams directly
             enabled_streams = self._state_manager.get_enabled_streams()
@@ -3475,6 +4120,7 @@ class WatchdogAggregator:
                     "note": "Prior-date nonterminal stream remains tracked; do not treat it as unknown broker-ahead exposure.",
                 }
                 _attach_position_authority_to_stream_row(self._state_manager, row)
+                _attach_risk_latches_to_stream_row(risk_latches, row)
                 carried_active_lifecycles.append(row)
 
             # Row-level tradability: same execution_safe as GET /api/watchdog/status (includes process check)
@@ -3609,27 +4255,31 @@ class WatchdogAggregator:
                             **flatten_fields,
                         }
                         _attach_position_authority_to_stream_row(self._state_manager, _row)
+                        _attach_risk_latches_to_stream_row(risk_latches, _row)
+                        stream_execution_truth = execution_journal_truth.get(stream_id)
+                        _apply_execution_journal_truth_to_stream_row(_row, stream_execution_truth)
                         streams.append(_row)
-                        gap_v1 = _slot_end_no_trade_expectation_gap(
-                            watchdog_info,
-                            current_trading_date,
-                            stream_id,
-                            canonical,
-                            getattr(watchdog_info, "session", None) or session,
-                        )
-                        if gap_v1:
-                            execution_expectation_gaps.append(gap_v1)
-                        else:
-                            gap_v2 = _slot_missing_summary_expectation_gap(
-                                stream_states_dict,
+                        if not _execution_journal_truth_explains_stream(stream_execution_truth):
+                            gap_v1 = _slot_end_no_trade_expectation_gap(
+                                watchdog_info,
                                 current_trading_date,
                                 stream_id,
                                 canonical,
                                 getattr(watchdog_info, "session", None) or session,
-                                slot_time,
                             )
-                            if gap_v2:
-                                execution_expectation_gaps.append(gap_v2)
+                            if gap_v1:
+                                execution_expectation_gaps.append(gap_v1)
+                            else:
+                                gap_v2 = _slot_missing_summary_expectation_gap(
+                                    stream_states_dict,
+                                    current_trading_date,
+                                    stream_id,
+                                    canonical,
+                                    getattr(watchdog_info, "session", None) or session,
+                                    slot_time,
+                                )
+                                if gap_v2:
+                                    execution_expectation_gaps.append(gap_v2)
                     else:
                         exec_instr = _get_execution_instrument_for_canonical(instrument)
                         _row2 = {
@@ -3656,6 +4306,11 @@ class WatchdogAggregator:
                             **flatten_fields,
                         }
                         _attach_position_authority_to_stream_row(self._state_manager, _row2)
+                        _attach_risk_latches_to_stream_row(risk_latches, _row2)
+                        _apply_execution_journal_truth_to_stream_row(
+                            _row2,
+                            execution_journal_truth.get(stream_id),
+                        )
                         streams.append(_row2)
 
                 _streams_before_td_filter = len(streams)
@@ -3719,6 +4374,8 @@ class WatchdogAggregator:
             "out_of_timetable_active_streams": out_of_timetable_active_streams,
             "execution_expectation_gaps": execution_expectation_gaps,
             "flatten_lookup_metrics": get_flatten_lookup_reason_counts(),
+            "active_risk_latches": risk_latches,
+            "active_risk_latch_count": len(risk_latches),
             "timetable_unavailable": timetable_unavailable
             or self._state_manager.get_enabled_streams_unknown(),
             "enabled_streams_unknown": self._state_manager.get_enabled_streams_unknown(),

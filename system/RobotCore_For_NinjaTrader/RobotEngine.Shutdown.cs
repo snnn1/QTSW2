@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -12,6 +13,16 @@ namespace QTSW2.Robot.Core;
 
 public sealed partial class RobotEngine
 {
+    private static int s_nextProcessEngineInstanceId;
+    private static readonly ConcurrentDictionary<int, WeakReference<RobotEngine>> s_processEngineInstances =
+        new();
+    private static readonly ConcurrentDictionary<string, ConcurrentDictionary<int, WeakReference<RobotEngine>>> s_processEnginesByRunId =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private readonly int _processEngineInstanceId = Interlocked.Increment(ref s_nextProcessEngineInstanceId);
+    private string? _registeredProcessRunId;
+    private string? _registeredProcessPersistenceBase;
+
     /// <summary>NT build: persists <c>STREAM_COMMIT_PERSIST_FAILED</c> to KEY_EVENTS. Modules tree: no-op.</summary>
     public void TryAppendKeyEventStreamCommitPersistFailed(
         DateTimeOffset utcNow, string stream, string instrument, string commitReason, string eventType, string stateLabel)
@@ -68,18 +79,198 @@ public sealed partial class RobotEngine
         return true;
     }
 
+    private void RegisterProcessEngineInstanceForRun()
+    {
+        var runId = _runId?.Trim();
+        if (string.IsNullOrWhiteSpace(runId))
+            return;
+
+        var previousRunId = _registeredProcessRunId;
+        if (!string.IsNullOrWhiteSpace(previousRunId) &&
+            !string.Equals(previousRunId, runId, StringComparison.OrdinalIgnoreCase))
+            UnregisterProcessEngineInstanceForRun(previousRunId);
+
+        var engines = s_processEnginesByRunId.GetOrAdd(
+            runId,
+            _ => new ConcurrentDictionary<int, WeakReference<RobotEngine>>());
+        engines[_processEngineInstanceId] = new WeakReference<RobotEngine>(this);
+        s_processEngineInstances[_processEngineInstanceId] = new WeakReference<RobotEngine>(this);
+        _registeredProcessRunId = runId;
+        _registeredProcessPersistenceBase = NormalizeProcessScopePath(_persistenceBase);
+    }
+
+    private void UnregisterProcessEngineInstanceForRun(string? explicitRunId = null)
+    {
+        var runId = explicitRunId ?? _registeredProcessRunId;
+        s_processEngineInstances.TryRemove(_processEngineInstanceId, out _);
+        _registeredProcessPersistenceBase = null;
+
+        if (string.IsNullOrWhiteSpace(runId))
+            return;
+
+        if (s_processEnginesByRunId.TryGetValue(runId, out var engines))
+        {
+            engines.TryRemove(_processEngineInstanceId, out _);
+            if (engines.IsEmpty)
+                s_processEnginesByRunId.TryRemove(runId, out _);
+        }
+
+        if (string.Equals(_registeredProcessRunId, runId, StringComparison.OrdinalIgnoreCase))
+            _registeredProcessRunId = null;
+    }
+
+    private static string NormalizeProcessScopePath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return "";
+        try { return Path.GetFullPath(path.Trim()).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar); }
+        catch { return path.Trim().TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar); }
+    }
+
+    private bool IsSameProcessRunScope(string runId, RobotEngine engine)
+    {
+        if (ReferenceEquals(engine, this))
+            return true;
+
+        var engineRunId = engine._runId?.Trim();
+        if (!string.IsNullOrWhiteSpace(engineRunId) &&
+            string.Equals(engineRunId, runId, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (!_isolatedPlaybackPersistence || !engine._isolatedPlaybackPersistence)
+            return false;
+
+        var thisScope = NormalizeProcessScopePath(_persistenceBase);
+        var engineScope = !string.IsNullOrWhiteSpace(engine._registeredProcessPersistenceBase)
+            ? engine._registeredProcessPersistenceBase
+            : NormalizeProcessScopePath(engine._persistenceBase);
+        return thisScope.Length > 0 &&
+               engineScope.Length > 0 &&
+               string.Equals(thisScope, engineScope, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void RequestBackgroundShutdownQuiescence()
+    {
+        StopEngineHeartbeatTimer();
+        try { _protectiveCoordinator?.Dispose(); } catch { /* shutdown best effort */ }
+        try { _mismatchCoordinator?.Dispose(); } catch { /* shutdown best effort */ }
+        _runtimeAudit?.RequestShutdown();
+    }
+
+    /// <summary>
+    /// Stop every in-process engine bound to this run. Used when the final NinjaTrader strategy instance terminates.
+    /// This is process-local only and intentionally does not write RUN_SHUTDOWN.json, which remains crash/freeze evidence.
+    /// </summary>
+    public void StopAllProcessEnginesForCurrentRun(bool writeRunSummary = true, string stopSource = "process_run_stop")
+    {
+        var runId = _runId?.Trim();
+        if (string.IsNullOrWhiteSpace(runId))
+        {
+            Stop(writeRunSummary, stopSource);
+            return;
+        }
+
+        var liveEngines = new List<RobotEngine>();
+        if (s_processEnginesByRunId.TryGetValue(runId, out var engines))
+        {
+            foreach (var pair in engines.ToArray())
+            {
+                if (pair.Value.TryGetTarget(out var engine))
+                    liveEngines.Add(engine);
+                else
+                    engines.TryRemove(pair.Key, out _);
+            }
+        }
+
+        foreach (var pair in s_processEngineInstances.ToArray())
+        {
+            if (pair.Value.TryGetTarget(out var engine))
+            {
+                if (IsSameProcessRunScope(runId, engine))
+                    liveEngines.Add(engine);
+            }
+            else
+            {
+                s_processEngineInstances.TryRemove(pair.Key, out _);
+            }
+        }
+
+        if (!liveEngines.Any(e => ReferenceEquals(e, this)))
+            liveEngines.Add(this);
+
+        liveEngines = liveEngines.Distinct().ToList();
+
+        try
+        {
+            LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: TradingDateString,
+                eventType: "PROCESS_RUN_STOP_BROADCAST", state: "ENGINE",
+                new
+                {
+                    stop_source = stopSource,
+                    run_id = runId,
+                    engine_count = liveEngines.Count,
+                    write_run_summary = writeRunSummary,
+                    note = "Final strategy termination requested process-local stop for all engines in this run; does not write RUN_SHUTDOWN.json."
+                }));
+        }
+        catch
+        {
+            // Shutdown path: never throw from diagnostics.
+        }
+
+        foreach (var engine in liveEngines)
+            engine.RequestBackgroundShutdownQuiescence();
+
+        foreach (var engine in liveEngines.Where(e => !ReferenceEquals(e, this)))
+            engine.Stop(writeRunSummary: false, stopSource: stopSource + "_follower");
+
+        lock (_engineLock)
+        {
+            _pendingProcessRunStopCompletionSource = stopSource;
+            _pendingProcessRunStopCompletionEngineCount = liveEngines.Count;
+        }
+        Stop(writeRunSummary: writeRunSummary, stopSource: stopSource);
+        WriteProcessRunStopCompletedFallback(runId, stopSource, liveEngines.Count, writeRunSummary);
+    }
+
+    private void WriteProcessRunStopCompletedFallback(string runId, string stopSource, int engineCount, bool writeRunSummary)
+    {
+        try
+        {
+            EmergencyLogger.WriteEngineFallback(RobotRunArtifactPaths.LogsRobot(_persistenceBase),
+                RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: TradingDateString,
+                    eventType: "PROCESS_RUN_STOP_COMPLETED", state: "ENGINE",
+                    new
+                    {
+                        stop_source = stopSource,
+                        run_id = runId,
+                        stopped_engine_count = engineCount,
+                        write_run_summary = writeRunSummary,
+                        source = "process_run_stop_fallback",
+                        note = "Process-local run stop returned for all engines in the resolved run scope."
+                    }));
+        }
+        catch
+        {
+            // Shutdown proof event is best-effort only.
+        }
+    }
+
     public void Stop(bool writeRunSummary = true, string stopSource = "direct")
     {
         var utcNow = DateTimeOffset.UtcNow;
 
         if (Interlocked.Exchange(ref _shutdownRequested, 1) != 0)
         {
-            StopEngineHeartbeatTimer();
+            RequestBackgroundShutdownQuiescence();
+            if (Volatile.Read(ref _shutdownCompleted) != 0)
+                UnregisterProcessEngineInstanceForRun();
             return;
         }
-        StopEngineHeartbeatTimer();
+        RequestBackgroundShutdownQuiescence();
         _runtimeAudit?.EmitEngineAuditSummary(utcNow, TradingDateString);
-        RuntimeAuditHubRef.Active = null;
+        if (ReferenceEquals(RuntimeAuditHubRef.Active, _runtimeAudit))
+            RuntimeAuditHubRef.Active = null;
         WaitForShutdownCallbackIngressQuiet();
         _ownershipEventJournal?.Flush(TimeSpan.FromMilliseconds(500), "engine_stop");
         _stateEmitter?.EmitEngineStop();
@@ -96,6 +287,8 @@ public sealed partial class RobotEngine
         var isolatedMode = ExecutionMode.DRYRUN;
         var isolatedInstruments = new List<string>();
         RobotLoggingService? loggingServiceToRelease = null;
+        string? processStopCompletionSource = null;
+        var processStopCompletionEngineCount = 0;
 
         lock (_engineLock)
         {
@@ -141,10 +334,19 @@ public sealed partial class RobotEngine
 
             // Stop health monitor
             _healthMonitor?.Stop();
+            _protectiveCoordinator?.Dispose();
+            _protectiveCoordinator = null;
+            _mismatchCoordinator?.Dispose();
+            _mismatchCoordinator = null;
             _stateEmitter?.Dispose();
             _stateEmitter = null;
+            _runtimeAudit = null;
 
             loggingServiceToRelease = _loggingService;
+            processStopCompletionSource = _pendingProcessRunStopCompletionSource;
+            processStopCompletionEngineCount = _pendingProcessRunStopCompletionEngineCount;
+            _pendingProcessRunStopCompletionSource = null;
+            _pendingProcessRunStopCompletionEngineCount = 0;
         }
 
         // Disk I/O outside engine lock
@@ -191,10 +393,32 @@ public sealed partial class RobotEngine
             FeatureFlags.ReconciliationRepairExecutorEnabled,
             FeatureFlags.StructuralLayerUseLedgerOwnership);
 
+        if (!string.IsNullOrWhiteSpace(processStopCompletionSource))
+        {
+            try
+            {
+                LogEvent(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: TradingDateString,
+                    eventType: "PROCESS_RUN_STOP_COMPLETED", state: "ENGINE",
+                    new
+                    {
+                        stop_source = processStopCompletionSource,
+                        run_id = _runId,
+                        stopped_engine_count = processStopCompletionEngineCount,
+                        write_run_summary = writeRunSummary,
+                        note = "Process-local run stop completed for all engines in the resolved run scope."
+                    }));
+            }
+            catch
+            {
+                // Shutdown proof event is best-effort only.
+            }
+        }
+
         loggingServiceToRelease?.FlushNowForSummary();
         loggingServiceToRelease?.Release();
 
         Volatile.Write(ref _shutdownCompleted, 1);
+        UnregisterProcessEngineInstanceForRun();
     }
 
     private void WaitForShutdownCallbackIngressQuiet()

@@ -13,6 +13,7 @@ from modules.watchdog import aggregator_main, state_manager as state_manager_mod
 from modules.watchdog.alert_ledger import AlertLedger
 from modules.watchdog.event_processor import EventProcessor
 from modules.watchdog.run_context import WatchdogRunContext
+from modules.watchdog.run_artifacts import read_run_summary_json
 from modules.watchdog.state_manager import CursorManager, StreamStateInfo, WatchdogStateManager, _stable_json_hash
 from modules.watchdog.timetable_poller import TimetablePoller, resolve_watchdog_timetable_path
 
@@ -23,6 +24,112 @@ def _workspace_temp_dir() -> Path:
     path = base / uuid.uuid4().hex
     path.mkdir(parents=True, exist_ok=False)
     return path
+
+
+def _watchdog_context_for_root(root: Path) -> WatchdogRunContext:
+    return WatchdogRunContext(
+        project_root=root,
+        persistence_base=root,
+        run_id=None,
+        is_run_scoped=False,
+        robot_logs_dir=root / "logs" / "robot",
+        frontend_feed_file=root / "logs" / "robot" / "frontend_feed.jsonl",
+        slot_journals_dir=root / "state" / "stream_journals",
+        execution_journals_dir=root / "state" / "execution_journals",
+        execution_summaries_dir=root / "derived" / "execution_summaries",
+    )
+
+
+def test_run_summary_reads_authority_shutdown_frame():
+    temp_root = _workspace_temp_dir()
+    run_root = temp_root / "runs" / "authority_frame"
+    run_root.mkdir(parents=True)
+    (run_root / "summary.json").write_text(
+        json.dumps({"run_id": "authority_frame", "status": "OK"}),
+        encoding="utf-8",
+    )
+    (run_root / "AUTHORITY_SHUTDOWN_FRAME.json").write_text(
+        json.dumps(
+            {
+                "action": "SHUTDOWN_SAFE_VERDICT",
+                "allowed": True,
+                "is_clean_flat": True,
+                "broker_position_qty": 0,
+                "broker_working_orders_count": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = read_run_summary_json(run_root)
+
+    assert summary is not None
+    assert summary["authority_shutdown_frame_available"] is True
+    assert summary["authority_shutdown_frame"]["action"] == "SHUTDOWN_SAFE_VERDICT"
+    assert summary["authority_shutdown_frame"]["is_clean_flat"] is True
+
+
+def test_risk_latch_files_are_visible_as_active_instrument_blocks():
+    temp_root = _workspace_temp_dir()
+    latch_dir = temp_root / "data" / "risk_latches"
+    latch_dir.mkdir(parents=True, exist_ok=True)
+    latch_file = latch_dir / "risk_latch_DEMO4338364-2_MNG.json"
+    latch_file.write_text(
+        json.dumps(
+            {
+                "Account": "DEMO4338364-2",
+                "Instrument": "MNG",
+                "BlockedAtUtc": "2026-05-10T23:22:36.1744164+00:00",
+                "Reason": "FORCED_CONVERGENCE_FAILED:position_qty_delta_2",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rows = aggregator_main._read_risk_latch_files(_watchdog_context_for_root(temp_root))
+    matching_rows = [
+        row
+        for row in rows
+        if Path(row.get("file_path", "")).resolve() == latch_file.resolve()
+    ]
+
+    assert len(matching_rows) == 1
+    assert matching_rows[0]["instrument"] == "MNG"
+    assert matching_rows[0]["reason"] == "FORCED_CONVERGENCE_FAILED:position_qty_delta_2"
+    assert matching_rows[0]["clear_policy"] == "auto_clear_when_clean_flat"
+    assert matching_rows[0]["blocks_entries"] is True
+    assert matching_rows[0]["blocks_reentry"] is True
+    assert matching_rows[0]["blocks_protectives"] is False
+    assert matching_rows[0]["blocks_flatten"] is False
+
+    payload = aggregator_main.WatchdogAggregator().get_risk_latches_for_context(_watchdog_context_for_root(temp_root))
+    matching_payload = [
+        row
+        for row in payload.get("risk_latches", [])
+        if Path(row.get("file_path", "")).resolve() == latch_file.resolve()
+    ]
+    assert len(matching_payload) == 1
+    assert matching_payload[0]["clear_readiness"]["status"] == "awaiting_position_authority"
+    assert matching_payload[0]["clear_readiness"]["can_watchdog_clear"] is False
+    assert matching_payload[0]["clear_readiness"]["failed_predicates"] == ["position_authority_available"]
+
+
+def test_risk_latch_clear_readiness_reports_failed_predicates():
+    readiness = aggregator_main._build_risk_latch_clear_readiness(
+        {"reason": "FORCED_CONVERGENCE_FAILED:position_qty_delta_2"},
+        {
+            "broker_qty": "2",
+            "real_open_qty": "0",
+            "recovery_open_qty": "0",
+            "journal_open_qty": "2",
+            "last_authority_ts_utc": "2026-05-12T15:47:17Z",
+        },
+    )
+
+    assert readiness["status"] == "blocked_by_position_authority"
+    assert readiness["robot_clear_candidate"] is False
+    assert readiness["clear_allowed"] is False
+    assert readiness["failed_predicates"] == ["broker_qty_flat", "journal_open_qty_flat"]
 
 
 def test_timetable_poller_keeps_disabled_stream_diagnostics(monkeypatch):
@@ -557,6 +664,91 @@ def test_completed_trade_journal_resolves_order_stuck_alert():
     assert ledger.get_active_alerts() == []
 
 
+def test_unfilled_resting_entry_journal_resolves_order_stuck_noise_alert():
+    temp_root = _workspace_temp_dir()
+    execution_journals = temp_root / "state" / "execution_journals"
+    execution_journals.mkdir(parents=True, exist_ok=True)
+    (execution_journals / "2026-05-12_YM1_intent-resting.json").write_text(
+        json.dumps(
+            {
+                "IntentId": "intent-resting",
+                "TradingDate": "2026-05-12",
+                "Stream": "YM1",
+                "Instrument": "MYM",
+                "EntrySubmitted": True,
+                "EntryFilled": False,
+                "TradeCompleted": False,
+                "EntryOrderType": "ENTRY_STOP",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    ledger = AlertLedger(temp_root / "alert_ledger.jsonl")
+    ledger.append_alert(
+        "alert-resting",
+        "ORDER_STUCK_DETECTED",
+        "medium",
+        {
+            "broker_order_id": "entry-stop-order",
+            "intent_id": "intent-resting",
+            "role": "entry",
+        },
+        "ORDER_STUCK_DETECTED:entry-stop-order",
+    )
+
+    class DummyNotificationService:
+        def __init__(self, alert_ledger):
+            self._ledger = alert_ledger
+
+        def get_ledger(self):
+            return self._ledger
+
+        def resolve_alert(self, dedupe_key: str) -> None:
+            self._ledger.resolve_alert(dedupe_key)
+
+    agg = aggregator_main.WatchdogAggregator.__new__(aggregator_main.WatchdogAggregator)
+    agg._snapshot_mode = True
+    agg._notification_service = DummyNotificationService(ledger)
+    agg._run_context = WatchdogRunContext(
+        project_root=temp_root,
+        persistence_base=temp_root,
+        run_id="test",
+        is_run_scoped=True,
+        robot_logs_dir=temp_root / "logs" / "robot",
+        frontend_feed_file=temp_root / "logs" / "robot" / "frontend_feed.jsonl",
+        slot_journals_dir=temp_root / "state" / "stream_journals",
+        execution_journals_dir=execution_journals,
+        execution_summaries_dir=temp_root / "derived" / "execution_summaries",
+    )
+
+    agg._resolve_completed_order_stuck_alerts()
+
+    assert ledger.get_active_alerts() == []
+
+
+def test_completed_incident_alert_is_a_notification_not_active_latch():
+    temp_root = _workspace_temp_dir()
+    ledger_path = temp_root / "alert_ledger.jsonl"
+    ledger = AlertLedger(ledger_path)
+
+    ledger.append_alert(
+        "alert-incident",
+        "INCIDENT_RECONCILIATION_GATE_FAIL_CLOSED",
+        "critical",
+        {
+            "incident_id": "incident-1",
+            "start_ts": "2026-05-10T23:22:33Z",
+            "end_ts": "2026-05-11T09:37:06Z",
+        },
+        "INCIDENT_RECONCILIATION_GATE_FAIL_CLOSED_incident-1",
+    )
+
+    assert ledger.get_active_alerts() == []
+    rehydrated = AlertLedger(ledger_path)
+    assert rehydrated.get_active_alerts() == []
+
+
 def test_order_submit_success_entry_stop_does_not_acknowledge_protection():
     sm = WatchdogStateManager()
     processor = EventProcessor(sm)
@@ -608,6 +800,83 @@ def test_watchdog_reports_untracked_broker_exposure_from_position_authority():
     assert positions[0]["broker_qty"] == 2
 
 
+def test_watchdog_tail_position_authority_refresh_keeps_newest_snapshot():
+    cutoff = datetime(2026, 5, 11, 20, 54, tzinfo=timezone.utc)
+    events = [
+        {
+            "event_type": "POSITION_AUTHORITY_EVALUATED",
+            "timestamp_utc": "2026-05-11T20:53:00Z",
+            "data": {
+                "instrument": "MES",
+                "authority_state": "REAL_DOMINANT",
+                "broker_qty": 2,
+                "real_open_qty": 2,
+                "recovery_open_qty": 0,
+                "journal_open_qty": 2,
+            },
+        },
+        {
+            "event_type": "POSITION_AUTHORITY_EVALUATED",
+            "timestamp_utc": "2026-05-11T20:55:40Z",
+            "data": {
+                "instrument": "MES",
+                "authority_state": "REAL_DOMINANT",
+                "broker_qty": 0,
+                "real_open_qty": 0,
+                "recovery_open_qty": 0,
+                "journal_open_qty": 0,
+            },
+        },
+        {
+            "event_type": "POSITION_AUTHORITY_EVALUATED",
+            "timestamp_utc": "2026-05-11T20:56:00Z",
+            "data": {
+                "instrument": "MYM",
+                "authority_state": "REAL_DOMINANT",
+                "broker_qty": 0,
+                "real_open_qty": 0,
+                "recovery_open_qty": 0,
+                "journal_open_qty": 0,
+            },
+        },
+    ]
+
+    snapshots = aggregator_main._latest_position_authority_tail_payloads(
+        events,
+        reject_at_or_before=cutoff,
+    )
+
+    by_instrument = {payload["instrument"]: payload for _ts, payload in snapshots}
+    assert by_instrument["MES"]["broker_qty"] == 0
+    assert by_instrument["MES"]["journal_open_qty"] == 0
+    assert by_instrument["MYM"]["broker_qty"] == 0
+
+
+def test_watchdog_ingests_release_readiness_working_order_counts():
+    sm = WatchdogStateManager()
+    processor = EventProcessor(sm)
+
+    processor.process_event(
+        {
+            "event_type": "RELEASE_READINESS_INPUT_AUDIT",
+            "timestamp_utc": "2026-05-13T04:08:08Z",
+            "data": {
+                "instrument": "MYM",
+                "broker_position_qty": "4",
+                "broker_working_count": "4",
+                "iea_trusted_working_count": "4",
+                "journal_open_qty": "4",
+            },
+        }
+    )
+
+    snapshots = sm.get_position_authority_snapshots()
+    assert snapshots["MYM"]["broker_qty"] == "4"
+    assert snapshots["MYM"]["broker_working_count"] == "4"
+    assert snapshots["MYM"]["iea_trusted_working_count"] == "4"
+    assert snapshots["MYM"]["source_event"] == "RELEASE_READINESS_INPUT_AUDIT"
+
+
 def test_watchdog_does_not_report_untracked_broker_exposure_when_intent_is_active():
     sm = WatchdogStateManager()
     sm.update_intent_exposure(
@@ -635,6 +904,143 @@ def test_watchdog_does_not_report_untracked_broker_exposure_when_intent_is_activ
     positions = sm.compute_unprotected_positions()
 
     assert not any(p.get("classification") == "UNTRACKED_BROKER_EXPOSURE" for p in positions)
+
+
+def test_watchdog_does_not_report_untracked_broker_exposure_when_authority_tracks_journal_open():
+    sm = WatchdogStateManager()
+    sm.record_position_authority_evaluated(
+        {
+            "instrument": "MES",
+            "authority_state": "REAL_DOMINANT",
+            "broker_qty": 2,
+            "real_open_qty": 2,
+            "recovery_open_qty": 0,
+            "journal_open_qty": 2,
+        },
+        datetime.now(timezone.utc),
+    )
+
+    positions = sm.compute_unprotected_positions()
+
+    assert not any(p.get("classification") == "UNTRACKED_BROKER_EXPOSURE" for p in positions)
+
+
+def test_watchdog_journal_hydration_reactivates_preexisting_closed_intent_shell():
+    temp_root = _workspace_temp_dir()
+    execution_journals = temp_root / "state" / "execution_journals"
+    execution_journals.mkdir(parents=True, exist_ok=True)
+    (execution_journals / "2026-05-11_ES2_intent-open.json").write_text(
+        json.dumps(
+            {
+                "IntentId": "intent-open",
+                "TradingDate": "2026-05-11",
+                "Stream": "ES2",
+                "Instrument": "MES",
+                "Direction": "Long",
+                "EntryFilled": True,
+                "TradeCompleted": False,
+                "EntryFilledQuantityTotal": 2,
+                "ExitFilledQuantityTotal": 0,
+                "EntryFilledAtUtc": "2026-05-11T16:25:10Z",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sm = WatchdogStateManager()
+    sm.update_intent_exposure(
+        "intent-open",
+        "ES2",
+        "MES",
+        "Long",
+        entry_filled_qty=0,
+        exit_filled_qty=0,
+        state="CLOSED",
+        trading_date="2026-05-11",
+    )
+
+    assert sm.hydrate_intent_exposures_from_journals(execution_journals) == 0
+    exposure = sm.get_intent_exposures()["intent-open"]
+    assert exposure.state == "ACTIVE"
+    assert exposure.entry_filled_qty == 2
+    assert exposure.exit_filled_qty == 0
+
+
+def test_watchdog_stuck_order_detector_ignores_working_protective_orders():
+    sm = WatchdogStateManager()
+    submitted_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+    sm.record_order_submitted(
+        "stop-order",
+        submitted_at,
+        intent_id="intent-protected",
+        instrument="MES",
+        role="stop",
+    )
+    sm.record_order_submitted(
+        "target-order",
+        submitted_at,
+        intent_id="intent-protected",
+        instrument="MES",
+        role="target",
+    )
+
+    assert sm.check_stuck_orders(datetime.now(timezone.utc)) == []
+
+
+def test_watchdog_stuck_order_detector_ignores_working_resting_entry_brackets():
+    sm = WatchdogStateManager()
+    submitted_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+    sm.record_order_submitted(
+        "entry-stop-order",
+        submitted_at,
+        intent_id="intent-resting-entry",
+        instrument="MYM",
+        role="entry_stop",
+        order_type="ENTRY_STOP",
+    )
+
+    assert sm.check_stuck_orders(datetime.now(timezone.utc)) == []
+
+
+def test_watchdog_stuck_order_detector_still_flags_market_entry_commands():
+    sm = WatchdogStateManager()
+    submitted_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+    sm.record_order_submitted(
+        "market-entry-order",
+        submitted_at,
+        intent_id="intent-market-entry",
+        instrument="MNG",
+        role="market_entry",
+        order_type="MARKET_REENTRY",
+    )
+
+    stuck = sm.check_stuck_orders(datetime.now(timezone.utc))
+
+    assert len(stuck) == 1
+    assert stuck[0]["broker_order_id"] == "market-entry-order"
+    assert stuck[0]["role"] == "market_entry"
+    assert stuck[0]["order_type"] == "MARKET_REENTRY"
+
+
+def test_event_processor_classifies_entry_stop_as_resting_order_not_stuck():
+    sm = WatchdogStateManager()
+    processor = EventProcessor(sm)
+    submitted_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+
+    processor.process_event(
+        {
+            "event_type": "ORDER_SUBMIT_SUCCESS",
+            "timestamp_utc": submitted_at.isoformat(),
+            "data": {
+                "intent_id": "intent-resting-entry",
+                "broker_order_id": "entry-stop-order",
+                "instrument": "MYM",
+                "order_type": "ENTRY_STOP",
+            },
+        }
+    )
+
+    assert sm.check_stuck_orders(datetime.now(timezone.utc)) == []
 
 
 def test_watchdog_stream_states_surface_prior_day_carried_lifecycle():
@@ -678,6 +1084,212 @@ def test_watchdog_stream_states_surface_prior_day_carried_lifecycle():
     assert carried[0]["current_timetable_lane_present"] is True
     assert carried[0]["same_stream_deferred_reason"] == "PRIOR_LIFECYCLE_ACTIVE"
     assert carried[0]["operator_classification"] == "TRACKED_CARRIED_STREAM"
+
+
+def test_stream_feed_uses_open_execution_journal_over_stale_terminal_stream_state():
+    temp_root = _workspace_temp_dir()
+    execution_journals = temp_root / "state" / "execution_journals"
+    execution_journals.mkdir(parents=True, exist_ok=True)
+    (execution_journals / "2026-05-12_RTY2_intent-open.json").write_text(
+        json.dumps(
+            {
+                "IntentId": "intent-open",
+                "TradingDate": "2026-05-12",
+                "Stream": "RTY2",
+                "Instrument": "M2K",
+                "Direction": "Short",
+                "EntrySubmitted": True,
+                "EntryFilled": True,
+                "EntryOrderType": "ENTRY_STOP",
+                "EntryFilledQuantityTotal": 2,
+                "ExitFilledQuantityTotal": 0,
+                "TradeCompleted": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sm = WatchdogStateManager()
+    now = datetime.now(timezone.utc)
+    sm.update_timetable_streams(
+        {"RTY2"},
+        "2026-05-12",
+        "hash-current",
+        now,
+        enabled_streams_metadata={
+            "RTY2": {"instrument": "RTY", "session": "S2", "slot_time": "11:00"},
+        },
+        enabled_streams_ordered=["RTY2"],
+    )
+    sm._stream_states[("2026-05-12", "RTY2")] = StreamStateInfo(
+        trading_date="2026-05-12",
+        stream="RTY2",
+        state="DONE",
+        committed=True,
+        commit_reason="STREAM_STAND_DOWN",
+        state_entry_time_utc=now,
+        execution_instrument="M2K",
+    )
+    sm._stream_states[("2026-05-12", "RTY2")].instrument = "RTY"
+    sm._stream_states[("2026-05-12", "RTY2")].session = "S2"
+
+    agg = aggregator_main.WatchdogAggregator.__new__(aggregator_main.WatchdogAggregator)
+    agg._state_manager = sm
+    agg._session_flatten_tracker = None
+    agg._last_slot_journal_hydrate_utc = now
+    agg._run_context = _watchdog_context_for_root(temp_root)
+    agg._snapshot_mode = True
+
+    payload = agg.get_stream_states()
+
+    assert payload["execution_expectation_gaps"] == []
+    row = payload["streams"][0]
+    assert row["state"] == "OPEN_TRACKED"
+    assert row["watchdog_state"] == "DONE"
+    assert row["watchdog_commit_reason"] == "STREAM_STAND_DOWN"
+    assert row["committed"] is False
+    assert row["operator_classification"] == "OPEN_TRACKED_EXPOSURE"
+    assert row["open_qty"] == 2
+    assert row["open_intent_count"] == 1
+
+
+def test_stream_feed_labels_unfilled_entry_brackets_and_suppresses_slot_gap():
+    temp_root = _workspace_temp_dir()
+    execution_journals = temp_root / "state" / "execution_journals"
+    execution_journals.mkdir(parents=True, exist_ok=True)
+    (execution_journals / "2026-05-12_ES2_intent-resting.json").write_text(
+        json.dumps(
+            {
+                "IntentId": "intent-resting",
+                "TradingDate": "2026-05-12",
+                "Stream": "ES2",
+                "Instrument": "MES",
+                "Direction": "Long",
+                "EntrySubmitted": True,
+                "EntryFilled": False,
+                "EntryOrderType": "ENTRY_STOP",
+                "TradeCompleted": False,
+                "Rejected": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    sm = WatchdogStateManager()
+    now = datetime.now(timezone.utc)
+    sm.update_timetable_streams(
+        {"ES2"},
+        "2026-05-12",
+        "hash-current",
+        now,
+        enabled_streams_metadata={
+            "ES2": {"instrument": "ES", "session": "S2", "slot_time": "00:01"},
+        },
+        enabled_streams_ordered=["ES2"],
+    )
+    sm._stream_states[("2026-05-12", "ES2")] = StreamStateInfo(
+        trading_date="2026-05-12",
+        stream="ES2",
+        state="RANGE_LOCKED",
+        committed=False,
+        state_entry_time_utc=now,
+        execution_instrument="MES",
+    )
+    sm._stream_states[("2026-05-12", "ES2")].instrument = "ES"
+    sm._stream_states[("2026-05-12", "ES2")].session = "S2"
+
+    agg = aggregator_main.WatchdogAggregator.__new__(aggregator_main.WatchdogAggregator)
+    agg._state_manager = sm
+    agg._session_flatten_tracker = None
+    agg._last_slot_journal_hydrate_utc = now
+    agg._run_context = _watchdog_context_for_root(temp_root)
+    agg._snapshot_mode = True
+
+    payload = agg.get_stream_states()
+
+    assert payload["execution_expectation_gaps"] == []
+    row = payload["streams"][0]
+    assert row["state"] == "ENTRY_BRACKETS_WORKING"
+    assert row["watchdog_state"] == "RANGE_LOCKED"
+    assert row["operator_classification"] == "RESTING_ENTRY_UNFILLED"
+    assert row["resting_entry_count"] == 1
+
+
+def test_stream_pnl_falls_back_to_execution_journals_when_ledger_invariant_fails(monkeypatch):
+    temp_root = _workspace_temp_dir()
+    execution_journals = temp_root / "state" / "execution_journals"
+    execution_journals.mkdir(parents=True, exist_ok=True)
+    (execution_journals / "2026-05-12_CL1_intent-open.json").write_text(
+        json.dumps(
+            {
+                "IntentId": "intent-open",
+                "TradingDate": "2026-05-12",
+                "Stream": "CL1",
+                "Instrument": "MCL",
+                "Direction": "Long",
+                "EntrySubmitted": True,
+                "EntryFilled": True,
+                "EntryOrderType": "ENTRY_STOP",
+                "FillPrice": 102.11,
+                "EntryPrice": 102.06,
+                "EntryFilledQuantityTotal": 2,
+                "ExitFilledQuantityTotal": 0,
+                "TradeCompleted": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (execution_journals / "2026-05-12_ES2_intent-resting.json").write_text(
+        json.dumps(
+            {
+                "IntentId": "intent-resting",
+                "TradingDate": "2026-05-12",
+                "Stream": "ES2",
+                "Instrument": "MES",
+                "Direction": "Long",
+                "EntrySubmitted": True,
+                "EntryFilled": False,
+                "EntryOrderType": "ENTRY_STOP",
+                "EntryPrice": 7421.0,
+                "TradeCompleted": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    from modules.watchdog.pnl.ledger_builder import LedgerBuilder, LedgerInvariantViolation
+
+    def raise_invariant(self, trading_date, stream=None, skip_invalid_intents=False):
+        raise LedgerInvariantViolation("duplicate sequence", {"invariant": "execution_sequence"})
+
+    monkeypatch.setattr(LedgerBuilder, "build_ledger_rows", raise_invariant)
+
+    sm = WatchdogStateManager()
+    now = datetime.now(timezone.utc)
+    sm.update_timetable_streams(
+        {"CL1", "ES2"},
+        "2026-05-12",
+        "hash-current",
+        now,
+        enabled_streams_metadata={},
+        enabled_streams_ordered=["CL1", "ES2"],
+    )
+
+    agg = aggregator_main.WatchdogAggregator.__new__(aggregator_main.WatchdogAggregator)
+    agg._state_manager = sm
+    agg._run_context = _watchdog_context_for_root(temp_root)
+    agg._snapshot_mode = True
+
+    payload = agg.get_stream_pnl("2026-05-12")
+    by_stream = {row["stream"]: row for row in payload["streams"]}
+
+    assert by_stream["CL1"]["source"] == "execution_journal_fallback"
+    assert by_stream["CL1"]["open_positions"] == 2
+    assert by_stream["CL1"]["open_count"] == 1
+    assert by_stream["CL1"]["entry_price"] == 102.11
+    assert by_stream["ES2"]["source"] == "execution_journal_fallback"
+    assert by_stream["ES2"]["open_positions"] == 0
+    assert by_stream["ES2"]["entry_price"] == 7421.0
 
 
 def test_watchdog_hydrates_stop_protection_for_active_journal_intent_from_feed():

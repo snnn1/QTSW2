@@ -82,6 +82,40 @@ public sealed partial class ExecutionJournal
             if (entry.EntryFilledQuantityTotal <= 0)
                 return false;
 
+            var journalOpenQtyBeforeClose = GetEntryRemainingOpenQuantity(entry);
+            var brokerFlatAuthority = EvaluateBrokerFlatJournalCompletionAuthority(
+                "ExecutionJournal.ForceReconcileManualOverride",
+                entry.Instrument,
+                BrokerPositionResolver.NormalizeCanonicalKey(entry.Instrument),
+                tradingDate,
+                stream,
+                intentId,
+                utcNow,
+                brokerPositionQtyAbsAtDecision: 0,
+                brokerWorkingOrderCount: 0,
+                journalOpenQtyBeforeClose: journalOpenQtyBeforeClose,
+                snapshotSufficient: false,
+                snapshotError: "manual_force_reconcile_requires_broker_snapshot");
+            if (!IsAllowedBrokerFlatCompletionAuthority(brokerFlatAuthority))
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_COMPLETION_AUTHORITY_DENIED", "ENGINE",
+                    new
+                    {
+                        intent_id = intentId,
+                        stream,
+                        trading_date = tradingDate,
+                        instrument = entry.Instrument,
+                        completion_reason = CompletionReasons.RECONCILIATION_MANUAL_OVERRIDE,
+                        journal_open_qty_before_close = journalOpenQtyBeforeClose,
+                        authority_gate = brokerFlatAuthority.GateName,
+                        authority_deny_reason = brokerFlatAuthority.DenyReason ?? "UNKNOWN",
+                        authority_frame_id = brokerFlatAuthority.AuthorityFrame?.FrameId ?? "",
+                        trigger_source = "ExecutionJournal.ForceReconcileManualOverride",
+                        note = "Manual force-reconcile journal completion requires canonical authority with sufficient broker/account evidence."
+                    }));
+                return false;
+            }
+
             entry.ExitFilledQuantityTotal = entry.EntryFilledQuantityTotal;
             entry.ExitAvgFillPrice = null;
             entry.ExitFillNotional = null;
@@ -109,13 +143,32 @@ public sealed partial class ExecutionJournal
     /// <param name="brokerPositionQtyAbsAtDecision">When &gt;= 0 and <paramref name="triggerSource"/> set, logged on <c>JOURNAL_COMPLETION_DECISION</c>.</param>
     /// <param name="journalOpenQtyBeforeClose">Remaining open qty before close; use -1 if unknown.</param>
     /// <param name="triggerSource">Non-null to emit <c>JOURNAL_COMPLETION_DECISION</c> after persist (e.g. ReconciliationRunner).</param>
+    /// <param name="brokerFlatAuthority">Allowed UEA decision for <see cref="ExecutionAuthorityAction.JournalCompleteBrokerFlat"/>.</param>
     public bool RecordReconciliationComplete(string tradingDate, string stream, string intentId, DateTimeOffset utcNow,
+        ExecutionAuthorityActionDecision brokerFlatAuthority,
         int brokerPositionQtyAbsAtDecision = -1,
         int journalOpenQtyBeforeClose = -1,
         string? triggerSource = null)
     {
         if (string.IsNullOrWhiteSpace(tradingDate) || string.IsNullOrWhiteSpace(stream) || string.IsNullOrWhiteSpace(intentId))
             return false;
+        if (!IsAllowedBrokerFlatCompletionAuthority(brokerFlatAuthority))
+        {
+            _log.Write(RobotEvents.EngineBase(utcNow, tradingDate, "JOURNAL_COMPLETION_AUTHORITY_DENIED", "ENGINE",
+                new
+                {
+                    intent_id = intentId,
+                    stream,
+                    trading_date = tradingDate,
+                    completion_reason = CompletionReasons.RECONCILIATION_BROKER_FLAT,
+                    authority_gate = brokerFlatAuthority?.GateName ?? "NULL",
+                    authority_deny_reason = brokerFlatAuthority?.DenyReason ?? "AUTHORITY_NOT_ALLOWED",
+                    authority_frame_id = brokerFlatAuthority?.AuthorityFrame?.FrameId ?? "",
+                    trigger_source = triggerSource ?? "",
+                    note = "RECONCILIATION_BROKER_FLAT journal completion requires an allowed UEA JournalCompleteBrokerFlat decision."
+                }));
+            return false;
+        }
 
         lock (_lock)
         {
@@ -182,6 +235,8 @@ public sealed partial class ExecutionJournal
                         completion_reason = CompletionReasons.RECONCILIATION_BROKER_FLAT,
                         broker_position_qty = brokerPositionQtyAbsAtDecision < 0 ? null : (int?)brokerPositionQtyAbsAtDecision,
                         journal_open_qty_before_close = journalOpenQtyBeforeClose < 0 ? null : (int?)journalOpenQtyBeforeClose,
+                        authority_gate = brokerFlatAuthority.GateName,
+                        authority_frame_id = brokerFlatAuthority.AuthorityFrame?.FrameId ?? "",
                         reason = "TradeCompleted via reconciliation — broker flat confirmed by caller",
                         trigger_source = triggerSource
                     }));
@@ -190,6 +245,72 @@ public sealed partial class ExecutionJournal
             return true;
         }
     }
+
+    public static ExecutionAuthorityActionDecision EvaluateBrokerFlatJournalCompletionAuthority(
+        string source,
+        string instrument,
+        string? canonicalInstrument,
+        string tradingDate,
+        string stream,
+        string intentId,
+        DateTimeOffset utcNow,
+        int brokerPositionQtyAbsAtDecision,
+        int brokerWorkingOrderCount,
+        int journalOpenQtyBeforeClose,
+        int ownershipOpenQty = 0,
+        int ownershipActiveSlotCount = 0,
+        int ownershipOrphanSlotCount = 0,
+        string account = "",
+        bool snapshotSufficient = true,
+        string? snapshotError = null)
+    {
+        var brokerAbs = Math.Max(0, Math.Abs(brokerPositionQtyAbsAtDecision));
+        var brokerWorking = Math.Max(0, brokerWorkingOrderCount);
+        var journalOpen = Math.Max(0, journalOpenQtyBeforeClose);
+        var frame = ExecutionAuthorityFrameBuilder.Build(new ExecutionAuthorityFrameBuilderInput
+        {
+            Source = string.IsNullOrWhiteSpace(source) ? "ExecutionJournal.RecordReconciliationComplete" : source,
+            Account = account ?? "",
+            Instrument = instrument?.Trim() ?? "",
+            CanonicalInstrument = canonicalInstrument,
+            TradingDate = tradingDate?.Trim() ?? "",
+            StreamId = stream?.Trim() ?? "",
+            IntentId = intentId?.Trim() ?? "",
+            SubmitPath = "JOURNAL_COMPLETE_BROKER_FLAT",
+            DecisionUtc = utcNow,
+            FrameCreatedUtc = utcNow,
+            SnapshotError = snapshotError,
+            BrokerPositionQty = brokerAbs,
+            BrokerWorkingOrdersCount = brokerWorking,
+            JournalOpenQty = journalOpen,
+            OwnershipOpenQty = Math.Max(0, ownershipOpenQty),
+            OwnershipActiveSlots = Math.Max(0, ownershipActiveSlotCount),
+            OwnershipOrphanSlots = Math.Max(0, ownershipOrphanSlotCount),
+            AuthorityState = "JOURNAL_COMPLETE_BROKER_FLAT"
+        });
+        return UnifiedExecutionAuthority.EvaluateAction(new ExecutionAuthorityActionEvaluationRequest
+        {
+            Action = ExecutionAuthorityAction.JournalCompleteBrokerFlat,
+            Source = string.IsNullOrWhiteSpace(source) ? "ExecutionJournal.RecordReconciliationComplete" : source,
+            Instrument = instrument?.Trim() ?? "",
+            IntentId = intentId?.Trim() ?? "",
+            Stream = stream?.Trim() ?? "",
+            UtcNow = utcNow,
+            BrokerAbsQty = brokerAbs,
+            BrokerWorkingOrderCount = brokerWorking,
+            JournalOpenQty = journalOpen,
+            OwnershipOpenQty = Math.Max(0, ownershipOpenQty),
+            OwnershipActiveSlotCount = Math.Max(0, ownershipActiveSlotCount),
+            OwnershipOrphanSlotCount = Math.Max(0, ownershipOrphanSlotCount),
+            SnapshotSufficient = snapshotSufficient,
+            AuthorityFrame = frame
+        });
+    }
+
+    private static bool IsAllowedBrokerFlatCompletionAuthority(ExecutionAuthorityActionDecision? authority) =>
+        authority != null &&
+        authority.Allowed &&
+        string.Equals(authority.GateName, "AuthorityJournalCompleteBrokerFlat", StringComparison.Ordinal);
 
     /// <summary>
     /// Pre-load all journal entries for a trading date into cache.

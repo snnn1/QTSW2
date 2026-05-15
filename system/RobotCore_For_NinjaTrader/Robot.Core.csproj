@@ -61,6 +61,7 @@
     <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.AuditLoop.cs" Link="Execution\MismatchEscalationCoordinator.AuditLoop.cs" />
     <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.Convergence.cs" Link="Execution\MismatchEscalationCoordinator.Convergence.cs" />
     <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.Diagnostics.cs" Link="Execution\MismatchEscalationCoordinator.Diagnostics.cs" />
+    <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.Dispose.cs" Link="Execution\MismatchEscalationCoordinator.Dispose.cs" />
     <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.FailClosed.cs" Link="Execution\MismatchEscalationCoordinator.FailClosed.cs" />
     <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.ForcedConvergence.cs" Link="Execution\MismatchEscalationCoordinator.ForcedConvergence.cs" />
     <Compile Include="..\modules\robot\core\Execution\MismatchEscalationCoordinator.MismatchFlow.cs" Link="Execution\MismatchEscalationCoordinator.MismatchFlow.cs" />
@@ -93,6 +94,7 @@
     <Compile Include="..\modules\robot\core\Execution\AuthoritativeStateEmitter.cs" Link="Execution\AuthoritativeStateEmitter.cs" />
     <Compile Include="..\modules\robot\core\Execution\AuthoritativeStateSnapshot.cs" Link="Execution\AuthoritativeStateSnapshot.cs" />
     <Compile Include="..\modules\robot\core\Execution\AuthorityDecisionModels.cs" Link="Execution\AuthorityDecisionModels.cs" />
+    <Compile Include="..\modules\robot\core\Execution\ExecutionAuthorityFrameBuilder.cs" Link="Execution\ExecutionAuthorityFrameBuilder.cs" />
     <Compile Include="..\modules\robot\core\SessionAuthority\SessionPolicyService.cs" Link="SessionAuthority\SessionPolicyService.cs" />
     <Compile Include="..\modules\robot\core\SessionAuthority\SessionCalendarDocument.cs" Link="SessionAuthority\SessionCalendarDocument.cs" />
     <Compile Include="..\modules\robot\core\SessionAuthority\CalendarGroupResolver.cs" Link="SessionAuthority\CalendarGroupResolver.cs" />
@@ -103,6 +105,7 @@
     <Compile Include="..\modules\robot\core\Execution\Qtsw2OrderUpdateHydrationPolicy.cs" Link="Execution\Qtsw2OrderUpdateHydrationPolicy.cs" />
     <Compile Include="..\modules\robot\core\Execution\ReconciliationDeferPolicy.cs" Link="Execution\ReconciliationDeferPolicy.cs" />
     <Compile Include="..\modules\robot\core\Execution\FlattenCoordinationTracker.cs" Link="Execution\FlattenCoordinationTracker.cs" />
+    <Compile Include="..\modules\robot\core\Execution\FlattenVerifierLifecycleRules.cs" Link="Execution\FlattenVerifierLifecycleRules.cs" />
     <Compile Include="..\modules\robot\core\Execution\FlattenFillAllocationPolicy.cs" Link="Execution\FlattenFillAllocationPolicy.cs" />
     <Compile Include="..\modules\robot\core\Execution\ReleaseReconciliationRedundancySuppression.cs" Link="Execution\ReleaseReconciliationRedundancySuppression.cs" />
     <Compile Include="..\modules\robot\core\Execution\NtNonLiveAccountValidation.cs" Link="Execution\NtNonLiveAccountValidation.cs" />

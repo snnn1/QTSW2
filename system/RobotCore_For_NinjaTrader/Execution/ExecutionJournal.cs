@@ -14,6 +14,7 @@ namespace QTSW2.Robot.Core.Execution;
 public sealed partial class ExecutionJournal
 {
     private readonly string _journalDir;
+    private readonly string _streamJournalDir;
     private readonly RobotLogger _log;
     private readonly Dictionary<string, ExecutionJournalEntry> _cache = new();
     private readonly Dictionary<string, bool> _entryFillByStream = new(); // key = "tradingDate_stream", O(1) HasEntryFillForStream
@@ -148,6 +149,7 @@ public sealed partial class ExecutionJournal
     {
         // RULE: No logging allowed before RobotEngine.Start() completes — do not call _log.Write here (RobotLogger may be blocked until RebindLogging).
         _journalDir = RobotRunArtifactPaths.StateExecutionJournals(projectRoot);
+        _streamJournalDir = RobotRunArtifactPaths.StateStreamJournals(projectRoot);
         Directory.CreateDirectory(_journalDir);
         ValidateJournalDirectory();  // Phase 3.2: fail closed if not writable
         _log = log;

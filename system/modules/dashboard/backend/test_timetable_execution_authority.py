@@ -70,6 +70,19 @@ def test_execution_publish_updates_manual_authority(monkeypatch):
     )
 
     try:
+        pointer_path = temp_root / "configs" / "robot" / "playback_scenario_current.json"
+        pointer_path.parent.mkdir(parents=True, exist_ok=True)
+        pointer_path.write_text(
+            json.dumps(
+                {
+                    "mode": "multi_day_carryover",
+                    "scenario_id": "stale_scenario",
+                    "source": "matrix_ui_playback_scenario",
+                }
+            ),
+            encoding="utf-8",
+        )
+
         result = asyncio.run(
             save_execution_timetable(
                 ExecutionTimetableRequest(
@@ -86,6 +99,13 @@ def test_execution_publish_updates_manual_authority(monkeypatch):
         authority = json.loads(authority_path.read_text(encoding="utf-8"))
 
         assert result["status"] == "published"
+        pointer_state = result["playback_scenario_pointer"]
+        assert pointer_state["status"] == "cleared"
+        assert pointer_state["removed"] is True
+        assert not pointer_path.exists()
+        archived_path = Path(pointer_state["archived_path"])
+        assert archived_path.exists()
+        assert archived_path.parent.name == "playback_scenario_archive"
         assert authority["mode"] == "manual"
         assert authority["session_trading_date"] == "2026-04-21"
         assert authority["locked"] is True
@@ -160,6 +180,7 @@ def test_historical_execution_publish_updates_replay_authority_and_file(monkeypa
 
         assert result["status"] == "published"
         assert str(result["file"]).endswith("timetable_replay_current.json")
+        assert result["playback_scenario_pointer"]["status"] == "not_present"
         assert authority["mode"] == "replay"
         assert authority["session_trading_date"] == "2026-04-02"
         assert authority["locked"] is True

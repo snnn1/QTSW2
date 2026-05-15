@@ -166,6 +166,12 @@ public sealed partial class MismatchEscalationCoordinator
                 return false;
         }
 
+        if (!HasCanonicalMismatchReleaseAuthority(readiness))
+        {
+            EmitGateReleaseBlocked(inst, utcNow, state, "fail_closed_release_authority_missing", readiness);
+            return false;
+        }
+
         var wasBlockedRelease = state.Blocked;
         state.Blocked = false;
         state.BlockReason = "";

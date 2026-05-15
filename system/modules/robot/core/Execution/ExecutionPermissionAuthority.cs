@@ -11,6 +11,25 @@ namespace QTSW2.Robot.Core.Execution;
 /// </summary>
 public static class ExecutionPermissionAuthority
 {
+    public static bool IsRiskCoverageSubmitPath(string? submitPath)
+    {
+        var path = submitPath?.Trim() ?? "";
+        return string.Equals(path, "SUBMIT_PROTECTIVE_STOP", StringComparison.Ordinal) ||
+               string.Equals(path, "SUBMIT_TARGET", StringComparison.Ordinal);
+    }
+
+    public static bool ShouldApplyEntryRiskBlockToSubmitPath(string? submitPath)
+    {
+        var path = submitPath?.Trim() ?? "";
+        return path switch
+        {
+            "SUBMIT_PROTECTIVE_STOP" or "SUBMIT_TARGET" => false,
+            "FLATTEN_ENQUEUE" or "FLATTEN" or "SUBMIT_FLATTEN" or "EMERGENCY_FLATTEN" or "RECOVERY_FLATTEN" => false,
+            "CANCEL" or "CANCEL_ORDERS" or "CANCEL_INTENT_ORDERS" => false,
+            _ => true
+        };
+    }
+
     /// <summary>
     /// Adapter order-submit path only: deny before structural/overlay evaluation when RiskGate-equivalent blocks apply.
     /// </summary>

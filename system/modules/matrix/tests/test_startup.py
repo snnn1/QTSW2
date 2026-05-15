@@ -18,6 +18,20 @@ from datetime import datetime
 QTSW2_ROOT = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(QTSW2_ROOT))
 
+def is_port_listening(port: int) -> bool:
+    """Return True if Windows reports a LISTENING socket for the port."""
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return False
+    needle = f":{port}"
+    return any(needle in line and "LISTENING" in line for line in result.stdout.splitlines())
+
 def print_test(name):
     """Print test header"""
     print(f'\n{"="*60}')
@@ -115,23 +129,19 @@ def test_python_imports():
 def test_port_availability():
     """Test 3: Port availability"""
     print_test('3. Port Availability')
-    issues = []
     
-    # Check backend ports
-    for port in [8000, 8001, 8002, 8003, 8004]:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        result = sock.connect_ex(('localhost', port))
-        sock.close()
-        
-        if result == 0:
-            print_result(True, f'Port {port} is in use (backend may be running)', warning=True)
-        else:
-            print_result(True, f'Port {port} is available')
+    # Matrix must use the shared Pipeline Dashboard API on IPv4 localhost:8000.
+    # Do not accept 8001/8002 as alternate Matrix backends; 8002 is watchdog.
+    backend_port = 8000
+    if is_port_listening(backend_port):
+        print_result(True, f'Port {backend_port} is in use (expected when Pipeline Dashboard API is running)', warning=True)
+    else:
+        print_result(True, f'Port {backend_port} is available; launcher will start the Dashboard API')
     
     # Check frontend port
     frontend_port = 5174
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    result = sock.connect_ex(('localhost', frontend_port))
+    result = sock.connect_ex(('127.0.0.1', frontend_port))
     sock.close()
     
     if result == 0:
@@ -144,29 +154,24 @@ def test_port_availability():
 def test_backend_startup():
     """Test 4: Backend startup process"""
     print_test('4. Backend Startup Process')
-    issues = []
     
-    # Check if backend is already running
+    # Check the actual Matrix contract: the shared Dashboard API must expose
+    # /api/matrix/test on 127.0.0.1:8000. Other ports are not valid here.
+    is_listening = is_port_listening(8000)
+    if not is_listening:
+        print_result(True, 'Dashboard API is not running on 127.0.0.1:8000; launcher will start it')
+        return True
+
     try:
-        response = requests.get('http://localhost:8000/', timeout=2)
+        response = requests.get('http://127.0.0.1:8000/api/matrix/test', timeout=2)
         if response.status_code == 200:
-            print_result(True, 'Backend is already running on port 8000')
+            print_result(True, 'Dashboard API is running and Matrix endpoint responds on 127.0.0.1:8000')
             return True
-    except:
-        pass
-    
-    # Try other ports
-    for port in [8001, 8002, 8003]:
-        try:
-            response = requests.get(f'http://localhost:{port}/', timeout=2)
-            if response.status_code == 200:
-                print_result(True, f'Backend is already running on port {port}')
-                return True
-        except:
-            pass
-    
-    print_result(True, 'Backend is not running (will start when batch file runs)')
-    return True
+        print_result(False, f'Dashboard API responded {response.status_code}; expected 200 from /api/matrix/test')
+        return False
+    except Exception as e:
+        print_result(False, f'Port 8000 is listening but /api/matrix/test did not respond: {e}')
+        return False
 
 def test_batch_file():
     """Test 5: Batch file existence and structure"""
@@ -185,12 +190,14 @@ def test_batch_file():
             with open(batch_file, 'r', encoding='utf-8') as f:
                 content = f.read()
                 
-            # Check for key components
+            # The Matrix frontend must reuse the Pipeline Dashboard API on :8000.
+            # The old launcher used to allocate fallback backend ports, which
+            # made the UI talk to the wrong API when the dashboard was already running.
             checks = {
-                'Port checking logic': 'check_port' in content or 'netstat' in content,
-                'Backend startup': 'uvicorn' in content,
-                'Frontend startup': 'npm run dev' in content,
-                'Project root': 'PROJECT_ROOT' in content
+                'Canonical launcher delegation': 'START_MASTER_MATRIX_APP.bat' in content,
+                'No fallback backend port allocation': 'check_port' not in content and 'BACKEND_PORT' not in content,
+                'Shared dashboard API port documented': '127.0.0.1:8000' in content,
+                'Matrix frontend port documented': '5174' in content,
             }
             
             for check_name, check_result in checks.items():
@@ -255,19 +262,22 @@ def test_frontend_config():
         except Exception as e:
             issues.append(f"Error reading vite.config.js: {e}")
     
-    # Check App.jsx for API configuration
-    app_jsx = frontend_dir / "src" / "App.jsx"
-    if app_jsx.exists():
+    # Check matrix API client for API configuration
+    api_js = frontend_dir / "src" / "api" / "matrixApi.js"
+    if api_js.exists():
         try:
-            with open(app_jsx, 'r', encoding='utf-8') as f:
+            with open(api_js, 'r', encoding='utf-8') as f:
                 content = f.read()
-                if 'VITE_API_PORT' in content or 'API_PORT' in content:
-                    print_result(True, 'API port configuration found in App.jsx')
+                if 'VITE_API_BASE' in content and '127.0.0.1:8000' in content:
+                    print_result(True, 'Dashboard API base configuration found in matrixApi.js')
                 else:
-                    issues.append("API port configuration not found in App.jsx")
-                    print_result(False, 'API port configuration missing')
+                    issues.append("Dashboard API base configuration not found in matrixApi.js")
+                    print_result(False, 'Dashboard API base configuration missing')
         except Exception as e:
-            issues.append(f"Error reading App.jsx: {e}")
+            issues.append(f"Error reading matrixApi.js: {e}")
+    else:
+        issues.append(f"matrixApi.js not found: {api_js}")
+        print_result(False, 'matrixApi.js not found')
     
     if issues:
         print_result(False, f'Found {len(issues)} frontend configuration issue(s)')

@@ -41,6 +41,7 @@ class StreamFilterConfig(BaseModel):
     exclude_days_of_week: List[str] = []  # e.g., ["Wednesday", "Friday"]
     exclude_days_of_month: List[int] = []  # e.g., [4, 16, 30]
     exclude_times: List[str] = []  # e.g., ["07:30", "08:00"]
+    include_streams: List[str] = []  # master-only stream selection for timetable publish
 
 
 class MatrixBuildRequest(BaseModel):

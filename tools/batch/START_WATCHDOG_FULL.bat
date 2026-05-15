@@ -1,7 +1,7 @@
 @echo off
 REM Start Watchdog UI with Backend (Full Stack)
 REM Watchdog runs standalone - separate backend (8002) and frontend (5175)
-REM Does NOT interfere with dashboard backend (8001) or frontend (5173)
+REM Does NOT interfere with the shared Dashboard/Matrix API (8000) or Matrix UI (5174)
 
 cd /d "%~dp0\.."
 
@@ -15,7 +15,7 @@ echo This will start:
 echo   - Watchdog Backend on http://localhost:8002 (standalone)
 echo   - Watchdog Frontend on http://localhost:5175 (standalone)
 echo.
-echo NOTE: Dashboard (8001/5173) and Matrix (8000/5174) are unaffected
+echo NOTE: Dashboard/Matrix API (8000) and Matrix UI (5174) are unaffected
 echo.
 echo Press Ctrl+C to stop both services.
 echo ============================================================
@@ -61,7 +61,7 @@ echo Starting watchdog frontend dev server...
 echo Frontend will be available at: http://localhost:5175
 echo.
 echo IMPORTANT: Uses standalone watchdog (modules/watchdog/frontend)
-echo Do NOT open dashboard (5173) or matrix (5174) - those are separate apps
+echo Do NOT open the Pipeline Dashboard/Matrix API (8000) or Matrix UI (5174) - those are separate apps
 echo.
 
 REM Open ONLY watchdog URL after a delay (frontend needs time to start)

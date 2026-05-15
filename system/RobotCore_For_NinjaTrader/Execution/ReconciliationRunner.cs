@@ -726,8 +726,51 @@ public sealed class ReconciliationRunner
 
             var familyKey = BrokerFlatFamilyKey(instrument);
             if (!familyClosureReadiness.TryGetValue(familyKey, out var fr)) continue;
+            var journalOpenQtyForAuthority = entries.Sum(e => ExecutionJournal.GetEntryRemainingOpenQuantity(e.Entry));
+            var completionAuthorityFrame = ExecutionAuthorityFrameBuilder.Build(new ExecutionAuthorityFrameBuilderInput
+            {
+                Source = "ReconciliationRunner.JournalCompleteBrokerFlat",
+                Account = _reconciliationAccountName?.Invoke() ?? "",
+                Instrument = instrument,
+                CanonicalInstrument = familyKey,
+                TradingDate = entries[0].TradingDate,
+                IntentId = entries[0].IntentId ?? "",
+                SubmitPath = "JOURNAL_COMPLETE_BROKER_FLAT",
+                DecisionUtc = utcNow,
+                FrameCreatedUtc = utcNow,
+                BrokerSnapshotCapturedUtc = snap.CapturedAtUtc,
+                BrokerPositionQty = fr.BrokerAbs,
+                BrokerWorkingOrdersCount = fr.HasWorking ? 1 : 0,
+                JournalOpenQty = journalOpenQtyForAuthority,
+                OwnershipOpenQty = fr.OwnershipGrossOpenQty,
+                OwnershipActiveSlots = fr.OwnershipActiveSlotCount,
+                OwnershipOrphanSlots = fr.OwnershipOrphanSlotCount,
+                AuthorityState = "JOURNAL_COMPLETE_BROKER_FLAT"
+            });
+            var completionAuthority = UnifiedExecutionAuthority.EvaluateAction(new ExecutionAuthorityActionEvaluationRequest
+            {
+                Action = ExecutionAuthorityAction.JournalCompleteBrokerFlat,
+                Source = "ReconciliationRunner.JournalCompleteBrokerFlat",
+                Instrument = instrument,
+                IntentId = entries[0].IntentId ?? "",
+                UtcNow = utcNow,
+                BrokerAbsQty = fr.BrokerAbs,
+                BrokerWorkingOrderCount = fr.HasWorking ? 1 : 0,
+                JournalOpenQty = journalOpenQtyForAuthority,
+                OwnershipOpenQty = fr.OwnershipGrossOpenQty,
+                OwnershipActiveSlotCount = fr.OwnershipActiveSlotCount,
+                OwnershipOrphanSlotCount = fr.OwnershipOrphanSlotCount,
+                AuthorityFrame = completionAuthorityFrame
+            });
+            _log.Write(RobotEvents.EngineBase(utcNow, entries[0].TradingDate, "AUTHORITY_FRAME_SNAPSHOT", "ENGINE",
+                ExecutionAuthorityFrameBuilder.ToLogPayload(
+                    completionAuthorityFrame,
+                    action: "JOURNAL_COMPLETE_BROKER_FLAT",
+                    decision: completionAuthority.Allowed ? "ALLOW" : "DENY",
+                    denyReason: completionAuthority.DenyReason)));
 
-            if (fr.BrokerAbs > 0)
+            if (!completionAuthority.Allowed &&
+                string.Equals(completionAuthority.DenyReason, "BROKER_NOT_FLAT", StringComparison.OrdinalIgnoreCase))
             {
                 var sampleIntent = entries[0].IntentId;
                 _log.Write(RobotEvents.EngineBase(utcNow, entries[0].TradingDate, "JOURNAL_COMPLETION_BLOCKED_BROKER_NOT_FLAT", "ENGINE",
@@ -744,7 +787,8 @@ public sealed class ReconciliationRunner
                 continue;
             }
 
-            if (fr.HasWorking)
+            if (!completionAuthority.Allowed &&
+                string.Equals(completionAuthority.DenyReason, "WORKING_ORDERS_OPEN", StringComparison.OrdinalIgnoreCase))
             {
                 _log.Write(RobotEvents.EngineBase(utcNow, entries[0].TradingDate, "RECONCILIATION_SKIPPED_HAS_WORKING_ORDERS", "ENGINE",
                     new
@@ -758,7 +802,8 @@ public sealed class ReconciliationRunner
                 continue;
             }
 
-            if (fr.OwnershipGrossOpenQty > 0 || fr.OwnershipActiveSlotCount > 0 || fr.OwnershipOrphanSlotCount > 0)
+            if (!completionAuthority.Allowed &&
+                string.Equals(completionAuthority.DenyReason, "OWNERSHIP_GROSS_OPEN", StringComparison.OrdinalIgnoreCase))
             {
                 _log.Write(RobotEvents.EngineBase(utcNow, entries[0].TradingDate, "RECONCILIATION_SKIPPED_OWNERSHIP_GROSS_OPEN", "ENGINE",
                     new
@@ -771,6 +816,22 @@ public sealed class ReconciliationRunner
                         ownership_orphan_slot_count = fr.OwnershipOrphanSlotCount,
                         note =
                             "Broker-net flat is not clean-flat while ownership has gross/open slots; defer RECONCILIATION_BROKER_FLAT journal closure"
+                }));
+                continue;
+            }
+
+            if (!completionAuthority.Allowed)
+            {
+                _log.Write(RobotEvents.EngineBase(utcNow, entries[0].TradingDate, "RECONCILIATION_SKIPPED_AUTHORITY_DENIED_JOURNAL_COMPLETION", "ENGINE",
+                    new
+                    {
+                        instrument,
+                        broker_flat_family_key = familyKey,
+                        open_journal_count = entries.Count,
+                        authority_gate = completionAuthority.GateName,
+                        authority_deny_reason = completionAuthority.DenyReason ?? "UNKNOWN",
+                        authority_detail = completionAuthority.Detail ?? "",
+                        note = "UEA denied RECONCILIATION_BROKER_FLAT journal closure."
                     }));
                 continue;
             }
@@ -779,6 +840,7 @@ public sealed class ReconciliationRunner
             {
                 var journalOpenBefore = ExecutionJournal.GetEntryRemainingOpenQuantity(entry);
                 if (_journal.RecordReconciliationComplete(tradingDate, stream, intentId, utcNow,
+                        completionAuthority,
                         fr.BrokerAbs, journalOpenBefore, "ReconciliationRunner_broker_flat_stable"))
                 {
                     var ownershipClose = RecordOwnershipBrokerFlatClose(

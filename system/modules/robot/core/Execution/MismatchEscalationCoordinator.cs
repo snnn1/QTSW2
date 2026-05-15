@@ -22,7 +22,7 @@ namespace QTSW2.Robot.Core.Execution;
 /// release-path journal integrity stays parity-only while pending; hard flatten / execution lock remain last resort for structural
 /// or persistent divergence outside those windows.
 /// </remarks>
-public sealed partial class MismatchEscalationCoordinator
+public sealed partial class MismatchEscalationCoordinator : IDisposable
 {
     private readonly Func<AccountSnapshot> _getSnapshot;
     private readonly Func<IReadOnlyList<string>> _getActiveInstruments;
@@ -66,6 +66,8 @@ public sealed partial class MismatchEscalationCoordinator
     private long _scheduleActivityGenPrev = long.MinValue;
     private readonly int _stableWindowMs;
     private readonly Timer _auditTimer;
+    private int _auditCallbackThreadId;
+    private int _disposed;
     private DateTimeOffset _lastAuditUtc = DateTimeOffset.MinValue;
     private ulong _nextConvergenceEpisodeId;
 
@@ -696,6 +698,12 @@ public sealed partial class MismatchEscalationCoordinator
             : state.EscalationState == MismatchEscalationState.PERSISTENT_MISMATCH
                 ? "persistent_recovery"
                 : "standard";
+
+        if (!HasCanonicalMismatchReleaseAuthority(readiness))
+        {
+            EmitGateReleaseBlocked(inst, utcNow, state, "canonical_mismatch_release_authority_missing", readiness);
+            return;
+        }
 
         var priorQuietFp = state.ReleaseQuietFingerprintKey;
         EmitGateReleasedDiagnostic(inst, utcNow, readiness, obsForSig, pendingIeA, preSigHash, postSigHash,

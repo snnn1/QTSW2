@@ -11,7 +11,7 @@ echo [%TIME%] PYTHONPATH=%PYTHONPATH%
 powershell -NoProfile -Command "$p = Get-NetTCPConnection -LocalPort 8002 -State Listen -ErrorAction SilentlyContinue; if ($p) { exit 0 } else { exit 1 }"
 if errorlevel 1 (
   echo [%TIME%] Port 8002 free — starting Watchdog API ^(modules.watchdog.backend.main:app^)...
-  start "Watchdog API :8002" cmd /k "cd /d ""%CD%"" && set PYTHONPATH=%CD%\system && python -m uvicorn modules.watchdog.backend.main:app --host 127.0.0.1 --port 8002 --reload"
+  start "Watchdog API :8002" cmd /k "cd /d ""%CD%"" && set PYTHONPATH=%CD%\system && python -m uvicorn modules.watchdog.backend.main:app --host 127.0.0.1 --port 8002"
   timeout /t 2 /nobreak >nul
 ) else (
   echo [%TIME%] Port 8002 already listening — skipping Watchdog API start.

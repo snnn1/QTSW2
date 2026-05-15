@@ -16,8 +16,12 @@ public sealed partial class RobotEngine
     {
         lock (_engineLock)
         {
+            if (IsTerminalShutdownLatched())
+                return;
+
             _engineHeartbeatTimer?.Dispose();
             _engineHeartbeatTimer = null;
+            Volatile.Write(ref _engineHeartbeatCallbackThreadId, 0);
             _heartbeatTradingDateCache = TradingDateString;
             _engineHeartbeatWallTick = 0;
             _engineHeartbeatTimer = new Timer(
@@ -33,10 +37,31 @@ public sealed partial class RobotEngine
     /// </summary>
     public void StopEngineHeartbeatTimer()
     {
+        Timer? timer;
         lock (_engineLock)
         {
-            _engineHeartbeatTimer?.Dispose();
+            timer = _engineHeartbeatTimer;
             _engineHeartbeatTimer = null;
+        }
+
+        if (timer == null)
+            return;
+
+        if (Volatile.Read(ref _engineHeartbeatCallbackThreadId) == Thread.CurrentThread.ManagedThreadId)
+        {
+            timer.Dispose();
+            return;
+        }
+
+        try
+        {
+            using var disposed = new ManualResetEvent(false);
+            if (timer.Dispose(disposed))
+                disposed.WaitOne(TimeSpan.FromMilliseconds(500));
+        }
+        catch
+        {
+            try { timer.Dispose(); } catch { /* shutdown best effort */ }
         }
     }
 
@@ -45,12 +70,15 @@ public sealed partial class RobotEngine
     /// </summary>
     private void EmitTimerHeartbeatUnsafe()
     {
+        Volatile.Write(ref _engineHeartbeatCallbackThreadId, Thread.CurrentThread.ManagedThreadId);
         var utcNow = DateTimeOffset.UtcNow;
-        if (TryRespectRunWideShutdownSignal(utcNow, "engine_timer"))
-            return;
-        if (IsTerminalShutdownLatched()) return;
         try
         {
+            if (TryRespectRunWideShutdownSignal(utcNow, "engine_timer"))
+                return;
+            if (IsTerminalShutdownLatched())
+                return;
+
             _runtimeAudit?.TryEmitPeriodicWallClock(utcNow);
             var tick = Interlocked.Increment(ref _engineHeartbeatWallTick);
             if (tick % 5 == 0)
@@ -92,6 +120,10 @@ public sealed partial class RobotEngine
         catch (Exception ex)
         {
             try { _log.Write(new { ts_utc = DateTimeOffset.UtcNow.ToString("o"), event_type = "ENGINE_TIMER_HEARTBEAT_ERROR", error = ex.Message }); } catch { /* must not throw */ }
+        }
+        finally
+        {
+            Volatile.Write(ref _engineHeartbeatCallbackThreadId, 0);
         }
     }
 }

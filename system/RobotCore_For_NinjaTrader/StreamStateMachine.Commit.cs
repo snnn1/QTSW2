@@ -163,6 +163,9 @@ public sealed partial class StreamStateMachine
             return true;
         }
 
+        if (HasEntryFillForCurrentStream() && !HasCompletedTradeForCurrentStream())
+            return true;
+
         return _journal.ExecutionInterruptedByClose ||
                (HasAnyReentryLifecycle() && !IsReentryLifecycleCompleted());
     }
@@ -313,6 +316,247 @@ public sealed partial class StreamStateMachine
                reentry?.TradeCompleted == true;
     }
 
+    private static bool IsIntentionalOpenLifecycleTerminalCommit(string commitReason, string eventType)
+    {
+        return string.Equals(commitReason, "SLOT_EXPIRED", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(eventType, "SLOT_EXPIRED", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(commitReason, "SINGLE_DAY_PLAYBACK_FORCED_FLATTEN_TERMINAL", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private IEnumerable<(string TradingDate, string Stream)> EnumerateLifecycleJournalKeys(
+        StreamJournal journal,
+        string tradingDate,
+        string stream)
+    {
+        yield return (tradingDate, stream);
+
+        if (string.IsNullOrWhiteSpace(journal.PriorJournalKey))
+            yield break;
+        if (!TryParseStreamJournalKey(journal.PriorJournalKey, out var priorDate, out var priorStream))
+            yield break;
+        if (string.Equals(priorDate, tradingDate, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(priorStream, stream, StringComparison.OrdinalIgnoreCase))
+            yield break;
+
+        yield return (priorDate, priorStream);
+    }
+
+    private bool TryGetLifecycleEntryForJournal(
+        StreamJournal journal,
+        string tradingDate,
+        string stream,
+        string? intentId,
+        out ExecutionJournalEntry? entry)
+    {
+        entry = null;
+        if (_executionJournal == null || string.IsNullOrWhiteSpace(intentId))
+            return false;
+
+        foreach (var (td, journalStream) in EnumerateLifecycleJournalKeys(journal, tradingDate, stream))
+        {
+            entry = _executionJournal.GetEntry(intentId, td, journalStream);
+            if (entry != null)
+                return true;
+        }
+
+        return false;
+    }
+
+    private bool HasEntryFillForJournal(StreamJournal journal, string tradingDate, string stream)
+    {
+        if (_executionJournal == null)
+            return false;
+
+        foreach (var (td, journalStream) in EnumerateLifecycleJournalKeys(journal, tradingDate, stream))
+        {
+            if (_executionJournal.HasEntryFillForStream(td, journalStream))
+                return true;
+        }
+
+        return false;
+    }
+
+    private bool IsJournalReferencedByCurrentPriorKey(StreamJournal journal)
+    {
+        return !string.IsNullOrWhiteSpace(_journal.PriorJournalKey) &&
+               TryParseStreamJournalKey(_journal.PriorJournalKey, out var priorTradingDate, out var priorStream) &&
+               string.Equals(priorTradingDate, journal.TradingDate, StringComparison.OrdinalIgnoreCase) &&
+               string.Equals(priorStream, journal.Stream, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool IsCarryForwardTerminalProvenByCurrentJournal(StreamJournal journal)
+    {
+        if (ReferenceEquals(journal, _journal) || !_journal.Committed)
+            return false;
+        if (!IsJournalReferencedByCurrentPriorKey(journal) && !IsSameCarryForwardLifecycle(journal))
+            return false;
+
+        return _journal.SlotStatus == SlotStatus.COMPLETE ||
+               _journal.SlotStatus == SlotStatus.EXPIRED ||
+               _journal.SlotStatus == SlotStatus.NO_TRADE ||
+               _journal.TerminalState == StreamTerminalState.TRADE_COMPLETED ||
+               _journal.TerminalState == StreamTerminalState.NO_TRADE ||
+               !string.IsNullOrWhiteSpace(_journal.CommitReason);
+    }
+
+    private bool HasCompletedTradeForJournal(StreamJournal journal, string tradingDate, string stream)
+    {
+        if (IsCarryForwardTerminalProvenByCurrentJournal(journal))
+            return true;
+
+        if (_executionJournal == null)
+            return false;
+
+        if (journal.ExecutionInterruptedByClose && !journal.ReentryFilled)
+            return false;
+
+        if (!string.IsNullOrWhiteSpace(journal.ReentryIntentId))
+        {
+            TryGetLifecycleEntryForJournal(journal, tradingDate, stream, journal.ReentryIntentId, out var reentry);
+            if (journal.ReentryFilled)
+                return reentry?.TradeCompleted == true;
+
+            if (journal.ReentrySubmitted || journal.ReentrySubmitFailureCount > 0)
+                return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(journal.OriginalIntentId))
+            return TryGetLifecycleEntryForJournal(journal, tradingDate, stream, journal.OriginalIntentId, out var original) &&
+                   original?.TradeCompleted == true;
+
+        foreach (var (td, journalStream) in EnumerateLifecycleJournalKeys(journal, tradingDate, stream))
+        {
+            if (_executionJournal.HasCompletedTradeForStream(td, journalStream))
+                return true;
+        }
+
+        return false;
+    }
+
+    private bool HasOpenLifecycleExposureOrPendingReentryForJournal(StreamJournal journal, string tradingDate, string stream)
+    {
+        if (IsCarryForwardTerminalProvenByCurrentJournal(journal))
+            return false;
+
+        if (_executionJournal != null)
+        {
+            if (!string.IsNullOrWhiteSpace(journal.ReentryIntentId))
+            {
+                TryGetLifecycleEntryForJournal(journal, tradingDate, stream, journal.ReentryIntentId, out var reentry);
+                if (reentry != null &&
+                    !reentry.TradeCompleted &&
+                    (reentry.EntrySubmitted || reentry.EntryFilled || reentry.EntryFilledQuantityTotal > 0))
+                {
+                    return true;
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(journal.OriginalIntentId))
+            {
+                TryGetLifecycleEntryForJournal(journal, tradingDate, stream, journal.OriginalIntentId, out var original);
+                if (original != null &&
+                    !original.TradeCompleted &&
+                    (original.EntrySubmitted || original.EntryFilled || original.EntryFilledQuantityTotal > 0))
+                {
+                    return true;
+                }
+            }
+
+            if (HasEntryFillForJournal(journal, tradingDate, stream) &&
+                !HasCompletedTradeForJournal(journal, tradingDate, stream))
+            {
+                return true;
+            }
+        }
+
+        var hasAnyReentryLifecycle =
+            !string.IsNullOrWhiteSpace(journal.ReentryIntentId) ||
+            journal.ReentrySubmitPending ||
+            journal.ReentrySubmitted ||
+            journal.ReentryFilled ||
+            journal.ProtectionSubmitted ||
+            journal.ProtectionAccepted;
+
+        var reentryCompleted = _executionJournal != null &&
+                               !string.IsNullOrWhiteSpace(journal.ReentryIntentId) &&
+                               TryGetLifecycleEntryForJournal(journal, tradingDate, stream, journal.ReentryIntentId, out var reentryEntry) &&
+                               reentryEntry?.TradeCompleted == true;
+
+        return journal.ExecutionInterruptedByClose ||
+               (hasAnyReentryLifecycle && !reentryCompleted);
+    }
+
+    private ExecutionAuthorityActionDecision EvaluateTerminalCommitAuthorityForJournal(
+        DateTimeOffset utcNow,
+        string commitReason,
+        string eventType,
+        StreamJournal journal,
+        string tradingDate,
+        string stream,
+        string source,
+        bool? forceCompletedTradeForStream = null,
+        bool? forceOpenLifecycleExposureOrPendingReentry = null)
+    {
+        var hasCompletedTradeForStream = forceCompletedTradeForStream ?? HasCompletedTradeForJournal(journal, tradingDate, stream);
+        var openLifecycleExposureOrPendingReentry = forceOpenLifecycleExposureOrPendingReentry ?? HasOpenLifecycleExposureOrPendingReentryForJournal(journal, tradingDate, stream);
+        var intentionalOpenLifecycleTerminalCommit = IsIntentionalOpenLifecycleTerminalCommit(commitReason, eventType);
+        var authorityIntentId = journal.ReentryIntentId ?? journal.OriginalIntentId ?? "";
+        var activeReentryState = journal.ReentryFilled
+            ? "REENTRY_FILLED"
+            : journal.ReentrySubmitted
+                ? "REENTRY_SUBMITTED"
+                : journal.ReentryIntentId != null
+                    ? "REENTRY_PENDING"
+                    : "";
+        var terminalCommitAuthorityFrame = ExecutionAuthorityFrameBuilder.Build(new ExecutionAuthorityFrameBuilderInput
+        {
+            Source = source,
+            Instrument = ExecutionInstrument,
+            CanonicalInstrument = CanonicalInstrument,
+            ExecutionInstrumentKey = ExecutionInstrument,
+            TradingDate = tradingDate,
+            StreamId = stream,
+            IntentId = authorityIntentId,
+            SubmitPath = "STREAM_COMMIT",
+            ExecutionMode = _executionMode.ToString(),
+            DecisionUtc = utcNow,
+            FrameCreatedUtc = utcNow,
+            StreamLifecycleState = ReferenceEquals(journal, _journal) ? State.ToString() : (journal.LastState ?? ""),
+            StreamCommitted = journal.Committed,
+            ActiveIntentsCount = openLifecycleExposureOrPendingReentry ? 1 : 0,
+            ActiveIntentIds = string.IsNullOrWhiteSpace(authorityIntentId)
+                ? Array.Empty<string>()
+                : new[] { authorityIntentId },
+            ActiveReentryState = activeReentryState,
+            AuthorityState = "STREAM_COMMIT",
+            IsPlayback = _executionMode == ExecutionMode.SIM && _ignoreExistingStreamJournals
+        });
+        var terminalCommitAuthority = UnifiedExecutionAuthority.EvaluateAction(new ExecutionAuthorityActionEvaluationRequest
+        {
+            Action = ExecutionAuthorityAction.TerminalCommit,
+            Source = source,
+            Instrument = ExecutionInstrument,
+            IntentId = authorityIntentId,
+            Stream = stream,
+            UtcNow = utcNow,
+            CommitReason = commitReason,
+            EventType = eventType,
+            HasOpenLifecycleExposureOrPendingReentry = openLifecycleExposureOrPendingReentry,
+            HasCompletedTradeForCurrentStream = hasCompletedTradeForStream,
+            IsIntentionalOpenLifecycleTerminalCommit = intentionalOpenLifecycleTerminalCommit,
+            AuthorityFrame = terminalCommitAuthorityFrame
+        });
+        _log.Write(RobotEvents.Base(_time, utcNow, tradingDate, stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "AUTHORITY_FRAME_SNAPSHOT", ReferenceEquals(journal, _journal) ? State.ToString() : (journal.LastState ?? ""),
+            ExecutionAuthorityFrameBuilder.ToLogPayload(
+                terminalCommitAuthorityFrame,
+                action: "STREAM_COMMIT",
+                decision: terminalCommitAuthority.Allowed ? "ALLOW" : "DENY",
+                denyReason: terminalCommitAuthority.DenyReason)));
+
+        return terminalCommitAuthority;
+    }
+
     private void LogActiveReentryForcedFlattenSkipIfNeeded(DateTimeOffset utcNow)
     {
         var key = string.Join("|",
@@ -360,13 +604,52 @@ public sealed partial class StreamStateMachine
     {
         if (_journal.Committed)
         {
+            var rehydrateAuthority = EvaluateTerminalCommitAuthorityForJournal(
+                utcNow,
+                _journal.CommitReason ?? commitReason,
+                eventType,
+                _journal,
+                TradingDate,
+                Stream,
+                "StreamStateMachine.Commit.AlreadyCommittedRehydrate");
+            if (!rehydrateAuthority.Allowed)
+            {
+                _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                    "STREAM_COMMITTED_REHYDRATION_DENIED_BY_AUTHORITY", State.ToString(),
+                    new
+                    {
+                        commit_reason = _journal.CommitReason ?? commitReason,
+                        event_type = eventType,
+                        original_intent_id = _journal.OriginalIntentId ?? "",
+                        reentry_intent_id = _journal.ReentryIntentId ?? "",
+                        execution_interrupted_by_close = _journal.ExecutionInterruptedByClose,
+                        authority_gate = rehydrateAuthority.GateName,
+                        authority_deny_reason = rehydrateAuthority.DenyReason ?? "",
+                        note = "Already-committed stream journal was not mirrored to in-memory DONE because fresh authority evidence still sees open lifecycle exposure."
+                    }));
+                return false;
+            }
+
+            TryEnsureCarryForwardTerminalMirror(
+                utcNow,
+                _journal.CommitReason ?? commitReason,
+                eventType,
+                _journal.SlotStatus);
             State = StreamState.DONE;
             return true;
         }
 
         var rollback = CaptureJournalCommitRollback();
         var hasCompletedTradeForStream = HasCompletedTradeForCurrentStream();
-        if (commitReason == "STREAM_STAND_DOWN" && HasOpenLifecycleExposureOrPendingReentry())
+        var terminalCommitAuthority = EvaluateTerminalCommitAuthorityForJournal(
+            utcNow,
+            commitReason,
+            eventType,
+            _journal,
+            TradingDate,
+            Stream,
+            "StreamStateMachine.Commit");
+        if (!terminalCommitAuthority.Allowed)
         {
             _journal.Committed = false;
             _journal.CommitReason = null;
@@ -375,9 +658,11 @@ public sealed partial class StreamStateMachine
             _journals.Save(_journal);
 
             _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
-                "STREAM_STAND_DOWN_DEFERRED_OPEN_EXPOSURE", State.ToString(),
+                "STREAM_COMMIT_DEFERRED_OPEN_LIFECYCLE", State.ToString(),
                 new
                 {
+                    commit_reason = commitReason,
+                    event_type = eventType,
                     original_intent_id = _journal.OriginalIntentId ?? "",
                     reentry_intent_id = _journal.ReentryIntentId ?? "",
                     execution_interrupted_by_close = _journal.ExecutionInterruptedByClose,
@@ -386,7 +671,9 @@ public sealed partial class StreamStateMachine
                     protection_submitted = _journal.ProtectionSubmitted,
                     protection_accepted = _journal.ProtectionAccepted,
                     prior_journal_key = _journal.PriorJournalKey ?? "",
-                    note = "Stand-down is not terminal while journal/reentry lifecycle evidence remains open."
+                    authority_gate = terminalCommitAuthority.GateName,
+                    authority_deny_reason = terminalCommitAuthority.DenyReason ?? "",
+                    note = "Terminal stream commit is deferred while journal/reentry lifecycle evidence remains open."
                 }));
             return false;
         }
@@ -471,6 +758,8 @@ public sealed partial class StreamStateMachine
                 });
         }
 
+        TryEnsureCarryForwardTerminalMirror(utcNow, commitReason, eventType, newSlotStatus);
+
         _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
             "JOURNAL_WRITTEN", StreamState.DONE.ToString(),
             new
@@ -496,8 +785,156 @@ public sealed partial class StreamStateMachine
                 slot_status = _journal.SlotStatus.ToString(),
                 execution_instrument = ExecutionInstrument,  // PHASE 3: Execution identity
                 canonical_instrument = CanonicalInstrument   // PHASE 3: Canonical identity
-            }));
+        }));
         return true;
+    }
+
+    private void TryEnsureCarryForwardTerminalMirror(
+        DateTimeOffset utcNow,
+        string commitReason,
+        string eventType,
+        SlotStatus slotStatus)
+    {
+        if (string.IsNullOrWhiteSpace(_journal.PriorJournalKey))
+            return;
+
+        var mirrorKey = string.Join("|",
+            _journal.TradingDate,
+            Stream,
+            _journal.PriorJournalKey,
+            commitReason,
+            eventType,
+            slotStatus.ToString());
+        if (string.Equals(_priorJournalTerminalMirrorCompletedKey, mirrorKey, StringComparison.Ordinal))
+            return;
+
+        if (TryMirrorCarryForwardTerminalCommitToPriorJournal(utcNow, commitReason, eventType, slotStatus))
+            _priorJournalTerminalMirrorCompletedKey = mirrorKey;
+    }
+
+    private bool TryMirrorCarryForwardTerminalCommitToPriorJournal(
+        DateTimeOffset utcNow,
+        string commitReason,
+        string eventType,
+        SlotStatus slotStatus)
+    {
+        if (string.IsNullOrWhiteSpace(_journal.PriorJournalKey))
+            return true;
+        if (!TryParseStreamJournalKey(_journal.PriorJournalKey, out var priorTradingDate, out var priorStream))
+            return true;
+        if (string.Equals(priorTradingDate, TradingDate, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(priorStream, Stream, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        StreamJournal? prior;
+        try
+        {
+            prior = _journals.TryLoad(priorTradingDate, priorStream);
+        }
+        catch
+        {
+            return false;
+        }
+
+        if (prior == null)
+            return false;
+        var sameCarryForwardLifecycle = IsSameCarryForwardLifecycle(prior);
+        var referencedByPriorKey = IsJournalReferencedByCurrentPriorKey(prior);
+        if (prior.Committed || (!sameCarryForwardLifecycle && !referencedByPriorKey))
+            return true;
+
+        var priorCommitAuthority = EvaluateTerminalCommitAuthorityForJournal(
+            utcNow,
+            commitReason,
+            eventType,
+            prior,
+            priorTradingDate,
+            priorStream,
+            "StreamStateMachine.Commit.CarryForwardPriorJournal",
+            forceCompletedTradeForStream: referencedByPriorKey && _journal.Committed,
+            forceOpenLifecycleExposureOrPendingReentry: referencedByPriorKey && _journal.Committed ? false : null);
+        if (!priorCommitAuthority.Allowed)
+        {
+            _log.Write(RobotEvents.Base(_time, utcNow, priorTradingDate, priorStream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+                "CARRY_FORWARD_PRIOR_JOURNAL_TERMINALIZE_DENIED_BY_AUTHORITY", prior.LastState ?? "",
+                new
+                {
+                    commit_reason = commitReason,
+                    event_type = eventType,
+                    current_trading_date = TradingDate,
+                    current_stream = Stream,
+                    prior_journal_key = _journal.PriorJournalKey ?? "",
+                    reentry_intent_id = prior.ReentryIntentId ?? "",
+                    original_intent_id = prior.OriginalIntentId ?? "",
+                    authority_gate = priorCommitAuthority.GateName,
+                    authority_deny_reason = priorCommitAuthority.DenyReason ?? "",
+                    note = "Carry-forward prior journal was not terminalized because canonical authority denied terminal commit for the prior journal evidence."
+                }));
+            return false;
+        }
+
+        prior.Committed = true;
+        prior.CommitReason = commitReason;
+        prior.EntryDetected = _journal.EntryDetected;
+        prior.LastState = StreamState.DONE.ToString();
+        prior.LastUpdateUtc = utcNow.ToString("o");
+        prior.TimetableHashAtCommit ??= _journal.TimetableHashAtCommit ?? _timetableHash;
+        prior.TerminalState = _journal.TerminalState;
+        prior.SlotStatus = slotStatus;
+        prior.ExecutionInterruptedByClose = _journal.ExecutionInterruptedByClose;
+        prior.ReentryIntentId = _journal.ReentryIntentId;
+        prior.ReentrySubmitPending = _journal.ReentrySubmitPending;
+        prior.ReentrySubmitted = _journal.ReentrySubmitted;
+        prior.ReentryFilled = _journal.ReentryFilled;
+        prior.ProtectionSubmitted = _journal.ProtectionSubmitted;
+        prior.ProtectionAccepted = _journal.ProtectionAccepted;
+
+        var persisted = _journals.Save(prior);
+        _log.Write(RobotEvents.Base(_time, utcNow, priorTradingDate, priorStream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "CARRY_FORWARD_PRIOR_JOURNAL_TERMINALIZED", StreamState.DONE.ToString(),
+            new
+            {
+                committed = persisted,
+                commit_reason = commitReason,
+                event_type = eventType,
+                current_trading_date = TradingDate,
+                current_stream = Stream,
+                slot_instance_key = _journal.SlotInstanceKey ?? "",
+                prior_journal_key = _journal.PriorJournalKey ?? "",
+                reentry_intent_id = _journal.ReentryIntentId ?? "",
+                original_intent_id = _journal.OriginalIntentId ?? "",
+                note = "Carry-forward lifecycle terminal commit was mirrored to the original prior-day journal so shutdown summary does not retain stale active streams."
+            }));
+        return persisted;
+    }
+
+    private static bool TryParseStreamJournalKey(string key, out string tradingDate, out string stream)
+    {
+        tradingDate = "";
+        stream = "";
+        var parts = key.Split('_');
+        if (parts.Length < 2)
+            return false;
+        tradingDate = parts[0];
+        stream = string.Join("_", parts.Skip(1));
+        return !string.IsNullOrWhiteSpace(tradingDate) && !string.IsNullOrWhiteSpace(stream);
+    }
+
+    private bool IsSameCarryForwardLifecycle(StreamJournal prior)
+    {
+        if (!string.IsNullOrWhiteSpace(prior.SlotInstanceKey) &&
+            !string.IsNullOrWhiteSpace(_journal.SlotInstanceKey) &&
+            string.Equals(prior.SlotInstanceKey, _journal.SlotInstanceKey, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (!string.IsNullOrWhiteSpace(prior.ReentryIntentId) &&
+            !string.IsNullOrWhiteSpace(_journal.ReentryIntentId) &&
+            string.Equals(prior.ReentryIntentId, _journal.ReentryIntentId, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return !string.IsNullOrWhiteSpace(prior.OriginalIntentId) &&
+               !string.IsNullOrWhiteSpace(_journal.OriginalIntentId) &&
+               string.Equals(prior.OriginalIntentId, _journal.OriginalIntentId, StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>

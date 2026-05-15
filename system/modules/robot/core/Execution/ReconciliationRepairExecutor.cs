@@ -96,7 +96,19 @@ public sealed class ReconciliationRepairExecutor
                 foreach (var (tradingDate, stream, intentId, entry) in kv.Value)
                 {
                     var openQty = ExecutionJournal.GetEntryRemainingOpenQuantity(entry);
+                    var brokerFlatAuthority = ExecutionJournal.EvaluateBrokerFlatJournalCompletionAuthority(
+                        "ReconciliationRepairExecutor.BrokerFlat",
+                        instrument,
+                        canonicalInstrument: null,
+                        tradingDate,
+                        stream,
+                        intentId,
+                        utcNow,
+                        brokerPositionQtyAbsAtDecision: 0,
+                        brokerWorkingOrderCount: 0,
+                        journalOpenQtyBeforeClose: openQty);
                     if (_journal.RecordReconciliationComplete(tradingDate, stream, intentId, utcNow,
+                            brokerFlatAuthority,
                             0, openQty, "ReconciliationRepairExecutor_broker_flat"))
                     {
                         count++;

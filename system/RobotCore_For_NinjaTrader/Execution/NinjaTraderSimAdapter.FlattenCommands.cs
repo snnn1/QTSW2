@@ -362,6 +362,62 @@ public sealed partial class NinjaTraderSimAdapter
             return (null, null);
         return GetCurrentMarketPriceReal(instrument, utcNow);
     }
+
+    private bool TryExecutionSafetyCancelAuthority(string? instrument, string? intentId, string submitPath, DateTimeOffset utcNow)
+    {
+        var inst = instrument?.Trim() ?? "";
+        var path = string.IsNullOrWhiteSpace(submitPath) ? "CANCEL_SUBMIT" : submitPath.Trim();
+        ExecutionPreflightAuthoritySample? preflight = null;
+        if (!string.IsNullOrWhiteSpace(inst))
+            preflight = SampleExecutionPreflightAuthority(inst, path);
+
+        var frame = ExecutionAuthorityFrameBuilder.Build(new ExecutionAuthorityFrameBuilderInput
+        {
+            FrameId = ExecutionAuthorityFrame.CreateFrameId(utcNow),
+            Source = "adapter_cancel_authority",
+            Account = GetLedgerAccountName(),
+            Instrument = inst,
+            CanonicalInstrument = string.IsNullOrWhiteSpace(inst) ? "" : ResolveCanonicalInstrumentForExecutionSafety(inst, intentId),
+            ExecutionInstrumentKey = _iea?.ExecutionInstrumentKey,
+            IntentId = intentId ?? "",
+            SubmitPath = path,
+            DecisionUtc = utcNow,
+            FrameCreatedUtc = DateTimeOffset.UtcNow,
+            PreflightAuthoritySampled = preflight.HasValue,
+            PreflightGlobalKillSwitchActive = preflight?.GlobalKillSwitchActive ?? false,
+            PreflightMismatchExecutionBlocked = preflight?.MismatchExecutionBlocked ?? false,
+            PreflightMismatchExecutionBlockedForSubmit = preflight?.MismatchExecutionBlockedForSubmit,
+            PreflightInstrumentFrozenOrEpaBlocked = preflight?.InstrumentFrozenOrEpaBlocked ?? false,
+            PreflightInstrumentFrozenOrEpaBlockReason = preflight?.InstrumentFrozenOrEpaBlockReason
+        });
+        EmitAuthorityFrameEvaluated(frame, utcNow);
+
+        var decision = UnifiedExecutionAuthority.EvaluateAction(new ExecutionAuthorityActionEvaluationRequest
+        {
+            Action = ExecutionAuthorityAction.CancelSubmit,
+            Source = "NinjaTraderSimAdapter.CancelAuthority",
+            Instrument = inst,
+            IntentId = intentId ?? "",
+            UtcNow = utcNow,
+            SnapshotSufficient = true,
+            AuthorityFrame = frame
+        });
+        if (decision.Allowed)
+            return true;
+
+        _log.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "ORDER_CANCEL_BLOCKED", state: "ENGINE",
+            new
+            {
+                reason = decision.DenyReason ?? "CANCEL_AUTHORITY_DENIED",
+                authority_gate = decision.GateName,
+                authority_frame_id = decision.AuthorityFrame?.FrameId,
+                instrument = inst,
+                intent_id = intentId ?? "",
+                submit_path = path,
+                note = decision.Detail
+            }));
+        return false;
+    }
     
     public void CancelRobotOwnedWorkingOrders(AccountSnapshot snap, DateTimeOffset utcNow)
     {
@@ -394,6 +450,9 @@ public sealed partial class NinjaTraderSimAdapter
             throw new InvalidOperationException(error);
         }
 
+        if (!TryExecutionSafetyCancelAuthority(null, null, "CANCEL_ROBOT_ORDERS", utcNow))
+            return;
+
         CancelRobotOwnedWorkingOrdersReal(snap, utcNow, instrumentRootForScope: null, explicitBrokerOrderIds: null, allowAccountWideCancelFallback: false, correlationId: null);
     }
 
@@ -417,6 +476,9 @@ public sealed partial class NinjaTraderSimAdapter
         throw new InvalidOperationException(error);
 #else
         var ids = orderIds?.ToList() ?? new List<string>();
+        if (!TryExecutionSafetyCancelAuthority(null, null, "CANCEL_ORDERS", utcNow))
+            return;
+
         if (!IsStrategyThreadContext())
         {
             if (_ntActionQueue != null)
@@ -767,6 +829,17 @@ public sealed partial class NinjaTraderSimAdapter
                 new { intent_id = intentId, reason = "NT_CONTEXT_NOT_SET", error }));
             return false;
         }
+
+        var cancelInstrument = "";
+        if (!string.IsNullOrWhiteSpace(intentId) &&
+            IntentMap.TryGetValue(intentId, out var cancelIntent))
+        {
+            cancelInstrument = string.IsNullOrWhiteSpace(cancelIntent.ExecutionInstrument)
+                ? cancelIntent.Instrument ?? ""
+                : cancelIntent.ExecutionInstrument ?? "";
+        }
+        if (!TryExecutionSafetyCancelAuthority(cancelInstrument, intentId, "CANCEL_INTENT_ORDERS", utcNow))
+            return false;
 
 #if NINJATRADER
         if (!IsStrategyThreadContext())

@@ -14,6 +14,8 @@ public static class Qtsw2HydrationDeferPolicyTests
         if (!d.Pass) return d;
         var h = RunHydrationMatchTests();
         if (!h.Pass) return h;
+        var l = RunLegStrictResolutionTests();
+        if (!l.Pass) return l;
         return RunUntaggedTagTests();
     }
 
@@ -100,6 +102,51 @@ public static class Qtsw2HydrationDeferPolicyTests
         };
         if (!Qtsw2OrderUpdateHydrationPolicy.IsTerminalRegistryRow(filledOnly))
             return (false, "terminal: FILLED lifecycle must be terminal for hydration gate");
+
+        return (true, null);
+    }
+
+    private static (bool Pass, string? Error) RunLegStrictResolutionTests()
+    {
+        var utc = DateTimeOffset.UtcNow;
+        var iea = new InstrumentExecutionAuthority("acct-leg-strict", "MES");
+        const string intentId = "intent-leg-strict";
+
+        var entryInfo = new OrderInfo
+        {
+            IntentId = intentId,
+            Instrument = "MES",
+            OrderId = "entry-pre-ack",
+            OrderType = "ENTRY",
+            State = "WORKING"
+        };
+        iea.RegisterOrder("entry-pre-ack", intentId, "MES", "ES2", OrderRole.ENTRY, OrderOwnershipStatus.OWNED,
+            "test_entry", entryInfo, utc);
+
+        if (iea.TryResolveForExecutionUpdate("stop-post-ack", intentId, "STOP", out var wrongStop, out var wrongStopPath))
+            return (false, $"leg-strict: STOP-tagged update must not resolve through base ENTRY alias (path={wrongStopPath}, role={wrongStop?.OrderRole})");
+
+        if (iea.TryResolveForExecutionUpdate("target-post-ack", intentId, "TARGET", out var wrongTarget, out var wrongTargetPath))
+            return (false, $"leg-strict: TARGET-tagged update must not resolve through base ENTRY alias (path={wrongTargetPath}, role={wrongTarget?.OrderRole})");
+
+        var stopInfo = new OrderInfo
+        {
+            IntentId = intentId,
+            Instrument = "MES",
+            OrderId = "stop-pre-ack",
+            OrderType = "STOP",
+            State = "SUBMITTED"
+        };
+        iea.RegisterOrder("stop-pre-ack", intentId, "MES", "ES2", OrderRole.STOP,
+            OrderOwnershipStatus.RECOVERABLE_ROBOT_OWNED, "test_stop", stopInfo, utc);
+
+        if (!iea.TryResolveForExecutionUpdate("stop-post-ack", intentId, "STOP", out var resolvedStop, out var stopPath) ||
+            resolvedStop == null ||
+            !string.Equals(resolvedStop.BrokerOrderId, "stop-pre-ack", StringComparison.OrdinalIgnoreCase))
+            return (false, $"leg-strict: STOP-tagged update must resolve to STOP alias row (path={stopPath})");
+
+        if (iea.TryResolveForExecutionUpdate("target-post-ack", intentId, "TARGET", out var unresolvedTarget, out var targetPath))
+            return (false, $"leg-strict: TARGET-tagged update must not resolve to STOP row or base ENTRY alias (path={targetPath}, role={unresolvedTarget?.OrderRole})");
 
         return (true, null);
     }

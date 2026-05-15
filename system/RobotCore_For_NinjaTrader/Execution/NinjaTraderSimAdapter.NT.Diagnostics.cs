@@ -101,6 +101,32 @@ public sealed partial class NinjaTraderSimAdapter
             signedSum += leg.SignedQuantity;
         var direction = signedSum > 0 ? "Long" : "Short";
 
+        var reopenedCarryover = _executionJournal.ReopenBrokerFlatCompletedJournalRowsForCarryoverFromStreamState(
+            instTrim,
+            DeriveCanonicalFromExecutionInstrument(instTrim),
+            repairQty,
+            direction,
+            utcNow,
+            "TaggedBrokerWithoutJournalStreamCarryover");
+        if (reopenedCarryover > 0)
+        {
+            HydrateIntentsFromOpenJournals();
+            resultCode = "REOPEN_CARRYOVER_JOURNAL_OK";
+            detail = reopenedCarryover.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            _log.Write(RobotEvents.EngineBase(utcNow, "", "ADOPTION_CARRYOVER_STREAM_JOURNAL_REOPENED", "ENGINE",
+                new
+                {
+                    instrument = instTrim,
+                    account_qty = accountQtyAbs,
+                    reopened_journal_count = reopenedCarryover,
+                    direction,
+                    repair_result = resultCode,
+                    note = "Broker exposure plus nonterminal stream journal restored a broker-flat-completed carried lifecycle before tagged-broker repair."
+                }));
+            ClearTaggedRepairFailureCooldown(instTrim);
+            return true;
+        }
+
         decimal? avgFill = null;
         foreach (var p in positions)
         {

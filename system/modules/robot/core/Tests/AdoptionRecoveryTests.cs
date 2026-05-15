@@ -42,6 +42,12 @@ public static class AdoptionRecoveryTests
         var (p5, e5) = TestMixedRestartCandidateCoverage();
         if (!p5) return (false, e5);
 
+        var (p6, e6) = TestAdoptedEntryRestoresMissingQuantityPolicy();
+        if (!p6) return (false, e6);
+
+        var (p7, e7) = TestAdoptedEntryPreservesExistingQuantityPolicy();
+        if (!p7) return (false, e7);
+
         return (true, null);
     }
 
@@ -228,6 +234,91 @@ public static class AdoptionRecoveryTests
                 return (false, "Mixed restart: expected 1 adoption candidate (entry+protective share intent), got 0");
             if (!ids.Contains(intentId))
                 return (false, $"Mixed restart: expected intentId {intentId} in candidates, got [{string.Join(",", ids)}]");
+
+            return (true, null);
+        }
+        finally
+        {
+            try { Directory.Delete(tempRoot, true); } catch { }
+        }
+    }
+
+    private static (bool Pass, string? Error) TestAdoptedEntryRestoresMissingQuantityPolicy()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"AdoptionPolicyTest_{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            var log = new RobotLogger(Path.Combine(tempRoot, "log"));
+            var iea = new InstrumentExecutionAuthority("SIM101", "MYM", log: log);
+            var now = DateTimeOffset.Parse("2026-05-12T15:00:00Z");
+            var intentId = "adoptpolicy000001";
+            var orderInfo = new OrderInfo
+            {
+                IntentId = intentId,
+                Instrument = "MYM",
+                OrderId = "broker-entry-1",
+                OrderType = "ENTRY",
+                Quantity = 2,
+                State = "WORKING",
+                IsEntryOrder = true
+            };
+
+            iea.RegisterAdoptedOrder(orderInfo.OrderId, intentId, "MYM", OrderRole.ENTRY, "RESTART_ADOPTION_ENTRY", orderInfo, now);
+
+            if (orderInfo.ExpectedQuantity != 2)
+                return (false, $"Adopted entry: expected OrderInfo.ExpectedQuantity=2, got {orderInfo.ExpectedQuantity}");
+            if (orderInfo.MaxQuantity != 2)
+                return (false, $"Adopted entry: expected OrderInfo.MaxQuantity=2, got {orderInfo.MaxQuantity}");
+            if (!string.Equals(orderInfo.PolicySource, "RESTART_ADOPTION_ENTRY", StringComparison.Ordinal))
+                return (false, $"Adopted entry: expected PolicySource=RESTART_ADOPTION_ENTRY, got {orderInfo.PolicySource}");
+            if (!iea.TryGetIntentPolicy(intentId, out var policy) || policy == null)
+                return (false, "Adopted entry: expected IEA intent policy to be restored");
+            if (policy.ExpectedQuantity != 2 || policy.MaxQuantity != 2)
+                return (false, $"Adopted entry: expected restored policy 2/2, got {policy.ExpectedQuantity}/{policy.MaxQuantity}");
+
+            return (true, null);
+        }
+        finally
+        {
+            try { Directory.Delete(tempRoot, true); } catch { }
+        }
+    }
+
+    private static (bool Pass, string? Error) TestAdoptedEntryPreservesExistingQuantityPolicy()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"AdoptionPolicyTest_{Guid.NewGuid():N}");
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            var log = new RobotLogger(Path.Combine(tempRoot, "log"));
+            var iea = new InstrumentExecutionAuthority("SIM101", "MYM", log: log);
+            var now = DateTimeOffset.Parse("2026-05-12T15:00:00Z");
+            var intentId = "adoptpolicy000002";
+            iea.RegisterIntentPolicy(intentId, expectedQty: 3, maxQty: 4, canonical: "YM", execution: "MYM", policySource: "EXECUTION_POLICY_FILE");
+            var orderInfo = new OrderInfo
+            {
+                IntentId = intentId,
+                Instrument = "MYM",
+                OrderId = "broker-entry-2",
+                OrderType = "ENTRY",
+                Quantity = 2,
+                State = "WORKING",
+                IsEntryOrder = true
+            };
+
+            iea.RegisterAdoptedOrder(orderInfo.OrderId, intentId, "MYM", OrderRole.ENTRY, "RESTART_ADOPTION_ENTRY", orderInfo, now);
+
+            if (orderInfo.ExpectedQuantity != 3 || orderInfo.MaxQuantity != 4)
+                return (false, $"Existing policy: expected OrderInfo policy 3/4, got {orderInfo.ExpectedQuantity}/{orderInfo.MaxQuantity}");
+            if (!string.Equals(orderInfo.PolicySource, "EXECUTION_POLICY_FILE", StringComparison.Ordinal))
+                return (false, $"Existing policy: expected PolicySource=EXECUTION_POLICY_FILE, got {orderInfo.PolicySource}");
+            if (!string.Equals(orderInfo.CanonicalInstrument, "YM", StringComparison.Ordinal))
+                return (false, $"Existing policy: expected CanonicalInstrument=YM, got {orderInfo.CanonicalInstrument}");
+            if (!iea.TryGetIntentPolicy(intentId, out var policy) || policy == null)
+                return (false, "Existing policy: expected IEA intent policy");
+            if (policy.ExpectedQuantity != 3 || policy.MaxQuantity != 4)
+                return (false, $"Existing policy: expected stored policy 3/4, got {policy.ExpectedQuantity}/{policy.MaxQuantity}");
 
             return (true, null);
         }

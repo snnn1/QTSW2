@@ -102,10 +102,11 @@ public sealed partial class StreamStateMachine
             }
         }
 
+        AccountSnapshot? reentryAccountSnapshot = null;
         try
         {
-            var snap = _executionAdapter.GetAccountSnapshot(utcNow);
-            var exposure = BrokerPositionResolver.ResolveFromSnapshots(snap.Positions ?? new List<PositionSnapshot>(), execInst);
+            reentryAccountSnapshot = _executionAdapter.GetAccountSnapshot(utcNow);
+            var exposure = BrokerPositionResolver.ResolveFromSnapshots(reentryAccountSnapshot.Positions ?? new List<PositionSnapshot>(), execInst);
             if (exposure.ReconciliationAbsQuantityTotal != 0)
             {
                 LogSessionReentryBlocked(utcNow, "BROKER_NOT_FLAT",
@@ -215,6 +216,9 @@ public sealed partial class StreamStateMachine
             return;
         }
 
+        if (TrySuppressSingleDayPlaybackReentryAndTerminalize(utcNow, originalEntry))
+            return;
+
         // Canonical reentry intent id — must match NinjaTraderSimAdapter.ExecuteSubmitMarketReentry Intent construction
         // (same strings: F2/NULL rules in ExecutionJournal.ComputeIntentId; slot/session verbatim; direction defaults to Long when empty in NT).
         var instrumentRaw = ExecutionInstrument ?? Instrument ?? "";
@@ -233,7 +237,12 @@ public sealed partial class StreamStateMachine
             reentryBeTrigger,
             utcNow,
             "SUBMIT_MARKET_REENTRY");
-        _journal.ReentryIntentId = reentryIntentForCanonicalId.ComputeIntentId();
+        var reentryIntentId = reentryIntentForCanonicalId.ComputeIntentId();
+
+        if (!TryAuthorizeMarketReentrySubmit(utcNow, instrumentRaw, reentryIntentId, reentryAccountSnapshot))
+            return;
+
+        _journal.ReentryIntentId = reentryIntentId;
 
         _engine?.LogEngineEvent(utcNow, "SESSION_REENTRY_ATTEMPT", new Dictionary<string, object?>
         {
@@ -243,7 +252,8 @@ public sealed partial class StreamStateMachine
             ["stream"] = Stream,
             ["original_intent_id"] = _journal.OriginalIntentId ?? "",
             ["reentry_intent_id"] = _journal.ReentryIntentId ?? "",
-            ["reason"] = "MARKET_OPEN_GATES_PASSED"
+            ["reason"] = "MARKET_OPEN_GATES_PASSED",
+            ["authority"] = "UEA_MARKET_REENTRY_ALLOWED"
         });
         
         // Enqueue SubmitMarketReentryCommand through IEA for actual order placement
@@ -306,6 +316,250 @@ public sealed partial class StreamStateMachine
                 note = "Re-entry MARKET order enqueued via IEA; awaiting broker submit completion"
             }));
     }
+
+    private bool TryAuthorizeMarketReentrySubmit(
+        DateTimeOffset utcNow,
+        string executionInstrument,
+        string reentryIntentId,
+        AccountSnapshot? accountSnapshot)
+    {
+        var frame = BuildMarketReentryAuthorityFrame(utcNow, executionInstrument, reentryIntentId, accountSnapshot);
+        var snapshotSufficient = accountSnapshot != null &&
+                                 accountSnapshot.IsAuthoritative &&
+                                 string.IsNullOrWhiteSpace(frame.SnapshotError);
+        var decision = UnifiedExecutionAuthority.EvaluateAction(new ExecutionAuthorityActionEvaluationRequest
+        {
+            Action = ExecutionAuthorityAction.MarketReentry,
+            Source = "StreamStateMachine.MarketOpenReentry",
+            Instrument = frame.Instrument,
+            IntentId = reentryIntentId,
+            Stream = Stream,
+            UtcNow = utcNow,
+            SnapshotSufficient = snapshotSufficient,
+            BrokerAbsQty = Math.Abs(frame.BrokerPositionQty),
+            BrokerWorkingOrderCount = frame.BrokerWorkingOrdersCount,
+            JournalOpenQty = frame.JournalOpenQty,
+            OwnershipOpenQty = frame.OwnershipOpenQty,
+            OwnershipActiveSlotCount = frame.OwnershipActiveSlots,
+            OwnershipOrphanSlotCount = frame.OwnershipOrphanSlots,
+            RealOpenQty = frame.RealOpenQty,
+            RecoveryOpenQty = frame.RecoveryOpenQty,
+            ActiveIntentCount = frame.ActiveIntentsCount,
+            NonTerminalStreamCount = frame.NonTerminalStreamsCount,
+            AuthorityFrame = frame
+        });
+
+        _log.Write(RobotEvents.Base(_time, utcNow, TradingDate, Stream, Instrument, Session, SlotTimeChicago, SlotTimeUtc,
+            "AUTHORITY_FRAME_SNAPSHOT", State.ToString(),
+            ExecutionAuthorityFrameBuilder.ToLogPayload(
+                frame,
+                action: "MARKET_REENTRY",
+                decision: decision.Allowed ? "ALLOW" : "DENY",
+                denyReason: decision.DenyReason)));
+
+        if (decision.Allowed)
+            return true;
+
+        var denyReason = decision.DenyReason ?? "UNKNOWN";
+        LogSessionReentryBlocked(utcNow, "AUTHORITY_DENIED",
+            "Market-open reentry blocked by canonical execution authority",
+            new Dictionary<string, object?>
+            {
+                ["authority_frame_id"] = frame.FrameId,
+                ["authority_gate"] = decision.GateName,
+                ["authority_deny_reason"] = denyReason,
+                ["authority_detail"] = decision.Detail ?? "",
+                ["reentry_intent_id"] = reentryIntentId,
+                ["failed_predicates"] = string.Join(",", frame.FailedPredicates),
+                ["broker_qty"] = frame.BrokerPositionQty,
+                ["broker_working_count"] = frame.BrokerWorkingOrdersCount,
+                ["journal_open_qty"] = frame.JournalOpenQty,
+                ["note"] = "No ReentrySubmitPending journal mutation or IEA enqueue was performed."
+            });
+
+        _engine?.LogEngineEvent(utcNow, "REENTRY_BLOCKED_AUTHORITY_DENIED", new Dictionary<string, object?>
+        {
+            ["trading_date"] = TradingDate,
+            ["session_class"] = Session,
+            ["stream"] = Stream,
+            ["instrument"] = frame.Instrument,
+            ["canonical_instrument"] = frame.CanonicalInstrument ?? "",
+            ["original_intent_id"] = _journal.OriginalIntentId ?? "",
+            ["reentry_intent_id"] = reentryIntentId,
+            ["authority_frame_id"] = frame.FrameId,
+            ["authority_gate"] = decision.GateName,
+            ["authority_deny_reason"] = denyReason,
+            ["authority_detail"] = decision.Detail ?? "",
+            ["failed_predicates"] = string.Join(",", frame.FailedPredicates)
+        });
+        return false;
+    }
+
+    private ExecutionAuthorityFrame BuildMarketReentryAuthorityFrame(
+        DateTimeOffset utcNow,
+        string executionInstrument,
+        string reentryIntentId,
+        AccountSnapshot? accountSnapshot)
+    {
+        var execInst = executionInstrument?.Trim() ?? "";
+        var canonical = string.IsNullOrWhiteSpace(CanonicalInstrument) ? Instrument : CanonicalInstrument;
+        var exposure = BrokerPositionResolver.ResolveFromSnapshots(
+            accountSnapshot?.Positions ?? new List<PositionSnapshot>(),
+            execInst);
+        var workingOrders = GetBrokerWorkingOrdersForReentryAuthorityFrame(accountSnapshot, execInst, canonical);
+        var (journalOpenQty, journalHash) = _executionJournal == null
+            ? (0, 0L)
+            : _executionJournal.GetOpenJournalStructuralStateForInstrument(execInst, canonical);
+        var qecSnapshot = QuantExecutionControlStore.GetSnapshot(execInst);
+        var snapshotError = ResolveReentryAuthoritySnapshotError(accountSnapshot);
+
+        return ExecutionAuthorityFrameBuilder.Build(new ExecutionAuthorityFrameBuilderInput
+        {
+            FrameId = ExecutionAuthorityFrame.CreateFrameId(utcNow),
+            Source = "stream_market_open_reentry",
+            Account = "",
+            Instrument = execInst,
+            CanonicalInstrument = canonical,
+            ExecutionInstrumentKey = execInst,
+            TradingDate = TradingDate,
+            StreamId = Stream,
+            IntentId = reentryIntentId,
+            OrderRole = "MARKET_REENTRY",
+            SubmitPath = "SUBMIT_MARKET_REENTRY",
+            ExecutionMode = _executionMode.ToString(),
+            DecisionUtc = utcNow,
+            FrameCreatedUtc = DateTimeOffset.UtcNow,
+            BrokerSnapshotCapturedUtc = accountSnapshot?.CapturedAtUtc,
+            SnapshotError = snapshotError,
+            BrokerPositionQty = exposure.ReconciliationAbsQuantityTotal,
+            BrokerWorkingOrdersCount = workingOrders.Count,
+            BrokerOrderIds = workingOrders
+                .Select(o => o.OrderId ?? "")
+                .Where(id => !string.IsNullOrWhiteSpace(id))
+                .ToArray(),
+            BrokerOrderTags = workingOrders
+                .Select(o => o.Tag ?? "")
+                .Where(tag => !string.IsNullOrWhiteSpace(tag))
+                .ToArray(),
+            JournalOpenQty = journalOpenQty,
+            JournalOpenIntentSetHash = journalHash,
+            StreamLifecycleState = State.ToString(),
+            StreamCommitted = Committed,
+            NonTerminalStreamsCount = Committed ? 0 : 1,
+            ActiveIntentsCount = 1,
+            ActiveIntentIds = new[] { reentryIntentId },
+            ActiveReentryState = "READY_TO_SUBMIT",
+            ScheduledExitTimeUtc = _journal.NextSlotTimeUtc,
+            UseInstrumentExecutionAuthority = true,
+            QecPhase = qecSnapshot.Phase.ToString(),
+            QecPendingAlignment =
+                PendingAlignmentAuthority.IsPendingAlignment(execInst, utcNow) ||
+                QuantExecutionControlStore.IsAnyBrokerJournalAlignmentWindowActive(execInst, utcNow),
+            TimetableAllowed = true,
+            SessionCloseState = Session,
+            IsPlayback = _executionMode == ExecutionMode.SIM && _ignoreExistingStreamJournals,
+            ProofLevel = "source-runtime-frame"
+        });
+    }
+
+    private static string? ResolveReentryAuthoritySnapshotError(AccountSnapshot? accountSnapshot)
+    {
+        if (accountSnapshot == null)
+            return "snapshot_unavailable";
+        if (!accountSnapshot.IsAuthoritative)
+            return string.IsNullOrWhiteSpace(accountSnapshot.NonAuthoritativeReason)
+                ? "snapshot_non_authoritative"
+                : accountSnapshot.NonAuthoritativeReason;
+        return null;
+    }
+
+    private static List<WorkingOrderSnapshot> GetBrokerWorkingOrdersForReentryAuthorityFrame(
+        AccountSnapshot? accountSnapshot,
+        string executionInstrument,
+        string canonicalInstrument)
+    {
+        var rows = new List<WorkingOrderSnapshot>();
+        if (accountSnapshot?.WorkingOrders == null)
+            return rows;
+
+        var execInst = executionInstrument?.Trim() ?? "";
+        var canonical = canonicalInstrument?.Trim() ?? "";
+        foreach (var order in accountSnapshot.WorkingOrders)
+        {
+            var inst = order.Instrument?.Trim() ?? "";
+            if (string.IsNullOrWhiteSpace(inst))
+                continue;
+            if ((!string.IsNullOrWhiteSpace(execInst) && string.Equals(inst, execInst, StringComparison.OrdinalIgnoreCase)) ||
+                (!string.IsNullOrWhiteSpace(canonical) && string.Equals(inst, canonical, StringComparison.OrdinalIgnoreCase)))
+            {
+                rows.Add(order);
+            }
+        }
+        return rows;
+    }
+
+    private bool TrySuppressSingleDayPlaybackReentryAndTerminalize(DateTimeOffset utcNow, ExecutionJournalEntry originalEntry)
+    {
+        if (!ShouldSuppressMarketReentryForSingleDayPlaybackProof())
+            return false;
+
+        if (!IsCompletedFlattenTrade(originalEntry))
+        {
+            LogSessionReentryBlocked(utcNow, "SINGLE_DAY_PLAYBACK_REENTRY_SUPPRESSED_ORIGINAL_NOT_TERMINAL",
+                "Single-day isolated playback cannot prove multi-session reentry, and the original forced-flatten journal is not terminal");
+            return true;
+        }
+
+        var originalIntentId = _journal.OriginalIntentId ?? "";
+        LogSessionReentryBlocked(utcNow, "SINGLE_DAY_PLAYBACK_REENTRY_SUPPRESSED",
+            "Single-day isolated playback cannot prove multi-session reentry; completed forced-flatten lifecycle will terminalize after broker-flat proof",
+            new Dictionary<string, object?>
+            {
+                ["original_intent_id"] = originalIntentId,
+                ["completion_reason"] = originalEntry.CompletionReason ?? "",
+                ["exit_order_type"] = originalEntry.ExitOrderType ?? "",
+                ["exit_filled_qty"] = originalEntry.ExitFilledQuantityTotal,
+                ["ignore_existing_stream_journals"] = _ignoreExistingStreamJournals,
+                ["execution_mode"] = _executionMode.ToString()
+            });
+
+        _engine?.LogEngineEvent(utcNow, "SESSION_REENTRY_SUPPRESSED_SINGLE_DAY_PLAYBACK", new Dictionary<string, object?>
+        {
+            ["trading_date"] = TradingDate,
+            ["session_class"] = Session,
+            ["stream"] = Stream,
+            ["instrument"] = ExecutionInstrument ?? Instrument ?? "",
+            ["original_intent_id"] = originalIntentId,
+            ["reason"] = "SINGLE_DAY_PLAYBACK_REENTRY_SUPPRESSED",
+            ["note"] = "Broker-flat forced-flatten lifecycle terminalized instead of opening a multi-session reentry in isolated single-day playback."
+        });
+
+        _journal.ReentryIntentId = null;
+        _journal.ReentrySubmitPending = false;
+        _journal.ReentrySubmitPendingAtUtc = null;
+        _journal.ReentrySubmitFailureCount = 0;
+        _journal.ReentrySubmitLastFailureUtc = null;
+        _journal.LastReentrySubmitError = null;
+        _journal.ReentrySubmitted = false;
+        _journal.ReentryFilled = false;
+        _journal.ProtectionSubmitted = false;
+        _journal.ProtectionAccepted = false;
+        _journal.ExecutionInterruptedByClose = false;
+        _journal.LastUpdateUtc = utcNow.ToString("o");
+        _journals.Save(_journal);
+
+        if (!Commit(utcNow, "SINGLE_DAY_PLAYBACK_FORCED_FLATTEN_TERMINAL", "TRADE_COMPLETED"))
+        {
+            LogHealth("CRITICAL", "SINGLE_DAY_PLAYBACK_FORCED_FLATTEN_TERMINAL_FAILED",
+                "Single-day playback forced-flatten lifecycle was broker-flat but stream terminal commit failed",
+                new { original_intent_id = originalIntentId, stream = Stream, instrument = ExecutionInstrument ?? Instrument ?? "" });
+        }
+
+        return true;
+    }
+
+    private bool ShouldSuppressMarketReentryForSingleDayPlaybackProof() =>
+        _executionMode == ExecutionMode.SIM && _ignoreExistingStreamJournals;
 
     public void HandleLateSessionCloseFlattenConfirmed(DateTimeOffset utcNow)
     {
@@ -673,6 +927,31 @@ public sealed partial class StreamStateMachine
             return;
         }
 
+        if (!string.Equals(_journal.ReentryIntentId, intentId, StringComparison.OrdinalIgnoreCase) &&
+            TryGetLifecycleEntry(intentId, out var completedEntry) &&
+            completedEntry != null &&
+            completedEntry.TradeCompleted &&
+            (completedEntry.EntryFilled || completedEntry.EntryFilledQuantityTotal > 0))
+        {
+            if (HasAnyReentryLifecycle() &&
+                !string.Equals(_journal.ReentryIntentId, intentId, StringComparison.OrdinalIgnoreCase) &&
+                !IsReentryLifecycleCompleted())
+            {
+                return;
+            }
+
+            _journal.ExecutionInterruptedByClose = false;
+            _journal.LastUpdateUtc = utcNow.ToString("o");
+            _journals.Save(_journal);
+
+            var normalCompletionReason = string.Equals(completionReason, CompletionReasons.RECONCILIATION_BROKER_FLAT, StringComparison.OrdinalIgnoreCase)
+                ? "TRADE_COMPLETED_RECONCILIATION_BROKER_FLAT"
+                : "TRADE_COMPLETED";
+
+            _ = Commit(utcNow, normalCompletionReason, "TRADE_COMPLETED");
+            return;
+        }
+
         if (!string.Equals(_journal.ReentryIntentId, intentId, StringComparison.OrdinalIgnoreCase))
             return;
 
@@ -680,11 +959,11 @@ public sealed partial class StreamStateMachine
         _journal.ExecutionInterruptedByClose = false;
         _journals.Save(_journal);
 
-        var reason = string.Equals(completionReason, CompletionReasons.RECONCILIATION_BROKER_FLAT, StringComparison.OrdinalIgnoreCase)
+        var reentryCompletionReason = string.Equals(completionReason, CompletionReasons.RECONCILIATION_BROKER_FLAT, StringComparison.OrdinalIgnoreCase)
             ? "REENTRY_TRADE_COMPLETED_RECONCILIATION_BROKER_FLAT"
             : "REENTRY_TRADE_COMPLETED";
 
-        _ = Commit(utcNow, reason, "TRADE_COMPLETED");
+        _ = Commit(utcNow, reentryCompletionReason, "TRADE_COMPLETED");
     }
 
     private static bool IsSessionCloseFlattenCompletionReason(string? completionReason)

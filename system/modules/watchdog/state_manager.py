@@ -109,11 +109,13 @@ def _position_authority_snapshot_is_clean_flat(snapshot: Optional[Dict[str, Any]
     real_open_qty = _coerce_int_or_none(snapshot.get("real_open_qty"))
     journal_open_qty = _coerce_int_or_none(snapshot.get("journal_open_qty"))
     recovery_open_qty = _coerce_int_or_none(snapshot.get("recovery_open_qty"))
+    broker_working_count = _coerce_int_or_none(snapshot.get("broker_working_count"))
     return (
         broker_qty == 0
         and real_open_qty == 0
         and journal_open_qty == 0
         and (recovery_open_qty is None or recovery_open_qty == 0)
+        and (broker_working_count is None or broker_working_count == 0)
     )
 
 
@@ -473,15 +475,45 @@ class WatchdogStateManager:
         if not key:
             return
         ts_iso = timestamp_utc.isoformat().replace("+00:00", "Z")
-        self._position_authority_by_instrument[key] = {
+        existing = self._position_authority_by_instrument.get(key, {})
+
+        broker_qty = payload.get("broker_qty")
+        if broker_qty is None:
+            broker_qty = payload.get("broker_position_qty")
+        if broker_qty is None:
+            broker_qty = existing.get("broker_qty")
+
+        journal_open_qty = payload.get("journal_open_qty")
+        if journal_open_qty is None:
+            journal_open_qty = payload.get("journal_qty")
+        if journal_open_qty is None:
+            journal_open_qty = existing.get("journal_open_qty")
+
+        broker_working_count = payload.get("broker_working_count")
+        if broker_working_count is None:
+            broker_working_count = existing.get("broker_working_count")
+
+        iea_trusted_working_count = payload.get("iea_trusted_working_count")
+        if iea_trusted_working_count is None:
+            iea_trusted_working_count = existing.get("iea_trusted_working_count")
+
+        snapshot = {
             "instrument": str(inst_raw).strip(),
-            "authority_state": payload.get("authority_state"),
-            "broker_qty": payload.get("broker_qty"),
-            "real_open_qty": payload.get("real_open_qty"),
-            "recovery_open_qty": payload.get("recovery_open_qty"),
-            "journal_open_qty": payload.get("journal_open_qty"),
+            "authority_state": payload.get("authority_state") if payload.get("authority_state") is not None else existing.get("authority_state"),
+            "broker_qty": broker_qty,
+            "real_open_qty": payload.get("real_open_qty") if payload.get("real_open_qty") is not None else existing.get("real_open_qty"),
+            "recovery_open_qty": payload.get("recovery_open_qty") if payload.get("recovery_open_qty") is not None else existing.get("recovery_open_qty"),
+            "journal_open_qty": journal_open_qty,
+            "broker_working_count": broker_working_count,
+            "iea_trusted_working_count": iea_trusted_working_count,
+            "source_event": payload.get("source_event") if payload.get("source_event") is not None else existing.get("source_event"),
             "last_authority_ts_utc": ts_iso,
         }
+        if payload.get("broker_working_count") is not None:
+            snapshot["last_working_order_ts_utc"] = ts_iso
+        elif existing.get("last_working_order_ts_utc") is not None:
+            snapshot["last_working_order_ts_utc"] = existing.get("last_working_order_ts_utc")
+        self._position_authority_by_instrument[key] = snapshot
 
     def resolve_position_authority_for_stream_row(
         self,
@@ -754,6 +786,7 @@ class WatchdogStateManager:
         instrument: str = "",
         role: str = "entry",
         stream_key: str = "",
+        order_type: str = "",
     ) -> None:
         """Phase 7-8: Record order submission for stuck/latency detection."""
         if not broker_order_id:
@@ -764,6 +797,7 @@ class WatchdogStateManager:
             "instrument": instrument,
             "role": role,
             "stream_key": stream_key,
+            "order_type": order_type,
         }
 
     def record_order_filled(
@@ -858,6 +892,11 @@ class WatchdogStateManager:
             if not submitted_at:
                 continue
             role = info.get("role", "entry")
+            if role in ("stop", "target", "entry_stop", "entry_limit", "resting_entry"):
+                # Protective orders and resting entry brackets can remain WORKING by
+                # design. Coverage and slot lifecycle diagnostics handle those paths;
+                # stuck-order detection is for immediate/market-style submits.
+                continue
             threshold = (
                 ORDER_STUCK_ENTRY_THRESHOLD_SECONDS
                 if role == "entry"
@@ -879,6 +918,7 @@ class WatchdogStateManager:
                 "instrument": info.get("instrument", ""),
                 "stream_key": info.get("stream_key", ""),
                 "role": role,
+                "order_type": info.get("order_type", ""),
                 "order_state": "WORKING",
                 "working_duration_seconds": int(working_sec),
                 "threshold_seconds": threshold,
@@ -1187,7 +1227,15 @@ class WatchdogStateManager:
                             )
                     else:
                         info = self._intent_exposures[intent_id]
-                        if not info.trading_date:
+                        info.stream_id = stream
+                        info.instrument = instrument
+                        info.direction = direction
+                        info.entry_filled_qty = entry_qty
+                        info.exit_filled_qty = exit_qty
+                        info.state = "ACTIVE" if entry_qty > exit_qty else "CLOSED"
+                        if entry_filled_at:
+                            info.entry_filled_at_utc = entry_filled_at
+                        if trading_date:
                             info.trading_date = trading_date
                 except Exception as e:
                     logger.debug(f"Skip journal {journal_file.name}: {e}")
@@ -2935,6 +2983,10 @@ class WatchdogStateManager:
             connection_status = "Unknown"  # Don't show BROKER CONNECTED when engine is stalled
         elif connection_status == "Unknown" and engine_alive:
             connection_status = "Connected"  # Optimistic: infer Connected when engine alive but no connection events yet
+            if self._last_connection_lost_utc is None and self._connection_stable_since_utc is None:
+                # Keep the operator-facing status and derived state congruent when the robot is
+                # clearly alive but startup/tail replay did not include an explicit connection event.
+                self._connection_stable_since_utc = now - timedelta(seconds=CONNECTION_STABLE_WINDOW_SECONDS)
 
         # Derived connection state: LOST | RECOVERING | STABLE (deterministic, timestamp-driven)
         derived_connection_state = self._compute_derived_connection_state(now)
@@ -3166,6 +3218,11 @@ class WatchdogStateManager:
                 continue
             norm_key = _normalize_position_authority_key(instrument_key)
             if norm_key in active_exposure_instruments:
+                continue
+            journal_open_qty = _coerce_int_or_none(snapshot.get("journal_open_qty")) or 0
+            real_open_qty = _coerce_int_or_none(snapshot.get("real_open_qty")) or 0
+            recovery_open_qty = _coerce_int_or_none(snapshot.get("recovery_open_qty")) or 0
+            if journal_open_qty != 0 or real_open_qty != 0 or recovery_open_qty != 0:
                 continue
             unprotected.append({
                 "intent_id": None,

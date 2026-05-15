@@ -117,23 +117,48 @@ public sealed partial class NinjaTraderSimAdapter
     private bool TryGetOrderInfoForIntentAndLeg(string intentId, string? tagLeg, out OrderInfo? orderInfo)
     {
         orderInfo = null;
+        if (string.Equals(tagLeg, "STOP", StringComparison.OrdinalIgnoreCase))
+        {
+            if (OrderMap.TryGetValue($"{intentId}:STOP", out var stopInfo) && stopInfo != null)
+            {
+                orderInfo = stopInfo;
+                return true;
+            }
+
+            if (OrderMap.TryGetValue(intentId, out stopInfo) && stopInfo != null &&
+                string.Equals(stopInfo.OrderType, "STOP", StringComparison.OrdinalIgnoreCase))
+            {
+                orderInfo = stopInfo;
+                return true;
+            }
+
+            return false;
+        }
+
+        if (string.Equals(tagLeg, "TARGET", StringComparison.OrdinalIgnoreCase))
+        {
+            if (OrderMap.TryGetValue($"{intentId}:TARGET", out var targetInfo) && targetInfo != null)
+            {
+                orderInfo = targetInfo;
+                return true;
+            }
+
+            if (OrderMap.TryGetValue(intentId, out targetInfo) && targetInfo != null &&
+                string.Equals(targetInfo.OrderType, "TARGET", StringComparison.OrdinalIgnoreCase))
+            {
+                orderInfo = targetInfo;
+                return true;
+            }
+
+            return false;
+        }
+
         if (OrderMap.TryGetValue(intentId, out var oi) && oi != null)
         {
             orderInfo = oi;
             return true;
         }
-        if (string.Equals(tagLeg, "STOP", StringComparison.OrdinalIgnoreCase) &&
-            OrderMap.TryGetValue($"{intentId}:STOP", out oi) && oi != null)
-        {
-            orderInfo = oi;
-            return true;
-        }
-        if (string.Equals(tagLeg, "TARGET", StringComparison.OrdinalIgnoreCase) &&
-            OrderMap.TryGetValue($"{intentId}:TARGET", out oi) && oi != null)
-        {
-            orderInfo = oi;
-            return true;
-        }
+
         return false;
     }
 
@@ -410,10 +435,10 @@ public sealed partial class NinjaTraderSimAdapter
             }
         }
 
-        if (!OrderMap.TryGetValue(intentId, out var orderInfo))
+        if (!TryGetOrderInfoForIntentAndLeg(intentId, parsed.Leg, out var orderInfo))
         {
             TryHydrateOrderMapFromIeRegistryBeforeOrderMapMiss(order, intentId, encodedTag, parsed, utcNow);
-            OrderMap.TryGetValue(intentId, out orderInfo);
+            TryGetOrderInfoForIntentAndLeg(intentId, parsed.Leg, out orderInfo);
         }
 
         if (orderInfo == null)
@@ -1307,6 +1332,11 @@ public sealed partial class NinjaTraderSimAdapter
         var instrument = record.Instrument;
         if (snapshot != null && snapshot.IsRobotFlattenOrder && record.FillQuantity != 0)
         {
+            _iea?.OnFlattenFillReceived(
+                instrument,
+                snapshot.BrokerOrderId,
+                utcNow,
+                RobotOrderIds.DecodeFlattenRequestId(record.EncodedTag));
             _log.Write(RobotEvents.ExecutionBase(utcNow, "FLATTEN", instrument, "FLATTEN_EXECUTION_RECOVERED", new
             {
                 broker_order_id = snapshot.BrokerOrderId,
@@ -1319,6 +1349,11 @@ public sealed partial class NinjaTraderSimAdapter
         }
         if (IsRobotOwnedFlattenByTag(record.EncodedTag) && order != null && record.FillQuantity != 0)
         {
+            _iea?.OnFlattenFillReceived(
+                instrument,
+                order.OrderId,
+                utcNow,
+                RobotOrderIds.DecodeFlattenRequestId(record.EncodedTag));
             string? execIdRec = null;
             try { dynamic d = record.Execution; execIdRec = d.ExecutionId as string; } catch { }
             _log.Write(RobotEvents.ExecutionBase(utcNow, "FLATTEN", instrument, "FLATTEN_EXECUTION_RECOVERED", new

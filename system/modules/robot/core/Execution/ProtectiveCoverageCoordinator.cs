@@ -17,7 +17,7 @@ namespace QTSW2.Robot.Core.Execution;
 /// Runs periodic protective coverage audits across active instruments.
 /// Phase 3: Blocks instruments on critical protective failure; requires 2 consecutive clean passes to clear.
 /// </summary>
-public sealed class ProtectiveCoverageCoordinator
+public sealed class ProtectiveCoverageCoordinator : IDisposable
 {
     private readonly Func<AccountSnapshot> _getSnapshot;
     private readonly Func<IReadOnlyList<string>> _getActiveInstruments;
@@ -34,6 +34,8 @@ public sealed class ProtectiveCoverageCoordinator
     private readonly Func<string, int>? _getPendingExecutionWorkloadForInstrument;
     private readonly Func<string?>? _getRunIdForMismatchDiagnostics;
     private readonly Timer _auditTimer;
+    private int _auditCallbackThreadId;
+    private int _disposed;
     private DateTimeOffset _lastAuditUtc = DateTimeOffset.MinValue;
 
     /// <summary>Per-instrument state. Key: instrument (case-insensitive).</summary>
@@ -94,10 +96,17 @@ public sealed class ProtectiveCoverageCoordinator
 
     private void OnAuditTick(object? _)
     {
+        if (Volatile.Read(ref _disposed) != 0)
+            return;
+
+        Volatile.Write(ref _auditCallbackThreadId, Thread.CurrentThread.ManagedThreadId);
         var utcNow = DateTimeOffset.UtcNow;
         var cpu = _runtimeAudit != null ? RuntimeAuditHub.CpuStart() : 0L;
         try
         {
+            if (Volatile.Read(ref _disposed) != 0)
+                return;
+
             var snapshot = _getSnapshot();
             var instruments = _getActiveInstruments();
 
@@ -160,6 +169,30 @@ public sealed class ProtectiveCoverageCoordinator
         {
             if (cpu != 0)
                 _runtimeAudit?.CpuEnd(cpu, RuntimeAuditSubsystem.ProtectiveTimerTotal, instrument: "", stream: "", onIeaWorker: false);
+            Volatile.Write(ref _auditCallbackThreadId, 0);
+        }
+    }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
+        if (Volatile.Read(ref _auditCallbackThreadId) == Thread.CurrentThread.ManagedThreadId)
+        {
+            _auditTimer.Dispose();
+            return;
+        }
+
+        try
+        {
+            using var disposed = new ManualResetEvent(false);
+            if (_auditTimer.Dispose(disposed))
+                disposed.WaitOne(TimeSpan.FromMilliseconds(500));
+        }
+        catch
+        {
+            try { _auditTimer.Dispose(); } catch { /* shutdown best effort */ }
         }
     }
 
@@ -230,6 +263,15 @@ public sealed class ProtectiveCoverageCoordinator
 
                 if (newCount >= ProtectiveAuditPolicy.PROTECTIVE_CLEAR_CONSECUTIVE_CLEAN_PASSES)
                 {
+                    var clearAuthority = EvaluateProtectiveAuthority(
+                        result,
+                        ExecutionAuthorityAction.ProtectiveBlockClear,
+                        "ProtectiveCoverageCoordinator.BlockClear",
+                        "PROTECTIVE_BLOCK_CLEAR",
+                        "PROTECTIVE_BLOCK");
+                    if (!clearAuthority.Allowed)
+                        return;
+
                     state.RecoveryState = ProtectiveRecoveryState.NONE;
                     state.Blocked = false;
                     state.BlockReason = "";
@@ -254,10 +296,35 @@ public sealed class ProtectiveCoverageCoordinator
                 IsCorrectiveEligible(result.Status) &&
                 _submitCorrective != null)
             {
-                state.RecoveryState = ProtectiveRecoveryState.CORRECTIVE_SUBMITTING;
                 state.FirstDetectedUtc = state.FirstDetectedUtc == default ? result.AuditUtc : state.FirstDetectedUtc;
                 state.LastDetectedUtc = result.AuditUtc;
                 state.LastAuditStatus = result.Status;
+
+                var authority = EvaluateProtectiveAuthority(
+                    result,
+                    ExecutionAuthorityAction.ProtectiveSubmit,
+                    "ProtectiveCoverageCoordinator.CorrectiveSubmit",
+                    "PROTECTIVE_SUBMIT",
+                    "PROTECTIVE_CORRECTIVE");
+                if (!authority.Allowed)
+                {
+                    var deniedPayload = new
+                    {
+                        instrument = inst,
+                        intent_id = result.IntentId,
+                        submitted = false,
+                        failure_reason = $"AUTHORITY_DENIED:{authority.DenyReason ?? "UNKNOWN"}",
+                        attempt_count = state.AttemptCount,
+                        authority_frame_id = authority.AuthorityFrame?.FrameId,
+                        authority_gate = authority.GateName,
+                        authority_detail = authority.Detail ?? ""
+                    };
+                    _log?.Write(RobotEvents.ExecutionBase(result.AuditUtc, result.IntentId ?? "", inst, "PROTECTIVE_RECOVERY_SUBMITTED", deniedPayload));
+                    EmitCanonical(inst, ExecutionEventTypes.PROTECTIVE_RECOVERY_SUBMITTED, result.AuditUtc, deniedPayload);
+                    return;
+                }
+
+                state.RecoveryState = ProtectiveRecoveryState.CORRECTIVE_SUBMITTING;
 
                 var req = new ProtectiveCorrectiveRequest
                 {
@@ -288,6 +355,28 @@ public sealed class ProtectiveCoverageCoordinator
         {
             if (!state.EmergencyFlattenTriggered && _emergencyFlatten != null)
             {
+                var authority = EvaluateProtectiveAuthority(
+                    result,
+                    ExecutionAuthorityAction.Flatten,
+                    "ProtectiveCoverageCoordinator.EscalatedEmergencyFlatten",
+                    "FLATTEN_SUBMIT",
+                    "PROTECTIVE_EMERGENCY_FLATTEN");
+                if (!authority.Allowed)
+                {
+                    state.LastDetectedUtc = result.AuditUtc;
+                    state.LastAuditStatus = result.Status;
+                    _log?.Write(RobotEvents.ExecutionBase(result.AuditUtc, result.IntentId ?? "", inst, "PROTECTIVE_ESCALATE_TO_FLATTEN", new
+                    {
+                        instrument = inst,
+                        reason = $"AUTHORITY_DENIED:{authority.DenyReason ?? "UNKNOWN"}",
+                        authority_frame_id = authority.AuthorityFrame?.FrameId,
+                        authority_gate = authority.GateName,
+                        authority_detail = authority.Detail ?? "",
+                        note = "Emergency flatten request was not submitted because canonical authority denied the action."
+                    }));
+                    return;
+                }
+
                 state.EmergencyFlattenTriggered = true;
                 var flattenResult = _emergencyFlatten(inst, result.AuditUtc);
                 state.RecoveryState = ProtectiveRecoveryState.FLATTEN_IN_PROGRESS;
@@ -356,6 +445,15 @@ public sealed class ProtectiveCoverageCoordinator
 
         if (!state.Blocked)
         {
+            var blockAuthority = EvaluateProtectiveAuthority(
+                result,
+                ExecutionAuthorityAction.ProtectiveBlockCreate,
+                "ProtectiveCoverageCoordinator.BlockCreate",
+                "PROTECTIVE_BLOCK_CREATE",
+                "PROTECTIVE_BLOCK");
+            if (!blockAuthority.Allowed)
+                return;
+
             state.Blocked = true;
             state.BlockReason = ProtectiveAuditPolicy.BLOCK_REASON_PROTECTIVE_FAILURE;
             _log?.Write(RobotEvents.ExecutionBase(result.AuditUtc, "", inst, "PROTECTIVE_INSTRUMENT_BLOCKED", ToPayload(result)));
@@ -367,6 +465,30 @@ public sealed class ProtectiveCoverageCoordinator
             IsCorrectiveEligible(result.Status) &&
             _submitCorrective != null)
         {
+            var authority = EvaluateProtectiveAuthority(
+                result,
+                ExecutionAuthorityAction.ProtectiveSubmit,
+                "ProtectiveCoverageCoordinator.CriticalCorrectiveSubmit",
+                "PROTECTIVE_SUBMIT",
+                "PROTECTIVE_CORRECTIVE");
+            if (!authority.Allowed)
+            {
+                var deniedPayload = new
+                {
+                    instrument = inst,
+                    intent_id = result.IntentId,
+                    submitted = false,
+                    failure_reason = $"AUTHORITY_DENIED:{authority.DenyReason ?? "UNKNOWN"}",
+                    attempt_count = state.AttemptCount,
+                    authority_frame_id = authority.AuthorityFrame?.FrameId,
+                    authority_gate = authority.GateName,
+                    authority_detail = authority.Detail ?? ""
+                };
+                _log?.Write(RobotEvents.ExecutionBase(result.AuditUtc, result.IntentId ?? "", inst, "PROTECTIVE_RECOVERY_SUBMITTED", deniedPayload));
+                EmitCanonical(inst, ExecutionEventTypes.PROTECTIVE_RECOVERY_SUBMITTED, result.AuditUtc, deniedPayload);
+                return;
+            }
+
             state.RecoveryState = ProtectiveRecoveryState.CORRECTIVE_SUBMITTING;
             var req = new ProtectiveCorrectiveRequest
             {
@@ -395,6 +517,28 @@ public sealed class ProtectiveCoverageCoordinator
                 }));
                 if (_emergencyFlatten != null && !state.EmergencyFlattenTriggered)
                 {
+                    var flattenAuthority = EvaluateProtectiveAuthority(
+                        result,
+                        ExecutionAuthorityAction.Flatten,
+                        "ProtectiveCoverageCoordinator.NoSafeStopEmergencyFlatten",
+                        "FLATTEN_SUBMIT",
+                        "PROTECTIVE_EMERGENCY_FLATTEN");
+                    if (!flattenAuthority.Allowed)
+                    {
+                        state.RecoveryState = ProtectiveRecoveryState.ESCALATE_TO_FLATTEN;
+                        _log?.Write(RobotEvents.ExecutionBase(result.AuditUtc, result.IntentId ?? "", inst, "PROTECTIVE_ESCALATE_TO_FLATTEN", new
+                        {
+                            instrument = inst,
+                            reason = $"AUTHORITY_DENIED:{flattenAuthority.DenyReason ?? "UNKNOWN"}",
+                            authority_frame_id = flattenAuthority.AuthorityFrame?.FrameId,
+                            authority_gate = flattenAuthority.GateName,
+                            authority_detail = flattenAuthority.Detail ?? "",
+                            trigger_reason = "NO_SAFE_STOP_PRICE",
+                            note = "Emergency flatten request was not submitted because canonical authority denied the action."
+                        }));
+                        return;
+                    }
+
                     state.EmergencyFlattenTriggered = true;
                     var flattenResult = _emergencyFlatten(inst, result.AuditUtc);
                     state.RecoveryState = ProtectiveRecoveryState.FLATTEN_IN_PROGRESS;
@@ -462,6 +606,82 @@ public sealed class ProtectiveCoverageCoordinator
             detail = r.Detail,
             timestamp_utc = r.AuditUtc.ToString("o")
         };
+    }
+
+    private ExecutionAuthorityActionDecision EvaluateProtectiveAuthority(
+        ProtectiveAuditResult result,
+        ExecutionAuthorityAction action,
+        string source,
+        string submitPath,
+        string orderRole)
+    {
+        var auditUtc = result.AuditUtc == default ? DateTimeOffset.UtcNow : result.AuditUtc;
+        var inst = result.Instrument?.Trim() ?? "";
+        var brokerAbsQty = Math.Abs(result.BrokerPositionQty);
+        var pendingAlignment = result.Status == ProtectiveAuditStatus.PROTECTIVE_PENDING_CONVERGENCE;
+        var frame = ExecutionAuthorityFrameBuilder.Build(new ExecutionAuthorityFrameBuilderInput
+        {
+            Source = source,
+            Instrument = inst,
+            IntentId = result.IntentId ?? "",
+            OrderRole = orderRole,
+            SubmitPath = submitPath,
+            DecisionUtc = auditUtc,
+            FrameCreatedUtc = auditUtc,
+            BrokerSnapshotCapturedUtc = auditUtc,
+            SnapshotError = string.IsNullOrWhiteSpace(inst) ? "INSTRUMENT_MISSING" : null,
+            BrokerPositionQty = result.BrokerPositionQty,
+            BrokerStopQty = Math.Max(0, result.StopQty),
+            BrokerTargetQty = Math.Max(0, result.TargetQty),
+            RecoveryOpenQty = result.RecoveryInProgress ? brokerAbsQty : 0,
+            AuthorityState = result.RecoveryState.ToString(),
+            ProtectiveCoverageState = result.Status.ToString(),
+            ProtectiveMissingQty = Math.Max(0, brokerAbsQty - Math.Max(0, result.StopQty)),
+            ProtectivePending = pendingAlignment || result.RecoveryInProgress,
+            QecPendingAlignment = pendingAlignment
+        });
+
+        var decision = UnifiedExecutionAuthority.EvaluateAction(new ExecutionAuthorityActionEvaluationRequest
+        {
+            Action = action,
+            Source = source,
+            Instrument = inst,
+            IntentId = result.IntentId ?? "",
+            UtcNow = auditUtc,
+            AccountQty = result.BrokerPositionQty,
+            BrokerAbsQty = brokerAbsQty,
+            BrokerWorkingOrderCount = 0,
+            SnapshotSufficient = !string.IsNullOrWhiteSpace(inst),
+            HasProtectiveBlock = ProtectiveCoverageAudit.IsCritical(result.Status),
+            PendingExecutionWorkload = _getPendingExecutionWorkloadForInstrument?.Invoke(inst) ?? 0,
+            AuthorityFrame = frame
+        });
+
+        var payload = ExecutionAuthorityFrameBuilder.ToLogPayload(
+            frame,
+            action: submitPath,
+            decision: decision.Allowed ? "ALLOW" : "DENY",
+            denyReason: decision.DenyReason);
+        payload["authority_gate"] = decision.GateName;
+        payload["authority_detail"] = decision.Detail ?? "";
+        payload["protective_status"] = result.Status.ToString();
+        payload["protective_action_source"] = source;
+        _log?.Write(RobotEvents.ExecutionBase(auditUtc, result.IntentId ?? "", inst, "AUTHORITY_FRAME_SNAPSHOT", payload));
+
+        if (!decision.Allowed)
+        {
+            _log?.Write(RobotEvents.ExecutionBase(auditUtc, result.IntentId ?? "", inst, "UEA_ACTIVE_DENY", new
+            {
+                authority_frame_id = frame.FrameId,
+                gate = decision.GateName,
+                reason = decision.DenyReason,
+                action = submitPath,
+                source,
+                protective_status = result.Status.ToString()
+            }));
+        }
+
+        return decision;
     }
 
     /// <summary>For tests: process a result directly (bypasses timer).</summary>

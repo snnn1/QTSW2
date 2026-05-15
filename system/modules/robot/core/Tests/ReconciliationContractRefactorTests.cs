@@ -29,6 +29,8 @@ public static class ReconciliationContractRefactorTests
         if (!i) return (false, ei);
         var (j, ej) = Case10_BrokerFlatSoftTransitionBlockersRelease();
         if (!j) return (false, ej);
+        var (k, ek) = Case11_ResolvedFlatForcedConvergenceLatchCanAutoClear();
+        if (!k) return (false, ek);
         return (true, null);
     }
 
@@ -311,6 +313,134 @@ public static class ReconciliationContractRefactorTests
             return (false, "Case10: expected broker-flat residual adoption cleanup release summary, got " + r.Summary);
         if (!r.PendingAdoptionExists)
             return (false, "Case10: pending adoption should remain visible in diagnostics");
+        return (true, null);
+    }
+
+    private static (bool, string?) Case11_ResolvedFlatForcedConvergenceLatchCanAutoClear()
+    {
+        if (!RiskLatchManager.ShouldAutoClearResolvedFlatLatch(
+                "FORCED_CONVERGENCE_FAILED:position_qty_delta_2",
+                accountQty: 0,
+                journalQty: 0,
+                brokerPositionQty: 0,
+                brokerWorkingCount: 0,
+                realOpenQty: 0,
+                recoveryOpenQty: 0,
+                hasSupervisoryBlock: false))
+            return (false, "Case11: resolved flat forced-convergence latch should auto-clear");
+
+        if (RiskLatchManager.ShouldAutoClearResolvedFlatLatch(
+                "FORCED_CONVERGENCE_FAILED:position_qty_delta_2",
+                accountQty: 1,
+                journalQty: 0,
+                brokerPositionQty: 0,
+                brokerWorkingCount: 0,
+                realOpenQty: 0,
+                recoveryOpenQty: 0,
+                hasSupervisoryBlock: false))
+            return (false, "Case11: account quantity must block auto-clear");
+
+        if (RiskLatchManager.ShouldAutoClearResolvedFlatLatch(
+                "FORCED_CONVERGENCE_FAILED:position_qty_delta_2",
+                accountQty: 0,
+                journalQty: 1,
+                brokerPositionQty: 0,
+                brokerWorkingCount: 0,
+                realOpenQty: 0,
+                recoveryOpenQty: 0,
+                hasSupervisoryBlock: false))
+            return (false, "Case11: journal quantity must block auto-clear");
+
+        if (RiskLatchManager.ShouldAutoClearResolvedFlatLatch(
+                "FORCED_CONVERGENCE_FAILED:position_qty_delta_2",
+                accountQty: 0,
+                journalQty: 0,
+                brokerPositionQty: 1,
+                brokerWorkingCount: 0,
+                realOpenQty: 0,
+                recoveryOpenQty: 0,
+                hasSupervisoryBlock: false))
+            return (false, "Case11: broker position must block auto-clear");
+
+        if (RiskLatchManager.ShouldAutoClearResolvedFlatLatch(
+                "FORCED_CONVERGENCE_FAILED:position_qty_delta_2",
+                accountQty: 0,
+                journalQty: 0,
+                brokerPositionQty: 0,
+                brokerWorkingCount: 1,
+                realOpenQty: 0,
+                recoveryOpenQty: 0,
+                hasSupervisoryBlock: false))
+            return (false, "Case11: working broker orders must block auto-clear");
+
+        if (RiskLatchManager.ShouldAutoClearResolvedFlatLatch(
+                "FORCED_CONVERGENCE_FAILED:position_qty_delta_2",
+                accountQty: 0,
+                journalQty: 0,
+                brokerPositionQty: 0,
+                brokerWorkingCount: 0,
+                realOpenQty: 1,
+                recoveryOpenQty: 0,
+                hasSupervisoryBlock: false))
+            return (false, "Case11: real open quantity must block auto-clear");
+
+        if (RiskLatchManager.ShouldAutoClearResolvedFlatLatch(
+                "FORCED_CONVERGENCE_FAILED:position_qty_delta_2",
+                accountQty: 0,
+                journalQty: 0,
+                brokerPositionQty: 0,
+                brokerWorkingCount: 0,
+                realOpenQty: 0,
+                recoveryOpenQty: 1,
+                hasSupervisoryBlock: false))
+            return (false, "Case11: recovery open quantity must block auto-clear");
+
+        if (RiskLatchManager.ShouldAutoClearResolvedFlatLatch(
+                "FORCED_CONVERGENCE_FAILED:position_qty_delta_2",
+                accountQty: 0,
+                journalQty: 0,
+                brokerPositionQty: 0,
+                brokerWorkingCount: 0,
+                realOpenQty: 0,
+                recoveryOpenQty: 0,
+                hasSupervisoryBlock: true))
+            return (false, "Case11: supervisory block must block auto-clear");
+
+        if (RiskLatchManager.ShouldAutoClearResolvedFlatLatch(
+                "FORCED_CONVERGENCE_FAILED:position_qty_delta_2",
+                accountQty: 0,
+                journalQty: 0,
+                brokerPositionQty: 0,
+                brokerWorkingCount: 0,
+                realOpenQty: 0,
+                recoveryOpenQty: 0,
+                hasSupervisoryBlock: false,
+                hasProtectiveBlock: true))
+            return (false, "Case11: protective block must block auto-clear");
+
+        if (RiskLatchManager.ShouldAutoClearResolvedFlatLatch(
+                "FORCED_CONVERGENCE_FAILED:position_qty_delta_2",
+                accountQty: 0,
+                journalQty: 0,
+                brokerPositionQty: 0,
+                brokerWorkingCount: 0,
+                realOpenQty: 0,
+                recoveryOpenQty: 0,
+                hasSupervisoryBlock: false,
+                hasMismatchBlock: true))
+            return (false, "Case11: mismatch block must block auto-clear");
+
+        if (RiskLatchManager.ShouldAutoClearResolvedFlatLatch(
+                "IEA_ENQUEUE_FAILURE",
+                accountQty: 0,
+                journalQty: 0,
+                brokerPositionQty: 0,
+                brokerWorkingCount: 0,
+                realOpenQty: 0,
+                recoveryOpenQty: 0,
+                hasSupervisoryBlock: false))
+            return (false, "Case11: non-forced-convergence latches must stay explicit");
+
         return (true, null);
     }
 }

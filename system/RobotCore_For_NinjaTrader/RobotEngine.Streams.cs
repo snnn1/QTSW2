@@ -499,7 +499,31 @@ public sealed partial class RobotEngine
         {
             var inst = instrument.Trim();
             _frozenInstruments.Add(inst);
-            _riskLatchManager?.Persist(inst, reason);
+            var latchCreateAuthority = UnifiedExecutionAuthority.EvaluateAction(new ExecutionAuthorityActionEvaluationRequest
+            {
+                Action = ExecutionAuthorityAction.LatchCreate,
+                Source = "RobotEngine.OnForcedFlattenFailed",
+                Instrument = inst,
+                DurableLatchReason = reason,
+                UtcNow = utcNow
+            });
+            if (latchCreateAuthority.Allowed)
+            {
+                _riskLatchManager?.Persist(inst, reason);
+            }
+            else
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "",
+                    eventType: "RISK_LATCH_CREATE_BLOCKED", state: "ENGINE",
+                    new
+                    {
+                        instrument = inst,
+                        reason,
+                        authority_gate = latchCreateAuthority.GateName,
+                        deny_reason = latchCreateAuthority.DenyReason,
+                        note = latchCreateAuthority.Detail
+                    }));
+            }
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: _activeTradingDate?.ToString("yyyy-MM-dd") ?? "",
                 eventType: "FORCED_FLATTEN_TIMEOUT_REENTRY_DEFERRED", state: "ENGINE",
                 new

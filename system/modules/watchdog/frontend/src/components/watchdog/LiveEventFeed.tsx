@@ -1,196 +1,274 @@
 /**
  * LiveEventFeed component
- * Scrollable list of last ~200 events, sorted by event_seq ASC
+ * Contained operator timeline with severity/domain filters.
  */
-import { memo, useRef, useEffect, useMemo } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { formatChicagoDateTime, formatEventTimestamp } from '../../utils/timeUtils.ts'
 import { getEventLevel, extractEventMessage } from '../../utils/eventUtils'
 import type { WatchdogEvent } from '../../types/watchdog'
 
-/** Internal heartbeat events hidden from UI to reduce verbosity (still ingested by watchdog) */
 const HIDDEN_EVENT_TYPES = new Set([
   'ENGINE_TIMER_HEARTBEAT',
   'ENGINE_TICK_CALLSITE',
 ])
+
+type EventFilter = 'critical' | 'warnings' | 'execution' | 'protection' | 'flatten' | 'all'
+
+const FILTERS: Array<{ id: EventFilter; label: string }> = [
+  { id: 'critical', label: 'Critical' },
+  { id: 'warnings', label: 'Warnings' },
+  { id: 'execution', label: 'Execution' },
+  { id: 'protection', label: 'Protection' },
+  { id: 'flatten', label: 'Flatten/Reentry' },
+  { id: 'all', label: 'All' },
+]
 
 interface LiveEventFeedProps {
   events: WatchdogEvent[]
   onEventClick: (event: WatchdogEvent) => void
 }
 
+function eventLevel(event: WatchdogEvent) {
+  return getEventLevel(event.event_type)
+}
+
+function eventType(event: WatchdogEvent) {
+  return String(event.event_type ?? '').toUpperCase()
+}
+
+function eventDomain(event: WatchdogEvent) {
+  const type = eventType(event)
+  const message = extractEventMessage(event).toUpperCase()
+  const combined = `${type} ${message}`
+  return {
+    execution:
+      combined.includes('EXECUTION') ||
+      combined.includes('ORDER') ||
+      combined.includes('FILL') ||
+      combined.includes('INTENT') ||
+      combined.includes('ENTRY'),
+    protection:
+      combined.includes('PROTECT') ||
+      combined.includes('STOP') ||
+      combined.includes('TARGET') ||
+      combined.includes('UNPROTECTED'),
+    flatten:
+      combined.includes('FLATTEN') ||
+      combined.includes('REENTRY') ||
+      combined.includes('TIME_EXIT') ||
+      combined.includes('SHUTDOWN'),
+  }
+}
+
+function filterMatches(event: WatchdogEvent, filter: EventFilter) {
+  const level = eventLevel(event)
+  const domain = eventDomain(event)
+  switch (filter) {
+    case 'critical':
+      return level === 'ERROR'
+    case 'warnings':
+      return level === 'WARN'
+    case 'execution':
+      return domain.execution
+    case 'protection':
+      return domain.protection
+    case 'flatten':
+      return domain.flatten
+    case 'all':
+      return true
+  }
+}
+
+function priority(event: WatchdogEvent) {
+  const level = eventLevel(event)
+  if (level === 'ERROR') return 0
+  if (level === 'WARN') return 1
+  return 2
+}
+
+function getLevelBadgeColor(level: string) {
+  switch (level) {
+    case 'ERROR':
+      return 'bg-red-600 text-white'
+    case 'WARN':
+      return 'bg-amber-500 text-black'
+    case 'INFO':
+      return 'bg-blue-600 text-white'
+    default:
+      return 'bg-gray-600 text-white'
+  }
+}
+
 function LiveEventFeedComponent({ events, onEventClick }: LiveEventFeedProps) {
+  const [activeFilter, setActiveFilter] = useState<EventFilter>('critical')
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const lastEventCountRef = useRef(0)
   const shouldAutoScrollRef = useRef(true)
 
-  // Filter out internal heartbeat events for UI display only (watchdog still ingests them)
   const displayEvents = useMemo(
     () => (events ?? []).filter((e) => e && !HIDDEN_EVENT_TYPES.has(e.event_type)),
     [events]
   )
 
-  // Track if user has scrolled up (don't auto-scroll if they have)
+  const filterCounts = useMemo(() => {
+    return FILTERS.reduce<Record<EventFilter, number>>((acc, filter) => {
+      acc[filter.id] = displayEvents.filter((event) => filterMatches(event, filter.id)).length
+      return acc
+    }, {
+      critical: 0,
+      warnings: 0,
+      execution: 0,
+      protection: 0,
+      flatten: 0,
+      all: 0,
+    })
+  }, [displayEvents])
+
+  const filteredEvents = useMemo(() => {
+    return displayEvents
+      .filter((event) => filterMatches(event, activeFilter))
+      .sort((a, b) => {
+        const priorityDelta = priority(a) - priority(b)
+        if (priorityDelta !== 0) return priorityDelta
+        return (b.event_seq ?? 0) - (a.event_seq ?? 0)
+      })
+  }, [activeFilter, displayEvents])
+
   useEffect(() => {
     const container = scrollContainerRef.current
     if (!container) return
-    
+
     const handleScroll = () => {
       const isAtBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 50
       shouldAutoScrollRef.current = isAtBottom
     }
-    
+
     container.addEventListener('scroll', handleScroll)
     return () => container.removeEventListener('scroll', handleScroll)
   }, [])
-  
-  // Auto-scroll to bottom when new events arrive (only if user is at bottom)
+
   useEffect(() => {
     const container = scrollContainerRef.current
-    if (!container || displayEvents.length === 0) return
+    if (!container || filteredEvents.length === 0) return
 
-    // Only auto-scroll if new events were added and user is at bottom
-    if (displayEvents.length > lastEventCountRef.current && shouldAutoScrollRef.current) {
-      // Use requestAnimationFrame to ensure DOM has updated
+    if (filteredEvents.length > lastEventCountRef.current && shouldAutoScrollRef.current) {
       requestAnimationFrame(() => {
-        if (container) {
-          container.scrollTop = container.scrollHeight
-        }
+        if (container) container.scrollTop = 0
       })
     }
 
-    lastEventCountRef.current = displayEvents.length
-  }, [displayEvents.length])
+    lastEventCountRef.current = filteredEvents.length
+  }, [filteredEvents.length])
 
-  // Empty state
-  if (displayEvents.length === 0) {
-    return (
-      <div className="bg-gray-800 rounded-lg p-4">
-        <h2 className="text-lg font-semibold mb-4">Live Event Feed</h2>
-        <div className="text-gray-500 text-center py-8">No events yet</div>
-      </div>
-    )
-  }
-  
-  const getLevelBadgeColor = (level: string) => {
-    switch (level) {
-      case 'ERROR':
-        return 'bg-red-600 text-white'
-      case 'WARN':
-        return 'bg-amber-500 text-black'
-      case 'INFO':
-        return 'bg-blue-600 text-white'
-      default:
-        return 'bg-gray-600 text-white'
-    }
-  }
-  
   return (
-    <div className="bg-gray-800 rounded-lg p-4">
-      <h2 className="text-lg font-semibold mb-4">Live Event Feed</h2>
-      <div ref={scrollContainerRef} className="overflow-y-auto max-h-96">
-        <table className="w-full text-sm">
-          <thead className="bg-gray-700 sticky top-0">
-            <tr>
-              <th className="px-2 py-1 text-left">Date & Time (CT)</th>
-              <th className="px-2 py-1 text-left">Level</th>
-              <th className="px-2 py-1 text-left">Stream</th>
-              <th className="px-2 py-1 text-left">Event Type</th>
-              <th className="px-2 py-1 text-left">Message</th>
-            </tr>
-          </thead>
-          <tbody>
-            {displayEvents.map((event) => {
-              const level = getEventLevel(event.event_type)
-              const message = extractEventMessage(event)
-              const repetitiveCount = (event.data as any)?._repetitive_count
-              const firstTs = (event.data as any)?._repetitive_first_timestamp
-              const lastTs = (event.data as any)?._repetitive_last_timestamp
-              const isCollapsed = repetitiveCount != null && repetitiveCount > 1
-              
-              return (
-                <tr
-                  key={`${event.run_id}:${event.event_seq}`}
-                  onClick={() => onEventClick(event)}
-                  className="border-b border-gray-700 hover:bg-gray-700 cursor-pointer"
-                >
-                  <td className="px-2 py-1 font-mono text-xs">
-                    {isCollapsed && firstTs
-                      ? `${formatEventTimestamp(firstTs)} – ${formatEventTimestamp(lastTs)}`
-                      : formatChicagoDateTime(event.timestamp_chicago)}
-                  </td>
-                  <td className="px-2 py-1">
-                    <span className={`px-1 py-0.5 rounded text-xs ${getLevelBadgeColor(level)}`}>
-                      {level}
-                    </span>
-                  </td>
-                  <td className="px-2 py-1 font-mono text-xs">
-                    {event.stream || 'ENGINE'}
-                  </td>
-                  <td className="px-2 py-1 text-xs">
-                    {event.event_type}
-                    {isCollapsed && (
-                      <span className="ml-1.5 text-amber-400 font-semibold" title={`${repetitiveCount} events collapsed`}>
-                        [×{repetitiveCount}]
-                      </span>
-                    )}
-                  </td>
-                  <td className="px-2 py-1 text-xs max-w-xs" title={isCollapsed ? `count: ${repetitiveCount}, first: ${firstTs ? formatEventTimestamp(firstTs) : ''}, last: ${lastTs ? formatEventTimestamp(lastTs) : ''}` : message}>
-                    {isCollapsed ? (
-                      <span className="block">
-                        <span className="text-gray-300">{message}</span>
-                        <span className="block mt-1 text-amber-400 font-medium">
-                          count: {repetitiveCount}
-                          {firstTs && lastTs && (
-                            <span className="block text-xs font-normal text-gray-400">
-                              first: {formatEventTimestamp(firstTs)} · last: {formatEventTimestamp(lastTs)}
-                            </span>
-                          )}
-                        </span>
-                      </span>
-                    ) : (
-                      <span className="truncate block">{message}</span>
-                    )}
-                  </td>
-                </tr>
-              )
-            })}
-          </tbody>
-        </table>
+    <section className="watchdog-panel min-w-0">
+      <div className="watchdog-panel-header">
+        <div>
+          <div className="watchdog-panel-kicker">Operator Timeline</div>
+          <div className="watchdog-panel-title">Event Feed</div>
+        </div>
+        <div className="watchdog-panel-meta">
+          {filteredEvents.length} shown / {displayEvents.length} total
+        </div>
       </div>
-    </div>
+
+      <div className="mb-3 flex flex-wrap gap-1.5">
+        {FILTERS.map((filter) => (
+          <button
+            key={filter.id}
+            type="button"
+            onClick={() => setActiveFilter(filter.id)}
+            className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${
+              activeFilter === filter.id
+                ? 'border-cyan-400/70 bg-cyan-500/15 text-cyan-100'
+                : 'border-slate-700 bg-slate-900/65 text-slate-400 hover:text-slate-100'
+            }`}
+          >
+            {filter.label} <span className="font-mono">{filterCounts[filter.id]}</span>
+          </button>
+        ))}
+      </div>
+
+      {displayEvents.length === 0 ? (
+        <div className="rounded-lg border border-slate-800 bg-slate-900/45 py-8 text-center text-sm text-gray-500">
+          No events yet
+        </div>
+      ) : filteredEvents.length === 0 ? (
+        <div className="rounded-lg border border-slate-800 bg-slate-900/45 py-8 text-center text-sm text-gray-500">
+          No events match this filter
+        </div>
+      ) : (
+        <div ref={scrollContainerRef} className="max-h-[22rem] overflow-auto rounded-lg border border-slate-800">
+          <table className="w-full min-w-[860px] text-sm">
+            <thead className="sticky top-0 bg-gray-800/98">
+              <tr>
+                <th className="px-2 py-1.5 text-left text-[10px] uppercase tracking-wide text-gray-400">Time CT</th>
+                <th className="px-2 py-1.5 text-left text-[10px] uppercase tracking-wide text-gray-400">Level</th>
+                <th className="px-2 py-1.5 text-left text-[10px] uppercase tracking-wide text-gray-400">Stream</th>
+                <th className="px-2 py-1.5 text-left text-[10px] uppercase tracking-wide text-gray-400">Type</th>
+                <th className="px-2 py-1.5 text-left text-[10px] uppercase tracking-wide text-gray-400">Message</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredEvents.map((event) => {
+                const level = eventLevel(event)
+                const message = extractEventMessage(event)
+                const repetitiveCount = (event.data as any)?._repetitive_count
+                const firstTs = (event.data as any)?._repetitive_first_timestamp
+                const lastTs = (event.data as any)?._repetitive_last_timestamp
+                const isCollapsed = repetitiveCount != null && repetitiveCount > 1
+
+                return (
+                  <tr
+                    key={`${event.run_id}:${event.event_seq}`}
+                    onClick={() => onEventClick(event)}
+                    className="cursor-pointer border-b border-gray-700/70 hover:bg-gray-700/80"
+                  >
+                    <td className="px-2 py-1.5 font-mono text-xs">
+                      {isCollapsed && firstTs
+                        ? `${formatEventTimestamp(firstTs)} - ${formatEventTimestamp(lastTs)}`
+                        : formatChicagoDateTime(event.timestamp_chicago)}
+                    </td>
+                    <td className="px-2 py-1.5">
+                      <span className={`rounded px-1 py-0.5 text-xs ${getLevelBadgeColor(level)}`}>
+                        {level}
+                      </span>
+                    </td>
+                    <td className="px-2 py-1.5 font-mono text-xs">{event.stream || 'ENGINE'}</td>
+                    <td className="px-2 py-1.5 font-mono text-[11px] text-slate-300">
+                      {event.event_type}
+                      {isCollapsed && (
+                        <span className="ml-1.5 text-amber-400 font-semibold" title={`${repetitiveCount} events collapsed`}>
+                          [x{repetitiveCount}]
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-2 py-1.5 text-xs" title={message}>
+                      <span className="block truncate">{message}</span>
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
   )
 }
 
-// Custom comparison function for memo - only re-render if events actually changed
 function areEventsEqual(prevProps: LiveEventFeedProps, nextProps: LiveEventFeedProps) {
-  // Compare callback function (should be stable, but check anyway)
-  if (prevProps.onEventClick !== nextProps.onEventClick) {
-    return false
-  }
-  
+  if (prevProps.onEventClick !== nextProps.onEventClick) return false
+
   const prevEvents = prevProps.events ?? []
   const nextEvents = nextProps.events ?? []
-  
-  // If array lengths differ, events changed
-  if (prevEvents.length !== nextEvents.length) {
-    return false
-  }
-  
-  // If both empty, they're equal
-  if (prevEvents.length === 0) {
-    return true
-  }
-  
-  // Compare by checking if the last event (by timestamp) is the same
-  // Events are sorted by timestamp, so last in array = most recent
+  if (prevEvents.length !== nextEvents.length) return false
+  if (prevEvents.length === 0) return true
+
   const prevLast = prevEvents[prevEvents.length - 1]
   const nextLast = nextEvents[nextEvents.length - 1]
-  
-  if (!prevLast || !nextLast) {
-    return false
-  }
-  
-  // Events are equal if the last event has the same run_id, event_seq, timestamp, and repetitive count
+  if (!prevLast || !nextLast) return false
+
   return (
     prevLast.run_id === nextLast.run_id &&
     prevLast.event_seq === nextLast.event_seq &&
@@ -199,6 +277,5 @@ function areEventsEqual(prevProps: LiveEventFeedProps, nextProps: LiveEventFeedP
   )
 }
 
-// Export memoized component with custom comparison for stable rendering
 export const LiveEventFeed = memo(LiveEventFeedComponent, areEventsEqual)
 LiveEventFeed.displayName = 'LiveEventFeed'

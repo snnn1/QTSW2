@@ -46,6 +46,12 @@ public static class EpaAdapterPreflightTests
                 "MES", "SUBMIT_PROTECTIVE_STOP", out var d8) || d8 != "")
             return (false, "Expected allow protective submit when delegate exempts SUBMIT_PROTECTIVE_STOP");
 
+        if (!ExecutionPermissionAuthority.TryAdapterOrderSubmitPreflight(() => false, _ => false,
+                null,
+                (inst, path) => ExecutionPermissionAuthority.ShouldApplyEntryRiskBlockToSubmitPath(path),
+                "MES", "SUBMIT_TARGET", out var d8b) || d8b != "")
+            return (false, "Expected allow target submit when entry-only latch blocks risk-increasing paths");
+
         if (ExecutionPermissionAuthority.TryAdapterOrderSubmitPreflight(() => false, _ => false,
                 null,
                 (inst, path) => string.Equals(path, "SUBMIT_PROTECTIVE_STOP", System.StringComparison.Ordinal) ? false : true,

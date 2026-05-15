@@ -20,17 +20,21 @@ interface ReliabilityPanelProps {
 export function ReliabilityPanel({ metrics, loading }: ReliabilityPanelProps) {
   if (loading) {
     return (
-      <div className="rounded-lg p-4 border bg-gray-800 border-gray-700">
-        <div className="text-sm font-semibold text-gray-300 mb-2">System Reliability</div>
-        <div className="text-sm text-gray-500">Loading...</div>
+      <div className="watchdog-panel">
+        <div className="flex items-center justify-between gap-2">
+          <div className="text-sm font-semibold text-gray-300">System Reliability</div>
+          <div className="text-xs text-gray-500">Loading...</div>
+        </div>
       </div>
     )
   }
   if (!metrics) {
     return (
-      <div className="rounded-lg p-4 border bg-gray-800 border-gray-700">
-        <div className="text-sm font-semibold text-gray-300 mb-2">System Reliability</div>
-        <div className="text-sm text-gray-500">No metrics</div>
+      <div className="watchdog-panel">
+        <div className="flex items-center justify-between gap-2">
+          <div className="text-sm font-semibold text-gray-300">System Reliability</div>
+          <div className="text-xs text-gray-500">No metrics</div>
+        </div>
       </div>
     )
   }
@@ -49,19 +53,30 @@ export function ReliabilityPanel({ metrics, loading }: ReliabilityPanelProps) {
     ff.forced_flatten_count > 0 ||
     recon.reconciliation_mismatch_count > 0
 
+  const summary = `${conn.uptime_percent.toFixed(1)}% uptime | stalls ${engine.engine_stalls + data.data_stalls} | recon ${recon.reconciliation_mismatch_count}`
+
   return (
-    <div
-      className={`rounded-lg p-4 border ${
-        hasIssues ? 'bg-amber-900/20 border-amber-600/30' : 'bg-gray-800 border-gray-700'
+    <details
+      open={hasIssues}
+      className={`watchdog-panel ${
+        hasIssues ? 'border-amber-600/50 bg-amber-900/20' : ''
       }`}
     >
-      <div className="text-sm font-semibold text-gray-300 mb-2">
-        System Reliability
-        <span className="ml-2 text-xs font-normal text-gray-500">
-          Last {metrics.window_hours}h
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-3">
+        <span>
+          <span className="block text-sm font-semibold text-gray-300">System Reliability</span>
+          <span className="block text-[11px] text-gray-500">Last {metrics.window_hours}h</span>
         </span>
-      </div>
-      <div className="space-y-2 text-sm">
+        <span
+          className={`rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+            hasIssues ? 'bg-amber-500 text-black' : 'bg-emerald-700/80 text-emerald-50'
+          }`}
+          title={summary}
+        >
+          {hasIssues ? 'Review' : 'OK'}
+        </span>
+      </summary>
+      <div className="mt-3 space-y-1.5 text-sm">
         <div className="flex justify-between">
           <span className="text-gray-400">Uptime</span>
           <span className={uptimeOk ? 'text-green-400' : 'text-amber-400'}>
@@ -105,6 +120,6 @@ export function ReliabilityPanel({ metrics, loading }: ReliabilityPanelProps) {
           </span>
         </div>
       </div>
-    </div>
+    </details>
   )
 }

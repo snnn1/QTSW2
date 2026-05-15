@@ -21,7 +21,7 @@ echo Browser will open automatically at:
 echo    http://localhost:5174
 echo.
 
-set "VITE_API_BASE=http://localhost:8000/api"
+set "VITE_API_BASE=http://127.0.0.1:8000/api"
 call npm run build
 if errorlevel 1 (
     echo Frontend build failed.
@@ -30,7 +30,7 @@ if errorlevel 1 (
 )
 
 REM Start static frontend server
-start "" /min "Frontend Static Server" cmd /c "python -m http.server 5174 --bind 127.0.0.1 --directory dist"
+start "" /min "Frontend Static Server" cmd /c "python -m http.server 5174 --bind localhost --directory dist"
 
 REM Wait for frontend dev server to start (give it a moment)
 timeout /t 3 /nobreak >nul
@@ -51,7 +51,7 @@ if %ATTEMPT% gtr %MAX_ATTEMPTS% (
 )
 
 REM Use PowerShell to check if backend test endpoint responds
-powershell -Command "$response = try { Invoke-WebRequest -Uri 'http://localhost:8000/api/matrix/test' -Method GET -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop; $response.StatusCode } catch { $null }; if ($response -eq 200) { exit 0 } else { exit 1 }" >nul 2>&1
+powershell -Command "$response = try { Invoke-WebRequest -Uri 'http://127.0.0.1:8000/api/matrix/test' -Method GET -TimeoutSec 2 -UseBasicParsing -ErrorAction Stop; $response.StatusCode } catch { $null }; if ($response -eq 200) { exit 0 } else { exit 1 }" >nul 2>&1
 
 if %ERRORLEVEL% equ 0 (
     echo Backend is ready!

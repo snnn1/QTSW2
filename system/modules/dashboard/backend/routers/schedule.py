@@ -5,6 +5,8 @@ import json
 import logging
 import subprocess
 import os
+import time
+from threading import Lock
 from pathlib import Path
 from datetime import datetime, timedelta
 from fastapi import APIRouter, HTTPException
@@ -26,6 +28,10 @@ except ImportError:
 
 router = APIRouter(prefix="/api", tags=["schedule"])
 logger = logging.getLogger(__name__)
+
+_SCHEDULER_STATUS_CACHE_SECONDS = 10.0
+_scheduler_status_cache = {"at": 0.0, "payload": None}
+_scheduler_status_cache_lock = Lock()
 
 
 @router.get("/schedule", response_model=ScheduleConfig)
@@ -215,8 +221,15 @@ async def disable_scheduler():
 
 
 @router.get("/scheduler/status")
-async def get_scheduler_status():
+def get_scheduler_status():
     """Get Windows Task Scheduler status."""
+    now = time.monotonic()
+    with _scheduler_status_cache_lock:
+        cached = _scheduler_status_cache.get("payload")
+        cached_at = float(_scheduler_status_cache.get("at") or 0.0)
+        if cached is not None and now - cached_at < _SCHEDULER_STATUS_CACHE_SECONDS:
+            return dict(cached)
+
     try:
         from ..main import orchestrator_instance
     except ImportError:
@@ -228,11 +241,15 @@ async def get_scheduler_status():
         from main import orchestrator_instance
     
     if orchestrator_instance is None or orchestrator_instance.scheduler is None:
-        return {
+        payload = {
             "enabled": False,
             "status": "unknown",
             "message": "Orchestrator not available"
         }
+        with _scheduler_status_cache_lock:
+            _scheduler_status_cache["payload"] = dict(payload)
+            _scheduler_status_cache["at"] = time.monotonic()
+        return payload
     
     state = orchestrator_instance.scheduler.get_state()
     windows_status = state.get("windows_task_status", {})
@@ -248,7 +265,7 @@ async def get_scheduler_status():
     else:
         message = "Windows Task Scheduler automation is disabled"
     
-    return {
+    payload = {
         "enabled": enabled,
         "status": "enabled" if enabled else "disabled",
         "windows_task_exists": exists,
@@ -258,6 +275,10 @@ async def get_scheduler_status():
         "last_changed_by": state.get("last_changed_by"),
         "message": message
     }
+    with _scheduler_status_cache_lock:
+        _scheduler_status_cache["payload"] = dict(payload)
+        _scheduler_status_cache["at"] = time.monotonic()
+    return payload
 
 
 @router.get("/schedule/next")

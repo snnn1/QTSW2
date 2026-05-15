@@ -27,7 +27,7 @@ export default function TimetableTab({
   timetableApiError = null,
   /** @type {TimetableRow[]} */
   timetableRows = [],
-  showBlockedTimetableRows = true,
+  showBlockedTimetableRows = false,
 }) {
   const utcDateStr = currentTime.toLocaleDateString('en-US', {
     weekday: 'long',

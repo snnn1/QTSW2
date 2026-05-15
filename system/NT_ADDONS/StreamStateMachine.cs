@@ -66,9 +66,19 @@ public sealed class StreamStateMachine
     public string? CommitReason => _journal.CommitReason;
     public bool ExecutionInterruptedByClose => _journal.ExecutionInterruptedByClose;
     public string? OriginalIntentId => _journal.OriginalIntentId;
+    public string? ReentryIntentId => _journal.ReentryIntentId;
     public SlotStatus SlotStatus => _journal.SlotStatus;
     public bool IsActiveInterruptedBySessionClose =>
         _journal.SlotStatus == SlotStatus.ACTIVE && _journal.ExecutionInterruptedByClose && !_journal.Committed;
+    public bool HasActiveReentryLifecycleEvidence =>
+        !_journal.Committed &&
+        _journal.SlotStatus == SlotStatus.ACTIVE &&
+        (!string.IsNullOrWhiteSpace(_journal.ReentryIntentId) ||
+         _journal.ReentrySubmitPending ||
+         _journal.ReentrySubmitted ||
+         _journal.ReentryFilled ||
+         _journal.ProtectionSubmitted ||
+         _journal.ProtectionAccepted);
     public bool RangeInvalidated => _rangeInvalidated; // Expose range invalidation status for engine-level tracking
     public string TradingDate => _journal.TradingDate;
 
@@ -8412,8 +8422,9 @@ public sealed class StreamStateMachine
         // Reentry: always flatten if reentry filled (reentry position may still be open at slot expiry)
         if (_executionAdapter != null)
         {
-            // Flatten original entry only if it was NOT already flattened by HandleForcedFlatten
-            if (!string.IsNullOrWhiteSpace(_journal.OriginalIntentId) && !_journal.ExecutionInterruptedByClose)
+            // Flatten original entry only if it is still open. A completed original may be
+            // followed by a linked reentry lifecycle that owns the live exposure.
+            if (ShouldFlattenOriginalIntentAtSlotExpiry())
             {
                 try
                 {
@@ -8482,6 +8493,23 @@ public sealed class StreamStateMachine
                 slot_status = _journal.SlotStatus.ToString(),
                 note = "Slot expired at next slot time"
             }));
+    }
+
+    private bool ShouldFlattenOriginalIntentAtSlotExpiry()
+    {
+        if (string.IsNullOrWhiteSpace(_journal.OriginalIntentId) || _journal.ExecutionInterruptedByClose)
+            return false;
+
+        if (TryGetLifecycleEntry(_journal.OriginalIntentId, out var original) && original != null)
+        {
+            if (original.TradeCompleted)
+                return false;
+
+            if (original.EntryFilled && ExecutionJournal.GetEntryRemainingOpenQuantity(original) <= 0)
+                return false;
+        }
+
+        return true;
     }
     
     /// <summary>

@@ -46,6 +46,8 @@ public static class RunSummaryBuilder
         TryParseRunShutdownSignal(persistenceBase, agg);
 
         ApplyTertiaryExecutionSummary(execSnap, agg, keyEventsPresent);
+        ApplyShutdownSafeVerdictAuthority(agg, ymd, modeLabel, instList);
+        TryWriteShutdownAuthorityFrameArtifact(persistenceBase, agg);
 
         var fail = ComputeFail(agg);
         var warn = !fail && ComputeWarn(agg);
@@ -65,6 +67,10 @@ public static class RunSummaryBuilder
         }
 
         var (recommendedAction, confidence) = ComputeRecommendedAction(status, reason, !keyEventsPresent);
+        var authorityShutdownSafeDeniedError = agg.AuthorityShutdownSafeDenied &&
+                                               reason == "AUTHORITY_SHUTDOWN_UNSAFE"
+            ? 1
+            : 0;
 
         return new RunSummaryDocument
         {
@@ -88,7 +94,8 @@ public static class RunSummaryBuilder
                      agg.HardRobotLogCriticalCount +
                      agg.CompletedRejectedJournalCount +
                      agg.IncompleteStreamJournalCount +
-                     (agg.HasOpenExposureAtShutdown ? 1 : 0),
+                     (agg.HasOpenExposureAtShutdown ? 1 : 0) +
+                     authorityShutdownSafeDeniedError,
             key_counts = new RunSummaryKeyCounts
             {
                 mismatch_block_enter = agg.MismatchEnter,
@@ -187,6 +194,12 @@ public static class RunSummaryBuilder
         public bool FlattenActivity;
         public bool TertiaryEntryReject;
         public bool TertiaryExecutionBlock;
+        public bool AuthorityShutdownSafeDenied;
+        public string AuthorityShutdownSafeDenyReason = "";
+        public bool AuthorityShutdownSafeAllowed;
+        public string AuthorityShutdownSafeGate = "";
+        public string AuthorityShutdownSafeDetail = "";
+        public Dictionary<string, object?>? AuthorityShutdownSafeFramePayload;
         public int UniqueEntryFilledIntentCount => EntryFilledIntentIds.Count;
         public int EffectiveDiagnosticContradictionCount =>
             RobotLogCriticalCount > 0 ? DiagnosticContradictionCount : 0;
@@ -216,6 +229,99 @@ public static class RunSummaryBuilder
             agg.TertiaryExecutionBlock = true;
     }
 
+    private static void ApplyShutdownSafeVerdictAuthority(
+        KeyEventAggregate agg,
+        string tradingDate,
+        string modeLabel,
+        IReadOnlyList<string> instruments)
+    {
+        var utcNow = DateTimeOffset.UtcNow;
+        var frameInstrument = instruments.Count == 1 ? instruments[0] : "__RUN__";
+        var frame = ExecutionAuthorityFrameBuilder.Build(new ExecutionAuthorityFrameBuilderInput
+        {
+            Source = "run_summary_shutdown_safe_verdict",
+            Instrument = frameInstrument,
+            TradingDate = tradingDate,
+            SubmitPath = "SHUTDOWN_SAFE_VERDICT",
+            ExecutionMode = modeLabel,
+            DecisionUtc = utcNow,
+            FrameCreatedUtc = utcNow,
+            BrokerPositionQty = agg.OpenBrokerAbsQty,
+            BrokerWorkingOrdersCount = agg.OpenBrokerWorkingOrders,
+            JournalOpenQty = agg.OpenJournalQty,
+            OwnershipOpenQty = agg.OwnershipJournalOpenQty,
+            OwnershipActiveSlots = agg.OwnershipActiveSlots,
+            OwnershipOrphanSlots = agg.OwnershipOrphanSlots,
+            ActiveIntentsCount = agg.OpenSubmittedIntentCount,
+            NonTerminalStreamsCount = agg.IncompleteStreamJournalCount,
+            ActiveIntentIds = Array.Empty<string>(),
+            AuthorityState = "SHUTDOWN_SAFE_VERDICT",
+            ProofLevel = "run-artifact-summary"
+        });
+
+        var decision = UnifiedExecutionAuthority.EvaluateAction(new ExecutionAuthorityActionEvaluationRequest
+        {
+            Action = ExecutionAuthorityAction.ShutdownSafeVerdict,
+            Source = "RunSummaryBuilder",
+            Instrument = frameInstrument,
+            UtcNow = utcNow,
+            SnapshotSufficient = true,
+            BrokerAbsQty = agg.OpenBrokerAbsQty,
+            BrokerWorkingOrderCount = agg.OpenBrokerWorkingOrders,
+            JournalOpenQty = agg.OpenJournalQty,
+            OwnershipOpenQty = agg.OwnershipJournalOpenQty,
+            OwnershipActiveSlotCount = agg.OwnershipActiveSlots,
+            OwnershipOrphanSlotCount = agg.OwnershipOrphanSlots,
+            ActiveIntentCount = agg.OpenSubmittedIntentCount,
+            NonTerminalStreamCount = agg.IncompleteStreamJournalCount,
+            AuthorityFrame = frame
+        });
+
+        agg.AuthorityShutdownSafeAllowed = decision.Allowed;
+        agg.AuthorityShutdownSafeGate = decision.GateName;
+        agg.AuthorityShutdownSafeDenyReason = decision.DenyReason ?? "";
+        agg.AuthorityShutdownSafeDetail = decision.Detail ?? "";
+        agg.AuthorityShutdownSafeFramePayload = ExecutionAuthorityFrameBuilder.ToLogPayload(
+            frame,
+            action: "SHUTDOWN_SAFE_VERDICT",
+            decision: decision.Allowed ? "ALLOW" : "DENY",
+            denyReason: decision.DenyReason);
+
+        if (!decision.Allowed)
+        {
+            agg.AuthorityShutdownSafeDenied = true;
+            agg.AuthorityShutdownSafeDenyReason = decision.DenyReason ?? "SHUTDOWN_SAFE_DENIED";
+        }
+    }
+
+    private static void TryWriteShutdownAuthorityFrameArtifact(string persistenceBase, KeyEventAggregate agg)
+    {
+        if (agg.AuthorityShutdownSafeFramePayload == null)
+            return;
+
+        try
+        {
+            var root = (persistenceBase ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(root))
+                return;
+            Directory.CreateDirectory(root);
+            var path = Path.Combine(root, "AUTHORITY_SHUTDOWN_FRAME.json");
+            File.WriteAllText(path, JsonUtil.Serialize(new
+            {
+                action = "SHUTDOWN_SAFE_VERDICT",
+                allowed = agg.AuthorityShutdownSafeAllowed,
+                gate = agg.AuthorityShutdownSafeGate,
+                deny_reason = agg.AuthorityShutdownSafeDenyReason,
+                detail = agg.AuthorityShutdownSafeDetail,
+                frame = agg.AuthorityShutdownSafeFramePayload
+            }));
+        }
+        catch
+        {
+            // Summary generation must not fail because the auxiliary authority artifact could not be written.
+        }
+    }
+
     private static bool ComputeFail(KeyEventAggregate agg)
     {
         if (agg.RobotLogErrorCount > 0 || agg.HardRobotLogCriticalCount > 0) return true;
@@ -226,6 +332,7 @@ public static class RunSummaryBuilder
         if (agg.ProtectiveFailed > 0) return true;
         if (agg.EntryRejected > 0 || agg.TertiaryEntryReject) return true;
         if (agg.HasOpenExposureAtShutdown) return true;
+        if (agg.AuthorityShutdownSafeDenied) return true;
 
         foreach (var kv in agg.MismatchDepth)
         {
@@ -264,6 +371,7 @@ public static class RunSummaryBuilder
         if (agg.ProtectiveFailed > 0) return "PROTECTIVE_FAILED";
         if (agg.EntryRejected > 0 || agg.TertiaryEntryReject) return "ENTRY_REJECTED";
         if (agg.HasCrashOrFreezeSignal) return "CRASH_OR_FREEZE_SIGNAL";
+        if (agg.AuthorityShutdownSafeDenied) return "AUTHORITY_SHUTDOWN_UNSAFE";
         if (agg.StrategyDisabledCount > 0) return "PLATFORM_DISABLED_SIGNAL";
         foreach (var kv in agg.MismatchDepth)
             if (kv.Value > 0) return "MISMATCH_BLOCK_ACTIVE_AT_END";
@@ -286,6 +394,8 @@ public static class RunSummaryBuilder
     private static string PickVerdictClass(KeyEventAggregate agg, string status, string reason)
     {
         if (agg.HasOpenExposureAtShutdown)
+            return "UNSAFE_EXPOSURE";
+        if (reason == "AUTHORITY_SHUTDOWN_UNSAFE")
             return "UNSAFE_EXPOSURE";
         if (reason == "CRASH_OR_FREEZE_SIGNAL")
             return "CRASH_OR_FREEZE";
@@ -335,6 +445,7 @@ public static class RunSummaryBuilder
             case "ROBOT_LOG_CRITICAL":
             case "COMPLETED_REJECTED_JOURNAL":
             case "STREAM_INCOMPLETE_AT_SHUTDOWN":
+            case "AUTHORITY_SHUTDOWN_UNSAFE":
                 return ("STOP", "HIGH");
             case "DIAGNOSTIC_CONTRADICTION":
             case "PLATFORM_DISABLED_SIGNAL":

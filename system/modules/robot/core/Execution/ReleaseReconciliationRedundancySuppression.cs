@@ -15,6 +15,7 @@ public readonly struct ReleaseReadinessSuppressionProbe
     public int BrokerPositionQty { get; init; }
     public int BrokerWorkingCount { get; init; }
     public int JournalOpenQty { get; init; }
+    public int PendingExecutionWorkload { get; init; }
     public int PendingCandidateCount { get; init; }
     /// <summary>Adoptable-only pending count (aligned with <see cref="StateConsistencyReleaseEvaluationInput.AdoptablePendingAdoptionCandidateCount"/>).</summary>
     public int AdoptablePendingCandidateCount { get; init; }
@@ -157,6 +158,7 @@ public sealed class ReleaseReconciliationRedundancySuppression
             p.BrokerPositionQty,
             p.BrokerWorkingCount,
             p.JournalOpenQty,
+            p.PendingExecutionWorkload,
             p.PendingCandidateCount,
             p.AdoptablePendingCandidateCount,
             p.OwnershipSnapshotAvailable ? 1 : 0,
@@ -176,6 +178,7 @@ public sealed class ReleaseReconciliationRedundancySuppression
             i.BrokerPositionQty,
             i.BrokerWorkingCount,
             i.JournalOpenQty,
+            i.PendingExecutionWorkload,
             i.PendingAdoptionCandidateCount,
             i.AdoptablePendingAdoptionCandidateCount,
             i.OwnershipSnapshotAvailable ? 1 : 0,
@@ -200,6 +203,7 @@ public sealed class ReleaseReconciliationRedundancySuppression
             input.BrokerPositionQty,
             input.BrokerWorkingCount,
             input.JournalOpenQty,
+            input.PendingExecutionWorkload,
             input.PendingAdoptionCandidateCount,
             input.AdoptablePendingAdoptionCandidateCount,
             input.OwnershipSnapshotAvailable ? 1 : 0,
@@ -239,7 +243,8 @@ public sealed class ReleaseReconciliationRedundancySuppression
         var inst = instrument.Trim();
         if (string.IsNullOrEmpty(inst)) return false;
 
-        if (probe.AdoptablePendingCandidateCount > 0 || probe.PendingCandidateCount > 0 ||
+        if (probe.PendingExecutionWorkload > 0 ||
+            probe.AdoptablePendingCandidateCount > 0 || probe.PendingCandidateCount > 0 ||
             probe.ReconciliationBlockersFingerprint != 0)
         {
             reason = "forced_eval_non_idle_pending";
@@ -337,7 +342,7 @@ public sealed class ReleaseReconciliationRedundancySuppression
         c.CachedResult = CloneReadiness(result);
 
         var skipMs = ComputeBackoffMs(c.ConsecutiveUnchangedStreak, ReleaseEvalBaseBackoffMs, ReleaseEvalMaxBackoffMs);
-        if (input.PendingAdoptionCandidateCount > 0)
+        if (input.PendingExecutionWorkload > 0 || input.PendingAdoptionCandidateCount > 0)
             skipMs = Math.Min(skipMs, ReleaseEvalBackoffCapPendingMs);
         if (Math.Abs(input.BrokerPositionQty - input.JournalOpenQty) > 0)
             skipMs = Math.Min(skipMs, ReleaseEvalBackoffCapPositionMismatchMs);
@@ -412,6 +417,10 @@ public sealed class ReleaseReconciliationRedundancySuppression
             UnexplainedBrokerWorkingCount = r.UnexplainedBrokerWorkingCount,
             Contradictions = r.Contradictions != null ? new List<string>(r.Contradictions) : new List<string>(),
             Summary = r.Summary ?? "",
+            CanonicalReleaseAuthorityAllowed = r.CanonicalReleaseAuthorityAllowed,
+            CanonicalReleaseAuthorityGate = r.CanonicalReleaseAuthorityGate ?? "",
+            CanonicalReleaseAuthorityDenyReason = r.CanonicalReleaseAuthorityDenyReason ?? "",
+            CanonicalReleaseAuthorityFrameId = r.CanonicalReleaseAuthorityFrameId ?? "",
             SnapshotSufficient = r.SnapshotSufficient,
             DiagnosticBrokerPositionQty = r.DiagnosticBrokerPositionQty,
             DiagnosticJournalOpenQty = r.DiagnosticJournalOpenQty,

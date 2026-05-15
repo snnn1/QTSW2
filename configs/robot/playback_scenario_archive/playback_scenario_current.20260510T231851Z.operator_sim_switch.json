@@ -1,0 +1,11 @@
+{
+  "mode": "multi_day_carryover",
+  "scenario_id": "playback_scenario_20260428_20260430_20260510T212420Z",
+  "run_id": "playback_scenario_20260428_20260430_20260510T212420Z",
+  "manifest_path": "C:\\Users\\jakej\\QTSW2\\runs\\playback_scenario_20260428_20260430_20260510T212420Z\\playback_scenario\\playback_scenario.json",
+  "manifest_sha256": "ccf0a54ff6ebdd365a134698670f6681e23fc5df457bcd24e520dfc0f84ed35b",
+  "created_utc": "2026-05-10T21:24:21.473256+00:00",
+  "source": "matrix_ui_playback_scenario",
+  "restart_ninjatrader_required": true,
+  "note": "Robot reads this pointer at startup when QTSW2_PLAYBACK_SCENARIO is not set. Clear it to restore normal single-day playback."
+}

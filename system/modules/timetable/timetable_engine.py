@@ -291,15 +291,38 @@ def _execution_merged_stream_filters_nonempty(merged: Dict[str, Any]) -> bool:
 
 
 def _execution_merged_stream_filters_has_effective_rules(merged: Dict[str, Any]) -> bool:
-    """True when at least one merged entry contains a non-empty exclusion rule."""
+    """True when at least one merged entry contains an execution-relevant rule."""
     if not isinstance(merged, dict):
         return False
     for value in merged.values():
         if not isinstance(value, dict):
             continue
-        if value.get("exclude_days_of_week") or value.get("exclude_days_of_month") or value.get("exclude_times"):
+        if (
+            value.get("exclude_days_of_week")
+            or value.get("exclude_days_of_month")
+            or value.get("exclude_times")
+            or value.get("include_streams")
+        ):
             return True
     return False
+
+
+def _execution_master_include_streams(stream_filters: Dict[str, Any]) -> Optional[set]:
+    """Return normalized master include_streams set; None means all streams included."""
+    if not isinstance(stream_filters, dict):
+        return None
+    master_filter = stream_filters.get("master", {}) or {}
+    if not isinstance(master_filter, dict):
+        return None
+    include_streams = master_filter.get("include_streams")
+    if not include_streams:
+        return None
+    included = {
+        str(stream_id).strip().upper()
+        for stream_id in include_streams
+        if str(stream_id).strip()
+    }
+    return included or None
 
 
 def _merge_stream_filters_for_execution(
@@ -686,12 +709,16 @@ def get_execution_stream_enablement(
     dow_pass = bool(calendar_eval["dow_pass"])
     dom_pass = bool(calendar_eval["dom_pass"])
     calendar_ok = dow_pass and dom_pass
+    include_streams = _execution_master_include_streams(stream_filters)
+    master_stream_included = include_streams is None or stream_id.upper() in include_streams
 
-    enabled = bool(has_valid_slot and m_nc_ok and calendar_ok)
+    enabled = bool(master_stream_included and has_valid_slot and m_nc_ok and calendar_ok)
     cal_block = f"calendar_filter_blocked:{filter_dow_name}:{filter_dom}"
 
-    if not has_valid_slot:
-        block_reason: Optional[str] = "no_valid_execution_slot"
+    if not master_stream_included:
+        block_reason: Optional[str] = "master_stream_not_included"
+    elif not has_valid_slot:
+        block_reason = "no_valid_execution_slot"
     elif not m_nc_ok:
         block_reason = "matrix_filter_blocked:" + (m_suf or "matrix_row_final_allowed_false")
     elif not calendar_ok:
@@ -707,6 +734,8 @@ def get_execution_stream_enablement(
         "calendar_eval": calendar_eval,
         "dow_pass": dow_pass,
         "dom_pass": dom_pass,
+        "master_stream_included": master_stream_included,
+        "master_include_streams": sorted(include_streams) if include_streams else [],
     }
     return enabled, block_reason, detail
 
@@ -1770,8 +1799,8 @@ class TimetableEngine:
             trade_date_obj = pd.to_datetime(session_trading_date_ymd).date()
             logger.info(
                 "PATH_B_EXECUTION_MODE: session_trading_date=%s (%s); "
-                "enabled=matrix(valid_slot+latest_row_final_allowed+DOW/DOM_on_session_day); "
-                "stream_filters merged keys=%s (DOW/DOM gate; exclude_times does not gate)",
+                "enabled=master_include_streams+matrix(valid_slot+latest_row_final_allowed+DOW/DOM_on_session_day); "
+                "stream_filters merged keys=%s (master include_streams + DOW/DOM gate; exclude_times diagnostic)",
                 session_trading_date_ymd,
                 session_source,
                 len(eff_stream_filters),

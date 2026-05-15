@@ -1,0 +1,141 @@
+{
+  "bundle_kind": "SIM_RUNTIME_SNAPSHOT",
+  "confidence": "MEDIUM",
+  "created_at_utc": "2026-05-06T12:52:43.640867+00:00",
+  "date": "2026-05-06",
+  "deployed_runtime": {
+    "exists": true,
+    "last_write_utc": "2026-05-06T03:00:12.831596+00:00",
+    "path": "C:\\Users\\jakej\\Documents\\NinjaTrader 8\\bin\\Custom\\Robot.Core.dll",
+    "robot_build_signature_event": {
+      "account": null,
+      "data": {
+        "assembly_hash": "655a9abada4c6b19bb781733c0cf79c938d17d660dd454cf32f5bb1a2fdca988",
+        "assembly_hash_algorithm": "SHA256",
+        "assembly_hash_cache_hit": "True",
+        "assembly_last_write_utc": "2026-05-06T03:00:12.8315962Z",
+        "assembly_length": "4328960",
+        "assembly_location": "C:\\Users\\jakej\\Documents\\NinjaTrader 8\\bin\\Custom\\Robot.Core.dll",
+        "assembly_name": "Robot.Core",
+        "assembly_version": "1.0.0.0",
+        "build_configuration": "Release",
+        "instrument": "ENGINE_START",
+        "note": "Runtime proof of loaded Robot.Core.dll; validate this signature appears in robot_ENGINE.jsonl after restart",
+        "session": "",
+        "slot_time_chicago": "",
+        "slot_time_utc": null,
+        "state": "ENGINE",
+        "trading_date": ""
+      },
+      "event": "ROBOT_BUILD_SIGNATURE",
+      "instrument": "",
+      "level": "INFO",
+      "message": "ROBOT_BUILD_SIGNATURE",
+      "run_id": "1c78dd1f035f4989ae9bf207e6405cd2",
+      "scope": null,
+      "session": null,
+      "slot_time_chicago": null,
+      "source": "RobotEngine",
+      "stream": null,
+      "trading_date": null,
+      "ts_utc": "2026-05-06T10:06:01.2384017+00:00"
+    },
+    "sha256": "655a9abada4c6b19bb781733c0cf79c938d17d660dd454cf32f5bb1a2fdca988",
+    "size": 4328960
+  },
+  "enabled_streams": [
+    "NG1",
+    "NQ1",
+    "RTY2"
+  ],
+  "execution_journal_files": 2,
+  "finalized": false,
+  "flags": {
+    "had_diagnostic_contradiction": false,
+    "had_execution_block": false,
+    "had_order_rejection": false,
+    "had_protective_failure": false,
+    "had_robot_log_critical": false,
+    "had_robot_log_error": true,
+    "had_robot_log_hard_critical": false,
+    "has_active_risk_latches": false,
+    "kill_switch_enabled": false
+  },
+  "key_counts": {
+    "active_risk_latches": 0,
+    "diagnostic_contradictions": 0,
+    "enabled_streams": 3,
+    "execution_blocked": 0,
+    "execution_journal_files": 2,
+    "order_rejections": 0,
+    "protective_failed": 0,
+    "robot_log_critical": 0,
+    "robot_log_errors": 1,
+    "robot_log_hard_critical": 0,
+    "stream_journals": 3
+  },
+  "mode": "SIM",
+  "persistence_base": "C:\\Users\\jakej\\QTSW2\\runs\\sim_2026-05-06_20260506T125243Z_cf79c863",
+  "recommended_action": "MONITOR",
+  "run_id": "sim_2026-05-06_20260506T125243Z_cf79c863",
+  "session": {
+    "locked": true,
+    "metadata": {
+      "endpoint": "POST /api/timetable/execution",
+      "publish_mode": "live",
+      "requested_reason": "manual_ui",
+      "requested_replay": false,
+      "requested_source": "matrix_ui"
+    },
+    "mode": "manual",
+    "session_trading_date": "2026-05-06",
+    "source": "user"
+  },
+  "source_persistence_base": "C:\\Users\\jakej\\QTSW2",
+  "status": "WARN",
+  "status_reason": "SIM_SNAPSHOT_NOT_FINAL",
+  "stream_journals": [
+    {
+      "committed": false,
+      "entry_detected": false,
+      "forced_flatten_timestamp": null,
+      "last_state": "RANGE_BUILDING",
+      "last_update_utc": "2026-05-06T07:00:00.0000000+00:00",
+      "path": "state\\stream_journals\\2026-05-06_NG1.json",
+      "protection_accepted": false,
+      "protection_submitted": false,
+      "stream": "NG1",
+      "terminal_state": null
+    },
+    {
+      "committed": false,
+      "entry_detected": false,
+      "forced_flatten_timestamp": null,
+      "last_state": "RANGE_LOCKED",
+      "last_update_utc": "2026-05-06T12:30:13.1659120+00:00",
+      "path": "state\\stream_journals\\2026-05-06_NQ1.json",
+      "protection_accepted": false,
+      "protection_submitted": false,
+      "stream": "NQ1",
+      "terminal_state": null
+    },
+    {
+      "committed": false,
+      "entry_detected": false,
+      "forced_flatten_timestamp": null,
+      "last_state": "PRE_HYDRATION",
+      "last_update_utc": "2026-05-06T10:05:51.6647303+00:00",
+      "path": "state\\stream_journals\\2026-05-06_RTY2.json",
+      "protection_accepted": false,
+      "protection_submitted": false,
+      "stream": "RTY2",
+      "terminal_state": null
+    }
+  ],
+  "timetable": {
+    "session_trading_date": "2026-05-06",
+    "source": "matrix_ui",
+    "timetable_hash": "25e31f4d8a16cf2e23e3c3d5945a14fdbcbe91daf7e88ca3a15b9de164f630c5"
+  },
+  "verdict_class": "RUNTIME_SNAPSHOT"
+}

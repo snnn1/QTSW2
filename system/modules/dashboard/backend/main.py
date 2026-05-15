@@ -476,10 +476,10 @@ async def debug_connection():
     }
 
 @app.get("/api/matrix/test")
-async def test_matrix_endpoint():
+def test_matrix_endpoint():
     """Simple test endpoint to verify frontend can reach backend"""
     logger = logging.getLogger(__name__)
-    logger.info("TEST ENDPOINT HIT - Frontend can reach backend!")
+    logger.debug("Matrix test endpoint hit")
     return {"status": "success", "message": "Backend is reachable from frontend"}
 
 
@@ -1316,15 +1316,20 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
                 status_code=500,
                 detail="Internal error: execution publish returned unexpected result type",
             )
+        playback_pointer_state = _clear_playback_scenario_pointer(
+            reason=f"{request.mode or 'execution'}_execution_publish",
+            source="POST /api/timetable/execution",
+        )
         st = "published" if pub_res.changed else "unchanged"
         logging.info(
-            "TIMETABLE_EXECUTION_API: status=%s changed=%s hash=%s previous_hash=%s source=%s reason=%s",
+            "TIMETABLE_EXECUTION_API: status=%s changed=%s hash=%s previous_hash=%s source=%s reason=%s playback_pointer=%s",
             st,
             pub_res.changed,
             pub_res.timetable_hash,
             pub_res.previous_hash or "",
             pub_ctx["source"],
             pub_ctx["reason"],
+            playback_pointer_state["status"],
         )
         return {
             "status": st,
@@ -1332,6 +1337,7 @@ async def save_execution_timetable(request: ExecutionTimetableRequest):
             "previous_hash": pub_res.previous_hash or "",
             "changed": pub_res.changed,
             "file": str(final_file),
+            "playback_scenario_pointer": playback_pointer_state,
         }
 
     except HTTPException:
@@ -1457,6 +1463,46 @@ def _safe_playback_scenario_id(raw: Optional[str], fallback: str) -> str:
 def _write_pretty_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=False, default=str) + "\n", encoding="utf-8")
+
+
+def _clear_playback_scenario_pointer(reason: str, source: str) -> Dict[str, Any]:
+    """
+    Deactivate the operator-selected multi-day Playback scenario pointer.
+
+    Live/Historical timetable publishes are mutually exclusive with multi-day
+    Playback startup authority. Archive rather than unlink so the operator has
+    an audit trail and the scenario artifacts remain available.
+    """
+    pointer_path = QTSW2_ROOT / "configs" / "robot" / "playback_scenario_current.json"
+    safe_reason = re.sub(r"[^A-Za-z0-9_.-]+", "_", (reason or "clear").strip()).strip("._-") or "clear"
+    existed = pointer_path.exists()
+    archived_path: Optional[Path] = None
+    if existed:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        archive_dir = pointer_path.parent / "playback_scenario_archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archived_path = archive_dir / f"playback_scenario_current.{stamp}.{safe_reason}.json"
+        suffix = 1
+        while archived_path.exists():
+            archived_path = archive_dir / f"playback_scenario_current.{stamp}.{safe_reason}.{suffix}.json"
+            suffix += 1
+        pointer_path.replace(archived_path)
+        logging.info(
+            "PLAYBACK_SCENARIO_POINTER_CLEARED reason=%s source=%s archived_path=%s",
+            reason,
+            source,
+            archived_path,
+        )
+    return {
+        "status": "cleared" if existed else "not_present",
+        "removed": existed,
+        "config_pointer_path": str(pointer_path),
+        "archived_path": str(archived_path) if archived_path else None,
+        "reason": reason,
+        "source": source,
+        "restart_ninjatrader_required": True,
+        "proof_level": "source-only",
+    }
 
 
 def _sha256_file(path: Path) -> str:
@@ -1677,18 +1723,11 @@ async def clear_playback_scenario_current():
     replay timetable authority. NinjaTrader must be restarted after clearing if
     it already loaded a scenario in-process.
     """
-    pointer_path = QTSW2_ROOT / "configs" / "robot" / "playback_scenario_current.json"
     try:
-        existed = pointer_path.exists()
-        if existed:
-            pointer_path.unlink()
-        return {
-            "status": "cleared",
-            "removed": existed,
-            "config_pointer_path": str(pointer_path),
-            "restart_ninjatrader_required": True,
-            "proof_level": "source-only",
-        }
+        return _clear_playback_scenario_pointer(
+            reason="operator_clear",
+            source="DELETE /api/timetable/playback-scenario/current",
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to clear Playback scenario pointer: {str(e)}") from e
 

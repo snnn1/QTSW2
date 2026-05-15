@@ -19,6 +19,39 @@ logger = logging.getLogger(__name__)
 DEFAULT_RETENTION_DAYS = 30
 
 
+def _is_completed_incident_alert(record: Dict[str, Any]) -> bool:
+    """Incident alerts are notifications about completed episodes, not active latches."""
+    alert_type = str(record.get("alert_type") or "")
+    if not alert_type.startswith("INCIDENT_"):
+        return False
+    context = record.get("context")
+    return isinstance(context, dict) and bool(context.get("end_ts"))
+
+
+def _parse_utc_timestamp(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _effective_alert_timestamp(record: Dict[str, Any]) -> Optional[datetime]:
+    candidates = [
+        _parse_utc_timestamp(record.get("resolved_utc")),
+        _parse_utc_timestamp(record.get("last_delivery_utc")),
+        _parse_utc_timestamp(record.get("last_seen_utc")),
+        _parse_utc_timestamp(record.get("first_seen_utc")),
+        _parse_utc_timestamp(record.get("_ledger_updated_utc")),
+    ]
+    candidates = [dt for dt in candidates if dt is not None]
+    return max(candidates) if candidates else None
+
+
 class AlertLedger:
     """Append-only alert ledger with resolution records and retention."""
 
@@ -69,6 +102,8 @@ class AlertLedger:
                                     continue
                             except (ValueError, TypeError):
                                 pass
+                        if _is_completed_incident_alert(rec):
+                            continue
                         if dedupe_key not in resolved_keys:
                             self._active_alerts[dedupe_key] = rec.copy()
             if self._active_alerts:
@@ -115,7 +150,18 @@ class AlertLedger:
             "last_delivery_utc": None,
         }
         self._append_line(record)
-        self._active_alerts[dedupe_key] = record.copy()
+        if _is_completed_incident_alert(record):
+            resolution_record = {
+                "event": "resolved",
+                "alert_id": alert_id,
+                "alert_type": alert_type,
+                "dedupe_key": dedupe_key,
+                "resolved_utc": now.isoformat(),
+                "reason": "completed_incident_notification",
+            }
+            self._append_line(resolution_record)
+        else:
+            self._active_alerts[dedupe_key] = record.copy()
 
     def update_delivery(
         self,
@@ -189,20 +235,25 @@ class AlertLedger:
         limit: int = 200,
     ) -> List[Dict[str, Any]]:
         """
-        Read recent records from ledger for API.
-        Parses file from end, returns in chronological order.
+        Read effective alert records from ledger for API.
+
+        The ledger is append-only and stores resolution/delivery updates as
+        separate rows. Operator views should not see an old full alert row as
+        still active after a later resolved row exists, so this folds update
+        rows into the latest full alert record before filtering.
         """
         if not self._ledger_path.exists():
             return []
-        records: List[Dict[str, Any]] = []
         cutoff = None
         if since_hours is not None:
             cutoff = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+        records_by_alert_id: Dict[str, Dict[str, Any]] = {}
+        latest_alert_id_by_dedupe: Dict[str, str] = {}
+        fallback_index = 0
         try:
             with open(self._ledger_path, "r", encoding="utf-8") as f:
                 lines = f.readlines()
-            # Process from end (most recent last)
-            for line in reversed(lines):
+            for line in lines:
                 line = line.strip()
                 if not line:
                     continue
@@ -210,41 +261,56 @@ class AlertLedger:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(rec, dict):
+                    continue
                 if "event" in rec:
-                    # Resolution or delivery update - include for history
-                    if active_only:
+                    dedupe_key = str(rec.get("dedupe_key") or "")
+                    alert_id = rec.get("alert_id") or latest_alert_id_by_dedupe.get(dedupe_key)
+                    if not alert_id:
                         continue
-                    ts = rec.get("resolved_utc") or rec.get("updated_utc")
-                    if ts and cutoff:
-                        try:
-                            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                            if dt.tzinfo is None:
-                                dt = dt.replace(tzinfo=timezone.utc)
-                            if dt < cutoff:
-                                continue
-                        except (ValueError, TypeError):
-                            pass
-                    records.append(rec)
-                else:
-                    # Full alert record
-                    if active_only and not rec.get("active", True):
+                    alert = records_by_alert_id.get(str(alert_id))
+                    if alert is None:
                         continue
-                    first_seen = rec.get("first_seen_utc")
-                    if first_seen and cutoff:
-                        try:
-                            dt = datetime.fromisoformat(first_seen.replace("Z", "+00:00"))
-                            if dt.tzinfo is None:
-                                dt = dt.replace(tzinfo=timezone.utc)
-                            if dt < cutoff:
-                                continue
-                        except (ValueError, TypeError):
-                            pass
-                    records.append(rec)
-                if len(records) >= limit:
-                    break
+                    event_type = rec.get("event")
+                    if event_type == "resolved":
+                        alert["active"] = False
+                        alert["resolved_utc"] = rec.get("resolved_utc")
+                        if rec.get("reason"):
+                            alert["resolution_reason"] = rec.get("reason")
+                        alert["_ledger_updated_utc"] = rec.get("resolved_utc")
+                    elif event_type == "delivery_update":
+                        alert["delivery_status"] = rec.get("delivery_status")
+                        alert["delivery_channel"] = rec.get("delivery_channel")
+                        alert["delivery_attempts"] = rec.get("delivery_attempts")
+                        alert["last_delivery_utc"] = rec.get("updated_utc")
+                        alert["_ledger_updated_utc"] = rec.get("updated_utc")
+                    continue
+
+                alert_id = str(rec.get("alert_id") or "")
+                if not alert_id:
+                    fallback_index += 1
+                    alert_id = f"ledger-row-{fallback_index}"
+                alert = rec.copy()
+                records_by_alert_id[alert_id] = alert
+                dedupe_key = str(alert.get("dedupe_key") or "")
+                if dedupe_key:
+                    latest_alert_id_by_dedupe[dedupe_key] = alert_id
         except Exception as e:
             logger.error(f"Failed to read alert ledger: {e}", exc_info=True)
-        records.reverse()
+
+        records = list(records_by_alert_id.values())
+        if active_only:
+            records = [rec for rec in records if rec.get("active", True)]
+        if cutoff is not None:
+            records = [
+                rec for rec in records
+                if (_effective_alert_timestamp(rec) is None or _effective_alert_timestamp(rec) >= cutoff)
+            ]
+        records.sort(key=lambda rec: _effective_alert_timestamp(rec) or datetime.min.replace(tzinfo=timezone.utc))
+        if limit > 0:
+            records = records[-limit:]
+        for rec in records:
+            rec.pop("_ledger_updated_utc", None)
         return records
 
     def trim_old_records(self) -> int:

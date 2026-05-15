@@ -42,7 +42,7 @@ echo Starting watchdog frontend dev server...
 echo Frontend will be available at: http://localhost:5175
 echo.
 echo IMPORTANT: Uses standalone watchdog (modules/watchdog/frontend)
-echo Do NOT open dashboard (5173) or matrix (5174) - those are separate apps
+echo Do NOT open the Pipeline Dashboard/Matrix API (8000) or Matrix UI (5174) - those are separate apps
 echo.
 
 echo Waiting 8 seconds for frontend to start, then opening watchdog...

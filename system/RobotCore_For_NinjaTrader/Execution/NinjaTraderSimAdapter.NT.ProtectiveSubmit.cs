@@ -186,6 +186,17 @@ public sealed partial class NinjaTraderSimAdapter
 
                 if (existingStop != null)
                 {
+                    EnsureExistingProtectiveOrderTracked(
+                        existingStop,
+                        intentId,
+                        instrument,
+                        direction,
+                        quantity,
+                        stopPrice,
+                        OrderRole.STOP,
+                        utcNow,
+                        "SubmitProtectiveStop_IdempotentExisting");
+
                     _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
                     {
                         broker_order_id = existingStop.OrderId,
@@ -458,6 +469,7 @@ public sealed partial class NinjaTraderSimAdapter
                 FilledQuantity = 0
             };
             OrderMap[intentId] = stopOrderInfo; // Use same intentId - OnExecutionUpdate will find it by tag decode
+            OrderMap[$"{intentId}:STOP"] = stopOrderInfo;
             _iea?.RegisterOrder(order.OrderId, intentId, instrument, IntentMap.TryGetValue(intentId, out var si) ? si.Stream : null, OrderRole.STOP, OrderOwnershipStatus.OWNED, "SubmitProtectiveStop", stopOrderInfo, utcNow);
             
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
@@ -636,6 +648,17 @@ public sealed partial class NinjaTraderSimAdapter
 
                 if (existingTarget != null)
                 {
+                    EnsureExistingProtectiveOrderTracked(
+                        existingTarget,
+                        intentId,
+                        instrument,
+                        direction,
+                        quantity,
+                        targetPrice,
+                        OrderRole.TARGET,
+                        utcNow,
+                        "SubmitTargetOrder_IdempotentExisting");
+
                     _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
                     {
                         broker_order_id = existingTarget.OrderId,
@@ -876,6 +899,7 @@ public sealed partial class NinjaTraderSimAdapter
                 FilledQuantity = 0
             };
             OrderMap[intentId] = targetOrderInfo; // Overwrites entry order (already filled) or stop order (if stop was added first)
+            OrderMap[$"{intentId}:TARGET"] = targetOrderInfo;
             _iea?.RegisterOrder(order.OrderId, intentId, instrument, IntentMap.TryGetValue(intentId, out var ti) ? ti.Stream : null, OrderRole.TARGET, OrderOwnershipStatus.OWNED, "SubmitTargetOrder", targetOrderInfo, utcNow);
             
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
@@ -903,6 +927,57 @@ public sealed partial class NinjaTraderSimAdapter
                 orderType: "TARGET", rejectedPrice: targetPrice, rejectedQuantity: quantity);
             return OrderSubmissionResult.FailureResult($"Target order submission failed: {ex.Message}", utcNow);
         }
+    }
+
+    private void EnsureExistingProtectiveOrderTracked(
+        Order order,
+        string intentId,
+        string instrument,
+        string direction,
+        int quantity,
+        decimal price,
+        OrderRole orderRole,
+        DateTimeOffset utcNow,
+        string sourceContext)
+    {
+        var orderType = orderRole == OrderRole.STOP ? "STOP" : "TARGET";
+        var orderInfo = new OrderInfo
+        {
+            IntentId = intentId,
+            Instrument = instrument,
+            OrderId = order.OrderId,
+            OrderType = orderType,
+            Direction = direction,
+            Quantity = quantity,
+            Price = price,
+            State = order.OrderState.ToString().ToUpperInvariant(),
+            NTOrder = order,
+            IsEntryOrder = false,
+            FilledQuantity = 0
+        };
+
+        OrderMap[intentId] = orderInfo;
+        OrderMap[$"{intentId}:{orderType}"] = orderInfo;
+
+        if (_iea == null || string.IsNullOrWhiteSpace(order.OrderId))
+            return;
+
+        if (!_iea.TryResolveForExecutionUpdate(order.OrderId, intentId, orderType, out _, out _))
+        {
+            _iea.RegisterOrder(
+                order.OrderId,
+                intentId,
+                instrument,
+                IntentMap.TryGetValue(intentId, out var intent) ? intent.Stream : null,
+                orderRole,
+                OrderOwnershipStatus.OWNED,
+                sourceContext,
+                orderInfo,
+                utcNow);
+        }
+
+        if (order.OrderState == OrderState.Working)
+            _iea.UpdateOrderLifecycle(order.OrderId, OrderLifecycleState.WORKING, utcNow);
     }
 
 }

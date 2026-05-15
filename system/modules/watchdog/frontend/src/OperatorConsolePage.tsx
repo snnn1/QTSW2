@@ -93,8 +93,14 @@ function InstrumentCard({
     WARNING: 'border-amber-500 bg-amber-950/20',
     SAFE: 'border-emerald-600/50 bg-emerald-950/10',
   }
-  const statusColor = statusColors[data.status] ?? 'border-gray-600 bg-gray-900/50'
+  const safeLowConfidence =
+    data.status === 'SAFE' &&
+    (data.confidence !== 'HIGH' || data.ownership === 'UNKNOWN' || data.protectives === 'UNKNOWN')
+  const statusColor = safeLowConfidence
+    ? 'border-amber-600 bg-amber-950/15'
+    : statusColors[data.status] ?? 'border-gray-600 bg-gray-900/50'
   const actionLabel = displayActionLabel(data.action_label)
+  const statusLabel = safeLowConfidence ? 'OBSERVED FLAT' : data.status
 
   return (
     <div className={`rounded-lg border-l-4 p-3 ${statusColor}`}>
@@ -113,14 +119,20 @@ function InstrumentCard({
           <span className={`rounded px-1.5 py-0.5 text-xs font-medium ${
             data.status === 'CRITICAL' ? 'bg-red-600 text-white' :
             data.status === 'WARNING' ? 'bg-amber-600 text-white' :
+            safeLowConfidence ? 'bg-amber-700/70 text-amber-100' :
             'bg-emerald-700/60 text-emerald-100'
           }`}>
-            {data.status}
+            {statusLabel}
           </span>
           <span className="text-gray-400">exposure: {data.exposure.quantity}</span>
           <span className="text-gray-400">ownership: {data.ownership}</span>
           <span className="text-gray-400">protectives: {data.protectives}</span>
           <span className="text-gray-500 text-xs">({data.confidence})</span>
+          {safeLowConfidence && (
+            <span className="text-xs font-medium text-amber-300">
+              zero exposure observed; proof incomplete
+            </span>
+          )}
         </div>
         <button
           type="button"

@@ -12,8 +12,18 @@ public sealed partial class MismatchEscalationCoordinator
 {
     private void OnAuditTick(object? _)
     {
+        if (Volatile.Read(ref _disposed) != 0)
+            return;
+
+        Volatile.Write(ref _auditCallbackThreadId, Thread.CurrentThread.ManagedThreadId);
         lock (_auditRunLock)
         {
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                Volatile.Write(ref _auditCallbackThreadId, 0);
+                return;
+            }
+
             var prevAuditUtc = _lastAuditUtc;
             var utcNow = DateTimeOffset.UtcNow;
             AccountSnapshot? snapshot = null;
@@ -270,6 +280,32 @@ public sealed partial class MismatchEscalationCoordinator
             return false;
         if (latestObs?.Present == true)
             return false;
+        if (_evaluateReleaseReadiness == null)
+            return false;
+
+        StateConsistencyReleaseReadinessResult readiness;
+        try
+        {
+            readiness = _evaluateReleaseReadiness.Invoke(inst, _getSnapshot(), utcNow, true);
+        }
+        catch (Exception ex)
+        {
+            _log?.Write(RobotEvents.EngineBase(utcNow, tradingDate: "", eventType: "EXECUTION_ERROR", state: "ENGINE",
+                new { error = ex.Message, context = "TryQuiesceInactiveInstrumentState_authority_release", instrument = inst }));
+            return false;
+        }
+
+        if (!readiness.SnapshotSufficient || !readiness.ReleaseReady)
+        {
+            EmitGateReleaseBlocked(inst, utcNow, state, "inactive_scope_quiesce_authority_denied", readiness);
+            return false;
+        }
+
+        if (!HasCanonicalMismatchReleaseAuthority(readiness))
+        {
+            EmitGateReleaseBlocked(inst, utcNow, state, "inactive_scope_quiesce_authority_missing", readiness);
+            return false;
+        }
 
         var wasBlocked = state.Blocked;
         state.Blocked = false;
@@ -333,11 +369,16 @@ public sealed partial class MismatchEscalationCoordinator
         nextMs = Math.Max(1, nextMs);
         try
         {
-            _auditTimer.Change(nextMs, Timeout.Infinite);
+            if (Volatile.Read(ref _disposed) == 0)
+                _auditTimer.Change(nextMs, Timeout.Infinite);
         }
         catch
         {
             // Timer disposed
+        }
+        finally
+        {
+            Volatile.Write(ref _auditCallbackThreadId, 0);
         }
     }
 

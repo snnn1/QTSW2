@@ -74,6 +74,17 @@ def test_slot_missing_summary_when_past_slot_and_trade_executed_unset():
     assert g["actual"] == "not_received"
 
 
+def test_slot_missing_summary_suppressed_for_terminal_stream():
+    info_today = SimpleNamespace(state="DONE", committed=True, trade_executed=None, slot_reason="TARGET")
+    d = {("2026-03-31", "ES2"): info_today}
+    now = CHI.localize(datetime(2026, 3, 31, 10, 0, 0))
+
+    assert (
+        _slot_missing_summary_expectation_gap(d, "2026-03-31", "ES2", "ES", "S1", "09:00", now_chicago=now)
+        is None
+    )
+
+
 def test_v2_suppressed_when_v1_would_apply():
     from datetime import datetime
 

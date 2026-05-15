@@ -87,7 +87,10 @@ def normalize_filter(filters: Dict) -> Dict:
     return {
         "exclude_days_of_week": filters.get('exclude_days_of_week', []),
         "exclude_days_of_month": filters.get('exclude_days_of_month', []),
-        "exclude_times": [str(t) for t in filters.get('exclude_times', [])]  # Ensure strings
+        "exclude_times": [str(t) for t in filters.get('exclude_times', [])],  # Ensure strings
+        # Master-level stream selection is consumed by timetable publish after
+        # matrix build/resequence. Row-level matrix filtering ignores it.
+        "include_streams": [str(s) for s in filters.get('include_streams', [])],
     }
 
 
@@ -108,7 +111,8 @@ def ensure_default_filters(streams: List[str], stream_filters: Dict[str, Dict]) 
             updated_filters[stream] = {
                 "exclude_days_of_week": [],
                 "exclude_days_of_month": [],
-                "exclude_times": []
+                "exclude_times": [],
+                "include_streams": [],
             }
     return updated_filters
 
@@ -166,4 +170,3 @@ def merged_exclude_times_normalized_set(stream_id: str, stream_filters: Dict[str
     if isinstance(sf, dict) and sf.get("exclude_times"):
         out.update(normalize_time(str(t)) for t in sf["exclude_times"])
     return out
-

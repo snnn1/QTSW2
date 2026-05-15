@@ -18,6 +18,15 @@ public static class FlattenFillJournalRoutingTests
                 "FLATTEN", StringComparison.Ordinal))
             return (false, "DecodeIntentId must return FLATTEN for QTSW2:FLATTEN:... (pseudo-intent; not in IntentMap)");
 
+        var flattenRequestId = "FLATTEN:MES:20260511205500123:L0";
+        if (!string.Equals(
+                RobotOrderIds.DecodeFlattenRequestId($"{RobotOrderIds.Prefix}FLATTEN:{flattenRequestId}"),
+                flattenRequestId,
+                StringComparison.Ordinal))
+        {
+            return (false, "DecodeFlattenRequestId must recover the full IEA flatten request id from QTSW2:FLATTEN tags");
+        }
+
         var root = Path.Combine(Path.GetTempPath(), "FlattenFillJournalRoutingTests_" + Guid.NewGuid().ToString("N")[..8]);
         Directory.CreateDirectory(root);
         try

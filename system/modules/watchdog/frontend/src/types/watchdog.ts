@@ -69,6 +69,8 @@ export interface WatchdogStatus {
   timetable_unavailable?: boolean;
   /** Last POSITION_AUTHORITY_EVALUATED per normalized instrument key (MES, MYM, …) — observability only. */
   position_authority_by_instrument?: Record<string, PositionAuthoritySnapshot>;
+  active_risk_latches?: RiskLatch[];
+  active_risk_latch_count?: number;
   // Phase 1: Active push alerts (process stopped, heartbeat lost, etc.)
   active_alerts?: ActiveAlert[];
 }
@@ -81,9 +83,47 @@ export interface PositionAuthoritySnapshot {
   real_open_qty?: number | null;
   recovery_open_qty?: number | null;
   journal_open_qty?: number | null;
+  broker_working_count?: number | null;
+  iea_trusted_working_count?: number | null;
+  source_event?: string | null;
   last_authority_ts_utc?: string;
+  last_working_order_ts_utc?: string;
   /** Stream row: snapshot instrument aligned with timetable execution/canonical keys. */
   attachment_status?: 'MATCHED' | 'UNVERIFIED';
+}
+
+export interface RiskLatch {
+  account?: string;
+  instrument: string;
+  instrument_key?: string;
+  blocked_at_utc?: string;
+  reason: string;
+  file_path?: string;
+  source_root?: string;
+  clear_policy?: 'auto_clear_when_clean_flat' | 'explicit_unfreeze_required' | string;
+  clean_flat_candidate?: boolean;
+  blocks_entries?: boolean;
+  blocks_reentry?: boolean;
+  blocks_protectives?: boolean;
+  blocks_cancel?: boolean;
+  blocks_flatten?: boolean;
+  scope_label?: string;
+  operator_action?: string;
+  clear_readiness?: RiskLatchClearReadiness;
+  position_authority?: PositionAuthoritySnapshot | null;
+}
+
+export interface RiskLatchClearReadiness {
+  status?: string;
+  reason_auto_clear_eligible?: boolean;
+  watchdog_clean_flat_candidate?: boolean;
+  robot_clear_candidate?: boolean;
+  clear_allowed?: boolean;
+  can_watchdog_clear?: boolean;
+  predicates?: Record<string, boolean>;
+  failed_predicates?: string[];
+  robot_must_verify?: string[];
+  last_authority_ts_utc?: string;
 }
 
 export interface ActiveAlert {
@@ -201,6 +241,9 @@ export interface StreamState {
   flatten_lookup_reason?: string;
   /** Last authority snapshot matched to this row by execution/canonical instrument — observability only. */
   position_authority?: PositionAuthoritySnapshot | null;
+  instrument_blocked?: boolean;
+  instrument_block_reason?: string | null;
+  instrument_blocks?: RiskLatch[];
   /** @deprecated Execution feed no longer carries prior-session flags */
   carried_over_from_prior_date?: boolean;
   /** @deprecated */
@@ -213,6 +256,8 @@ export enum StreamStateEnum {
   RANGE_BUILDING = "RANGE_BUILDING",
   RANGE_LOCKED = "RANGE_LOCKED",
   OPEN = "OPEN",  // Position open, managing stop/target
+  OPEN_TRACKED = "OPEN_TRACKED",
+  ENTRY_BRACKETS_WORKING = "ENTRY_BRACKETS_WORKING",
   DONE = "DONE"
 }
 
@@ -247,6 +292,9 @@ export interface CarriedActiveLifecycle {
   operator_classification?: string | null;
   note?: string | null;
   position_authority?: PositionAuthoritySnapshot | null;
+  instrument_blocked?: boolean;
+  instrument_block_reason?: string | null;
+  instrument_blocks?: RiskLatch[];
 }
 
 /** Expected vs actual: robot reported slot ended without trade (SLOT_END_SUMMARY). */
@@ -288,6 +336,8 @@ export interface StreamStatesResponse {
   execution_expectation_gaps?: ExecutionExpectationGap[];
   /** Cumulative flatten lookup outcomes (process lifetime); omit on older backends. */
   flatten_lookup_metrics?: FlattenLookupMetrics;
+  active_risk_latches?: RiskLatch[];
+  active_risk_latch_count?: number;
   timetable_unavailable?: boolean;
   enabled_streams_unknown?: boolean;
   timetable_source?: string | null;
@@ -471,6 +521,7 @@ export interface EngineRunSummary {
   mode: string;
   status: string;
   status_reason: string;
+  verdict_class?: string;
   recommended_action?: string;
   confidence?: string;
   instruments: string[];
@@ -479,6 +530,44 @@ export interface EngineRunSummary {
   errors: number;
   key_counts: Record<string, number>;
   flags: Record<string, boolean>;
+  deployed_runtime?: DeployedRuntimeProof | null;
+  watchdog_overlay?: WatchdogRunOverlay;
+  watchdog_platform_diagnostics?: WatchdogPlatformDiagnostics;
+}
+
+export interface DeployedRuntimeProof {
+  exists?: boolean;
+  path?: string | null;
+  sha256?: string | null;
+  size?: number | null;
+  last_write_utc?: string | null;
+  robot_build_signature_event?: {
+    event?: string;
+    ts_utc?: string;
+    data?: {
+      assembly_hash?: string | null;
+      assembly_hash_algorithm?: string | null;
+      assembly_location?: string | null;
+      assembly_last_write_utc?: string | null;
+      assembly_version?: string | null;
+      build_configuration?: string | null;
+    };
+  } | null;
+}
+
+export interface WatchdogRunOverlay {
+  status?: string;
+  status_reason?: string;
+  recommended_action?: string;
+  confidence?: string;
+  proof_level?: string;
+}
+
+export interface WatchdogPlatformDiagnostics {
+  available?: boolean;
+  evidence_level?: string;
+  had_platform_crash_or_freeze_signal?: boolean;
+  events?: unknown[];
 }
 
 export interface RunSummaryUnavailable {

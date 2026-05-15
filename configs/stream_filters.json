@@ -1,7 +1,281 @@
 {
-  "master": {
-    "exclude_days_of_week": [],
-    "exclude_days_of_month": [],
+  "CL1": {
+    "exclude_days_of_month": [
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      15,
+      16,
+      17,
+      18,
+      19,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31
+    ],
+    "exclude_days_of_week": [
+      "Friday"
+    ],
     "exclude_times": []
+  },
+  "CL2": {
+    "exclude_days_of_month": [
+      3,
+      4,
+      5,
+      6,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31
+    ],
+    "exclude_days_of_week": [
+      "Friday",
+      "Thursday"
+    ],
+    "exclude_times": [
+      "09:30"
+    ]
+  },
+  "ES1": {
+    "exclude_days_of_month": [
+      2,
+      3,
+      7,
+      8,
+      16,
+      17,
+      18,
+      25
+    ],
+    "exclude_days_of_week": [
+      "Wednesday"
+    ],
+    "exclude_times": [
+      "07:30"
+    ]
+  },
+  "ES2": {
+    "exclude_days_of_month": [
+      7,
+      8,
+      14,
+      15,
+      16,
+      17,
+      28,
+      29,
+      30,
+      31
+    ],
+    "exclude_days_of_week": [
+      "Wednesday",
+      "Thursday"
+    ],
+    "exclude_times": [
+      "10:30"
+    ]
+  },
+  "GC1": {
+    "exclude_days_of_month": [
+      3,
+      4,
+      5,
+      6,
+      9,
+      10,
+      11,
+      12,
+      13,
+      16,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31
+    ],
+    "exclude_days_of_week": [
+      "Friday",
+      "Wednesday"
+    ],
+    "exclude_times": []
+  },
+  "GC2": {
+    "exclude_days_of_month": [
+      3,
+      4,
+      5,
+      6,
+      16
+    ],
+    "exclude_days_of_week": [],
+    "exclude_times": [
+      "10:30"
+    ]
+  },
+  "NG1": {
+    "exclude_days_of_month": [
+      1,
+      2,
+      3,
+      4,
+      19
+    ],
+    "exclude_days_of_week": [
+      "Thursday"
+    ],
+    "exclude_times": []
+  },
+  "NG2": {
+    "exclude_days_of_month": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      19
+    ],
+    "exclude_days_of_week": [
+      "Wednesday"
+    ],
+    "exclude_times": [
+      "10:00"
+    ]
+  },
+  "NQ1": {
+    "exclude_days_of_month": [
+      1,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      30,
+      31
+    ],
+    "exclude_days_of_week": [
+      "Thursday",
+      "Friday"
+    ],
+    "exclude_times": [
+      "08:00"
+    ]
+  },
+  "NQ2": {
+    "exclude_days_of_month": [
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      16
+    ],
+    "exclude_days_of_week": [],
+    "exclude_times": []
+  },
+  "RTY1": {
+    "exclude_days_of_month": [
+      5,
+      6,
+      7,
+      8,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      30,
+      31
+    ],
+    "exclude_days_of_week": [
+      "Wednesday",
+      "Monday",
+      "Friday"
+    ],
+    "exclude_times": [
+      "07:30"
+    ]
+  },
+  "RTY2": {
+    "exclude_days_of_month": [
+      1,
+      2,
+      3,
+      30,
+      31
+    ],
+    "exclude_days_of_week": [],
+    "exclude_times": [
+      "10:30"
+    ]
+  },
+  "YM1": {
+    "exclude_days_of_month": [
+      1,
+      2,
+      6,
+      7,
+      8,
+      9,
+      31
+    ],
+    "exclude_days_of_week": [
+      "Thursday"
+    ],
+    "exclude_times": [
+      "08:00"
+    ]
+  },
+  "YM2": {
+    "exclude_days_of_month": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+    ],
+    "exclude_days_of_week": [
+      "Monday"
+    ],
+    "exclude_times": [
+      "09:30"
+    ]
+  },
+  "master": {
+    "exclude_days_of_month": [],
+    "exclude_days_of_week": [],
+    "exclude_times": [],
+    "include_streams": []
   }
 }

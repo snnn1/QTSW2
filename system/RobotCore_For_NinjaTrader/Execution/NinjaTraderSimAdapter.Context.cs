@@ -124,6 +124,7 @@ public sealed partial class NinjaTraderSimAdapter
 
     /// <summary>RiskGate gate −1b: execution lock + path-aware policy (instrument, submit_path) — excludes mismatch authority.</summary>
     private Func<string, string?, bool>? _isInstrumentFrozenOrEpaBlocked;
+    private Func<string, string?, string?>? _getInstrumentFrozenOrEpaBlockReason;
 
     /// <summary>Authoritative engine session day (<see cref="RobotEngine.TradingDateString"/>). When null, session-identity gate is skipped (harness/tests).</summary>
     private Func<string?>? _getActiveTradingDateString;

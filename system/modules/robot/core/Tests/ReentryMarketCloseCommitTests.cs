@@ -37,11 +37,38 @@ public static class ReentryMarketCloseCommitTests
         var globalSweepInterruptedBrokerFlat = Case_GlobalSweepInterruptedBrokerFlat_DoesNotCommitAndReenters();
         if (!globalSweepInterruptedBrokerFlat.Pass) return globalSweepInterruptedBrokerFlat;
 
+        var reentryAuthorityWorkingOrderBlock = Case_MarketReentryAuthorityBlocksBrokerWorkingOrderBeforeEnqueue();
+        if (!reentryAuthorityWorkingOrderBlock.Pass) return reentryAuthorityWorkingOrderBlock;
+
+        var globalSweepScope = Case_GlobalSweepDoesNotFlattenOtherEngineScope();
+        if (!globalSweepScope.Pass) return globalSweepScope;
+
+        var trackedReentrySweep = Case_GlobalSweepDoesNotFlattenTrackedReentryFromDifferentSession();
+        if (!trackedReentrySweep.Pass) return trackedReentrySweep;
+
+        var trackedSameSessionReentrySweep = Case_GlobalSweepDoesNotFlattenTrackedReentryWithOpenJournalQty();
+        if (!trackedSameSessionReentrySweep.Pass) return trackedSameSessionReentrySweep;
+
+        var committedTrackedReentrySweep = Case_GlobalSweepDoesNotFlattenCommittedStreamWithOpenReentryJournal();
+        if (!committedTrackedReentrySweep.Pass) return committedTrackedReentrySweep;
+
+        var staleCloseWindowSweep = Case_GlobalSweepDoesNotFlattenStaleCloseWindowWithOpenJournal();
+        if (!staleCloseWindowSweep.Pass) return staleCloseWindowSweep;
+
         var completedStopRetires = Case_SessionCloseCompletedStopWithoutOriginalIntent_CommitsBeforeFlatten();
         if (!completedStopRetires.Pass) return completedStopRetires;
 
         var interruptedOriginalStopRetires = Case_InterruptedOriginalStopClearsStaleReentryAndCommits();
         if (!interruptedOriginalStopRetires.Pass) return interruptedOriginalStopRetires;
+
+        var normalTradeCompletedCallback = Case_NormalTradeCompletedCallback_CommitsStreamJournal();
+        if (!normalTradeCompletedCallback.Pass) return normalTradeCompletedCallback;
+
+        var carryForwardPriorTerminalized = Case_CarryForwardReentryCompletion_CommitsPriorJournal();
+        if (!carryForwardPriorTerminalized.Pass) return carryForwardPriorTerminalized;
+
+        var committedCarryForwardPriorTerminalized = Case_CommittedCarryForwardStartup_CommitsPriorJournal();
+        if (!committedCarryForwardPriorTerminalized.Pass) return committedCarryForwardPriorTerminalized;
 
         var second = Case_ReentryCompleted_CommitsAtMarketClose();
         if (!second.Pass) return second;
@@ -49,11 +76,23 @@ public static class ReentryMarketCloseCommitTests
         var third = Case_ReentryFilledButUncompleted_DoesNotCommitNoTrade();
         if (!third.Pass) return third;
 
+        var mymNoTradeRegression = Case_OpenReentryDefersLateStartUnifiedNoTradeCommit();
+        if (!mymNoTradeRegression.Pass) return mymNoTradeRegression;
+
         var fourth = Case_LateSessionCloseConfirm_AtMarketOpenEnqueuesReentry();
         if (!fourth.Pass) return fourth;
 
+        var singleDayPlaybackSuppress = Case_SingleDayPlaybackLateSessionCloseConfirm_TerminalizesWithoutReentry();
+        if (!singleDayPlaybackSuppress.Pass) return singleDayPlaybackSuppress;
+
         var breakEvenCarryForward = Case_ReentryCarriesBreakEvenStopToCommandAndProtection();
         if (!breakEvenCarryForward.Pass) return breakEvenCarryForward;
+
+        var slotExpiryAfterReentry = Case_SlotExpiryAfterReentry_FlattensOnlyReentryIntent();
+        if (!slotExpiryAfterReentry.Pass) return slotExpiryAfterReentry;
+
+        var flattenVerifierLifecycleRules = Case_FlattenVerifierLifecycleRules_LinkedProtectedReentry();
+        if (!flattenVerifierLifecycleRules.Pass) return flattenVerifierLifecycleRules;
 
         var fifth = Case_LateSessionCloseConfirm_WallClockAfterSlotDefersUntilMarketOpenTick();
         if (!fifth.Pass) return fifth;
@@ -403,6 +442,229 @@ public static class ReentryMarketCloseCommitTests
         }
     }
 
+    private static (bool Pass, string? Error) Case_NormalTradeCompletedCallback_CommitsStreamJournal()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "NormalTradeCompleteCommit_" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            Directory.CreateDirectory(Path.Combine(tempRoot, "logs", "robot", "journal"));
+            Directory.CreateDirectory(RobotRunArtifactPaths.StateExecutionJournals(tempRoot));
+
+            var spec = LoadSpec();
+            var time = new TimeService(spec.timezone);
+            var log = new RobotLogger(tempRoot);
+            var journals = new JournalStore(tempRoot);
+            var executionJournal = new ExecutionJournal(tempRoot, log);
+
+            const string tradingDate = "2026-05-12";
+            const string stream = "CL1";
+            const string instrument = "MCL";
+            const string intentId = "cl1-target-complete";
+            var completedUtc = DateTimeOffset.Parse("2026-05-12T13:54:01Z");
+
+            SeedCompletedTradeWithExit(executionJournal, tradingDate, stream, instrument, intentId, completedUtc.AddSeconds(-1), "TARGET");
+
+            journals.Save(new StreamJournal
+            {
+                TradingDate = tradingDate,
+                Stream = stream,
+                Committed = false,
+                SlotStatus = SlotStatus.ACTIVE,
+                ExecutionInterruptedByClose = false,
+                SlotInstanceKey = "CL1_08:00_2026-05-12",
+                LastState = "RANGE_LOCKED",
+                NextSlotTimeUtc = DateTimeOffset.Parse("2026-05-13T13:00:00Z")
+            });
+
+            var sm = CreateStreamStateMachine(tempRoot, time, spec, log, journals, executionJournal, tradingDate, stream, instrument);
+            sm.HandleExecutionTradeCompleted(intentId, completedUtc, "TARGET");
+
+            var reloaded = journals.TryLoad(tradingDate, stream);
+            if (reloaded?.Committed != true)
+                return (false, "Expected normal completed trade callback to commit the stream journal");
+            if (reloaded.CommitReason != "TRADE_COMPLETED")
+                return (false, $"Expected TRADE_COMPLETED commit reason, got {reloaded.CommitReason ?? "null"}");
+            if (reloaded.SlotStatus != SlotStatus.COMPLETE)
+                return (false, $"Expected COMPLETE slot status, got {reloaded.SlotStatus}");
+            if (reloaded.TerminalState != StreamTerminalState.TRADE_COMPLETED)
+                return (false, $"Expected TRADE_COMPLETED terminal state, got {reloaded.TerminalState?.ToString() ?? "null"}");
+
+            return (true, null);
+        }
+        finally
+        {
+            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, true); } catch { }
+        }
+    }
+
+    private static (bool Pass, string? Error) Case_CarryForwardReentryCompletion_CommitsPriorJournal()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "CarryForwardPriorCommit_" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            Directory.CreateDirectory(Path.Combine(tempRoot, "logs", "robot", "journal"));
+            Directory.CreateDirectory(RobotRunArtifactPaths.StateExecutionJournals(tempRoot));
+
+            var spec = LoadSpec();
+            var time = new TimeService(spec.timezone);
+            var log = new RobotLogger(tempRoot);
+            var journals = new JournalStore(tempRoot);
+            var executionJournal = new ExecutionJournal(tempRoot, log);
+
+            const string priorDate = "2026-05-11";
+            const string currentDate = "2026-05-12";
+            const string stream = "ES2";
+            const string instrument = "MES";
+            const string originalIntent = "es2-original-carry";
+            const string reentryIntent = "es2-reentry-carry";
+            const string slotKey = "ES2_11:00_2026-05-11";
+            var completedUtc = DateTimeOffset.Parse("2026-05-12T16:05:00Z");
+
+            SeedCompletedTrade(executionJournal, priorDate, stream, instrument, originalIntent, completedUtc.AddHours(-18));
+            SeedCompletedTradeWithExit(executionJournal, priorDate, stream, instrument, reentryIntent, completedUtc.AddSeconds(-1), "TARGET");
+
+            journals.Save(new StreamJournal
+            {
+                TradingDate = priorDate,
+                Stream = stream,
+                Committed = false,
+                SlotStatus = SlotStatus.ACTIVE,
+                ExecutionInterruptedByClose = false,
+                OriginalIntentId = originalIntent,
+                ReentryIntentId = reentryIntent,
+                ReentrySubmitted = true,
+                ReentryFilled = true,
+                ProtectionSubmitted = true,
+                ProtectionAccepted = true,
+                SlotInstanceKey = slotKey,
+                LastState = "RANGE_LOCKED",
+                NextSlotTimeUtc = DateTimeOffset.Parse("2026-05-12T16:00:00Z")
+            });
+
+            journals.Save(new StreamJournal
+            {
+                TradingDate = currentDate,
+                Stream = stream,
+                Committed = false,
+                SlotStatus = SlotStatus.ACTIVE,
+                ExecutionInterruptedByClose = false,
+                OriginalIntentId = originalIntent,
+                ReentryIntentId = reentryIntent,
+                ReentrySubmitted = true,
+                ReentryFilled = true,
+                ProtectionSubmitted = true,
+                ProtectionAccepted = true,
+                SlotInstanceKey = slotKey,
+                LastState = "RANGE_LOCKED",
+                NextSlotTimeUtc = DateTimeOffset.Parse("2026-05-12T16:00:00Z"),
+                PriorJournalKey = $"{priorDate}_{stream}"
+            });
+
+            var sm = CreateStreamStateMachine(tempRoot, time, spec, log, journals, executionJournal, currentDate, stream, instrument);
+            sm.HandleExecutionTradeCompleted(reentryIntent, completedUtc, "TARGET");
+
+            var current = journals.TryLoad(currentDate, stream);
+            if (current?.Committed != true)
+                return (false, "Expected carried current-day journal to commit after reentry completion");
+
+            var prior = journals.TryLoad(priorDate, stream);
+            if (prior?.Committed != true)
+                return (false, "Expected original prior-day carried journal to be terminalized with the current clone");
+            if (prior.CommitReason != "REENTRY_TRADE_COMPLETED")
+                return (false, $"Expected prior commit reason REENTRY_TRADE_COMPLETED, got {prior.CommitReason ?? "null"}");
+            if (prior.SlotStatus != SlotStatus.COMPLETE)
+                return (false, $"Expected prior slot status COMPLETE, got {prior.SlotStatus}");
+
+            return (true, null);
+        }
+        finally
+        {
+            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, true); } catch { }
+        }
+    }
+
+    private static (bool Pass, string? Error) Case_CommittedCarryForwardStartup_CommitsPriorJournal()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "CarryForwardStartupMirror_" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            Directory.CreateDirectory(Path.Combine(tempRoot, "logs", "robot", "journal"));
+            Directory.CreateDirectory(RobotRunArtifactPaths.StateExecutionJournals(tempRoot));
+
+            var spec = LoadSpec();
+            var time = new TimeService(spec.timezone);
+            var log = new RobotLogger(tempRoot);
+            var journals = new JournalStore(tempRoot);
+            var executionJournal = new ExecutionJournal(tempRoot, log);
+
+            const string priorDate = "2026-05-12";
+            const string currentDate = "2026-05-13";
+            const string stream = "YM1";
+            const string instrument = "MYM";
+            const string originalIntent = "ym1-original-carry";
+            const string reentryIntent = "ym1-reentry-carry";
+            const string slotKey = "YM1_09:00_2026-05-12";
+
+            journals.Save(new StreamJournal
+            {
+                TradingDate = priorDate,
+                Stream = stream,
+                Committed = false,
+                SlotStatus = SlotStatus.ACTIVE,
+                ExecutionInterruptedByClose = false,
+                OriginalIntentId = originalIntent,
+                ReentryIntentId = reentryIntent,
+                ReentrySubmitted = true,
+                ReentryFilled = true,
+                ProtectionSubmitted = true,
+                ProtectionAccepted = true,
+                SlotInstanceKey = slotKey,
+                LastState = "RANGE_LOCKED",
+                NextSlotTimeUtc = DateTimeOffset.Parse("2026-05-13T14:00:00Z")
+            });
+
+            journals.Save(new StreamJournal
+            {
+                TradingDate = currentDate,
+                Stream = stream,
+                Committed = true,
+                CommitReason = "REENTRY_TRADE_COMPLETED",
+                TerminalState = StreamTerminalState.TRADE_COMPLETED,
+                SlotStatus = SlotStatus.COMPLETE,
+                ExecutionInterruptedByClose = false,
+                OriginalIntentId = originalIntent,
+                ReentryIntentId = reentryIntent,
+                ReentrySubmitted = true,
+                ReentryFilled = true,
+                ProtectionSubmitted = true,
+                ProtectionAccepted = true,
+                SlotInstanceKey = slotKey,
+                LastState = "DONE",
+                NextSlotTimeUtc = DateTimeOffset.Parse("2026-05-13T14:00:00Z"),
+                PriorJournalKey = $"{priorDate}_{stream}"
+            });
+
+            _ = CreateStreamStateMachine(tempRoot, time, spec, log, journals, executionJournal, currentDate, stream, instrument);
+
+            var prior = journals.TryLoad(priorDate, stream);
+            if (prior?.Committed != true)
+                return (false, "Expected startup to terminalize original prior-day journal when current carry-forward clone was already committed");
+            if (prior.CommitReason != "REENTRY_TRADE_COMPLETED")
+                return (false, $"Expected prior commit reason REENTRY_TRADE_COMPLETED, got {prior.CommitReason ?? "null"}");
+            if (prior.SlotStatus != SlotStatus.COMPLETE)
+                return (false, $"Expected prior slot status COMPLETE, got {prior.SlotStatus}");
+
+            return (true, null);
+        }
+        finally
+        {
+            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, true); } catch { }
+        }
+    }
+
     private static (bool Pass, string? Error) Case_ReentryFilledButUncompleted_DoesNotCommitNoTrade()
     {
         var tempRoot = Path.Combine(Path.GetTempPath(), "ReentryNoTradeGate_" + Guid.NewGuid().ToString("N")[..8]);
@@ -452,6 +714,71 @@ public static class ReentryMarketCloseCommitTests
             var reloaded = journals.TryLoad(tradingDate, stream);
             if (reloaded?.Committed == true)
                 return (false, $"Expected stream to remain unresolved at market close, got commit reason {reloaded.CommitReason ?? "null"}");
+
+            return (true, null);
+        }
+        finally
+        {
+            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, true); } catch { }
+        }
+    }
+
+    private static (bool Pass, string? Error) Case_OpenReentryDefersLateStartUnifiedNoTradeCommit()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "MymLateStartReentryGate_" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            Directory.CreateDirectory(Path.Combine(tempRoot, "logs", "robot", "journal"));
+            Directory.CreateDirectory(RobotRunArtifactPaths.StateExecutionJournals(tempRoot));
+
+            var spec = LoadSpec();
+            var time = new TimeService(spec.timezone);
+            var log = new RobotLogger(tempRoot);
+            var journals = new JournalStore(tempRoot);
+            var executionJournal = new ExecutionJournal(tempRoot, log);
+
+            const string tradingDate = "2026-05-13";
+            const string stream = "YM1";
+            const string instrument = "MYM";
+            const string originalIntent = "82b2ba63cd1a3a4b";
+            const string reentryIntent = "98a85943c86dc092";
+            var utc = DateTimeOffset.Parse("2026-05-13T22:01:03Z");
+
+            SeedCompletedTrade(executionJournal, tradingDate, stream, instrument, originalIntent, DateTimeOffset.Parse("2026-05-13T20:55:05Z"));
+            SeedOpenTrade(executionJournal, tradingDate, stream, instrument, reentryIntent, DateTimeOffset.Parse("2026-05-13T22:00:04Z"));
+
+            journals.Save(new StreamJournal
+            {
+                TradingDate = tradingDate,
+                Stream = stream,
+                Committed = false,
+                SlotStatus = SlotStatus.ACTIVE,
+                ExecutionInterruptedByClose = false,
+                ForcedFlattenTimestamp = DateTimeOffset.Parse("2026-05-13T20:55:02Z"),
+                OriginalIntentId = originalIntent,
+                ReentryIntentId = reentryIntent,
+                ReentrySubmitted = true,
+                ReentryFilled = true,
+                ProtectionSubmitted = true,
+                ProtectionAccepted = true,
+                SlotInstanceKey = "YM1_09:00_2026-05-13",
+                LastState = "ARMED",
+                NextSlotTimeUtc = DateTimeOffset.Parse("2026-05-14T16:00:00Z")
+            });
+
+            var sm = CreateStreamStateMachine(tempRoot, time, spec, log, journals, executionJournal, tradingDate, stream, instrument);
+            var committed = InvokeCommit(sm, utc, "NO_TRADE_LATE_START_UNIFIED_BREAKOUT_INVALID", "NO_TRADE_LATE_START_UNIFIED_BREAKOUT_INVALID");
+            if (committed)
+                return (false, "Late-start unified no-trade commit returned true while reentry journal is open");
+
+            var reloaded = journals.TryLoad(tradingDate, stream);
+            if (reloaded?.Committed == true)
+                return (false, $"Expected stream to remain active with open reentry, got committed reason {reloaded.CommitReason ?? "null"}");
+            if (reloaded?.SlotStatus != SlotStatus.ACTIVE)
+                return (false, $"Expected slot status ACTIVE after deferred commit, got {reloaded?.SlotStatus.ToString() ?? "null"}");
+            if (!string.Equals(reloaded?.ReentryIntentId, reentryIntent, StringComparison.OrdinalIgnoreCase))
+                return (false, $"Expected reentry intent {reentryIntent} to remain attached, got {reloaded?.ReentryIntentId ?? "null"}");
 
             return (true, null);
         }
@@ -620,6 +947,7 @@ public static class ReentryMarketCloseCommitTests
                     stream,
                     originalIntent,
                     forcedFlattenUtc,
+                    BrokerFlatAuthority(instrument, "NG", tradingDate, stream, originalIntent, forcedFlattenUtc, 2),
                     brokerPositionQtyAbsAtDecision: 0,
                     journalOpenQtyBeforeClose: 2,
                     triggerSource: "unit_test_session_close_flatten"))
@@ -784,6 +1112,7 @@ public static class ReentryMarketCloseCommitTests
                     stream,
                     originalIntent,
                     forcedFlattenUtc.AddSeconds(1),
+                    BrokerFlatAuthority(instrument, "NG", tradingDate, stream, originalIntent, forcedFlattenUtc.AddSeconds(1), 2),
                     brokerPositionQtyAbsAtDecision: 0,
                     journalOpenQtyBeforeClose: 2,
                     triggerSource: "unit_test_global_sweep_broker_flat"))
@@ -818,6 +1147,441 @@ public static class ReentryMarketCloseCommitTests
         {
             try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, true); } catch { }
         }
+    }
+
+    private static (bool Pass, string? Error) Case_MarketReentryAuthorityBlocksBrokerWorkingOrderBeforeEnqueue()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "ReentryAuthorityWorkingBlock_" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            JournalParityPendingLedger.Clear();
+            QuantExecutionControlStore.Clear();
+            Directory.CreateDirectory(tempRoot);
+            Directory.CreateDirectory(Path.Combine(tempRoot, "logs", "robot", "journal"));
+            Directory.CreateDirectory(RobotRunArtifactPaths.StateExecutionJournals(tempRoot));
+
+            var spec = LoadSpec();
+            var time = new TimeService(spec.timezone);
+            var log = new RobotLogger(tempRoot);
+            var journals = new JournalStore(tempRoot);
+            var executionJournal = new ExecutionJournal(tempRoot, log);
+
+            const string tradingDate = "2026-04-13";
+            const string stream = "NG2";
+            const string instrument = "MNG";
+            const string originalIntent = "orig-ng2-authority-working-block";
+            var forcedFlattenUtc = DateTimeOffset.Parse("2026-04-13T20:55:00Z");
+            var reopenUtc = DateTimeOffset.Parse("2026-04-13T22:00:01Z");
+
+            SeedOpenTrade(executionJournal, tradingDate, stream, instrument, originalIntent, forcedFlattenUtc.AddMinutes(-30));
+
+            journals.Save(new StreamJournal
+            {
+                TradingDate = tradingDate,
+                Stream = stream,
+                Committed = false,
+                SlotStatus = SlotStatus.ACTIVE,
+                ExecutionInterruptedByClose = false,
+                OriginalIntentId = null,
+                ReentrySubmitted = false,
+                ReentryFilled = false,
+                ProtectionSubmitted = false,
+                ProtectionAccepted = false,
+                SlotInstanceKey = "2026-04-13_NG2_11:00",
+                LastState = "RANGE_LOCKED",
+                NextSlotTimeUtc = DateTimeOffset.Parse("2026-04-14T16:00:00Z")
+            });
+
+            var capturingAdapter = new CapturingExecutionAdapter(log);
+            capturingAdapter.Snapshot.WorkingOrders!.Add(new WorkingOrderSnapshot
+            {
+                Instrument = instrument,
+                OrderId = "stale-working-order",
+                Tag = "QTSW2:stale-working-order",
+                Quantity = 1
+            });
+
+            var sm = CreateStreamStateMachine(tempRoot, time, spec, log, journals, executionJournal, tradingDate, stream, instrument, capturingAdapter);
+            if (!sm.MarkSessionCloseInterruptedByGlobalSweep(forcedFlattenUtc, originalIntent, "unit_test_global_sweep"))
+                return (false, "Expected global sweep to mark live stream interrupted");
+
+            if (!executionJournal.RecordReconciliationComplete(
+                    tradingDate,
+                    stream,
+                    originalIntent,
+                    forcedFlattenUtc.AddSeconds(1),
+                    BrokerFlatAuthority(instrument, "NG", tradingDate, stream, originalIntent, forcedFlattenUtc.AddSeconds(1), 2),
+                    brokerPositionQtyAbsAtDecision: 0,
+                    journalOpenQtyBeforeClose: 2,
+                    triggerSource: "unit_test_global_sweep_broker_flat"))
+            {
+                return (false, "Expected test setup to close interrupted original intent with RECONCILIATION_BROKER_FLAT");
+            }
+
+            sm.HandleForcedFlatten(forcedFlattenUtc.AddSeconds(2));
+            sm.Tick(reopenUtc);
+
+            if (capturingAdapter.TryGetLastCommand<SubmitMarketReentryCommand>(out var cmd) && cmd != null)
+                return (false, "UEA market-reentry authority should block enqueue while broker working orders remain");
+
+            var reloaded = journals.TryLoad(tradingDate, stream);
+            if (reloaded?.ReentrySubmitPending == true)
+                return (false, "UEA-denied market reentry must not set ReentrySubmitPending");
+            if (!string.IsNullOrWhiteSpace(reloaded?.ReentryIntentId))
+                return (false, $"UEA-denied market reentry must not persist ReentryIntentId, got {reloaded.ReentryIntentId}");
+
+            return (true, null);
+        }
+        finally
+        {
+            JournalParityPendingLedger.Clear();
+            QuantExecutionControlStore.Clear();
+            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, true); } catch { }
+        }
+    }
+
+    private static (bool Pass, string? Error) Case_GlobalSweepDoesNotFlattenOtherEngineScope()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "GlobalSweepScope_" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+
+            const string tradingDate = "2026-05-11";
+            const string sessionClass = "S1";
+            const string instrument = "MES";
+            const string intentId = "scope-mes-reentry";
+            var utc = DateTimeOffset.Parse("2026-05-11T22:01:06Z");
+
+            var nonOwnerRoot = Path.Combine(tempRoot, "non_owner");
+            Directory.CreateDirectory(RobotRunArtifactPaths.StateStreamJournals(nonOwnerRoot));
+            var nonOwnerLog = new RobotLogger(nonOwnerRoot);
+            var nonOwnerAdapter = CreateGlobalSweepSnapshotAdapter(nonOwnerLog, instrument, intentId);
+            var nonOwnerEngine = new RobotEngine(
+                nonOwnerRoot,
+                TimeSpan.FromSeconds(60),
+                ExecutionMode.DRYRUN,
+                null,
+                null,
+                "MNG",
+                useAsyncLogging: false);
+
+            nonOwnerEngine.RunSessionCloseGlobalExposureSweepForTest(nonOwnerAdapter, tradingDate, sessionClass, utc);
+
+            if (nonOwnerAdapter.SessionCloseFlattenRequests.Count != 0)
+                return (false, $"Non-owner engine MNG must not flatten MES shared account exposure; got {nonOwnerAdapter.SessionCloseFlattenRequests.Count} requests");
+
+            var ownerRoot = Path.Combine(tempRoot, "owner");
+            Directory.CreateDirectory(RobotRunArtifactPaths.StateStreamJournals(ownerRoot));
+            var ownerLog = new RobotLogger(ownerRoot);
+            var ownerAdapter = CreateGlobalSweepSnapshotAdapter(ownerLog, instrument, intentId);
+            var ownerEngine = new RobotEngine(
+                ownerRoot,
+                TimeSpan.FromSeconds(60),
+                ExecutionMode.DRYRUN,
+                null,
+                null,
+                instrument,
+                useAsyncLogging: false);
+
+            ownerEngine.RunSessionCloseGlobalExposureSweepForTest(ownerAdapter, tradingDate, sessionClass, utc);
+
+            if (ownerAdapter.SessionCloseFlattenRequests.Count != 1)
+                return (false, $"Owner engine MES should still request one global sweep flatten, got {ownerAdapter.SessionCloseFlattenRequests.Count}");
+
+            var request = ownerAdapter.SessionCloseFlattenRequests[0];
+            if (!string.Equals(request.IntentId, intentId, StringComparison.OrdinalIgnoreCase))
+                return (false, $"Expected owner sweep intent {intentId}, got {request.IntentId}");
+            if (!string.Equals(request.Instrument, instrument, StringComparison.OrdinalIgnoreCase))
+                return (false, $"Expected owner sweep instrument {instrument}, got {request.Instrument}");
+
+            return (true, null);
+        }
+        finally
+        {
+            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, true); } catch { }
+        }
+    }
+
+    private static (bool Pass, string? Error) Case_GlobalSweepDoesNotFlattenTrackedReentryFromDifferentSession()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "GlobalSweepTrackedReentry_" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            Directory.CreateDirectory(Path.Combine(tempRoot, "logs", "robot", "journal"));
+            Directory.CreateDirectory(RobotRunArtifactPaths.StateExecutionJournals(tempRoot));
+
+            const string tradingDate = "2026-05-11";
+            const string stream = "NG2";
+            const string instrument = "MNG";
+            const string originalIntent = "ng2-original";
+            const string reentryIntent = "ng2-reentry";
+            var utc = DateTimeOffset.Parse("2026-05-11T22:01:00Z");
+
+            var spec = LoadSpec();
+            var time = new TimeService(spec.timezone);
+            var log = new RobotLogger(tempRoot);
+            var journals = new JournalStore(tempRoot);
+            var executionJournal = new ExecutionJournal(tempRoot, log);
+            SeedCompletedTrade(executionJournal, tradingDate, stream, instrument, originalIntent, utc.AddMinutes(-66));
+            SeedOpenTrade(executionJournal, tradingDate, stream, instrument, reentryIntent, utc.AddMinutes(-1));
+
+            journals.Save(new StreamJournal
+            {
+                TradingDate = tradingDate,
+                Stream = stream,
+                Committed = false,
+                SlotStatus = SlotStatus.ACTIVE,
+                ExecutionInterruptedByClose = false,
+                ForcedFlattenTimestamp = DateTimeOffset.Parse("2026-05-11T20:55:00Z"),
+                OriginalIntentId = originalIntent,
+                ReentryIntentId = reentryIntent,
+                ReentrySubmitted = true,
+                ReentryFilled = true,
+                ProtectionSubmitted = true,
+                ProtectionAccepted = true,
+                SlotInstanceKey = "2026-05-11_NG2_11:00",
+                LastState = "RANGE_LOCKED"
+            });
+
+            var adapter = CreateGlobalSweepSnapshotAdapter(log, instrument, reentryIntent);
+            var engine = new RobotEngine(
+                tempRoot,
+                TimeSpan.FromSeconds(60),
+                ExecutionMode.DRYRUN,
+                null,
+                null,
+                instrument,
+                useAsyncLogging: false);
+            var sm = CreateStreamStateMachine(tempRoot, time, spec, log, journals, executionJournal, tradingDate, stream, instrument, adapter, engine);
+            AddStreamForTest(engine, stream, sm);
+
+            engine.RunSessionCloseGlobalExposureSweepForTest(adapter, tradingDate, "S1", utc);
+
+            if (adapter.SessionCloseFlattenRequests.Count != 0)
+                return (false, $"S1 global sweep must not flatten active S2 reentry {reentryIntent}; got {adapter.SessionCloseFlattenRequests.Count} request(s)");
+
+            return (true, null);
+        }
+        finally
+        {
+            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, true); } catch { }
+        }
+    }
+
+    private static (bool Pass, string? Error) Case_GlobalSweepDoesNotFlattenTrackedReentryWithOpenJournalQty()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "GlobalSweepOpenReentry_" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            Directory.CreateDirectory(Path.Combine(tempRoot, "logs", "robot", "journal"));
+            Directory.CreateDirectory(RobotRunArtifactPaths.StateExecutionJournals(tempRoot));
+
+            const string tradingDate = "2026-05-13";
+            const string stream = "YM1";
+            const string instrument = "MYM";
+            const string originalIntent = "ym1-original";
+            const string reentryIntent = "ym1-reentry";
+            var utc = DateTimeOffset.Parse("2026-05-13T22:02:03Z");
+
+            var log = new RobotLogger(tempRoot);
+            var journals = new JournalStore(tempRoot);
+            var executionJournal = new ExecutionJournal(tempRoot, log);
+            SeedCompletedTrade(executionJournal, tradingDate, stream, instrument, originalIntent, utc.AddMinutes(-67));
+            SeedOpenTrade(executionJournal, tradingDate, stream, instrument, reentryIntent, utc.AddMinutes(-2));
+
+            journals.Save(new StreamJournal
+            {
+                TradingDate = tradingDate,
+                Stream = stream,
+                Committed = false,
+                SlotStatus = SlotStatus.ACTIVE,
+                ExecutionInterruptedByClose = false,
+                ForcedFlattenTimestamp = DateTimeOffset.Parse("2026-05-13T20:55:02Z"),
+                OriginalIntentId = originalIntent,
+                ReentryIntentId = reentryIntent,
+                ReentrySubmitted = true,
+                ReentryFilled = true,
+                ProtectionSubmitted = true,
+                ProtectionAccepted = true,
+                SlotInstanceKey = "YM1_09:00_2026-05-13",
+                LastState = "ARMED"
+            });
+
+            var adapter = CreateGlobalSweepSnapshotAdapter(log, instrument, reentryIntent);
+            var engine = new RobotEngine(
+                tempRoot,
+                TimeSpan.FromSeconds(60),
+                ExecutionMode.DRYRUN,
+                null,
+                null,
+                instrument,
+                useAsyncLogging: false);
+
+            engine.RunSessionCloseGlobalExposureSweepForTest(adapter, tradingDate, "S1", utc);
+
+            if (adapter.SessionCloseFlattenRequests.Count != 0)
+                return (false, $"Global sweep must not flatten tracked open reentry {reentryIntent}; got {adapter.SessionCloseFlattenRequests.Count} request(s)");
+
+            return (true, null);
+        }
+        finally
+        {
+            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, true); } catch { }
+        }
+    }
+
+    private static (bool Pass, string? Error) Case_GlobalSweepDoesNotFlattenCommittedStreamWithOpenReentryJournal()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "GlobalSweepCommittedOpenReentry_" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            Directory.CreateDirectory(Path.Combine(tempRoot, "logs", "robot", "journal"));
+            Directory.CreateDirectory(RobotRunArtifactPaths.StateExecutionJournals(tempRoot));
+
+            const string tradingDate = "2026-05-13";
+            const string stream = "YM1";
+            const string instrument = "MYM";
+            const string originalIntent = "ym1-original-committed";
+            const string reentryIntent = "ym1-reentry-committed";
+            var utc = DateTimeOffset.Parse("2026-05-13T22:02:03Z");
+
+            var log = new RobotLogger(tempRoot);
+            var journals = new JournalStore(tempRoot);
+            var executionJournal = new ExecutionJournal(tempRoot, log);
+            SeedCompletedTrade(executionJournal, tradingDate, stream, instrument, originalIntent, utc.AddMinutes(-67));
+            SeedOpenTrade(executionJournal, tradingDate, stream, instrument, reentryIntent, utc.AddMinutes(-2));
+
+            journals.Save(new StreamJournal
+            {
+                TradingDate = tradingDate,
+                Stream = stream,
+                Committed = true,
+                CommitReason = "NO_TRADE_LATE_START_UNIFIED_BREAKOUT_INVALID",
+                TerminalState = StreamTerminalState.NO_TRADE,
+                SlotStatus = SlotStatus.NO_TRADE,
+                ExecutionInterruptedByClose = false,
+                ForcedFlattenTimestamp = DateTimeOffset.Parse("2026-05-13T20:55:02Z"),
+                OriginalIntentId = originalIntent,
+                ReentryIntentId = reentryIntent,
+                ReentrySubmitted = true,
+                ReentryFilled = true,
+                ProtectionSubmitted = true,
+                ProtectionAccepted = true,
+                SlotInstanceKey = "YM1_09:00_2026-05-13",
+                LastState = "DONE"
+            });
+
+            var adapter = CreateGlobalSweepSnapshotAdapter(log, instrument, reentryIntent);
+            var engine = new RobotEngine(
+                tempRoot,
+                TimeSpan.FromSeconds(60),
+                ExecutionMode.DRYRUN,
+                null,
+                null,
+                instrument,
+                useAsyncLogging: false);
+
+            engine.RunSessionCloseGlobalExposureSweepForTest(adapter, tradingDate, "S1", utc);
+
+            if (adapter.SessionCloseFlattenRequests.Count != 0)
+                return (false, $"Global sweep must not flatten committed stream with open reentry journal {reentryIntent}; got {adapter.SessionCloseFlattenRequests.Count} request(s)");
+
+            return (true, null);
+        }
+        finally
+        {
+            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, true); } catch { }
+        }
+    }
+
+    private static (bool Pass, string? Error) Case_GlobalSweepDoesNotFlattenStaleCloseWindowWithOpenJournal()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "GlobalSweepStaleWindowOpenJournal_" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            Directory.CreateDirectory(Path.Combine(tempRoot, "logs", "robot", "journal"));
+            Directory.CreateDirectory(RobotRunArtifactPaths.StateExecutionJournals(tempRoot));
+
+            const string tradingDate = "2026-05-13";
+            const string stream = "YM1";
+            const string instrument = "MYM";
+            const string originalIntent = "ym1-original-stale-window";
+            const string reentryIntent = "ym1-reentry-stale-window";
+            var utc = DateTimeOffset.Parse("2026-05-13T22:02:04Z");
+            var forcedFlattenUtc = DateTimeOffset.Parse("2026-05-13T20:55:02Z");
+
+            var log = new RobotLogger(tempRoot);
+            var journals = new JournalStore(tempRoot);
+            var executionJournal = new ExecutionJournal(tempRoot, log);
+            SeedCompletedTrade(executionJournal, tradingDate, stream, instrument, originalIntent, forcedFlattenUtc.AddSeconds(3));
+            SeedOpenTrade(executionJournal, tradingDate, stream, instrument, reentryIntent, utc.AddMinutes(-2));
+
+            journals.Save(new StreamJournal
+            {
+                TradingDate = tradingDate,
+                Stream = stream,
+                Committed = true,
+                CommitReason = "NO_TRADE_LATE_START_UNIFIED_BREAKOUT_INVALID",
+                TerminalState = StreamTerminalState.NO_TRADE,
+                SlotStatus = SlotStatus.NO_TRADE,
+                ExecutionInterruptedByClose = false,
+                ForcedFlattenTimestamp = forcedFlattenUtc,
+                OriginalIntentId = originalIntent,
+                ReentryIntentId = null,
+                ReentrySubmitted = false,
+                ReentryFilled = false,
+                ProtectionSubmitted = false,
+                ProtectionAccepted = false,
+                SlotInstanceKey = "YM1_09:00_2026-05-13",
+                LastState = "DONE"
+            });
+
+            var adapter = CreateGlobalSweepSnapshotAdapter(log, instrument, reentryIntent);
+            var engine = new RobotEngine(
+                tempRoot,
+                TimeSpan.FromSeconds(60),
+                ExecutionMode.DRYRUN,
+                null,
+                null,
+                instrument,
+                useAsyncLogging: false);
+
+            engine.RunSessionCloseGlobalExposureSweepForTest(adapter, tradingDate, "S1", utc);
+
+            if (adapter.SessionCloseFlattenRequests.Count != 0)
+                return (false, $"Global sweep must not flatten journal-backed exposure from a stale close window; got {adapter.SessionCloseFlattenRequests.Count} request(s)");
+
+            return (true, null);
+        }
+        finally
+        {
+            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, true); } catch { }
+        }
+    }
+
+    private static CapturingExecutionAdapter CreateGlobalSweepSnapshotAdapter(RobotLogger log, string instrument, string intentId)
+    {
+        var adapter = new CapturingExecutionAdapter(log);
+        adapter.Snapshot.Positions!.Add(new PositionSnapshot
+        {
+            Instrument = instrument,
+            Quantity = 2,
+            AveragePrice = 5000m
+        });
+        adapter.Snapshot.WorkingOrders!.Add(new WorkingOrderSnapshot
+        {
+            Instrument = instrument,
+            OrderId = "working-stop-" + intentId,
+            Tag = RobotOrderIds.EncodeStopTag(intentId),
+            OrderType = "StopMarket",
+            Quantity = 2
+        });
+        return adapter;
     }
 
     private static (bool Pass, string? Error) Case_LateSessionCloseConfirm_AtMarketOpenEnqueuesReentry()
@@ -874,6 +1638,101 @@ public static class ReentryMarketCloseCommitTests
                 return (false, "Expected ReentrySubmitPending=true after late session-close reentry enqueue");
             if (string.IsNullOrWhiteSpace(reloaded?.ReentryIntentId))
                 return (false, "Expected ReentryIntentId to be created after late session-close reentry enqueue");
+
+            return (true, null);
+        }
+        finally
+        {
+            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, true); } catch { }
+        }
+    }
+
+    private static (bool Pass, string? Error) Case_SingleDayPlaybackLateSessionCloseConfirm_TerminalizesWithoutReentry()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "SingleDayPlaybackFlattenTerminal_" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            Directory.CreateDirectory(Path.Combine(tempRoot, "logs", "robot", "journal"));
+            Directory.CreateDirectory(RobotRunArtifactPaths.StateExecutionJournals(tempRoot));
+
+            var spec = LoadSpec();
+            var time = new TimeService(spec.timezone);
+            var log = new RobotLogger(tempRoot);
+            var journals = new JournalStore(tempRoot);
+            var executionJournal = new ExecutionJournal(tempRoot, log);
+
+            const string tradingDate = "2026-05-12";
+            const string stream = "NG1";
+            const string instrument = "MNG";
+            const string originalIntent = "orig-ng1-single-day-playback";
+            var forcedFlattenUtc = DateTimeOffset.Parse("2026-05-12T20:56:00Z");
+            var reopenUtc = DateTimeOffset.Parse("2026-05-12T22:01:00Z");
+
+            SeedCompletedTrade(executionJournal, tradingDate, stream, instrument, originalIntent, forcedFlattenUtc);
+
+            var interruptedJournal = new StreamJournal
+            {
+                TradingDate = tradingDate,
+                Stream = stream,
+                Committed = false,
+                SlotStatus = SlotStatus.ACTIVE,
+                ExecutionInterruptedByClose = true,
+                ForcedFlattenTimestamp = forcedFlattenUtc,
+                OriginalIntentId = originalIntent,
+                ReentrySubmitted = false,
+                ReentryFilled = false,
+                ProtectionSubmitted = false,
+                ProtectionAccepted = false,
+                SlotInstanceKey = "2026-05-12_NG1_09:00",
+                LastState = "RANGE_LOCKED",
+                NextSlotTimeUtc = DateTimeOffset.Parse("2026-05-13T14:00:00Z")
+            };
+            journals.Save(interruptedJournal);
+
+            var capturingAdapter = new CapturingExecutionAdapter(log);
+            var sm = CreateStreamStateMachine(
+                tempRoot,
+                time,
+                spec,
+                log,
+                journals,
+                executionJournal,
+                tradingDate,
+                stream,
+                instrument,
+                capturingAdapter,
+                executionMode: ExecutionMode.SIM,
+                ignoreExistingStreamJournals: true);
+            SetPrivate(sm, "_journal", interruptedJournal);
+
+            sm.HandleLateSessionCloseFlattenConfirmed(reopenUtc);
+
+            if (capturingAdapter.CommandCount != 0)
+                return (false, $"Single-day isolated playback must not enqueue market reentry, got {capturingAdapter.CommandCount} command(s)");
+
+            var reloaded = journals.TryLoad(tradingDate, stream);
+            if (reloaded?.Committed != true)
+                return (false,
+                    "Expected single-day isolated playback completed forced-flatten stream to terminalize; " +
+                    $"journal_present={reloaded != null}, committed={reloaded?.Committed.ToString() ?? "null"}, " +
+                    $"commit_reason={reloaded?.CommitReason ?? "null"}, slot_status={reloaded?.SlotStatus.ToString() ?? "null"}, " +
+                    $"terminal_state={reloaded?.TerminalState?.ToString() ?? "null"}, last_state={reloaded?.LastState ?? "null"}, " +
+                    $"execution_interrupted_by_close={reloaded?.ExecutionInterruptedByClose.ToString() ?? "null"}, " +
+                    $"reentry_intent_id={reloaded?.ReentryIntentId ?? "null"}, reentry_submitted={reloaded?.ReentrySubmitted.ToString() ?? "null"}, " +
+                    $"reentry_filled={reloaded?.ReentryFilled.ToString() ?? "null"}");
+            if (reloaded.CommitReason != "SINGLE_DAY_PLAYBACK_FORCED_FLATTEN_TERMINAL")
+                return (false, $"Expected SINGLE_DAY_PLAYBACK_FORCED_FLATTEN_TERMINAL, got {reloaded.CommitReason ?? "null"}");
+            if (reloaded.SlotStatus != SlotStatus.COMPLETE)
+                return (false, $"Expected slot COMPLETE, got {reloaded.SlotStatus}");
+            if (reloaded.TerminalState != StreamTerminalState.TRADE_COMPLETED)
+                return (false, $"Expected TRADE_COMPLETED terminal state, got {reloaded.TerminalState?.ToString() ?? "null"}");
+            if (reloaded.ExecutionInterruptedByClose)
+                return (false, "Expected ExecutionInterruptedByClose=false after terminalizing broker-flat forced flatten");
+            if (reloaded.ReentrySubmitPending || reloaded.ReentrySubmitted || reloaded.ReentryFilled)
+                return (false, "Expected no reentry lifecycle state in single-day isolated playback terminal stream");
+            if (!string.IsNullOrWhiteSpace(reloaded.ReentryIntentId))
+                return (false, $"Expected no ReentryIntentId, got {reloaded.ReentryIntentId}");
 
             return (true, null);
         }
@@ -1007,6 +1866,102 @@ public static class ReentryMarketCloseCommitTests
         {
             try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, true); } catch { }
         }
+    }
+
+    private static (bool Pass, string? Error) Case_SlotExpiryAfterReentry_FlattensOnlyReentryIntent()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "ReentrySlotExpiry_" + Guid.NewGuid().ToString("N")[..8]);
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            Directory.CreateDirectory(Path.Combine(tempRoot, "logs", "robot", "journal"));
+            Directory.CreateDirectory(RobotRunArtifactPaths.StateExecutionJournals(tempRoot));
+
+            var spec = LoadSpec();
+            var time = new TimeService(spec.timezone);
+            var log = new RobotLogger(tempRoot);
+            var journals = new JournalStore(tempRoot);
+            var executionJournal = new ExecutionJournal(tempRoot, log);
+
+            const string tradingDate = "2026-05-06";
+            const string stream = "YM1";
+            const string instrument = "MYM";
+            const string originalIntent = "orig-ym1-slot-expiry";
+            const string reentryIntent = "reentry-ym1-slot-expiry";
+            var forcedFlattenUtc = DateTimeOffset.Parse("2026-05-06T20:55:00Z");
+            var expiryUtc = DateTimeOffset.Parse("2026-05-07T16:00:00Z");
+
+            SeedCompletedTrade(executionJournal, tradingDate, stream, instrument, originalIntent, forcedFlattenUtc);
+            SeedOpenTrade(executionJournal, tradingDate, stream, instrument, reentryIntent, forcedFlattenUtc.AddHours(1));
+
+            journals.Save(new StreamJournal
+            {
+                TradingDate = tradingDate,
+                Stream = stream,
+                Committed = false,
+                SlotStatus = SlotStatus.ACTIVE,
+                ExecutionInterruptedByClose = false,
+                ForcedFlattenTimestamp = forcedFlattenUtc,
+                OriginalIntentId = originalIntent,
+                ReentryIntentId = reentryIntent,
+                ReentrySubmitted = true,
+                ReentryFilled = true,
+                ProtectionSubmitted = true,
+                ProtectionAccepted = true,
+                SlotInstanceKey = "2026-05-06_YM1_11:00",
+                LastState = "RANGE_LOCKED",
+                NextSlotTimeUtc = expiryUtc
+            });
+
+            var adapter = new CapturingExecutionAdapter(log);
+            var sm = CreateStreamStateMachine(tempRoot, time, spec, log, journals, executionJournal, tradingDate, stream, instrument, adapter);
+            sm.Tick(expiryUtc.AddSeconds(1));
+
+            if (adapter.FlattenRequests.Count != 1)
+                return (false, $"Expected exactly one slot-expiry flatten request after reentry, got {adapter.FlattenRequests.Count}");
+
+            var request = adapter.FlattenRequests[0];
+            if (!string.Equals(request.IntentId, reentryIntent, StringComparison.Ordinal))
+                return (false, $"Expected slot expiry to flatten reentry intent {reentryIntent}, got {request.IntentId}");
+
+            var reloaded = journals.TryLoad(tradingDate, stream);
+            if (reloaded?.CommitReason != "SLOT_EXPIRED")
+                return (false, $"Expected SLOT_EXPIRED stream commit after reentry slot expiry, got {reloaded?.CommitReason ?? "null"}");
+
+            return (true, null);
+        }
+        finally
+        {
+            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, true); } catch { }
+        }
+    }
+
+    private static (bool Pass, string? Error) Case_FlattenVerifierLifecycleRules_LinkedProtectedReentry()
+    {
+        if (!FlattenVerifierLifecycleRules.ShouldRetireForLinkedProtectedReentry(
+                originalTradeCompleted: true,
+                originalOpenQty: 0,
+                streamOriginalMatches: true,
+                reentryIntentId: "reentry-ok",
+                reentrySubmitted: true,
+                reentryFilled: true,
+                protectionAccepted: true,
+                reentryTradeCompleted: false,
+                reentryOpenQty: 2))
+        {
+            return (false, "Expected stale flatten verifier to retire for linked protected open reentry");
+        }
+
+        if (FlattenVerifierLifecycleRules.ShouldRetireForLinkedProtectedReentry(true, 1, true, "reentry", true, true, true, false, 2))
+            return (false, "Must not retire when original open quantity remains");
+        if (FlattenVerifierLifecycleRules.ShouldRetireForLinkedProtectedReentry(true, 0, false, "reentry", true, true, true, false, 2))
+            return (false, "Must not retire when stream journal does not match original intent");
+        if (FlattenVerifierLifecycleRules.ShouldRetireForLinkedProtectedReentry(true, 0, true, "reentry", true, true, false, false, 2))
+            return (false, "Must not retire before reentry protection is accepted");
+        if (FlattenVerifierLifecycleRules.ShouldRetireForLinkedProtectedReentry(true, 0, true, "reentry", true, true, true, true, 0))
+            return (false, "Must not retire when reentry lifecycle is already terminal");
+
+        return (true, null);
     }
 
     private static (bool Pass, string? Error) Case_LateSessionCloseConfirm_WallClockAfterSlotDefersUntilMarketOpenTick()
@@ -1144,7 +2099,10 @@ public static class ReentryMarketCloseCommitTests
         string tradingDate,
         string stream,
         string instrument,
-        IExecutionAdapter? executionAdapter = null)
+        IExecutionAdapter? executionAdapter = null,
+        RobotEngine? engine = null,
+        ExecutionMode executionMode = ExecutionMode.DRYRUN,
+        bool ignoreExistingStreamJournals = false)
     {
         var directive = new TimetableStream
         {
@@ -1164,13 +2122,23 @@ public static class ReentryMarketCloseCommitTests
             DateOnly.Parse(tradingDate),
             "test_hash",
             directive,
-            ExecutionMode.DRYRUN,
+            executionMode,
             1,
             2,
             tempRoot,
             tempRoot,
+            ignoreExistingStreamJournals,
             executionAdapter: executionAdapter ?? new NullExecutionAdapter(log),
-            executionJournal: executionJournal);
+            executionJournal: executionJournal,
+            engine: engine);
+    }
+
+    private static void AddStreamForTest(RobotEngine engine, string streamKey, StreamStateMachine stream)
+    {
+        var field = typeof(RobotEngine).GetField("_streams", BindingFlags.Instance | BindingFlags.NonPublic);
+        var streams = field?.GetValue(engine) as System.Collections.Generic.Dictionary<string, StreamStateMachine>;
+        if (streams != null)
+            streams[streamKey] = stream;
     }
 
     private static bool InvokeTryCommitCompletedTradeAtMarketClose(StreamStateMachine sm, DateTimeOffset utcNow)
@@ -1185,6 +2153,12 @@ public static class ReentryMarketCloseCommitTests
         method?.Invoke(sm, new object[] { utcNow });
     }
 
+    private static bool InvokeCommit(StreamStateMachine sm, DateTimeOffset utcNow, string commitReason, string eventType)
+    {
+        var method = typeof(StreamStateMachine).GetMethod("Commit", BindingFlags.Instance | BindingFlags.NonPublic);
+        return method != null && (bool)(method.Invoke(sm, new object[] { utcNow, commitReason, eventType }) ?? false);
+    }
+
     private static string InvokeComputeIntentId(StreamStateMachine sm, string direction, decimal entryPrice, string triggerReason)
     {
         var slotProp = typeof(StreamStateMachine).GetProperty("SlotTimeUtc", BindingFlags.Instance | BindingFlags.Public);
@@ -1192,6 +2166,26 @@ public static class ReentryMarketCloseCommitTests
         var method = typeof(StreamStateMachine).GetMethod("ComputeIntentId", BindingFlags.Instance | BindingFlags.NonPublic);
         return (string)(method?.Invoke(sm, new object[] { direction, entryPrice, slotTimeUtc, triggerReason }) ?? "");
     }
+
+    private static ExecutionAuthorityActionDecision BrokerFlatAuthority(
+        string instrument,
+        string canonicalInstrument,
+        string tradingDate,
+        string stream,
+        string intentId,
+        DateTimeOffset utcNow,
+        int journalOpenQty) =>
+        ExecutionJournal.EvaluateBrokerFlatJournalCompletionAuthority(
+            "ReentryMarketCloseCommitTests",
+            instrument,
+            canonicalInstrument,
+            tradingDate,
+            stream,
+            intentId,
+            utcNow,
+            brokerPositionQtyAbsAtDecision: 0,
+            brokerWorkingOrderCount: 0,
+            journalOpenQtyBeforeClose: journalOpenQty);
 
     private static void SetPrivate<T>(StreamStateMachine sm, string name, T value)
     {

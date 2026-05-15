@@ -110,7 +110,7 @@ public sealed partial class NinjaTraderSimAdapter
                     note = "Multiple entry orders prevented - only one entry order allowed per intent"
                 }));
                 
-                return OrderSubmissionResult.FailureResult(error, utcNow);
+                return DuplicateEntryResubmitResult(existingOrder.OrderId, utcNow);
             }
             
             // If existing order is filled, allow new entry (shouldn't happen but handle gracefully)
@@ -124,7 +124,7 @@ public sealed partial class NinjaTraderSimAdapter
                     note = "This should not happen - entry orders should only be submitted once per intent"
                 }));
                 
-                return OrderSubmissionResult.FailureResult("Entry order already filled for this intent", utcNow);
+                return DuplicateEntryResubmitResult(existingOrder.OrderId, utcNow);
             }
         }
 

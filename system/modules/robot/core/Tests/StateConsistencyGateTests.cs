@@ -23,19 +23,46 @@ public static class StateConsistencyGateTests
             WorkingOrders = new List<WorkingOrderSnapshot>()
         };
 
-        StateConsistencyReleaseReadinessResult Ready(string inst) => new()
+        StateConsistencyReleaseReadinessResult WithMismatchReleaseAuthority(StateConsistencyReleaseReadinessResult r)
+        {
+            r.SnapshotSufficient = true;
+            r.CanonicalReleaseAuthorityAllowed = true;
+            r.CanonicalReleaseAuthorityGate = "AuthorityMismatchRelease";
+            r.CanonicalReleaseAuthorityFrameId = "test-authority-frame";
+            return r;
+        }
+
+        StateConsistencyReleaseReadinessResult Ready(string inst) => WithMismatchReleaseAuthority(new StateConsistencyReleaseReadinessResult
         {
             Instrument = inst,
+            SnapshotSufficient = true,
             ReleaseReady = true,
             IsExplainable = true,
             BrokerPositionExplainable = true,
             BrokerWorkingExplainable = true,
             LocalStateCoherent = true,
             PendingAdoptionExists = false,
+            DiagnosticBrokerPositionQty = 1,
+            DiagnosticJournalOpenQty = 1,
+            DiagnosticBrokerWorkingCount = 0,
+            DiagnosticIeaOwnedPlusAdoptedWorking = 0,
             Summary = "release_ready"
+        });
+
+        StateConsistencyReleaseReadinessResult ReadyWithoutCanonicalAuthority(string inst) => new()
+        {
+            Instrument = inst,
+            SnapshotSufficient = true,
+            ReleaseReady = true,
+            IsExplainable = true,
+            BrokerPositionExplainable = true,
+            BrokerWorkingExplainable = true,
+            LocalStateCoherent = true,
+            PendingAdoptionExists = false,
+            Summary = "release_ready_no_authority"
         };
 
-        StateConsistencyReleaseReadinessResult ImmediateBrokerFlatReady(string inst) => new()
+        StateConsistencyReleaseReadinessResult ImmediateBrokerFlatReady(string inst) => WithMismatchReleaseAuthority(new StateConsistencyReleaseReadinessResult
         {
             Instrument = inst,
             SnapshotSufficient = true,
@@ -50,9 +77,9 @@ public static class StateConsistencyGateTests
             DiagnosticBrokerWorkingCount = 0,
             DiagnosticIeaOwnedPlusAdoptedWorking = 0,
             Summary = "release_ready"
-        };
+        });
 
-        StateConsistencyReleaseReadinessResult ImmediateBrokerFlatReadyUnknownIea(string inst) => new()
+        StateConsistencyReleaseReadinessResult ImmediateBrokerFlatReadyUnknownIea(string inst) => WithMismatchReleaseAuthority(new StateConsistencyReleaseReadinessResult
         {
             Instrument = inst,
             SnapshotSufficient = true,
@@ -67,9 +94,9 @@ public static class StateConsistencyGateTests
             DiagnosticBrokerWorkingCount = 0,
             DiagnosticIeaOwnedPlusAdoptedWorking = -1,
             Summary = "release_ready"
-        };
+        });
 
-        StateConsistencyReleaseReadinessResult ImmediateBrokerFlatReadyStaleDiagnosticWorking(string inst) => new()
+        StateConsistencyReleaseReadinessResult ImmediateBrokerFlatReadyStaleDiagnosticWorking(string inst) => WithMismatchReleaseAuthority(new StateConsistencyReleaseReadinessResult
         {
             Instrument = inst,
             SnapshotSufficient = true,
@@ -84,7 +111,7 @@ public static class StateConsistencyGateTests
             DiagnosticBrokerWorkingCount = 2,
             DiagnosticIeaOwnedPlusAdoptedWorking = 0,
             Summary = "release_ready"
-        };
+        });
 
         StateConsistencyReleaseReadinessResult NotReady(string inst, string why) => new()
         {
@@ -155,7 +182,7 @@ public static class StateConsistencyGateTests
             }
         };
 
-        StateConsistencyReleaseReadinessResult ResidualCleanupReady(string inst) => new()
+        StateConsistencyReleaseReadinessResult ResidualCleanupReady(string inst) => WithMismatchReleaseAuthority(new StateConsistencyReleaseReadinessResult
         {
             Instrument = inst,
             SnapshotSufficient = true,
@@ -173,7 +200,7 @@ public static class StateConsistencyGateTests
             DiagnosticIeaOwnedPlusAdoptedWorking = 0,
             DiagnosticPendingAdoptionCandidateCount = 2,
             Summary = "release_ready_residual_cleanup:" + ResidualCleanupMismatchClass.MISMATCH_RESIDUAL_JOURNAL_AND_ADOPTION_RETIREMENT
-        };
+        });
 
         // 1) First mismatch engages immediately + DetectedBlocked
         var coord1 = new MismatchEscalationCoordinator(
@@ -495,6 +522,58 @@ public static class StateConsistencyGateTests
         if (ev.ResidualCleanupOnly)
             return (false, "8d: active exposure must not be classified as residual cleanup");
 
+        // 8e) Coherent exposure is not release-ready while IEA still has pending execution work.
+        inp = new StateConsistencyReleaseEvaluationInput
+        {
+            Instrument = "M2K",
+            BrokerPositionQty = 2,
+            BrokerWorkingCount = 2,
+            PendingExecutionWorkload = 2,
+            JournalOpenQty = 2,
+            OwnershipSnapshotAvailable = true,
+            OwnershipGrossOpenQty = 2,
+            OwnershipSignedNetQty = 2,
+            OwnershipActiveSlotCount = 1,
+            OwnershipOrphanSlotCount = 0,
+            IeaOwnedPlusAdoptedWorking = 2,
+            PendingAdoptionCandidateCount = 0,
+            SnapshotSufficient = true,
+            UseInstrumentExecutionAuthority = true,
+            ReconciliationBlockers = Array.Empty<ReconciliationBlocker>()
+        };
+        ev = StateConsistencyReleaseEvaluator.Evaluate(inp);
+        if (ev.ReleaseReady || ev.IsExplainable)
+            return (false, "8e: pending IEA execution workload must block mismatch release");
+        if (!ev.Contradictions.Any(c => c == "pending_execution_workload_2"))
+            return (false, "8e: pending execution workload contradiction missing");
+
+        var suppression = new ReleaseReconciliationRedundancySuppression();
+        var cachedReadyInput = new StateConsistencyReleaseEvaluationInput
+        {
+            Instrument = "M2K",
+            BrokerPositionQty = 0,
+            BrokerWorkingCount = 0,
+            JournalOpenQty = 0,
+            PendingExecutionWorkload = 0,
+            IeaOwnedPlusAdoptedWorking = 0,
+            SnapshotSufficient = true,
+            UseInstrumentExecutionAuthority = true
+        };
+        suppression.RecordReleaseFullEvaluation("M2K", cachedReadyInput, StateConsistencyReleaseEvaluator.Evaluate(cachedReadyInput), t0, suppression.ExecutionActivityGeneration);
+        var pendingProbe = new ReleaseReadinessSuppressionProbe
+        {
+            BrokerPositionQty = 0,
+            BrokerWorkingCount = 0,
+            JournalOpenQty = 0,
+            PendingExecutionWorkload = 1,
+            IeaTrustedWorkingCount = 0,
+            UseIea = true
+        };
+        if (suppression.TryGetCachedReleaseReadiness("M2K", in pendingProbe, suppression.ExecutionActivityGeneration, t0.AddMilliseconds(10), out _, out var pendingCacheReason))
+            return (false, "8f: pending execution workload must force full release-readiness evaluation, not cached release-ready");
+        if (pendingCacheReason != "forced_eval_non_idle_pending")
+            return (false, $"8f: expected forced_eval_non_idle_pending, got {pendingCacheReason}");
+
         // 9) PERSISTENT_MISMATCH + release_ready: after stability window, gate releases (no stuck-forever)
         var coord9 = new MismatchEscalationCoordinator(
             getSnapshot: () => snap,
@@ -535,6 +614,40 @@ public static class StateConsistencyGateTests
         st = coord9.GetStateForTest("GC");
         if (st!.Blocked || st.EscalationState != MismatchEscalationState.NONE || st.GateLifecyclePhase != GateLifecyclePhase.None)
             return (false, "9b: should release from persistent after stable window");
+
+        // 9c) ReleaseReady is not enough; mismatch release mutation requires an explicit UEA authority token.
+        var coord9c = new MismatchEscalationCoordinator(
+            getSnapshot: () => snap,
+            getActiveInstruments: () => Array.Empty<string>(),
+            getMismatchObservations: (_, _) => Array.Empty<MismatchObservation>(),
+            isInstrumentBlocked: _ => false,
+            isFlattenInProgress: _ => false,
+            isRecoveryInProgress: _ => false,
+            log: null,
+            runInstrumentGateReconciliation: (_, _, _) => new GateReconciliationResult { RunnerInvoked = true, OutcomeStatus = ReconciliationOutcomeStatus.Success },
+            evaluateReleaseReadiness: (_, _, _, _) => ReadyWithoutCanonicalAuthority("GCA"),
+            stateConsistencyStableWindowMs: 50);
+        coord9c.ProcessObservationForTest(new MismatchObservation
+        {
+            Instrument = "GCA",
+            MismatchType = MismatchType.BROKER_AHEAD,
+            Present = true,
+            ObservedUtc = t0
+        });
+        var tGca = t0.AddMilliseconds(MismatchEscalationPolicy.MISMATCH_PERSISTENT_THRESHOLD_MS + 200);
+        coord9c.ProcessObservationForTest(new MismatchObservation
+        {
+            Instrument = "GCA",
+            MismatchType = MismatchType.BROKER_AHEAD,
+            Present = true,
+            ObservedUtc = tGca
+        });
+        coord9c.SetStableWindowForTest(50);
+        coord9c.AdvanceStateConsistencyGateForTest("GCA", snap, tGca);
+        coord9c.AdvanceStateConsistencyGateForTest("GCA", snap, tGca.AddMilliseconds(100));
+        st = coord9c.GetStateForTest("GCA");
+        if (st == null || !st.Blocked || st.EscalationState == MismatchEscalationState.NONE)
+            return (false, "9c: release-ready without canonical authority token must remain blocked");
 
         // 10) PERSISTENT_MISMATCH + !release_ready: never releases, stays blocked
         var coord10 = new MismatchEscalationCoordinator(

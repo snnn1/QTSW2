@@ -1,0 +1,22 @@
+{
+  "scenario_id": "codex_audit_playback_scenario_20260509",
+  "mode": "multi_day_carryover",
+  "run_id": "codex_audit_playback_scenario_20260509",
+  "matrix_snapshot": "C:\\Users\\jakej\\QTSW2\\data\\master_matrix\\master_matrix_20260508_231819_29810n.parquet",
+  "matrix_sha256": "2a6f6a488e4301c86734fedf76d67deb4e6537edd68e7fe9d4edf19a2bc385f0",
+  "created_utc": "2026-05-09T00:11:31.208949+00:00",
+  "dates": [
+    "2026-05-05"
+  ],
+  "state_policy": {
+    "persistence": "isolated_run_root",
+    "stream_journals": "load_and_carry_forward",
+    "day_switch": "event_clock_cme_18ct"
+  },
+  "timetables": {
+    "2026-05-05": {
+      "path": "timetables/timetable_2026-05-05.json",
+      "hash": "99190e62ea93aa95c49cb0239b157639d2bab6fcef1a7824f4613fe6d47f7ce7"
+    }
+  }
+}

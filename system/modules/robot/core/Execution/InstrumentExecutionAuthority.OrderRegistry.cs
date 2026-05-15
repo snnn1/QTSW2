@@ -139,21 +139,34 @@ public sealed partial class InstrumentExecutionAuthority
     {
         resolutionPath = "Unresolved";
         entry = null;
+        var protectiveLeg = NormalizeProtectiveLeg(legFromTag);
 
         if (TryResolveByBrokerOrderId(brokerOrderId, out entry))
         {
+            if (protectiveLeg != null && entry?.OrderRole == OrderRole.ENTRY)
+            {
+                entry = null;
+                resolutionPath = "RejectedProtectiveToEntry";
+                return false;
+            }
+
             resolutionPath = "DirectId";
             return true;
         }
 
         if (!string.IsNullOrEmpty(intentIdFromTag))
         {
-            var alias = legFromTag == "STOP" ? $"{intentIdFromTag}:STOP" : legFromTag == "TARGET" ? $"{intentIdFromTag}:TARGET" : intentIdFromTag;
-            if (TryResolveByAlias(alias, out entry))
+            if (protectiveLeg != null)
             {
-                resolutionPath = "Alias";
-                return true;
+                if (TryResolveByAlias($"{intentIdFromTag}:{protectiveLeg}", out entry))
+                {
+                    resolutionPath = "Alias";
+                    return true;
+                }
+
+                return false;
             }
+
             if (TryResolveByAlias(intentIdFromTag, out entry))
             {
                 resolutionPath = "Alias";
@@ -162,6 +175,15 @@ public sealed partial class InstrumentExecutionAuthority
         }
 
         return false;
+    }
+
+    private static string? NormalizeProtectiveLeg(string? legFromTag)
+    {
+        if (string.Equals(legFromTag, "STOP", StringComparison.OrdinalIgnoreCase))
+            return "STOP";
+        if (string.Equals(legFromTag, "TARGET", StringComparison.OrdinalIgnoreCase))
+            return "TARGET";
+        return null;
     }
 
     /// <summary>Update lifecycle state and optionally set terminal time. Phase 2: Validates transition; emits ORDER_LIFECYCLE_TRANSITION_INVALID if invalid.</summary>
@@ -339,6 +361,109 @@ public sealed partial class InstrumentExecutionAuthority
         return false;
     }
 
+    private void RestoreAdoptedEntryIntentPolicy(
+        string intentId,
+        string instrument,
+        string? sourceContext,
+        OrderInfo orderInfo,
+        DateTimeOffset utcNow)
+    {
+        if (string.IsNullOrWhiteSpace(intentId) || orderInfo == null)
+            return;
+
+        var source = string.IsNullOrWhiteSpace(sourceContext)
+            ? "ScanAndAdoptExistingOrders"
+            : sourceContext.Trim();
+        var restoredFrom = "order_info";
+        var expectedQty = orderInfo.ExpectedQuantity;
+        var maxQty = orderInfo.MaxQuantity;
+        var policySource = string.IsNullOrWhiteSpace(orderInfo.PolicySource) ? source : orderInfo.PolicySource;
+        var canonical = orderInfo.CanonicalInstrument ?? "";
+        var execution = orderInfo.ExecutionInstrument ?? "";
+
+        if (IntentPolicy.TryGetValue(intentId, out var existing) && existing.ExpectedQuantity > 0)
+        {
+            expectedQty = existing.ExpectedQuantity;
+            maxQty = existing.MaxQuantity > 0 ? existing.MaxQuantity : existing.ExpectedQuantity;
+            policySource = string.IsNullOrWhiteSpace(existing.PolicySource) ? policySource : existing.PolicySource;
+            canonical = existing.CanonicalInstrument ?? "";
+            execution = existing.ExecutionInstrument ?? "";
+            restoredFrom = "existing_intent_policy";
+        }
+        else if (expectedQty <= 0 && orderInfo.Quantity > 0)
+        {
+            expectedQty = orderInfo.Quantity;
+            if (maxQty <= 0)
+                maxQty = orderInfo.Quantity;
+            policySource = source;
+            restoredFrom = "adopted_broker_order_quantity";
+        }
+        else if (expectedQty > 0 && maxQty <= 0)
+        {
+            maxQty = expectedQty;
+        }
+
+        if (IntentMap.TryGetValue(intentId, out var intent) && intent != null)
+        {
+            if (string.IsNullOrWhiteSpace(canonical))
+                canonical = intent.Instrument ?? "";
+            if (string.IsNullOrWhiteSpace(execution))
+                execution = intent.ExecutionInstrument ?? "";
+        }
+
+        if (string.IsNullOrWhiteSpace(canonical))
+            canonical = instrument ?? "";
+        if (string.IsNullOrWhiteSpace(execution))
+            execution = ExecutionInstrumentKey;
+        if (string.IsNullOrWhiteSpace(execution))
+            execution = instrument ?? "";
+
+        if (expectedQty <= 0 || maxQty <= 0)
+        {
+            Log?.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument ?? "", "INTENT_QUANTITY_POLICY_MISSING", new
+            {
+                intent_id = intentId,
+                instrument,
+                source_context = source,
+                broker_order_qty = orderInfo.Quantity,
+                expected_qty = expectedQty,
+                max_qty = maxQty,
+                policy_source = policySource,
+                reason = "Adopted entry order has no recoverable expected quantity policy."
+            }));
+            return;
+        }
+
+        orderInfo.ExpectedQuantity = expectedQty;
+        orderInfo.MaxQuantity = maxQty;
+        orderInfo.PolicySource = policySource;
+        orderInfo.CanonicalInstrument = canonical;
+        orderInfo.ExecutionInstrument = execution;
+
+        IntentPolicy[intentId] = new IntentPolicyExpectation
+        {
+            ExpectedQuantity = expectedQty,
+            MaxQuantity = maxQty,
+            PolicySource = policySource,
+            CanonicalInstrument = canonical,
+            ExecutionInstrument = execution
+        };
+
+        Log?.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument ?? "", "INTENT_POLICY_RESTORED_FROM_ADOPTION", new
+        {
+            intent_id = intentId,
+            instrument,
+            source_context = source,
+            restored_from = restoredFrom,
+            broker_order_qty = orderInfo.Quantity,
+            expected_qty = expectedQty,
+            max_qty = maxQty,
+            policy_source = policySource,
+            canonical_instrument = canonical,
+            execution_instrument = execution
+        }));
+    }
+
     /// <summary>Register an adopted order (restart protectives). Ownership = ADOPTED.</summary>
     internal void RegisterAdoptedOrder(
         string brokerOrderId,
@@ -374,6 +499,8 @@ public sealed partial class InstrumentExecutionAuthority
 
         var isEntry = orderRole == OrderRole.ENTRY;
         SharedAdoptedOrderRegistry.Register(brokerOrderId, intentId, instrument ?? "", null, null, isEntry);
+        if (isEntry)
+            RestoreAdoptedEntryIntentPolicy(intentId, instrument ?? "", sourceContext, orderInfo, utcNow);
 
         Log?.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_REGISTRY_ADOPTED", new
         {

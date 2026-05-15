@@ -16,7 +16,7 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Repo root (data/, logs/ live here). api.py is under system/modules/matrix/ -> parents[3].
 QTSW2_ROOT = Path(__file__).resolve().parents[3]
@@ -34,6 +34,7 @@ _stream_stats_cache: Dict[Tuple, Dict] = {}
 _api_cache_hits: int = 0
 _api_cache_misses: int = 0
 _last_matrix_row_count: Optional[int] = None
+STREAM_FILTERS_CONFIG_PATH = QTSW2_ROOT / "configs" / "stream_filters.json"
 
 
 def _matrix_data_error_response(status_code: int, message: str) -> JSONResponse:
@@ -130,6 +131,86 @@ def _invalidate_matrix_cache():
     logger.debug("Matrix data cache invalidated")
 
 
+def _filter_config_to_dict(filter_config: Any, stream_id: str = "") -> Dict[str, Any]:
+    """Normalize a filter model/dict for matrix and timetable execution paths."""
+    if filter_config is None:
+        source: Dict[str, Any] = {}
+    elif hasattr(filter_config, "model_dump"):
+        source = filter_config.model_dump()
+    elif hasattr(filter_config, "dict"):
+        source = filter_config.dict()
+    elif isinstance(filter_config, dict):
+        source = filter_config
+    else:
+        source = {}
+
+    exclude_days_of_month: List[int] = []
+    for day in source.get("exclude_days_of_month") or []:
+        try:
+            if str(day).strip():
+                exclude_days_of_month.append(int(day))
+        except (TypeError, ValueError):
+            continue
+
+    normalized: Dict[str, Any] = {
+        "exclude_days_of_week": list(source.get("exclude_days_of_week") or []),
+        "exclude_days_of_month": exclude_days_of_month,
+        "exclude_times": list(source.get("exclude_times") or []),
+    }
+    if str(stream_id).lower() == "master":
+        normalized["include_streams"] = [
+            str(stream).strip().upper()
+            for stream in (source.get("include_streams") or [])
+            if str(stream).strip()
+        ]
+    return normalized
+
+
+def _stream_filters_to_dict(stream_filters: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Convert API filter payloads to plain JSON-safe dicts without dropping master.include_streams."""
+    if not stream_filters:
+        return {}
+    normalized: Dict[str, Dict[str, Any]] = {}
+    for stream_id, filter_config in stream_filters.items():
+        sid = str(stream_id).strip()
+        if not sid:
+            continue
+        normalized[sid] = _filter_config_to_dict(filter_config, sid)
+    return normalized
+
+
+def _read_stream_filters_config() -> Dict[str, Dict[str, Any]]:
+    """Read persisted matrix stream filters. Missing/invalid files are treated as empty config."""
+    if not STREAM_FILTERS_CONFIG_PATH.exists():
+        return {}
+    try:
+        import json
+
+        loaded = json.loads(STREAM_FILTERS_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Could not read stream filter config %s: %s", STREAM_FILTERS_CONFIG_PATH, exc)
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    return _stream_filters_to_dict(loaded)
+
+
+def _write_stream_filters_config(stream_filters: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Persist matrix stream filters atomically inside configs/stream_filters.json."""
+    import json
+
+    normalized = _stream_filters_to_dict(stream_filters)
+    normalized.setdefault("master", _filter_config_to_dict({}, "master"))
+    STREAM_FILTERS_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = STREAM_FILTERS_CONFIG_PATH.with_suffix(".json.tmp")
+    tmp_path.write_text(
+        json.dumps(normalized, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    tmp_path.replace(STREAM_FILTERS_CONFIG_PATH)
+    return normalized
+
+
 # ============================================================
 # Models
 # ============================================================
@@ -138,6 +219,11 @@ class StreamFilterConfig(BaseModel):
     exclude_days_of_week: List[str] = []  # e.g., ["Wednesday", "Friday"]
     exclude_days_of_month: List[int] = []  # e.g., [4, 16, 30]
     exclude_times: List[str] = []  # e.g., ["07:30", "08:00"]
+    include_streams: List[str] = []  # master-only stream selection for timetable publish
+
+
+class StreamFiltersConfigRequest(BaseModel):
+    stream_filters: Dict[str, StreamFilterConfig] = Field(default_factory=dict)
 
 
 class MatrixBuildRequest(BaseModel):
@@ -175,24 +261,41 @@ class MatrixDiffRequest(BaseModel):
 # Endpoints
 # ============================================================
 
+@router.get("/filters")
+def get_stream_filters_config():
+    """Return persisted Matrix stream filters used as the durable UI/config source."""
+    filters = _read_stream_filters_config()
+    return {
+        "status": "success",
+        "path": str(STREAM_FILTERS_CONFIG_PATH),
+        "stream_filters": filters,
+    }
+
+
+@router.post("/filters")
+def save_stream_filters_config(request: StreamFiltersConfigRequest):
+    """Persist Matrix stream filters so selected streams survive browser/session changes."""
+    try:
+        filters = _write_stream_filters_config(request.stream_filters)
+        return {
+            "status": "success",
+            "path": str(STREAM_FILTERS_CONFIG_PATH),
+            "stream_filters": filters,
+        }
+    except Exception as e:
+        logger.error("Error saving stream filters config: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/build")
-async def build_master_matrix(request: MatrixBuildRequest):
+def build_master_matrix(request: MatrixBuildRequest):
     """Build or rebuild the master matrix from analyzer runs."""
     try:
         from modules.matrix.master_matrix import MasterMatrix
         
         matrix = MasterMatrix(analyzer_runs_dir=request.analyzer_runs_dir)
         
-        # Convert stream filters format if provided
-        stream_filters_dict = None
-        if request.stream_filters:
-            stream_filters_dict = {}
-            for stream_id, filter_config in request.stream_filters.items():
-                stream_filters_dict[stream_id] = {
-                    "exclude_days_of_week": filter_config.exclude_days_of_week,
-                    "exclude_days_of_month": filter_config.exclude_days_of_month,
-                    "exclude_times": filter_config.exclude_times
-                }
+        stream_filters_dict = _stream_filters_to_dict(request.stream_filters) or None
         
         matrix.build_master_matrix(
             start_date=request.start_date,
@@ -222,7 +325,7 @@ class ResequenceRequest(BaseModel):
 
 
 @router.post("/resequence")
-async def resequence_master_matrix(request: ResequenceRequest):
+def resequence_master_matrix(request: ResequenceRequest):
     """Perform rolling resequence: remove window rows and resequence from checkpoint state.
     
     Behavior:
@@ -240,16 +343,7 @@ async def resequence_master_matrix(request: ResequenceRequest):
         
         matrix = MasterMatrix(analyzer_runs_dir=request.analyzer_runs_dir)
         
-        # Convert stream filters format if provided
-        stream_filters_dict = None
-        if request.stream_filters:
-            stream_filters_dict = {}
-            for stream_id, filter_config in request.stream_filters.items():
-                stream_filters_dict[stream_id] = {
-                    "exclude_days_of_week": filter_config.exclude_days_of_week,
-                    "exclude_days_of_month": filter_config.exclude_days_of_month,
-                    "exclude_times": filter_config.exclude_times
-                }
+        stream_filters_dict = _stream_filters_to_dict(request.stream_filters) or None
         
         logger.info(f"ROLLING RESEQUENCE: Resequencing last {request.resequence_days} trading days")
         
@@ -297,7 +391,7 @@ def _get_latest_analyzer_write_time(analyzer_runs_dir: Path) -> Optional[float]:
 
 
 @router.post("/reload_latest")
-async def reload_latest_matrix():
+def reload_latest_matrix():
     """Reload the most recent matrix file from disk without rebuilding.
     
     This endpoint simply finds and returns the latest matrix file metadata,
@@ -326,7 +420,7 @@ async def reload_latest_matrix():
 
 
 @router.get("/freshness")
-async def get_matrix_freshness(analyzer_runs_dir: str = "data/analyzed"):
+def get_matrix_freshness(analyzer_runs_dir: str = "data/analyzed"):
     """Get freshness metadata comparing analyzer output vs matrix build time.
     
     Returns:
@@ -407,7 +501,7 @@ async def get_matrix_freshness(analyzer_runs_dir: str = "data/analyzed"):
 
 
 @router.get("/data")
-async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, order: str = "newest", essential_columns_only: bool = True, skip_cleaning: bool = False, contract_multiplier: float = 1.0, include_filtered_executed: bool = False, stream_include: Optional[str] = None, nocache: bool = False, start_date: Optional[str] = None, end_date: Optional[str] = None, include_stats: bool = True):
+def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, order: str = "newest", essential_columns_only: bool = True, skip_cleaning: bool = False, contract_multiplier: float = 1.0, include_filtered_executed: bool = False, stream_include: Optional[str] = None, nocache: bool = False, start_date: Optional[str] = None, end_date: Optional[str] = None, include_stats: bool = True):
     """Get master matrix data from the most recent file or specified file.
     
     Args:
@@ -697,7 +791,7 @@ async def get_matrix_data(file_path: Optional[str] = None, limit: int = 10000, o
 
 
 @router.post("/breakdown")
-async def calculate_profit_breakdown(request: BreakdownRequest):
+def calculate_profit_breakdown(request: BreakdownRequest):
     """Calculate profit breakdowns (DOW, DOM, time, etc.) from the full dataset.
     
     This endpoint calculates breakdowns from ALL data in the parquet file, not just the loaded subset.
@@ -783,7 +877,7 @@ async def calculate_profit_breakdown(request: BreakdownRequest):
 
 
 @router.post("/stream-stats")
-async def get_stream_stats(request: StreamStatsRequest):
+def get_stream_stats(request: StreamStatsRequest):
     """Get statistics for a specific stream using the full dataset."""
     try:
         import pandas as pd
@@ -865,7 +959,7 @@ async def get_stream_stats(request: StreamStatsRequest):
 
 
 @router.get("/performance")
-async def get_matrix_performance():
+def get_matrix_performance():
     """
     Return matrix performance metrics for the dashboard.
     Aggregates from in-memory counters and timing logs.
@@ -947,7 +1041,7 @@ async def get_matrix_performance():
 
 
 @router.post("/diff")
-async def diff_matrices(request: MatrixDiffRequest):
+def diff_matrices(request: MatrixDiffRequest):
     """
     Compare two matrix files. Returns differences in RS, Time, final_allowed, Profit
     for final rows (one per stream per date).
@@ -1043,7 +1137,7 @@ async def diff_matrices(request: MatrixDiffRequest):
 
 
 @router.get("/stream-health")
-async def get_stream_health():
+def get_stream_health():
     """
     Return per-stream health metrics: rolling RS, drawdown, hit rate.
     """
@@ -1096,7 +1190,7 @@ async def get_stream_health():
 
 
 @router.get("/files")
-async def list_matrix_files():
+def list_matrix_files():
     """List available master matrix files."""
     try:
         root_matrix_dir = QTSW2_ROOT / "data" / "master_matrix"

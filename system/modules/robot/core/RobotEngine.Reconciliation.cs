@@ -369,16 +369,7 @@ public sealed partial class RobotEngine
     /// </summary>
     private bool IsInstrumentEpaExecutionLocked(string instrument)
     {
-        var inst = (instrument ?? "").Trim();
-        if (string.IsNullOrEmpty(inst)) return false;
-        if (_frozenInstruments.Contains(inst)) return true;
-        var account = _accountName ?? "";
-        foreach (var iea in InstrumentExecutionAuthorityRegistry.GetAllForAccount(account))
-        {
-            if (ExecutionInstrumentResolver.IsSameInstrument(iea.ExecutionInstrumentKey, inst) && iea.IsSupervisorilyBlocked)
-                return true;
-        }
-        return false;
+        return GetInstrumentEpaExecutionLockReason(instrument) != null;
     }
 
     /// <summary>
@@ -386,13 +377,60 @@ public sealed partial class RobotEngine
     /// </summary>
     private bool IsInstrumentEpaAdapterSubmitBlocked(string instrument, string? submitPath)
     {
-        if (IsInstrumentEpaExecutionLocked(instrument)) return true;
-        if (string.Equals(submitPath, "SUBMIT_PROTECTIVE_STOP", StringComparison.Ordinal) ||
-            string.Equals(submitPath, "SUBMIT_TARGET", StringComparison.Ordinal))
-            return false;
+        return GetInstrumentEpaAdapterSubmitBlockReason(instrument, submitPath) != null;
+    }
+
+    private string? GetRiskLatchReasonForInstrument(string instrument)
+    {
+        var inst = (instrument ?? "").Trim();
+        if (string.IsNullOrEmpty(inst) || _riskLatchManager == null)
+            return null;
+        try
+        {
+            var entry = _riskLatchManager.HydrateEntries()
+                .FirstOrDefault(x => string.Equals(x.Instrument?.Trim(), inst, StringComparison.OrdinalIgnoreCase));
+            return string.IsNullOrWhiteSpace(entry?.Reason) ? null : entry!.Reason.Trim();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private string? GetInstrumentEpaExecutionLockReason(string instrument)
+    {
+        var inst = (instrument ?? "").Trim();
+        if (string.IsNullOrEmpty(inst)) return null;
+        if (_frozenInstruments.Contains(inst))
+        {
+            var latchReason = GetRiskLatchReasonForInstrument(inst);
+            return string.IsNullOrWhiteSpace(latchReason)
+                ? "ENGINE_INSTRUMENT_FROZEN"
+                : "DURABLE_RISK_LATCH_ACTIVE:" + latchReason;
+        }
+
+        var account = _accountName ?? "";
+        foreach (var iea in InstrumentExecutionAuthorityRegistry.GetAllForAccount(account))
+        {
+            if (ExecutionInstrumentResolver.IsSameInstrument(iea.ExecutionInstrumentKey, inst) && iea.IsSupervisorilyBlocked)
+                return "IEA_SUPERVISORY_BLOCK:" + iea.CurrentSupervisoryState;
+        }
+        return null;
+    }
+
+    private string? GetInstrumentEpaAdapterSubmitBlockReason(string instrument, string? submitPath)
+    {
+        if (!ExecutionPermissionAuthority.ShouldApplyEntryRiskBlockToSubmitPath(submitPath))
+            return null;
+
+        var lockReason = GetInstrumentEpaExecutionLockReason(instrument);
+        if (!string.IsNullOrWhiteSpace(lockReason)) return lockReason;
+        var protectiveReason = _protectiveCoordinator?.GetBlockReason(instrument);
+        if (!string.IsNullOrWhiteSpace(protectiveReason))
+            return "PROTECTIVE_COVERAGE_BLOCK:" + protectiveReason.Trim();
         if (_protectiveCoordinator != null && _protectiveCoordinator.IsInstrumentBlockedByProtective(instrument))
-            return true;
-        return false;
+            return "PROTECTIVE_COVERAGE_BLOCK";
+        return null;
     }
 
     /// <summary>
@@ -457,6 +495,89 @@ public sealed partial class RobotEngine
             return false;
 
         var auditUtc = DateTimeOffset.UtcNow;
+        var canonical = GetCanonicalInstrument(inst) ?? inst;
+        var journalQty = _executionJournal.GetOpenJournalStructuralStateForInstrument(inst, canonical).OpenQtySum;
+        var (realOpenQty, recoveryOpenQty, _) =
+            _executionJournal.GetPositionAuthorityOpenQuantitiesForInstrument(inst, canonical);
+        var latchReason = GetRiskLatchReasonForInstrument(inst);
+        var authorityLatchReason = string.IsNullOrWhiteSpace(latchReason)
+            ? "FORCED_CONVERGENCE_FAILED:IN_MEMORY_SESSION_REENTRY_BLOCK"
+            : latchReason;
+        var hasProtectiveBlock =
+            !string.IsNullOrWhiteSpace(_protectiveCoordinator?.GetBlockReason(inst)) ||
+            (_protectiveCoordinator?.IsInstrumentBlockedByProtective(inst) ?? false);
+        var hasMismatchBlock = _mismatchCoordinator?.IsInstrumentBlockedByMismatch(inst) == true;
+        var latchClearFrame = ExecutionAuthorityFrameBuilder.Build(new ExecutionAuthorityFrameBuilderInput
+        {
+            Source = "RobotEngine.InterruptedLateSessionCloseReentryBypass",
+            Account = _accountName ?? "",
+            Instrument = inst,
+            CanonicalInstrument = canonical,
+            TradingDate = TradingDateString,
+            SubmitPath = "LATCH_CLEAR",
+            ExecutionMode = _executionMode.ToString(),
+            DecisionUtc = auditUtc,
+            FrameCreatedUtc = auditUtc,
+            BrokerSnapshotCapturedUtc = snapshot.CapturedAtUtc,
+            BrokerPositionQty = brokerPositionQty,
+            BrokerWorkingOrdersCount = brokerWorkingCount,
+            JournalOpenQty = journalQty,
+            RealOpenQty = realOpenQty,
+            RecoveryOpenQty = recoveryOpenQty,
+            DurableLatchActive = !string.IsNullOrWhiteSpace(latchReason),
+            DurableLatchReason = authorityLatchReason,
+            MismatchBlockActive = hasMismatchBlock,
+            IeaSupervisoryBlock = hasSupervisoryBlock,
+            ProtectiveCoverageState = hasProtectiveBlock ? "BLOCKED" : "",
+            AuthorityState = "LATCH_CLEAR",
+            IsPlayback = _isolatedPlaybackPersistence || _playbackAccountDetected,
+            IsMultiDayScenario = _playbackScenarioActive && (_playbackScenario?.dates?.Count ?? 0) > 1,
+            PlaybackScenarioId = _playbackScenario?.scenario_id ?? ""
+        });
+        var latchClearAuthority = UnifiedExecutionAuthority.EvaluateAction(new ExecutionAuthorityActionEvaluationRequest
+        {
+            Action = ExecutionAuthorityAction.LatchClear,
+            Source = "RobotEngine.InterruptedLateSessionCloseReentryBypass",
+            Instrument = inst,
+            UtcNow = auditUtc,
+            DurableLatchReason = authorityLatchReason,
+            AccountQty = brokerPositionQty,
+            BrokerAbsQty = Math.Abs(brokerPositionQty),
+            BrokerWorkingOrderCount = brokerWorkingCount,
+            JournalOpenQty = journalQty,
+            RealOpenQty = realOpenQty,
+            RecoveryOpenQty = recoveryOpenQty,
+            HasSupervisoryBlock = hasSupervisoryBlock,
+            HasProtectiveBlock = hasProtectiveBlock,
+            HasMismatchBlock = hasMismatchBlock,
+            AuthorityFrame = latchClearFrame
+        });
+        LogEvent(RobotEvents.EngineBase(auditUtc, tradingDate: TradingDateString, eventType: "AUTHORITY_FRAME_SNAPSHOT", state: "ENGINE",
+            ExecutionAuthorityFrameBuilder.ToLogPayload(
+                latchClearFrame,
+                action: "LATCH_CLEAR",
+                decision: latchClearAuthority.Allowed ? "ALLOW" : "DENY",
+                denyReason: latchClearAuthority.DenyReason)));
+        if (!latchClearAuthority.Allowed)
+        {
+            LogEvent(RobotEvents.EngineBase(auditUtc, tradingDate: TradingDateString,
+                eventType: "SESSION_REENTRY_BLOCK_BYPASS_DENIED_BY_AUTHORITY", state: "ENGINE",
+                new
+                {
+                    instrument = inst,
+                    authority_gate = latchClearAuthority.GateName,
+                    deny_reason = latchClearAuthority.DenyReason,
+                    detail = latchClearAuthority.Detail,
+                    broker_position_qty = brokerPositionQty,
+                    broker_working_count = brokerWorkingCount,
+                    journal_open_qty = journalQty,
+                    real_open_qty = realOpenQty,
+                    recovery_open_qty = recoveryOpenQty,
+                    latch_reason = authorityLatchReason
+                }));
+            return false;
+        }
+
         lock (_engineLock)
         {
             _frozenInstruments.Remove(inst);
@@ -550,7 +671,31 @@ public sealed partial class RobotEngine
         lock (_engineLock)
         {
             _frozenInstruments.Add(instrument);
-            _riskLatchManager?.Persist(instrument, reason);
+            var latchCreateAuthority = UnifiedExecutionAuthority.EvaluateAction(new ExecutionAuthorityActionEvaluationRequest
+            {
+                Action = ExecutionAuthorityAction.LatchCreate,
+                Source = "RobotEngine.StandDownStreamsForInstrument",
+                Instrument = instrument,
+                DurableLatchReason = reason,
+                UtcNow = utcNow
+            });
+            if (latchCreateAuthority.Allowed)
+            {
+                _riskLatchManager?.Persist(instrument, reason);
+            }
+            else
+            {
+                LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+                    eventType: "RISK_LATCH_CREATE_BLOCKED", state: "ENGINE",
+                    new
+                    {
+                        instrument,
+                        reason,
+                        authority_gate = latchCreateAuthority.GateName,
+                        deny_reason = latchCreateAuthority.DenyReason,
+                        note = latchCreateAuthority.Detail
+                    }));
+            }
 
             var tradingDateStr = _activeTradingDate?.ToString("yyyy-MM-dd") ?? "";
             foreach (var kvp in _streams)
@@ -585,6 +730,253 @@ public sealed partial class RobotEngine
     /// Explicit operator/engine unfreeze — not driven by reconciliation or parity convergence.
     /// Clears engine freeze + risk latch only when <see cref="NinjaTraderSimAdapter.TryValidateExplicitUnfreezeConditions"/> passes (REAL authority, structural clear, overlay clear, fresh snapshot).
     /// </summary>
+    private void MaybeEmitRiskLatchAutoClearSkipped(
+        string instrument,
+        RiskLatchManager.RiskLatchEntry latch,
+        int accountQty,
+        int journalQty,
+        int brokerPositionQty,
+        int brokerWorkingCount,
+        int realOpenQty,
+        int recoveryOpenQty,
+        bool hasSupervisoryBlock,
+        bool hasProtectiveBlock,
+        bool hasMismatchBlock,
+        DateTimeOffset utcNow)
+    {
+        var inst = instrument?.Trim() ?? "";
+        if (string.IsNullOrEmpty(inst)) return;
+
+        var reasonAllowsAutoClear = RiskLatchManager.IsAutoClearEligibleReason(latch.Reason);
+        var failedPredicates = new List<string>();
+        if (!reasonAllowsAutoClear) failedPredicates.Add("reason_auto_clear_eligible");
+        if (accountQty != 0) failedPredicates.Add("account_qty_flat");
+        if (journalQty != 0) failedPredicates.Add("journal_qty_flat");
+        if (brokerPositionQty != 0) failedPredicates.Add("broker_position_flat");
+        if (brokerWorkingCount != 0) failedPredicates.Add("broker_working_orders_flat");
+        if (realOpenQty != 0) failedPredicates.Add("real_open_qty_flat");
+        if (recoveryOpenQty != 0) failedPredicates.Add("recovery_open_qty_flat");
+        if (hasSupervisoryBlock) failedPredicates.Add("iea_supervisory_block_clear");
+        if (hasProtectiveBlock) failedPredicates.Add("protective_block_clear");
+        if (hasMismatchBlock) failedPredicates.Add("mismatch_block_clear");
+        var clearAllowed = failedPredicates.Count == 0;
+        var throttleKey = inst + "|" + (latch.Reason ?? "");
+        lock (_engineLock)
+        {
+            if (_riskLatchAutoClearSkippedThrottle.TryGetValue(throttleKey, out var last) &&
+                (utcNow - last).TotalSeconds < RiskLatchAutoClearSkippedThrottleSeconds)
+                return;
+            _riskLatchAutoClearSkippedThrottle[throttleKey] = utcNow;
+        }
+
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+            eventType: "RISK_LATCH_AUTO_CLEAR_SKIPPED", state: "ENGINE",
+            new
+            {
+                account = _accountName ?? "",
+                instrument = inst,
+                latch_reason = latch.Reason,
+                reason_allows_auto_clear = reasonAllowsAutoClear,
+                clear_allowed = clearAllowed,
+                failed_predicates = failedPredicates.ToArray(),
+                account_qty = accountQty,
+                account_qty_flat = accountQty == 0,
+                broker_qty = brokerPositionQty,
+                journal_qty = journalQty,
+                journal_qty_flat = journalQty == 0,
+                broker_position_qty = brokerPositionQty,
+                broker_position_flat = brokerPositionQty == 0,
+                working_orders = brokerWorkingCount,
+                broker_working_count = brokerWorkingCount,
+                broker_working_flat = brokerWorkingCount == 0,
+                ownership_qty = realOpenQty + recoveryOpenQty,
+                real_open_qty = realOpenQty,
+                real_open_flat = realOpenQty == 0,
+                recovery_open_qty = recoveryOpenQty,
+                recovery_open_flat = recoveryOpenQty == 0,
+                iea_supervisory_block = hasSupervisoryBlock,
+                has_supervisory_block = hasSupervisoryBlock,
+                protective_block = hasProtectiveBlock,
+                mismatch_block = hasMismatchBlock,
+                note = "Durable risk latch remains active because at least one clean-flat auto-clear predicate is not satisfied."
+            }));
+    }
+
+    private void TryAutoClearResolvedFlatRiskLatch(string instrument, int accountQty, int journalQty, DateTimeOffset utcNow)
+    {
+        var inst = instrument?.Trim() ?? "";
+        if (string.IsNullOrEmpty(inst) || _riskLatchManager == null || _executionAdapter == null)
+            return;
+
+        lock (_engineLock)
+        {
+            if (!_frozenInstruments.Contains(inst))
+                return;
+        }
+
+        RiskLatchManager.RiskLatchEntry? latch = null;
+        try
+        {
+            latch = _riskLatchManager.HydrateEntries()
+                .FirstOrDefault(x => string.Equals(x.Instrument?.Trim(), inst, StringComparison.OrdinalIgnoreCase));
+        }
+        catch
+        {
+            return;
+        }
+        if (latch == null)
+            return;
+
+        AccountSnapshot snapshot;
+        try
+        {
+            snapshot = _executionAdapter.GetAccountSnapshot(utcNow);
+        }
+        catch
+        {
+            return;
+        }
+
+        var brokerPositionQty = SumBrokerPositionQty(snapshot, inst);
+        var brokerWorkingCount = CountBrokerWorkingOrders(snapshot, inst);
+        var canonical = GetCanonicalInstrument(inst) ?? inst;
+        var (realOpenQty, recoveryOpenQty, _) =
+            _executionJournal.GetPositionAuthorityOpenQuantitiesForInstrument(inst, canonical);
+        var hasSupervisoryBlock = HasInstrumentSupervisoryBlock(inst);
+        var hasProtectiveBlock =
+            !string.IsNullOrWhiteSpace(_protectiveCoordinator?.GetBlockReason(inst)) ||
+            (_protectiveCoordinator?.IsInstrumentBlockedByProtective(inst) ?? false);
+        var hasMismatchBlock = _mismatchCoordinator?.IsInstrumentBlockedByMismatch(inst) == true;
+
+        var legacyLatchClearAllowed = RiskLatchManager.ShouldAutoClearResolvedFlatLatch(
+            latch.Reason,
+            accountQty,
+            journalQty,
+            brokerPositionQty,
+            brokerWorkingCount,
+            realOpenQty,
+            recoveryOpenQty,
+            hasSupervisoryBlock,
+            hasProtectiveBlock,
+            hasMismatchBlock);
+        var latchClearFrame = ExecutionAuthorityFrameBuilder.Build(new ExecutionAuthorityFrameBuilderInput
+        {
+            Source = "RobotEngine.RiskLatchClear",
+            Account = _accountName ?? "",
+            Instrument = inst,
+            CanonicalInstrument = canonical,
+            TradingDate = TradingDateString,
+            SubmitPath = "LATCH_CLEAR",
+            ExecutionMode = _executionMode.ToString(),
+            DecisionUtc = utcNow,
+            FrameCreatedUtc = utcNow,
+            BrokerSnapshotCapturedUtc = snapshot.CapturedAtUtc,
+            BrokerPositionQty = brokerPositionQty,
+            BrokerWorkingOrdersCount = brokerWorkingCount,
+            JournalOpenQty = journalQty,
+            RealOpenQty = realOpenQty,
+            RecoveryOpenQty = recoveryOpenQty,
+            DurableLatchActive = true,
+            DurableLatchReason = latch.Reason ?? "",
+            MismatchBlockActive = hasMismatchBlock,
+            IeaSupervisoryBlock = hasSupervisoryBlock,
+            ProtectiveCoverageState = hasProtectiveBlock ? "BLOCKED" : "",
+            AuthorityState = "LATCH_CLEAR",
+            IsPlayback = _isolatedPlaybackPersistence || _playbackAccountDetected,
+            IsMultiDayScenario = _playbackScenarioActive && (_playbackScenario?.dates?.Count ?? 0) > 1,
+            PlaybackScenarioId = _playbackScenario?.scenario_id ?? ""
+        });
+        var latchClearAuthority = UnifiedExecutionAuthority.EvaluateAction(new ExecutionAuthorityActionEvaluationRequest
+        {
+            Action = ExecutionAuthorityAction.LatchClear,
+            Source = "RobotEngine.RiskLatchClear",
+            Instrument = inst,
+            UtcNow = utcNow,
+            DurableLatchReason = latch.Reason ?? "",
+            AccountQty = accountQty,
+            BrokerAbsQty = Math.Abs(brokerPositionQty),
+            BrokerWorkingOrderCount = brokerWorkingCount,
+            JournalOpenQty = journalQty,
+            RealOpenQty = realOpenQty,
+            RecoveryOpenQty = recoveryOpenQty,
+            HasSupervisoryBlock = hasSupervisoryBlock,
+            HasProtectiveBlock = hasProtectiveBlock,
+            HasMismatchBlock = hasMismatchBlock,
+            AuthorityFrame = latchClearFrame
+        });
+        var latchClearAllowed = latchClearAuthority.Allowed && legacyLatchClearAllowed;
+        var latchClearDenyReason = latchClearAuthority.DenyReason ??
+                                   (legacyLatchClearAllowed ? null : "LEGACY_LATCH_CLEAR_VALIDATOR_DENIED");
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "AUTHORITY_FRAME_SNAPSHOT", state: "ENGINE",
+            ExecutionAuthorityFrameBuilder.ToLogPayload(
+                latchClearFrame,
+                action: "LATCH_CLEAR",
+                decision: latchClearAllowed ? "ALLOW" : "DENY",
+                denyReason: latchClearDenyReason)));
+        if (!latchClearAllowed)
+        {
+            MaybeEmitRiskLatchAutoClearSkipped(inst, latch, accountQty, journalQty, brokerPositionQty, brokerWorkingCount,
+                realOpenQty, recoveryOpenQty, hasSupervisoryBlock, hasProtectiveBlock, hasMismatchBlock, utcNow);
+            return;
+        }
+
+        lock (_engineLock)
+        {
+            _frozenInstruments.Remove(inst);
+            _riskLatchManager.Clear(inst);
+        }
+
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+            eventType: "RISK_LATCH_AUTO_CLEARED_RESOLVED_FLAT", state: "ENGINE",
+            new
+            {
+                instrument = inst,
+                latch_reason = latch.Reason,
+                account_qty = accountQty,
+                journal_qty = journalQty,
+                broker_position_qty = brokerPositionQty,
+                broker_working_count = brokerWorkingCount,
+                real_open_qty = realOpenQty,
+                recovery_open_qty = recoveryOpenQty,
+                note = "Durable forced-convergence latch cleared after broker, working-order, and journal authority all proved clean flat."
+            }));
+    }
+
+    private void TryAutoClearResolvedFlatRiskLatchesAbsentFromReconciliationPass(
+        IReadOnlyDictionary<string, (int AccountQty, int JournalQty)> qtyByInstrument,
+        DateTimeOffset utcNow)
+    {
+        if (_riskLatchManager == null || _executionAdapter == null)
+            return;
+
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (qtyByInstrument != null)
+        {
+            foreach (var inst in qtyByInstrument.Keys)
+            {
+                if (!string.IsNullOrWhiteSpace(inst))
+                    seen.Add(inst.Trim());
+            }
+        }
+
+        string[] missingFrozen;
+        lock (_engineLock)
+        {
+            missingFrozen = _frozenInstruments
+                .Where(inst => !string.IsNullOrWhiteSpace(inst) && !seen.Contains(inst.Trim()))
+                .Select(inst => inst.Trim())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
+        }
+
+        foreach (var inst in missingFrozen)
+        {
+            // A fully resolved flat instrument can vanish from both broker-position and open-journal maps.
+            // It still needs one clean-flat evaluation so durable forced-convergence latches do not persist forever.
+            TryAutoClearResolvedFlatRiskLatch(inst, accountQty: 0, journalQty: 0, utcNow);
+        }
+    }
+
     public bool TryUnfreezeInstrument(string instrument, DateTimeOffset utcNow, out string reason)
     {
         reason = "";
@@ -611,6 +1003,102 @@ public sealed partial class RobotEngine
             reason = "explicit_unfreeze_requires_sim_adapter";
             LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, "INSTRUMENT_UNFREEZE_DENIED", "ENGINE",
                 new { instrument = inst, reason }));
+            return false;
+        }
+
+        AccountSnapshot snapshot;
+        try
+        {
+            snapshot = _executionAdapter.GetAccountSnapshot(utcNow);
+        }
+        catch
+        {
+            reason = "explicit_unfreeze_snapshot_failed";
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, "INSTRUMENT_UNFREEZE_DENIED", "ENGINE",
+                new { instrument = inst, reason }));
+            return false;
+        }
+
+        var brokerPositionQty = SumBrokerPositionQty(snapshot, inst);
+        var brokerWorkingCount = CountBrokerWorkingOrders(snapshot, inst);
+        var canonical = GetCanonicalInstrument(inst) ?? inst;
+        var journalQty = _executionJournal.GetOpenJournalStructuralStateForInstrument(inst, canonical).OpenQtySum;
+        var (realOpenQty, recoveryOpenQty, _) =
+            _executionJournal.GetPositionAuthorityOpenQuantitiesForInstrument(inst, canonical);
+        var latchReason = GetRiskLatchReasonForInstrument(inst) ?? "EXPLICIT_OPERATOR_UNFREEZE";
+        var hasSupervisoryBlock = HasInstrumentSupervisoryBlock(inst);
+        var hasProtectiveBlock =
+            !string.IsNullOrWhiteSpace(_protectiveCoordinator?.GetBlockReason(inst)) ||
+            (_protectiveCoordinator?.IsInstrumentBlockedByProtective(inst) ?? false);
+        var hasMismatchBlock = _mismatchCoordinator?.IsInstrumentBlockedByMismatch(inst) == true;
+        var latchClearFrame = ExecutionAuthorityFrameBuilder.Build(new ExecutionAuthorityFrameBuilderInput
+        {
+            Source = "RobotEngine.ExplicitUnfreeze",
+            Account = _accountName ?? "",
+            Instrument = inst,
+            CanonicalInstrument = canonical,
+            TradingDate = TradingDateString,
+            SubmitPath = "LATCH_CLEAR_EXPLICIT_OPERATOR",
+            ExecutionMode = _executionMode.ToString(),
+            DecisionUtc = utcNow,
+            FrameCreatedUtc = utcNow,
+            BrokerSnapshotCapturedUtc = snapshot.CapturedAtUtc,
+            BrokerPositionQty = brokerPositionQty,
+            BrokerWorkingOrdersCount = brokerWorkingCount,
+            JournalOpenQty = journalQty,
+            RealOpenQty = realOpenQty,
+            RecoveryOpenQty = recoveryOpenQty,
+            DurableLatchActive = !string.IsNullOrWhiteSpace(GetRiskLatchReasonForInstrument(inst)),
+            DurableLatchReason = latchReason,
+            MismatchBlockActive = hasMismatchBlock,
+            IeaSupervisoryBlock = hasSupervisoryBlock,
+            ProtectiveCoverageState = hasProtectiveBlock ? "BLOCKED" : "",
+            AuthorityState = "LATCH_CLEAR_EXPLICIT_OPERATOR",
+            IsPlayback = _isolatedPlaybackPersistence || _playbackAccountDetected,
+            IsMultiDayScenario = _playbackScenarioActive && (_playbackScenario?.dates?.Count ?? 0) > 1,
+            PlaybackScenarioId = _playbackScenario?.scenario_id ?? ""
+        });
+        var latchClearAuthority = UnifiedExecutionAuthority.EvaluateAction(new ExecutionAuthorityActionEvaluationRequest
+        {
+            Action = ExecutionAuthorityAction.LatchClearExplicitOperator,
+            Source = "RobotEngine.ExplicitUnfreeze",
+            Instrument = inst,
+            UtcNow = utcNow,
+            DurableLatchReason = latchReason,
+            AccountQty = brokerPositionQty,
+            BrokerAbsQty = Math.Abs(brokerPositionQty),
+            BrokerWorkingOrderCount = brokerWorkingCount,
+            JournalOpenQty = journalQty,
+            RealOpenQty = realOpenQty,
+            RecoveryOpenQty = recoveryOpenQty,
+            HasSupervisoryBlock = hasSupervisoryBlock,
+            HasProtectiveBlock = hasProtectiveBlock,
+            HasMismatchBlock = hasMismatchBlock,
+            AuthorityFrame = latchClearFrame
+        });
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "AUTHORITY_FRAME_SNAPSHOT", state: "ENGINE",
+            ExecutionAuthorityFrameBuilder.ToLogPayload(
+                latchClearFrame,
+                action: "LATCH_CLEAR_EXPLICIT_OPERATOR",
+                decision: latchClearAuthority.Allowed ? "ALLOW" : "DENY",
+                denyReason: latchClearAuthority.DenyReason)));
+        if (!latchClearAuthority.Allowed)
+        {
+            reason = latchClearAuthority.DenyReason ?? "explicit_unfreeze_authority_denied";
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, "INSTRUMENT_UNFREEZE_DENIED", "ENGINE",
+                new
+                {
+                    instrument = inst,
+                    reason,
+                    authority_gate = latchClearAuthority.GateName,
+                    authority_detail = latchClearAuthority.Detail,
+                    broker_position_qty = brokerPositionQty,
+                    broker_working_count = brokerWorkingCount,
+                    journal_open_qty = journalQty,
+                    real_open_qty = realOpenQty,
+                    recovery_open_qty = recoveryOpenQty,
+                    latch_reason = latchReason
+                }));
             return false;
         }
 

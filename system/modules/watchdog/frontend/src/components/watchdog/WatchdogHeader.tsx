@@ -132,7 +132,7 @@ export function WatchdogHeader({
           className={`${badgeClass} bg-emerald-700 text-white`}
           title={title}
         >
-          Overlay OK
+          OVERLAY TRADABLE
         </span>
       )
     }
@@ -163,7 +163,7 @@ export function WatchdogHeader({
           className={`${badgeClass} bg-red-700 text-white`}
           title={`${message}${hashSuffix}`}
         >
-          {isDrift ? 'Execution Drift' : 'Execution Critical'}
+          {isDrift ? 'CRITICAL Timetable Drift' : 'CRITICAL Execution'}
         </span>
       )
     }

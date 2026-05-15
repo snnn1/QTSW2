@@ -94,6 +94,12 @@ public sealed partial class MismatchEscalationCoordinator
     private static bool HasResidualReleaseBlocker(StateConsistencyReleaseReadinessResult r) =>
         r.PendingAdoptionExists || !r.BrokerPositionExplainable || !r.BrokerWorkingExplainable || !r.LocalStateCoherent;
 
+    private static bool HasCanonicalMismatchReleaseAuthority(StateConsistencyReleaseReadinessResult readiness) =>
+        readiness.SnapshotSufficient &&
+        readiness.ReleaseReady &&
+        readiness.CanonicalReleaseAuthorityAllowed &&
+        string.Equals(readiness.CanonicalReleaseAuthorityGate, "AuthorityMismatchRelease", StringComparison.Ordinal);
+
     private static bool IsStallLikeSkipReason(string? skipReason) =>
         skipReason is "post_alignment_stall" or "throttle_cooldown" or "reconciliation_hysteresis"
             or "reentry_loop_blocked" or "execution_cycle_cap_reached" or "hard_stop_active"

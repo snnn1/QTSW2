@@ -1,0 +1,88 @@
+{
+  "as_of": "2026-05-09T19:50:49.453052+00:00",
+  "session_trading_date": "2026-04-27",
+  "trading_date": "2026-04-27",
+  "timezone": "America/Chicago",
+  "source": "playback_scenario",
+  "timetable_hash": "10549670007c1b29c4a3f632f518e00ab7a4b623d9b7ce962dfc969fb48d41c6",
+  "previous_hash": null,
+  "version_timestamp": "2026-05-09T19:50:49.453058+00:00",
+  "metadata": {
+    "replay": true,
+    "scenario_id": "playback_scenario_20260427_20260501_20260509T195049Z",
+    "matrix_snapshot": "master_matrix_20260509_193653_29810n.parquet",
+    "matrix_sha256": "2a6f6a488e4301c86734fedf76d67deb4e6537edd68e7fe9d4edf19a2bc385f0"
+  },
+  "streams": [
+    {
+      "stream": "ES2",
+      "slot_time": "11:00",
+      "enabled": true
+    },
+    {
+      "stream": "CL2",
+      "slot_time": "11:00",
+      "enabled": true
+    },
+    {
+      "stream": "NG2",
+      "slot_time": "11:00",
+      "enabled": true
+    },
+    {
+      "stream": "YM2",
+      "slot_time": "11:00",
+      "enabled": true
+    },
+    {
+      "stream": "RTY2",
+      "slot_time": "11:00",
+      "enabled": true
+    },
+    {
+      "stream": "GC2",
+      "slot_time": "10:00",
+      "enabled": true
+    },
+    {
+      "stream": "NQ2",
+      "slot_time": "09:30",
+      "enabled": true
+    },
+    {
+      "stream": "CL1",
+      "slot_time": "09:00",
+      "enabled": true
+    },
+    {
+      "stream": "NG1",
+      "slot_time": "09:00",
+      "enabled": true
+    },
+    {
+      "stream": "RTY1",
+      "slot_time": "09:00",
+      "enabled": true
+    },
+    {
+      "stream": "ES1",
+      "slot_time": "08:00",
+      "enabled": true
+    },
+    {
+      "stream": "GC1",
+      "slot_time": "07:30",
+      "enabled": true
+    },
+    {
+      "stream": "NQ1",
+      "slot_time": "07:30",
+      "enabled": true
+    },
+    {
+      "stream": "YM1",
+      "slot_time": "07:30",
+      "enabled": true
+    }
+  ]
+}

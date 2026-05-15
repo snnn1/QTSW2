@@ -52,7 +52,8 @@ public static class TerminalIntentHardeningTests
             var intentId2 = "test_intent_2";
             journal.RecordSubmission(intentId2, tradingDate, stream, "MNG", "ENTRY_STOP", "broker_2", utcNow);
             journal.RecordEntryFill(intentId2, tradingDate, stream, 3.14m, 2, utcNow, 1000m, "Short", "MNG", "NG");
-            journal.RecordReconciliationComplete(tradingDate, stream, intentId2, utcNow);
+            journal.RecordReconciliationComplete(tradingDate, stream, intentId2, utcNow,
+                BrokerFlatAuthority("MNG", "NG", tradingDate, stream, intentId2, utcNow, 2));
             if (!journal.IsIntentCompleted(intentId2, tradingDate, stream))
                 return (false, "IsIntentCompleted should be true after RecordReconciliationComplete");
 
@@ -111,7 +112,8 @@ public static class TerminalIntentHardeningTests
             var completedAt = utcNow.AddSeconds(5);
             journal.RecordSubmission(lateFillIntent, tradingDate, stream, "MES", "ENTRY_STOP", "broker_5", utcNow, direction: "Long");
             journal.RecordEntryFill(lateFillIntent, tradingDate, stream, 4500m, 2, utcNow, 5m, "Long", "MES", "ES");
-            journal.RecordReconciliationComplete(tradingDate, stream, lateFillIntent, completedAt);
+            journal.RecordReconciliationComplete(tradingDate, stream, lateFillIntent, completedAt,
+                BrokerFlatAuthority("MES", "ES", tradingDate, stream, lateFillIntent, completedAt, 2));
             journal.RecordExitFill(lateFillIntent, tradingDate, stream, 4501m, 2, "STOP", completedAt.AddMilliseconds(75));
             var lateFillEntry = journal.GetEntry(lateFillIntent, tradingDate, stream);
             if (lateFillEntry == null)
@@ -136,4 +138,24 @@ public static class TerminalIntentHardeningTests
             try { Directory.Delete(root, recursive: true); } catch { }
         }
     }
+
+    private static ExecutionAuthorityActionDecision BrokerFlatAuthority(
+        string instrument,
+        string canonicalInstrument,
+        string tradingDate,
+        string stream,
+        string intentId,
+        DateTimeOffset utcNow,
+        int journalOpenQty) =>
+        ExecutionJournal.EvaluateBrokerFlatJournalCompletionAuthority(
+            "TerminalIntentHardeningTests",
+            instrument,
+            canonicalInstrument,
+            tradingDate,
+            stream,
+            intentId,
+            utcNow,
+            brokerPositionQtyAbsAtDecision: 0,
+            brokerWorkingOrderCount: 0,
+            journalOpenQtyBeforeClose: journalOpenQty);
 }

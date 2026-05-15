@@ -1578,6 +1578,20 @@ public sealed partial class StreamStateMachine
     /// Submit paired stop-market entry orders (long + short) immediately after RANGE_LOCKED.
     /// These are linked via OCO so only one side can fill.
     /// </summary>
+    private static string NormalizeEntryBracketBlockCommitReason(string? longError, string? shortError)
+    {
+        var combined = ((longError ?? "") + "|" + (shortError ?? "")).ToUpperInvariant();
+        if (combined.Contains("DURABLE_RISK_LATCH_ACTIVE")) return "NO_TRADE_ENTRY_BLOCKED_DURABLE_RISK_LATCH_ACTIVE";
+        if (combined.Contains("IEA_SUPERVISORY_BLOCK")) return "NO_TRADE_ENTRY_BLOCKED_IEA_SUPERVISORY";
+        if (combined.Contains("PROTECTIVE_COVERAGE_BLOCK")) return "NO_TRADE_ENTRY_BLOCKED_PROTECTIVE_COVERAGE";
+        if (combined.Contains("MISMATCH_EXECUTION_BLOCK")) return "NO_TRADE_ENTRY_BLOCKED_MISMATCH";
+        if (combined.Contains("GLOBAL_KILL_SWITCH_ACTIVE") || combined.Contains("KILL_SWITCH_ACTIVE")) return "NO_TRADE_ENTRY_BLOCKED_KILL_SWITCH";
+        if (combined.Contains("ENGINE_INSTRUMENT_FROZEN") || combined.Contains("INSTRUMENT_FROZEN_OR_EPA_BLOCKED")) return "NO_TRADE_ENTRY_BLOCKED_INSTRUMENT_LOCK";
+        if (combined.Contains("EXECUTION_BLOCKED_EPA")) return "NO_TRADE_ENTRY_BLOCKED_EPA";
+        if (combined.Contains("UEA_DENIED")) return "NO_TRADE_ENTRY_BLOCKED_AUTHORITY";
+        return "NO_TRADE_ENTRY_BRACKETS_AT_LOCK_REJECTED";
+    }
+
     private void SubmitStopEntryBracketsAtLock(DateTimeOffset utcNow, bool fromDeferredAuthorityExecution = false)
     {
         // DIAGNOSTIC: Log entry into function
@@ -2158,7 +2172,8 @@ public sealed partial class StreamStateMachine
                 else if (bothRejected || partialRejected)
                 {
                     // Terminal NO_TRADE: avoid substring FAILED in commit reason (classified as FAILED_RUNTIME elsewhere)
-                    _ = Commit(utcNow, "NO_TRADE_ENTRY_BRACKETS_AT_LOCK_REJECTED", "NO_TRADE_ENTRY_BRACKETS_AT_LOCK_REJECTED");
+                    var commitReason = NormalizeEntryBracketBlockCommitReason(longRes.ErrorMessage, shortRes.ErrorMessage);
+                    _ = Commit(utcNow, commitReason, commitReason);
                 }
             }
         }

@@ -14,11 +14,12 @@ export function ActiveIntentPanel({ intents, unprotectedPositions }: ActiveInten
   const [, forceUpdate] = useState(0)
 
   useEffect(() => {
+    if (intents.length === 0 && unprotectedPositions.length === 0) return
     const interval = setInterval(() => {
       forceUpdate((prev) => prev + 1)
     }, 1000)
     return () => clearInterval(interval)
-  }, [])
+  }, [intents.length, unprotectedPositions.length])
 
   const isUnprotected = (intentId: string) =>
     unprotectedPositions.some((position) => position.intent_id === intentId)
@@ -26,13 +27,16 @@ export function ActiveIntentPanel({ intents, unprotectedPositions }: ActiveInten
   if (intents.length === 0) {
     return (
       <div id="active-intent-panel" className="watchdog-panel">
-        <div className="watchdog-panel-header">
+        <div className="watchdog-panel-header mb-0">
           <div>
             <div className="watchdog-panel-kicker">Exposure</div>
             <div className="watchdog-panel-title">Active Intents</div>
           </div>
+          <div className="watchdog-panel-meta text-emerald-300">0 live</div>
         </div>
-        <div className="py-4 text-center text-gray-500">No active intents</div>
+        <div className="mt-2 rounded-lg border border-emerald-800/50 bg-emerald-950/10 px-3 py-2 text-xs text-emerald-200">
+          No active intent exposure observed.
+        </div>
       </div>
     )
   }

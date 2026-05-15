@@ -278,8 +278,9 @@ public sealed partial class NinjaTraderSimAdapter
             new { instrument, note = "Flatten on block — enqueued via NtFlattenInstrumentCommand (policy funnel)" }));
         if (_useInstrumentExecutionAuthority && _iea != null)
         {
-            EnqueueEmergencyFlattenProtective(instrument, utcNow);
-            return FlattenResult.FailureResult("Enqueued for strategy thread", utcNow);
+            if (EnqueueEmergencyFlattenProtective(instrument, utcNow))
+                return FlattenResult.FailureResult("Enqueued for strategy thread", utcNow);
+            return FlattenResult.FailureResult("Emergency flatten was not enqueued: authority denied or NT action queue unavailable", utcNow);
         }
         return FlattenIntentReal("EMERGENCY_BLOCK", instrument, utcNow);
     }
@@ -301,9 +302,6 @@ public sealed partial class NinjaTraderSimAdapter
                     note = "Session identity latch remains armed for opening submits, but flatten is exposure-reducing."
                 }));
         }
-        PurgePendingBEForIntent(intentId, utcNow, instrument, "flatten");
-        if (!string.IsNullOrEmpty(intentId) && intentId != "NT_FLATTEN" && intentId != "EMERGENCY_BLOCK")
-            PruneIntentState(intentId, "flatten");
         if (_ntAccount == null || _ntInstrument == null)
         {
             var error = "NT context not set";
@@ -325,6 +323,10 @@ public sealed partial class NinjaTraderSimAdapter
             : intentId;
         if (!TryExecutionSafetyFlattenGuard(instrument, flattenIntentIdForGate, utcNow, "FLATTEN_INTENT_REAL", null, out _))
             return FlattenResult.FailureResult("EXECUTION_BLOCKED_UNSAFE_STATE", utcNow);
+
+        PurgePendingBEForIntent(intentId, utcNow, instrument, "flatten");
+        if (!string.IsNullOrEmpty(intentId) && intentId != "NT_FLATTEN" && intentId != "EMERGENCY_BLOCK")
+            PruneIntentState(intentId, "flatten");
 
         try
         {

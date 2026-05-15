@@ -1,0 +1,100 @@
+{
+  "as_of": "2026-05-14T00:19:23.670808+00:00",
+  "session_trading_date": "2026-05-11",
+  "trading_date": "2026-05-11",
+  "timezone": "America/Chicago",
+  "source": "playback_scenario",
+  "timetable_hash": "bd35f6ed763e6a3858b975d6984f9177d668b13feb994af36663a96fc2c0e306",
+  "previous_hash": null,
+  "version_timestamp": "2026-05-14T00:19:23.670808+00:00",
+  "metadata": {
+    "replay": true,
+    "scenario_id": "playback_scenario_20260511_20260512_20260514T001923Z",
+    "matrix_snapshot": "data\\master_matrix\\master_matrix_20260514_001158_29894n.parquet",
+    "matrix_sha256": "d451362548f1abaf5a4d9ee2ac24029907f5b0c5d220b20ab19a2667fd9404f5",
+    "matrix_meta": {
+      "source_kind": "disk",
+      "source_path": "data\\master_matrix\\master_matrix_20260514_001158_29894n.parquet",
+      "source_name": "master_matrix_20260514_001158_29894n.parquet",
+      "file_mtime": 1778717518.7067165,
+      "snapshot_id": "master_matrix_20260514_001158_29894n.parquet",
+      "row_count": 29894
+    }
+  },
+  "streams": [
+    {
+      "stream": "ES2",
+      "slot_time": "11:00",
+      "enabled": true
+    },
+    {
+      "stream": "NG2",
+      "slot_time": "11:00",
+      "enabled": true
+    },
+    {
+      "stream": "YM2",
+      "slot_time": "11:00",
+      "enabled": false,
+      "block_reason": "calendar_filter_blocked:Monday:11"
+    },
+    {
+      "stream": "RTY2",
+      "slot_time": "11:00",
+      "enabled": true
+    },
+    {
+      "stream": "CL2",
+      "slot_time": "10:00",
+      "enabled": true
+    },
+    {
+      "stream": "GC2",
+      "slot_time": "09:30",
+      "enabled": true
+    },
+    {
+      "stream": "NQ2",
+      "slot_time": "09:30",
+      "enabled": true
+    },
+    {
+      "stream": "NG1",
+      "slot_time": "09:00",
+      "enabled": true
+    },
+    {
+      "stream": "YM1",
+      "slot_time": "09:00",
+      "enabled": true
+    },
+    {
+      "stream": "RTY1",
+      "slot_time": "09:00",
+      "enabled": false,
+      "block_reason": "calendar_filter_blocked:Monday:11"
+    },
+    {
+      "stream": "ES1",
+      "slot_time": "08:00",
+      "enabled": true
+    },
+    {
+      "stream": "CL1",
+      "slot_time": "08:00",
+      "enabled": true
+    },
+    {
+      "stream": "GC1",
+      "slot_time": "07:30",
+      "enabled": false,
+      "block_reason": "calendar_filter_blocked:Monday:11"
+    },
+    {
+      "stream": "NQ1",
+      "slot_time": "07:30",
+      "enabled": false,
+      "block_reason": "calendar_filter_blocked:Monday:11"
+    }
+  ]
+}

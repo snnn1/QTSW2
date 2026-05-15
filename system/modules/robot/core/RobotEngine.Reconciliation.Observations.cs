@@ -206,17 +206,18 @@ public sealed partial class RobotEngine
 
             InstrumentExecutionAuthority? ieaForInstrument = null;
             var ieaOwnershipAmbiguous = false;
+            var pendingIeaWorkloadForInstrument = 0;
             if (useIea && ReconciliationIeaLookup.TryResolveForMismatchAssembly(account, inst, brokerWorking, GetExecutionInstrument,
                     out ieaForInstrument, out ieaOwnershipAmbiguous) && ieaForInstrument != null)
             {
                 _ieaUnavailableDegradedSuppressByInstrument.Remove(inst);
                 localWorking = ieaForInstrument.GetMismatchTrustedWorkingCount();
                 var ieaOwnedPlusAdoptedWorking = ieaForInstrument.GetOwnedPlusAdoptedWorkingCount();
-                var pendingIeaWorkload = ieaForInstrument.PendingExecutionWorkloadCount;
-                if (brokerWorking > 0 && ieaOwnedPlusAdoptedWorking == 0)
+                pendingIeaWorkloadForInstrument = ieaForInstrument.PendingExecutionWorkloadCount;
+                if (brokerWorking > 0 && localWorking == 0)
                 {
                     var registryConvergenceActive =
-                        pendingIeaWorkload > 0 ||
+                        pendingIeaWorkloadForInstrument > 0 ||
                         PendingAlignmentAuthority.IsPendingAlignment(inst, utcNow) ||
                         QuantExecutionControlStore.IsPostFillAlignmentWindowActive(inst, utcNow) ||
                         QuantExecutionControlStore.IsWorkingOrderSubmitWindowActive(inst, utcNow) ||
@@ -247,11 +248,11 @@ public sealed partial class RobotEngine
                                 broker_working_count = brokerWorking,
                                 iea_owned_plus_adopted_working = ieaOwnedPlusAdoptedWorking,
                                 iea_mismatch_trusted_working = localWorking,
-                                pending_execution_workload = pendingIeaWorkload,
+                                pending_execution_workload = pendingIeaWorkloadForInstrument,
                                 convergence_active = registryConvergenceActive,
                                 note = registryConvergenceActive
                                     ? "Broker reports working orders while IEA registry is settling inside a bounded order lifecycle convergence window."
-                                    : "Broker reports working orders but IEA registry has no OWNED/ADOPTED live (SUBMITTED/WORKING/PART_FILLED) rows — check ownership/lifecycle/adoption"
+                                    : "Broker reports working orders but IEA registry has no mismatch-trusted live (OWNED/ADOPTED/RECOVERABLE SUBMITTED/WORKING/PART_FILLED) rows - check ownership/lifecycle/adoption"
                             }));
                     }
                 }
@@ -402,6 +403,11 @@ public sealed partial class RobotEngine
             if (mismatchType == MismatchType.ORDER_REGISTRY_MISSING && brokerWorking > 0 && effectiveLocalWorking == 0)
             {
                 var pendingRegistryConvergence =
+                    pendingIeaWorkloadForInstrument > 0 ||
+                    PendingAlignmentAuthority.IsPendingAlignment(inst, utcNow) ||
+                    QuantExecutionControlStore.IsPostFillAlignmentWindowActive(inst, utcNow) ||
+                    QuantExecutionControlStore.IsWorkingOrderSubmitWindowActive(inst, utcNow) ||
+                    QuantExecutionControlStore.IsBrokerExecutionCallbackPendingActive(inst, utcNow) ||
                     QuantExecutionControlStore.IsAnyBrokerJournalAlignmentWindowActive(inst, utcNow);
                 if (pendingRegistryConvergence)
                 {
@@ -411,7 +417,8 @@ public sealed partial class RobotEngine
                             instrument = inst,
                             broker_working = brokerWorking,
                             iea_working = effectiveLocalWorking,
-                            note = "ORDER_REGISTRY_MISSING observed inside bounded submit/fill convergence window"
+                            pending_execution_workload = pendingIeaWorkloadForInstrument,
+                            note = "ORDER_REGISTRY_MISSING observed inside bounded IEA/order lifecycle convergence window"
                         }));
                     continue;
                 }

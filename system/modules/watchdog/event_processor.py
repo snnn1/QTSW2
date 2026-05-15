@@ -23,6 +23,29 @@ from .state_manager import WatchdogStateManager
 from .timetable_poller import compute_timetable_trading_date
 logger = logging.getLogger(__name__)
 
+
+def _submitted_order_role(order_type_raw: Any) -> str:
+    order_type = str(order_type_raw or "entry").strip().upper()
+    if not order_type:
+        return "entry"
+    if "TARGET" in order_type:
+        return "target"
+    if order_type in ("ENTRY_STOP", "STOP_ENTRY") or (
+        order_type.startswith("ENTRY") and "STOP" in order_type
+    ):
+        return "entry_stop"
+    if order_type in ("ENTRY_LIMIT", "LIMIT_ENTRY") or (
+        order_type.startswith("ENTRY") and "LIMIT" in order_type
+    ):
+        return "entry_limit"
+    if "REENTRY" in order_type or "MARKET" in order_type:
+        return "market_entry"
+    if "STOP" in order_type or "PROTECTIVE" in order_type:
+        return "stop"
+    if order_type.startswith("ENTRY"):
+        return "entry"
+    return "entry"
+
 CHICAGO_TZ = pytz.timezone("America/Chicago")
 
 # Cumulative counts since process start: how often each flatten_lookup_reason occurred.
@@ -1389,14 +1412,7 @@ class EventProcessor:
             broker_order_id = data.get("broker_order_id") or event.get("broker_order_id")
             if broker_order_id:
                 order_type = str(data.get("order_type", "entry") or "entry").upper()
-                if order_type.startswith("ENTRY"):
-                    role = "entry"
-                elif "TARGET" in order_type:
-                    role = "target"
-                elif "STOP" in order_type or "PROTECTIVE" in order_type:
-                    role = "stop"
-                else:
-                    role = "entry"
+                role = _submitted_order_role(order_type)
                 intent_id_submit = (data.get("intent_id") or event.get("intent_id") or "").strip()
                 if role == "stop" and intent_id_submit:
                     self._state_manager.record_protective_order_submitted(intent_id_submit, timestamp_utc)
@@ -1407,6 +1423,7 @@ class EventProcessor:
                     instrument=data.get("instrument", "") or event.get("instrument", ""),
                     role=role,
                     stream_key=data.get("stream_key", "") or data.get("stream", "") or event.get("stream_id", ""),
+                    order_type=order_type,
                 )
 
         elif event_type == "EXECUTION_FILLED":
@@ -1529,7 +1546,24 @@ class EventProcessor:
                 "real_open_qty": data.get("real_open_qty"),
                 "recovery_open_qty": data.get("recovery_open_qty"),
                 "journal_open_qty": data.get("journal_open_qty"),
+                "broker_working_count": data.get("broker_working_count"),
+                "iea_trusted_working_count": data.get("iea_trusted_working_count"),
                 "authority_state": data.get("authority_state"),
+                "source_event": event_type,
+            }
+            self._state_manager.record_position_authority_evaluated(pa, timestamp_utc)
+
+        elif event_type == "RELEASE_READINESS_INPUT_AUDIT":
+            # Read-only observability. This carries broker working-order counts that
+            # POSITION_AUTHORITY_EVALUATED does not currently emit.
+            pa = {
+                "instrument": data.get("instrument") if data.get("instrument") is not None else event.get("instrument"),
+                "broker_position_qty": data.get("broker_position_qty"),
+                "broker_working_count": data.get("broker_working_count"),
+                "iea_trusted_working_count": data.get("iea_trusted_working_count"),
+                "journal_open_qty": data.get("journal_open_qty"),
+                "authority_state": data.get("authority_state"),
+                "source_event": event_type,
             }
             self._state_manager.record_position_authority_evaluated(pa, timestamp_utc)
     

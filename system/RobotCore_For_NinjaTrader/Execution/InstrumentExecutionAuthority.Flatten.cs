@@ -329,10 +329,20 @@ public sealed partial class InstrumentExecutionAuthority
     }
 
     /// <summary>Check if flatten order fill matches our latch. Call from ProcessExecutionUpdate.</summary>
-    internal void OnFlattenFillReceived(string instrumentKey, string? orderId, DateTimeOffset utcNow)
+    internal void OnFlattenFillReceived(string instrumentKey, string? orderId, DateTimeOffset utcNow, string? flattenRequestId = null)
     {
-        if (_flattenLatchByInstrument.TryGetValue(instrumentKey, out var entry) &&
-            (string.IsNullOrEmpty(orderId) || orderId == entry.OrderId))
+        if (!_flattenLatchByInstrument.TryGetValue(instrumentKey, out var entry))
+            return;
+
+        var orderMatches =
+            string.IsNullOrEmpty(orderId) ||
+            string.Equals(orderId, entry.OrderId, StringComparison.OrdinalIgnoreCase);
+        var requestMatches =
+            !string.IsNullOrWhiteSpace(flattenRequestId) &&
+            (string.Equals(flattenRequestId, entry.RequestId, StringComparison.OrdinalIgnoreCase) ||
+             flattenRequestId.StartsWith(entry.RequestId + ":", StringComparison.OrdinalIgnoreCase));
+
+        if (orderMatches || requestMatches)
         {
             if (!string.IsNullOrEmpty(orderId))
                 UpdateOrderLifecycle(orderId, OrderLifecycleState.FILLED, utcNow);
@@ -343,6 +353,8 @@ public sealed partial class InstrumentExecutionAuthority
                 instrument = instrumentKey,
                 order_id = orderId,
                 request_id = entry.RequestId,
+                flatten_request_id_from_tag = flattenRequestId,
+                latch_release_match = requestMatches ? "flatten_request_id" : "broker_order_id",
                 original_intent_id = TryResolveByBrokerOrderId(orderId ?? "", out var regEntry) ? regEntry?.FlattenOriginalIntentId : null
             }));
         }

@@ -41,6 +41,136 @@ public sealed partial class NinjaTraderSimAdapter : IExecutionAdapter, IIEAOrder
         entry.EntryFilledQuantityTotal > 0 &&
         entry.ExitFilledQuantityTotal >= entry.EntryFilledQuantityTotal;
 
+    internal static bool IsEntryResubmitBlockingState(string? state)
+    {
+        var normalized = (state ?? "").Trim().Replace("_", "").Replace(" ", "");
+        return normalized.Equals("SUBMITTED", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Equals("ACCEPTED", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Equals("WORKING", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Equals("PARTFILLED", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Equals("CANCELPENDING", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Equals("CHANGEPENDING", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Equals("INITIALIZED", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Equals("FILLED", StringComparison.OrdinalIgnoreCase);
+    }
+
+    internal static bool ShouldBlockEntryResubmitForExistingOrder(OrderInfo? existingOrder) =>
+        existingOrder != null &&
+        existingOrder.IsEntryOrder &&
+        IsEntryResubmitBlockingState(existingOrder.State);
+
+    internal static OrderSubmissionResult DuplicateEntryResubmitResult(string? existingOrderId, DateTimeOffset utcNow) =>
+        OrderSubmissionResult.SuccessResult(existingOrderId, utcNow, utcNow);
+
+    private bool TryBlockDuplicateEntrySubmit(
+        string intentId,
+        string instrument,
+        string orderType,
+        int requestedQuantity,
+        DateTimeOffset utcNow,
+        out OrderSubmissionResult? failure)
+    {
+        failure = null;
+
+        OrderSubmissionResult Block(string source, string? existingOrderId, string? existingState, int? existingQuantity, int? existingFilledQuantity)
+        {
+            var error = $"Entry order already exists for intent {intentId}. Source={source}, State={existingState ?? "unknown"}, BrokerOrderId={existingOrderId ?? "unknown"}";
+            var expectedQty = IntentPolicy.TryGetValue(intentId, out var expectation) ? expectation.ExpectedQuantity : (int?)null;
+            var maxQty = IntentPolicy.TryGetValue(intentId, out var expectation2) ? expectation2.MaxQuantity : (int?)null;
+
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ENTRY_SUBMIT_PRECHECK", new
+            {
+                intent_id = intentId,
+                order_type = orderType,
+                requested_quantity = requestedQuantity,
+                expected_quantity = expectedQty,
+                max_quantity = maxQty,
+                cumulative_filled_qty = existingFilledQuantity ?? 0,
+                remaining_allowed_qty = 0,
+                active_entry_quantity = existingQuantity,
+                active_entry_source = source,
+                active_entry_order_id = existingOrderId,
+                active_entry_state = existingState,
+                allowed = false,
+                reason = "DUPLICATE_ACTIVE_ENTRY_INTENT",
+                idempotent_replay = true
+            }));
+
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ENTRY_ORDER_DUPLICATE_BLOCKED", new
+            {
+                intent_id = intentId,
+                order_type = orderType,
+                requested_quantity = requestedQuantity,
+                existing_source = source,
+                existing_order_id = existingOrderId,
+                existing_order_state = existingState,
+                existing_order_quantity = existingQuantity,
+                existing_filled_quantity = existingFilledQuantity,
+                error,
+                idempotent_replay = true,
+                note = "Blocked duplicate same-intent broker submit and returned the existing order as an idempotent success. Opposite bracket leg remains allowed because it has a different intent id."
+            }));
+
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "DUPLICATE_ORDER_SUBMISSION_DETECTED", new
+            {
+                intent_id = intentId,
+                instrument,
+                role = "entry",
+                order_type = orderType,
+                first_order_id = existingOrderId,
+                second_order_id = (string?)null,
+                requested_quantity = requestedQuantity,
+                existing_quantity = existingQuantity,
+                existing_filled_quantity = existingFilledQuantity,
+                reason = "Entry order already exists for intent"
+            }));
+
+            return DuplicateEntryResubmitResult(existingOrderId, utcNow);
+        }
+
+        if (OrderMap.TryGetValue(intentId, out var existingOrder) &&
+            ShouldBlockEntryResubmitForExistingOrder(existingOrder))
+        {
+            failure = Block("ORDER_MAP", existingOrder.OrderId, existingOrder.State, existingOrder.Quantity, existingOrder.FilledQuantity);
+            return true;
+        }
+
+        if (_iea != null &&
+            _iea.TryResolveByAlias(intentId, out var registryEntry) &&
+            registryEntry != null &&
+            registryEntry.OrderRole == OrderRole.ENTRY &&
+            registryEntry.OwnershipStatus is OrderOwnershipStatus.OWNED or OrderOwnershipStatus.ADOPTED or OrderOwnershipStatus.RECOVERABLE_ROBOT_OWNED &&
+            registryEntry.LifecycleState is OrderLifecycleState.SUBMITTED or OrderLifecycleState.WORKING or OrderLifecycleState.PART_FILLED)
+        {
+            failure = Block("ORDER_REGISTRY", registryEntry.BrokerOrderId, registryEntry.LifecycleState.ToString(), null, null);
+            return true;
+        }
+
+        if (IntentMap.TryGetValue(intentId, out var intent))
+        {
+            var tradingDate = intent.TradingDate ?? "";
+            var stream = intent.Stream ?? "";
+            if (!string.IsNullOrWhiteSpace(tradingDate) && !string.IsNullOrWhiteSpace(stream))
+            {
+                var journalEntry = _executionJournal.GetEntry(intentId, tradingDate, stream);
+                if (journalEntry != null &&
+                    !journalEntry.TradeCompleted &&
+                    (journalEntry.EntrySubmitted || journalEntry.EntryFilled || journalEntry.EntryFilledQuantityTotal > 0))
+                {
+                    var journalState = journalEntry.EntryFilled || journalEntry.EntryFilledQuantityTotal > 0
+                        ? "ENTRY_FILLED"
+                        : "ENTRY_SUBMITTED";
+                    failure = Block("EXECUTION_JOURNAL", journalEntry.BrokerOrderId, journalState,
+                        journalEntry.FillQuantity ?? journalEntry.EntryFilledQuantityTotal,
+                        journalEntry.EntryFilledQuantityTotal);
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
     /// <summary>At most one delayed critical flatten re-enqueue per (account, canonical) until the retry fires (stale-owner takeover window).</summary>
     private readonly ConcurrentDictionary<string, byte> _criticalFlattenCoordinationRetryInflight = new(StringComparer.OrdinalIgnoreCase);
 

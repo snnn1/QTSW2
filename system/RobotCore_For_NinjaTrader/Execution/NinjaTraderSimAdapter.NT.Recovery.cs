@@ -941,6 +941,106 @@ public sealed partial class NinjaTraderSimAdapter
             });
     }
 
+    private static bool TryExtractSessionCloseFlattenOriginalIntentId(string? correlationId, out string originalIntentId)
+    {
+        originalIntentId = "";
+        const string prefix = "SESSION_CLOSE_FLATTEN:";
+        if (string.IsNullOrWhiteSpace(correlationId) ||
+            !correlationId.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var remainder = correlationId.Substring(prefix.Length);
+        var separator = remainder.IndexOf(':');
+        originalIntentId = separator >= 0 ? remainder.Substring(0, separator) : remainder;
+        return !string.IsNullOrWhiteSpace(originalIntentId);
+    }
+
+    private bool TryRetirePendingFlattenVerificationForLinkedReentry(
+        string instrumentKey,
+        string correlationId,
+        string? pendingEpisodeId,
+        BrokerCanonicalExposure exposure,
+        DateTimeOffset utcNow,
+        string coordAcct,
+        string coordInst,
+        string? hostChart)
+    {
+        if (!TryExtractSessionCloseFlattenOriginalIntentId(correlationId, out var originalIntentId))
+            return false;
+
+        var originalLocation = _executionJournal.TryFindEntryByIntentId(originalIntentId);
+        if (!originalLocation.HasValue)
+            return false;
+
+        var (tradingDate, stream, originalEntry) = originalLocation.Value;
+        var originalOpenQty = ExecutionJournal.GetEntryRemainingOpenQuantity(originalEntry);
+        var journal = new JournalStore(_stateRoot).TryLoad(tradingDate, stream);
+        if (journal == null)
+            return false;
+
+        var streamOriginalMatches = string.Equals(journal.OriginalIntentId, originalIntentId, StringComparison.OrdinalIgnoreCase);
+        var reentryIntentId = journal.ReentryIntentId;
+        ExecutionJournalEntry? reentryEntry = null;
+        if (!string.IsNullOrWhiteSpace(reentryIntentId))
+            reentryEntry = _executionJournal.GetEntry(reentryIntentId!, tradingDate, stream);
+        var reentryOpenQty = reentryEntry == null ? 0 : ExecutionJournal.GetEntryRemainingOpenQuantity(reentryEntry);
+
+        if (reentryEntry != null &&
+            !ExecutionInstrumentResolver.IsSameInstrument(reentryEntry.Instrument ?? "", instrumentKey) &&
+            !string.Equals(BrokerPositionResolver.NormalizeCanonicalKey(reentryEntry.Instrument ?? ""),
+                BrokerPositionResolver.NormalizeCanonicalKey(instrumentKey),
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (!FlattenVerifierLifecycleRules.ShouldRetireForLinkedProtectedReentry(
+                originalTradeCompleted: originalEntry.TradeCompleted,
+                originalOpenQty: originalOpenQty,
+                streamOriginalMatches: streamOriginalMatches,
+                reentryIntentId: reentryIntentId,
+                reentrySubmitted: journal.ReentrySubmitted,
+                reentryFilled: journal.ReentryFilled,
+                protectionAccepted: journal.ProtectionAccepted,
+                reentryTradeCompleted: reentryEntry?.TradeCompleted == true,
+                reentryOpenQty: reentryOpenQty))
+        {
+            return false;
+        }
+
+        FlattenCoordinationTracker.Shared.ProcessVerifyWindow(coordAcct, instrumentKey, coordInst, 0, utcNow, out _, out var episodeAfter, out _);
+        var episodeId = string.IsNullOrEmpty(episodeAfter) ? pendingEpisodeId : episodeAfter;
+        _iea?.ReleaseFlattenLatch(instrumentKey, InstrumentExecutionAuthority.FlattenLatchState.Resolved, utcNow);
+
+        _log.Write(RobotEvents.ExecutionBase(utcNow, originalIntentId, instrumentKey, "FLATTEN_VERIFY_RETIRED_LINKED_REENTRY_ACTIVE",
+            new
+            {
+                account = coordAcct,
+                correlation_id = correlationId,
+                episode_id = episodeId,
+                logical_instrument = instrumentKey,
+                canonical_broker_key = exposure.CanonicalKey,
+                reconciliation_abs_remaining = exposure.ReconciliationAbsQuantityTotal,
+                host_chart_instrument = hostChart,
+                owner_instance_id = coordInst,
+                trading_date = tradingDate,
+                stream,
+                original_intent_id = originalIntentId,
+                original_open_qty = originalOpenQty,
+                original_trade_completed = originalEntry.TradeCompleted,
+                reentry_intent_id = reentryIntentId,
+                reentry_open_qty = reentryOpenQty,
+                reentry_submitted = journal.ReentrySubmitted,
+                reentry_filled = journal.ReentryFilled,
+                protection_accepted = journal.ProtectionAccepted,
+                note = "Retired stale session-close flatten verifier because linked protected reentry now owns the live exposure; this is not broker-flat proof."
+            }));
+
+        return true;
+    }
+
     partial void OnVerifyPendingFlattens()
     {
         var utcNow = DateTimeOffset.UtcNow;
@@ -1048,6 +1148,20 @@ public sealed partial class NinjaTraderSimAdapter
                     _log.Write(RobotEvents.EngineBase(utcNow, "", "UNTRACKED_FILL_RECOVERY_JOURNAL_COMPLETE_ERROR", "ENGINE",
                         new { instrument = instrumentKey, error = ex.Message, exception_type = ex.GetType().Name }));
                 }
+                toRemove.Add(instrumentKey);
+                continue;
+            }
+
+            if (TryRetirePendingFlattenVerificationForLinkedReentry(
+                    instrumentKey,
+                    correlationId,
+                    pendingEpisodeId,
+                    exposure,
+                    utcNow,
+                    coordAcct,
+                    coordInst,
+                    hostChart))
+            {
                 toRemove.Add(instrumentKey);
                 continue;
             }

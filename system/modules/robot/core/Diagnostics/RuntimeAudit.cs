@@ -79,6 +79,7 @@ public sealed class RuntimeAuditHub
     private readonly RobotLogger _log;
     private readonly Func<string?> _getRunId;
     private readonly object _lock = new();
+    private int _shutdownRequested;
 
     private readonly long[] _win5TotalMs = new long[SubsystemCount];
     private readonly int[] _win5Count = new int[SubsystemCount];
@@ -132,6 +133,10 @@ public sealed class RuntimeAuditHub
         _getRunId = getRunId ?? (() => null);
     }
 
+    public void RequestShutdown() => Volatile.Write(ref _shutdownRequested, 1);
+
+    private bool IsShutdownRequested => Volatile.Read(ref _shutdownRequested) != 0;
+
     public static long CpuStart() => Stopwatch.GetTimestamp();
 
     /// <summary>Elapsed milliseconds since <see cref="CpuStart"/> (for stream-loop aggregates without double CpuEnd).</summary>
@@ -145,6 +150,7 @@ public sealed class RuntimeAuditHub
 
     public void CpuEnd(long startTimestamp, string subsystem, string? instrument = null, string? stream = null, bool onIeaWorker = false)
     {
+        if (IsShutdownRequested) return;
         if (startTimestamp == 0) return;
         var idx = RuntimeAuditSubsystem.IndexOf(subsystem);
         if (idx < 0) return;
@@ -174,6 +180,7 @@ public sealed class RuntimeAuditHub
     /// <summary>After each StreamStateMachine.Tick (strategy thread).</summary>
     public void RecordStreamTick(string streamId, long elapsedMs)
     {
+        if (IsShutdownRequested) return;
         if (elapsedMs < 0) return;
         lock (_lock)
         {
@@ -191,6 +198,7 @@ public sealed class RuntimeAuditHub
     /// <summary>After stream foreach completes (strategy thread).</summary>
     public void RecordStreamLoopAggregate(int streamsActiveCount, long streamLoopTotalMs)
     {
+        if (IsShutdownRequested) return;
         lock (_lock)
         {
             if (streamsActiveCount > _winMaxStreamsActive)
@@ -203,6 +211,7 @@ public sealed class RuntimeAuditHub
 
     public void RecordIeaIdleMs(long ms)
     {
+        if (IsShutdownRequested) return;
         if (ms <= 0) return;
         Interlocked.Add(ref _winIeaIdleMsBacking, ms);
     }
@@ -211,6 +220,7 @@ public sealed class RuntimeAuditHub
 
     public void NotifyIeaEnqueue()
     {
+        if (IsShutdownRequested) return;
         var d = Interlocked.Increment(ref _ieaQueueDepthApprox);
         lock (_lock)
         {
@@ -220,15 +230,21 @@ public sealed class RuntimeAuditHub
 
     public void NotifyIeaDequeue()
     {
+        if (IsShutdownRequested) return;
         Interlocked.Decrement(ref _ieaQueueDepthApprox);
     }
 
-    public void NotifyReconciliationRunCompleted() => Interlocked.Increment(ref _reconciliationRunCount);
+    public void NotifyReconciliationRunCompleted()
+    {
+        if (IsShutdownRequested) return;
+        Interlocked.Increment(ref _reconciliationRunCount);
+    }
 
     public long ReconciliationRuns => Interlocked.Read(ref _reconciliationRunCount);
 
     private void EmitHighFrequencyLoop(string subsystem, double callsPerSecond, double threshold)
     {
+        if (IsShutdownRequested) return;
         Interlocked.Increment(ref _highFreqBacking);
         var runId = _getRunId();
         _log.Write(RobotEvents.EngineBase(DateTimeOffset.UtcNow, tradingDate: "", eventType: "HIGH_FREQUENCY_LOOP_DETECTED", state: "ENGINE",
@@ -243,6 +259,7 @@ public sealed class RuntimeAuditHub
 
     public void NotifySupervisoryStateTransitionInvalid(DateTimeOffset utcNow)
     {
+        if (IsShutdownRequested) return;
         lock (_lock)
         {
             _supervisoryInvalidWindow.Add(utcNow);
@@ -268,6 +285,7 @@ public sealed class RuntimeAuditHub
 
     public void TryEmitPeriodicWallClock(DateTimeOffset utcNow)
     {
+        if (IsShutdownRequested) return;
         lock (_lock)
         {
             MaybeEmitProfileUnlocked(utcNow);

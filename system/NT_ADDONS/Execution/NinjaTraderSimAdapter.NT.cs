@@ -1739,6 +1739,106 @@ public sealed partial class NinjaTraderSimAdapter
         _pendingFlattenVerifications[instrumentKey] = (utcNow, deadline, correlationId, eid);
     }
 
+    private static bool TryExtractSessionCloseFlattenOriginalIntentId(string? correlationId, out string originalIntentId)
+    {
+        originalIntentId = "";
+        const string prefix = "SESSION_CLOSE_FLATTEN:";
+        if (string.IsNullOrWhiteSpace(correlationId) ||
+            !correlationId.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var remainder = correlationId.Substring(prefix.Length);
+        var separator = remainder.IndexOf(':');
+        originalIntentId = separator >= 0 ? remainder.Substring(0, separator) : remainder;
+        return !string.IsNullOrWhiteSpace(originalIntentId);
+    }
+
+    private bool TryRetirePendingFlattenVerificationForLinkedReentry(
+        string instrumentKey,
+        string correlationId,
+        string? pendingEpisodeId,
+        BrokerCanonicalExposure exposure,
+        DateTimeOffset utcNow,
+        string coordAcct,
+        string coordInst,
+        string? hostChart)
+    {
+        if (!TryExtractSessionCloseFlattenOriginalIntentId(correlationId, out var originalIntentId))
+            return false;
+
+        var originalLocation = _executionJournal.TryFindEntryByIntentId(originalIntentId);
+        if (!originalLocation.HasValue)
+            return false;
+
+        var (tradingDate, stream, originalEntry) = originalLocation.Value;
+        var originalOpenQty = ExecutionJournal.GetEntryRemainingOpenQuantity(originalEntry);
+        var journal = new JournalStore(_stateRoot).TryLoad(tradingDate, stream);
+        if (journal == null)
+            return false;
+
+        var streamOriginalMatches = string.Equals(journal.OriginalIntentId, originalIntentId, StringComparison.OrdinalIgnoreCase);
+        var reentryIntentId = journal.ReentryIntentId;
+        ExecutionJournalEntry? reentryEntry = null;
+        if (!string.IsNullOrWhiteSpace(reentryIntentId))
+            reentryEntry = _executionJournal.GetEntry(reentryIntentId!, tradingDate, stream);
+        var reentryOpenQty = reentryEntry == null ? 0 : ExecutionJournal.GetEntryRemainingOpenQuantity(reentryEntry);
+
+        if (reentryEntry != null &&
+            !ExecutionInstrumentResolver.IsSameInstrument(reentryEntry.Instrument ?? "", instrumentKey) &&
+            !string.Equals(BrokerPositionResolver.NormalizeCanonicalKey(reentryEntry.Instrument ?? ""),
+                BrokerPositionResolver.NormalizeCanonicalKey(instrumentKey),
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (!FlattenVerifierLifecycleRules.ShouldRetireForLinkedProtectedReentry(
+                originalTradeCompleted: originalEntry.TradeCompleted,
+                originalOpenQty: originalOpenQty,
+                streamOriginalMatches: streamOriginalMatches,
+                reentryIntentId: reentryIntentId,
+                reentrySubmitted: journal.ReentrySubmitted,
+                reentryFilled: journal.ReentryFilled,
+                protectionAccepted: journal.ProtectionAccepted,
+                reentryTradeCompleted: reentryEntry?.TradeCompleted == true,
+                reentryOpenQty: reentryOpenQty))
+        {
+            return false;
+        }
+
+        FlattenCoordinationTracker.Shared.ProcessVerifyWindow(coordAcct, instrumentKey, coordInst, 0, utcNow, out _, out var episodeAfter, out _);
+        var episodeId = string.IsNullOrEmpty(episodeAfter) ? pendingEpisodeId : episodeAfter;
+        _iea?.ReleaseFlattenLatch(instrumentKey, InstrumentExecutionAuthority.FlattenLatchState.Resolved, utcNow);
+
+        _log.Write(RobotEvents.ExecutionBase(utcNow, originalIntentId, instrumentKey, "FLATTEN_VERIFY_RETIRED_LINKED_REENTRY_ACTIVE",
+            new
+            {
+                account = coordAcct,
+                correlation_id = correlationId,
+                episode_id = episodeId,
+                logical_instrument = instrumentKey,
+                canonical_broker_key = exposure.CanonicalKey,
+                reconciliation_abs_remaining = exposure.ReconciliationAbsQuantityTotal,
+                host_chart_instrument = hostChart,
+                owner_instance_id = coordInst,
+                trading_date = tradingDate,
+                stream,
+                original_intent_id = originalIntentId,
+                original_open_qty = originalOpenQty,
+                original_trade_completed = originalEntry.TradeCompleted,
+                reentry_intent_id = reentryIntentId,
+                reentry_open_qty = reentryOpenQty,
+                reentry_submitted = journal.ReentrySubmitted,
+                reentry_filled = journal.ReentryFilled,
+                protection_accepted = journal.ProtectionAccepted,
+                note = "Retired stale session-close flatten verifier because linked protected reentry now owns the live exposure; this is not broker-flat proof."
+            }));
+
+        return true;
+    }
+
     partial void OnVerifyPendingFlattens()
     {
         var utcNow = DateTimeOffset.UtcNow;
@@ -1846,6 +1946,20 @@ public sealed partial class NinjaTraderSimAdapter
                     _log.Write(RobotEvents.EngineBase(utcNow, "", "UNTRACKED_FILL_RECOVERY_JOURNAL_COMPLETE_ERROR", "ENGINE",
                         new { instrument = instrumentKey, error = ex.Message, exception_type = ex.GetType().Name }));
                 }
+                toRemove.Add(instrumentKey);
+                continue;
+            }
+
+            if (TryRetirePendingFlattenVerificationForLinkedReentry(
+                    instrumentKey,
+                    correlationId,
+                    pendingEpisodeId,
+                    exposure,
+                    utcNow,
+                    coordAcct,
+                    coordInst,
+                    hostChart))
+            {
                 toRemove.Add(instrumentKey);
                 continue;
             }
@@ -2128,7 +2242,7 @@ public sealed partial class NinjaTraderSimAdapter
                     reason = "Entry order already exists for intent"
                 }));
                 
-                return OrderSubmissionResult.FailureResult(error, utcNow);
+                return DuplicateEntryResubmitResult(existingOrder.OrderId, utcNow);
             }
             
             // If existing order is filled, allow new entry (shouldn't happen but handle gracefully)
@@ -2142,7 +2256,7 @@ public sealed partial class NinjaTraderSimAdapter
                     note = "This should not happen - entry orders should only be submitted once per intent"
                 }));
                 
-                return OrderSubmissionResult.FailureResult("Entry order already filled for this intent", utcNow);
+                return DuplicateEntryResubmitResult(existingOrder.OrderId, utcNow);
             }
         }
 
@@ -2901,23 +3015,48 @@ public sealed partial class NinjaTraderSimAdapter
     private bool TryGetOrderInfoForIntentAndLeg(string intentId, string? tagLeg, out OrderInfo? orderInfo)
     {
         orderInfo = null;
+        if (string.Equals(tagLeg, "STOP", StringComparison.OrdinalIgnoreCase))
+        {
+            if (OrderMap.TryGetValue($"{intentId}:STOP", out var stopInfo) && stopInfo != null)
+            {
+                orderInfo = stopInfo;
+                return true;
+            }
+
+            if (OrderMap.TryGetValue(intentId, out stopInfo) && stopInfo != null &&
+                string.Equals(stopInfo.OrderType, "STOP", StringComparison.OrdinalIgnoreCase))
+            {
+                orderInfo = stopInfo;
+                return true;
+            }
+
+            return false;
+        }
+
+        if (string.Equals(tagLeg, "TARGET", StringComparison.OrdinalIgnoreCase))
+        {
+            if (OrderMap.TryGetValue($"{intentId}:TARGET", out var targetInfo) && targetInfo != null)
+            {
+                orderInfo = targetInfo;
+                return true;
+            }
+
+            if (OrderMap.TryGetValue(intentId, out targetInfo) && targetInfo != null &&
+                string.Equals(targetInfo.OrderType, "TARGET", StringComparison.OrdinalIgnoreCase))
+            {
+                orderInfo = targetInfo;
+                return true;
+            }
+
+            return false;
+        }
+
         if (OrderMap.TryGetValue(intentId, out var oi) && oi != null)
         {
             orderInfo = oi;
             return true;
         }
-        if (string.Equals(tagLeg, "STOP", StringComparison.OrdinalIgnoreCase) &&
-            OrderMap.TryGetValue($"{intentId}:STOP", out oi) && oi != null)
-        {
-            orderInfo = oi;
-            return true;
-        }
-        if (string.Equals(tagLeg, "TARGET", StringComparison.OrdinalIgnoreCase) &&
-            OrderMap.TryGetValue($"{intentId}:TARGET", out oi) && oi != null)
-        {
-            orderInfo = oi;
-            return true;
-        }
+
         return false;
     }
 
@@ -3193,10 +3332,10 @@ public sealed partial class NinjaTraderSimAdapter
             }
         }
 
-        if (!OrderMap.TryGetValue(intentId, out var orderInfo))
+        if (!TryGetOrderInfoForIntentAndLeg(intentId, parsed.Leg, out var orderInfo))
         {
             TryHydrateOrderMapFromIeRegistryBeforeOrderMapMiss(order, intentId, encodedTag, parsed, utcNow);
-            OrderMap.TryGetValue(intentId, out orderInfo);
+            TryGetOrderInfoForIntentAndLeg(intentId, parsed.Leg, out orderInfo);
         }
 
         if (orderInfo == null)
@@ -4639,8 +4778,55 @@ public sealed partial class NinjaTraderSimAdapter
                 (IntentPolicy.TryGetValue(intentId, out var exp) ? exp.ExpectedQuantity : 0);
             var maxQty = orderInfo.MaxQuantity > 0 ? orderInfo.MaxQuantity :
                 (IntentPolicy.TryGetValue(intentId, out var exp2) ? exp2.MaxQuantity : 0);
-            var remainingQty = expectedQty - filledTotal;
-            var overfill = filledTotal > expectedQty;
+            var policySource = string.IsNullOrWhiteSpace(orderInfo.PolicySource) ? "UNKNOWN" : orderInfo.PolicySource;
+            if (expectedQty <= 0 && orderInfo.Quantity > 0)
+            {
+                expectedQty = orderInfo.Quantity;
+                maxQty = maxQty > 0 ? maxQty : orderInfo.Quantity;
+                policySource = "ORDER_INFO_FILL_FALLBACK";
+                orderInfo.ExpectedQuantity = expectedQty;
+                orderInfo.MaxQuantity = maxQty;
+                orderInfo.PolicySource = policySource;
+                orderInfo.CanonicalInstrument = string.IsNullOrWhiteSpace(orderInfo.CanonicalInstrument)
+                    ? context.CanonicalInstrument
+                    : orderInfo.CanonicalInstrument;
+                orderInfo.ExecutionInstrument = string.IsNullOrWhiteSpace(orderInfo.ExecutionInstrument)
+                    ? context.ExecutionInstrument
+                    : orderInfo.ExecutionInstrument;
+
+                if (!string.IsNullOrWhiteSpace(intentId))
+                {
+                    IntentPolicy[intentId] = new IntentPolicyExpectation
+                    {
+                        ExpectedQuantity = expectedQty,
+                        MaxQuantity = maxQty,
+                        PolicySource = policySource,
+                        CanonicalInstrument = orderInfo.CanonicalInstrument,
+                        ExecutionInstrument = orderInfo.ExecutionInstrument
+                    };
+                }
+
+                _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument,
+                    "INTENT_POLICY_RESTORED_FROM_ORDER_INFO", new
+                    {
+                        intent_id = intentId,
+                        broker_order_id = order?.OrderId ?? "",
+                        order_qty = orderInfo.Quantity,
+                        expected_qty = expectedQty,
+                        max_qty = maxQty,
+                        policy_source = policySource,
+                        reason = "Entry fill order row had broker quantity but no expected quantity policy."
+                    }));
+            }
+            else if (expectedQty > 0 && maxQty <= 0)
+            {
+                maxQty = expectedQty;
+                orderInfo.MaxQuantity = maxQty;
+            }
+
+            var quantityPolicyMissing = expectedQty <= 0 || maxQty <= 0;
+            var remainingQty = expectedQty > 0 ? expectedQty - filledTotal : -filledTotal;
+            var overfill = expectedQty > 0 && filledTotal > expectedQty;
 
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, orderInfo.Instrument,
                 "INTENT_FILL_UPDATE", new
@@ -4651,10 +4837,23 @@ public sealed partial class NinjaTraderSimAdapter
                     expected_qty = expectedQty,
                     max_qty = maxQty,
                     remaining_qty = remainingQty,
+                    quantity_policy_missing = quantityPolicyMissing,
+                    policy_source = policySource,
                     overfill = overfill
                 }));
 
-            if (overfill)
+            if (quantityPolicyMissing)
+            {
+                TriggerQuantityEmergency(intentId, "INTENT_QUANTITY_POLICY_MISSING", utcNow, new Dictionary<string, object>
+                {
+                    { "expected_qty", expectedQty },
+                    { "actual_filled_qty", filledTotal },
+                    { "last_fill_qty", fillQuantity },
+                    { "order_qty", orderInfo.Quantity },
+                    { "reason", "Entry fill has no expected quantity policy; journal the fill but block new risk." }
+                });
+            }
+            else if (overfill)
             {
                 TriggerQuantityEmergency(intentId, "INTENT_OVERFILL_EMERGENCY", utcNow, new Dictionary<string, object>
                 {
@@ -6153,6 +6352,7 @@ public sealed partial class NinjaTraderSimAdapter
                 FilledQuantity = 0
             };
             OrderMap[intentId] = stopOrderInfo; // Use same intentId - OnExecutionUpdate will find it by tag decode
+            OrderMap[$"{intentId}:STOP"] = stopOrderInfo;
             _iea?.RegisterOrder(order.OrderId, intentId, instrument, IntentMap.TryGetValue(intentId, out var si) ? si.Stream : null, OrderRole.STOP, OrderOwnershipStatus.OWNED, "SubmitProtectiveStop", stopOrderInfo, utcNow);
             
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
@@ -6567,6 +6767,7 @@ public sealed partial class NinjaTraderSimAdapter
                 FilledQuantity = 0
             };
             OrderMap[intentId] = targetOrderInfo; // Overwrites entry order (already filled) or stop order (if stop was added first)
+            OrderMap[$"{intentId}:TARGET"] = targetOrderInfo;
             _iea?.RegisterOrder(order.OrderId, intentId, instrument, IntentMap.TryGetValue(intentId, out var ti) ? ti.Stream : null, OrderRole.TARGET, OrderOwnershipStatus.OWNED, "SubmitTargetOrder", targetOrderInfo, utcNow);
             
             _log.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument, "ORDER_SUBMIT_SUCCESS", new
@@ -8810,6 +9011,9 @@ public sealed partial class NinjaTraderSimAdapter
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 
+        if (TryBlockDuplicateEntrySubmit(intentId, instrument, "ENTRY_STOP", quantity, utcNow, out var duplicateEntryFailure))
+            return duplicateEntryFailure!;
+
         try
         {
             var orderAction = direction == "Long" ? OrderAction.Buy : OrderAction.SellShort;
@@ -9506,6 +9710,9 @@ public sealed partial class NinjaTraderSimAdapter
         var ntInstrument = _ntInstrument as Instrument;
         if (account == null || ntInstrument == null)
             return OrderSubmissionResult.FailureResult("NT context not set", utcNow);
+
+        if (TryBlockDuplicateEntrySubmit(intentId, instrument, "ENTRY_STOP_SINGLE", quantity, utcNow, out var duplicateEntryFailure))
+            return duplicateEntryFailure!;
 
         var orderAction = direction == "Long" ? OrderAction.Buy : OrderAction.SellShort;
 

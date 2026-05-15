@@ -66,6 +66,8 @@ export function RiskGatesPanel({ gates, loading, overallExecution, tradable }: R
       : gates.execution_safe ?? (gates.recovery_state_allowed && gates.kill_switch_allowed)
   const reasonMsg = overallExecutionOperatorMessage(overallExecution)
   const rowClass = executionRowTextClass(overallExecution.overall_execution_severity)
+  const uniqueStreamArmed = Array.from(new Map(gates.stream_armed.map((stream) => [stream.stream, stream])).values())
+  const armedCount = uniqueStreamArmed.filter((stream) => stream.armed).length
 
   return (
     <div className="watchdog-panel" data-testid="risk-gates-panel">
@@ -112,8 +114,13 @@ export function RiskGatesPanel({ gates, loading, overallExecution, tradable }: R
           <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-slate-500">
             Stream Armed
           </div>
+          {armedCount === 0 && uniqueStreamArmed.length > 0 && (
+            <div className="mb-2 rounded-lg border border-slate-700/70 bg-slate-900/45 px-2 py-1 text-[11px] text-slate-400">
+              System may be tradable while no stream is currently armed.
+            </div>
+          )}
           <div className="space-y-1">
-            {Array.from(new Map(gates.stream_armed.map((stream) => [stream.stream, stream])).values()).map(
+            {uniqueStreamArmed.map(
               (stream) => (
                 <div key={stream.stream} className="flex items-center justify-between text-sm">
                   <span className="font-mono text-gray-300">{stream.stream}</span>

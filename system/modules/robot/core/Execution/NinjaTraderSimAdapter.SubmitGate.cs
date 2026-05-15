@@ -67,18 +67,23 @@ public sealed partial class NinjaTraderSimAdapter
             bool globalKillSwitchActive,
             bool mismatchExecutionBlocked,
             bool? mismatchExecutionBlockedForSubmit,
-            bool instrumentFrozenOrEpaBlocked)
+            bool instrumentFrozenOrEpaBlocked,
+            string? instrumentFrozenOrEpaBlockReason)
         {
             GlobalKillSwitchActive = globalKillSwitchActive;
             MismatchExecutionBlocked = mismatchExecutionBlocked;
             MismatchExecutionBlockedForSubmit = mismatchExecutionBlockedForSubmit;
             InstrumentFrozenOrEpaBlocked = instrumentFrozenOrEpaBlocked;
+            InstrumentFrozenOrEpaBlockReason = string.IsNullOrWhiteSpace(instrumentFrozenOrEpaBlockReason)
+                ? null
+                : instrumentFrozenOrEpaBlockReason.Trim();
         }
 
         public bool GlobalKillSwitchActive { get; }
         public bool MismatchExecutionBlocked { get; }
         public bool? MismatchExecutionBlockedForSubmit { get; }
         public bool InstrumentFrozenOrEpaBlocked { get; }
+        public string? InstrumentFrozenOrEpaBlockReason { get; }
     }
 
     private ExecutionPreflightAuthoritySample SampleExecutionPreflightAuthority(string instrument, string submitPath)
@@ -92,11 +97,15 @@ public sealed partial class NinjaTraderSimAdapter
             mismatchExecutionBlockedForSubmit = _isMismatchExecutionBlockedForSubmit(inst, submitPath);
         var instrumentFrozenOrEpaBlocked = !string.IsNullOrEmpty(inst) &&
                                            _isInstrumentFrozenOrEpaBlocked?.Invoke(inst, submitPath) == true;
+        var instrumentFrozenOrEpaBlockReason = instrumentFrozenOrEpaBlocked
+            ? _getInstrumentFrozenOrEpaBlockReason?.Invoke(inst, submitPath)
+            : null;
         return new ExecutionPreflightAuthoritySample(
             globalKillSwitchActive,
             mismatchExecutionBlocked,
             mismatchExecutionBlockedForSubmit,
-            instrumentFrozenOrEpaBlocked);
+            instrumentFrozenOrEpaBlocked,
+            instrumentFrozenOrEpaBlockReason);
     }
 
     private static int CountBrokerWorkingOrdersForAuthorityFrame(AccountSnapshot? snap, string instrument)
@@ -111,6 +120,71 @@ public sealed partial class NinjaTraderSimAdapter
                 count++;
         }
         return count;
+    }
+
+    private static string[] CollectBrokerOrderIdsForAuthorityFrame(AccountSnapshot? snap, string instrument, string? role = null)
+    {
+        if (snap?.WorkingOrders == null || string.IsNullOrWhiteSpace(instrument)) return Array.Empty<string>();
+        var inst = instrument.Trim();
+        var ids = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var w in snap.WorkingOrders)
+        {
+            if (w == null || string.IsNullOrWhiteSpace(w.OrderId) || string.IsNullOrWhiteSpace(w.Instrument))
+                continue;
+            if (!string.Equals(w.Instrument.Trim(), inst, StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!string.IsNullOrWhiteSpace(role) &&
+                !string.Equals(ClassifyBrokerOrderRoleForAuthorityFrame(w), role, StringComparison.OrdinalIgnoreCase))
+                continue;
+            ids.Add(w.OrderId.Trim());
+        }
+        return ids.ToArray();
+    }
+
+    private static string[] CollectBrokerOrderTagsForAuthorityFrame(AccountSnapshot? snap, string instrument)
+    {
+        if (snap?.WorkingOrders == null || string.IsNullOrWhiteSpace(instrument)) return Array.Empty<string>();
+        var inst = instrument.Trim();
+        var tags = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var w in snap.WorkingOrders)
+        {
+            if (w == null || string.IsNullOrWhiteSpace(w.Instrument))
+                continue;
+            if (!string.Equals(w.Instrument.Trim(), inst, StringComparison.OrdinalIgnoreCase))
+                continue;
+            if (!string.IsNullOrWhiteSpace(w.Tag))
+                tags.Add(w.Tag.Trim());
+            if (!string.IsNullOrWhiteSpace(w.OcoGroup))
+                tags.Add(w.OcoGroup.Trim());
+        }
+        return tags.ToArray();
+    }
+
+    private static string ClassifyBrokerOrderRoleForAuthorityFrame(WorkingOrderSnapshot order)
+    {
+        var parsed = RobotOrderIds.ParseTag(order.Tag);
+        if (!string.IsNullOrWhiteSpace(parsed.Leg))
+            return parsed.Leg!.Trim().ToUpperInvariant();
+
+        var tag = (order.Tag ?? "") + " " + (order.OcoGroup ?? "");
+        if (tag.IndexOf("FLATTEN", StringComparison.OrdinalIgnoreCase) >= 0)
+            return "FLATTEN";
+        if (tag.IndexOf(":STOP", StringComparison.OrdinalIgnoreCase) >= 0)
+            return "STOP";
+        if (tag.IndexOf(":TARGET", StringComparison.OrdinalIgnoreCase) >= 0)
+            return "TARGET";
+        if (tag.IndexOf(":ENTRY", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            tag.IndexOf("OCO_ENTRY", StringComparison.OrdinalIgnoreCase) >= 0)
+            return "ENTRY";
+
+        var orderType = order.OrderType ?? "";
+        if (orderType.IndexOf("target", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            orderType.IndexOf("limit", StringComparison.OrdinalIgnoreCase) >= 0)
+            return "TARGET";
+        if (orderType.IndexOf("stop", StringComparison.OrdinalIgnoreCase) >= 0)
+            return "STOP";
+
+        return "UNKNOWN";
     }
 
     private ExecutionAuthorityFrame BuildExecutionAuthorityFrame(
@@ -136,21 +210,29 @@ public sealed partial class NinjaTraderSimAdapter
         var (journalOpenQty, journalOpenHash) =
             _executionJournal.GetOpenJournalStructuralStateForInstrument(trimmed, canonical);
 
-        return new ExecutionAuthorityFrame
+        return ExecutionAuthorityFrameBuilder.Build(new ExecutionAuthorityFrameBuilderInput
         {
             FrameId = ExecutionAuthorityFrame.CreateFrameId(utcNow),
             Source = "adapter_execution_safety_request",
+            Account = GetLedgerAccountName(),
             Instrument = trimmed,
             CanonicalInstrument = canonical,
             ExecutionInstrumentKey = _iea?.ExecutionInstrumentKey,
             IntentId = intentId ?? "",
             SubmitPath = submitPath ?? "",
+            ExecutionMode = _authorityExecutionMode.ToString(),
             DecisionUtc = utcNow,
             FrameCreatedUtc = DateTimeOffset.UtcNow,
             BrokerSnapshotCapturedUtc = snap?.CapturedAtUtc,
             SnapshotError = snapshotError,
             BrokerPositionQty = positionAuthority.BrokerQty,
-            BrokerWorkingOrderCount = CountBrokerWorkingOrdersForAuthorityFrame(snap, trimmed),
+            BrokerWorkingOrdersCount = CountBrokerWorkingOrdersForAuthorityFrame(snap, trimmed),
+            BrokerOrderIds = CollectBrokerOrderIdsForAuthorityFrame(snap, trimmed),
+            BrokerOrderTags = CollectBrokerOrderTagsForAuthorityFrame(snap, trimmed),
+            BrokerEntryOrderIds = CollectBrokerOrderIdsForAuthorityFrame(snap, trimmed, "ENTRY"),
+            BrokerStopOrderIds = CollectBrokerOrderIdsForAuthorityFrame(snap, trimmed, "STOP"),
+            BrokerTargetOrderIds = CollectBrokerOrderIdsForAuthorityFrame(snap, trimmed, "TARGET"),
+            BrokerFlattenOrderIds = CollectBrokerOrderIdsForAuthorityFrame(snap, trimmed, "FLATTEN"),
             JournalOpenQty = journalOpenQty,
             JournalOpenIntentSetHash = journalOpenHash,
             RealOpenQty = positionAuthority.RealOpenQty,
@@ -158,6 +240,7 @@ public sealed partial class NinjaTraderSimAdapter
             AuthorityState = positionAuthority.AuthorityState,
             UseInstrumentExecutionAuthority = _useInstrumentExecutionAuthority,
             IeaOwnedPlusAdoptedWorking = ieaOwnedPlusAdoptedWorking,
+            IeaMismatchTrustedWorkingCount = ieaOwnedPlusAdoptedWorking,
             RecoveryExecutionDisallowed = recoveryExecutionDisallowed,
             JournalIntegrityOrReconciliationRepairActive = repairActive,
             PreflightAuthoritySampled = preflightAuthority.HasValue,
@@ -165,51 +248,29 @@ public sealed partial class NinjaTraderSimAdapter
             PreflightMismatchExecutionBlocked = preflightAuthority?.MismatchExecutionBlocked ?? false,
             PreflightMismatchExecutionBlockedForSubmit = preflightAuthority?.MismatchExecutionBlockedForSubmit,
             PreflightInstrumentFrozenOrEpaBlocked = preflightAuthority?.InstrumentFrozenOrEpaBlocked ?? false,
+            PreflightInstrumentFrozenOrEpaBlockReason = preflightAuthority?.InstrumentFrozenOrEpaBlockReason,
             LedgerAccountName = GetLedgerAccountName(),
             LedgerOwnershipVersion = ledgerSnap?.OwnershipVersion,
             LedgerSignedNetQty = ledgerSnap?.LedgerSignedNetQty,
             LedgerActiveSlotCount = ledgerSnap?.ActiveSlotCount,
             LedgerOrphanSlotCount = ledgerSnap?.OrphanSlotCount,
-            OwnershipSnapshot = ledgerSnap
-        };
+            OwnershipSnapshot = ledgerSnap,
+            QecPhase = QuantExecutionControlStore.GetSnapshot(trimmed).Phase.ToString(),
+            QecPendingAlignment =
+                PendingAlignmentAuthority.IsPendingAlignment(trimmed, utcNow) ||
+                QuantExecutionControlStore.IsAnyBrokerJournalAlignmentWindowActive(trimmed, utcNow),
+            IsPlayback = _authorityIsPlayback,
+            IsMultiDayScenario = _authorityIsMultiDayScenario,
+            PlaybackScenarioId = _authorityPlaybackScenarioId
+        });
     }
 
     private void EmitAuthorityFrameEvaluated(ExecutionAuthorityFrame frame, DateTimeOffset utcNow)
     {
+        var payload = ExecutionAuthorityFrameBuilder.ToLogPayload(frame);
+        _log.Write(RobotEvents.ExecutionBase(utcNow, frame.IntentId, frame.Instrument, "AUTHORITY_FRAME_SNAPSHOT", payload));
         _log.Write(RobotEvents.ExecutionBase(utcNow, frame.IntentId, frame.Instrument, "AUTHORITY_FRAME_EVALUATED",
-            new
-            {
-                authority_frame_id = frame.FrameId,
-                source = frame.Source,
-                instrument = frame.Instrument,
-                canonical_instrument = frame.CanonicalInstrument,
-                execution_instrument_key = frame.ExecutionInstrumentKey,
-                intent_id = frame.IntentId,
-                submit_path = frame.SubmitPath,
-                broker_snapshot_captured_at = frame.BrokerSnapshotCapturedUtc,
-                snapshot_error = frame.SnapshotError,
-                broker_qty = frame.BrokerPositionQty,
-                broker_working_count = frame.BrokerWorkingOrderCount,
-                journal_open_qty = frame.JournalOpenQty,
-                journal_open_intent_hash = frame.JournalOpenIntentSetHash,
-                real_open_qty = frame.RealOpenQty,
-                recovery_open_qty = frame.RecoveryOpenQty,
-                authority_state = frame.AuthorityState,
-                use_iea = frame.UseInstrumentExecutionAuthority,
-                iea_owned_plus_adopted_working = frame.IeaOwnedPlusAdoptedWorking,
-                recovery_execution_disallowed = frame.RecoveryExecutionDisallowed,
-                repair_active = frame.JournalIntegrityOrReconciliationRepairActive,
-                preflight_authority_sampled = frame.PreflightAuthoritySampled,
-                preflight_global_kill_switch_active = frame.PreflightGlobalKillSwitchActive,
-                preflight_mismatch_execution_blocked = frame.PreflightMismatchExecutionBlocked,
-                preflight_mismatch_execution_blocked_for_submit = frame.PreflightMismatchExecutionBlockedForSubmit,
-                preflight_instrument_frozen_or_epa_blocked = frame.PreflightInstrumentFrozenOrEpaBlocked,
-                ledger_account = frame.LedgerAccountName,
-                ledger_version = frame.LedgerOwnershipVersion,
-                ledger_signed_net_qty = frame.LedgerSignedNetQty,
-                ledger_active_slot_count = frame.LedgerActiveSlotCount,
-                ledger_orphan_slot_count = frame.LedgerOrphanSlotCount
-            }));
+            payload));
     }
 
     private ExecutionSafetyEvaluationRequest BuildExecutionSafetyEvaluationRequest(
@@ -401,6 +462,10 @@ public sealed partial class NinjaTraderSimAdapter
         {
             "GLOBAL_KILL_SWITCH_ACTIVE" => "operator_or_config_kill_switch_enabled",
             "MISMATCH_EXECUTION_BLOCK" => "mismatch_execution_block_authority",
+            var r when r.StartsWith("DURABLE_RISK_LATCH_ACTIVE:", StringComparison.OrdinalIgnoreCase) => "durable_risk_latch_active",
+            var r when r.StartsWith("IEA_SUPERVISORY_BLOCK:", StringComparison.OrdinalIgnoreCase) => "iea_supervisory_block",
+            var r when r.StartsWith("PROTECTIVE_COVERAGE_BLOCK:", StringComparison.OrdinalIgnoreCase) => "protective_coverage_block",
+            "ENGINE_INSTRUMENT_FROZEN" => "engine_instrument_frozen",
             "INSTRUMENT_FROZEN_OR_EPA_BLOCKED" => "instrument_frozen_or_supervisory_block",
             _ => denyReason
         };
@@ -443,7 +508,7 @@ public sealed partial class NinjaTraderSimAdapter
         }
 
         // Old gate chain -- still the decision path unless UEA is activated.
-        var protectiveStructuralFirst = string.Equals(blockedWhat, "SUBMIT_PROTECTIVE_STOP", StringComparison.Ordinal);
+        var protectiveStructuralFirst = ExecutionPermissionAuthority.IsRiskCoverageSubmitPath(blockedWhat);
         Func<string, string?, bool>? sampledMismatchForSubmit = preflightAuthority.MismatchExecutionBlockedForSubmit.HasValue
             ? (_, _) => preflightAuthority.MismatchExecutionBlockedForSubmit.Value
             : null;
@@ -458,6 +523,9 @@ public sealed partial class NinjaTraderSimAdapter
                 skipMismatchExecutionBlock: protectiveStructuralFirst))
         {
             var inst = instrument?.Trim() ?? "";
+            if (string.Equals(epaDeny, "INSTRUMENT_FROZEN_OR_EPA_BLOCKED", StringComparison.Ordinal) &&
+                !string.IsNullOrWhiteSpace(preflightAuthority.InstrumentFrozenOrEpaBlockReason))
+                epaDeny = preflightAuthority.InstrumentFrozenOrEpaBlockReason!;
             EmitExecutionBlockedEpa(blockedWhat, intentId, inst, epaDeny, utcNow);
             failure = OrderSubmissionResult.FailureResult($"EXECUTION_BLOCKED_EPA:{epaDeny}", utcNow);
             RunUeaShadowEval(intentId, instrument, blockedWhat, utcNow, oldAllowed: false, oldDenyReason: $"EPA:{epaDeny}", preflightAuthority: preflightAuthority);
@@ -541,6 +609,7 @@ public sealed partial class NinjaTraderSimAdapter
             MismatchExecutionBlocked = _isMismatchExecutionBlocked,
             MismatchExecutionBlockedForSubmit = _isMismatchExecutionBlockedForSubmit,
             InstrumentFrozenOrEpaBlocked = _isInstrumentFrozenOrEpaBlocked,
+            InstrumentFrozenOrEpaBlockReason = _getInstrumentFrozenOrEpaBlockReason,
             PreflightGlobalKillSwitchActive = preflightAuthority?.GlobalKillSwitchActive ??
                                               (hasFramePreflight ? frame!.PreflightGlobalKillSwitchActive : (bool?)null),
             PreflightMismatchExecutionBlocked = preflightAuthority?.MismatchExecutionBlocked ??
@@ -549,6 +618,8 @@ public sealed partial class NinjaTraderSimAdapter
                                                          (hasFramePreflight ? frame!.PreflightMismatchExecutionBlockedForSubmit : null),
             PreflightInstrumentFrozenOrEpaBlocked = preflightAuthority?.InstrumentFrozenOrEpaBlocked ??
                                                     (hasFramePreflight ? frame!.PreflightInstrumentFrozenOrEpaBlocked : (bool?)null),
+            PreflightInstrumentFrozenOrEpaBlockReason = preflightAuthority?.InstrumentFrozenOrEpaBlockReason ??
+                                                        (hasFramePreflight ? frame!.PreflightInstrumentFrozenOrEpaBlockReason : null),
             PrebuiltSafetyRequest = prebuiltSafetyRequest,
             AuthorityFrame = prebuiltSafetyRequest?.AuthorityFrame,
             BuildSafetyRequest = (inst, iid, t) => BuildExecutionSafetyEvaluationRequest(inst, iid, t, blockedWhat, preflightAuthority),
@@ -583,18 +654,30 @@ public sealed partial class NinjaTraderSimAdapter
 
             if (oldAllowed != ueaDecision.Allowed)
             {
+                var disagreementPayload = new
+                {
+                    old_allowed = oldAllowed,
+                    old_deny_reason = oldDenyReason,
+                    authority_frame_id = ueaDecision.AuthorityFrame?.FrameId,
+                    uea_allowed = ueaDecision.Allowed,
+                    uea_deny_gate = ueaDecision.DenyGate,
+                    uea_deny_reason = ueaDecision.DenyReason,
+                    blocked_what = blockedWhat,
+                    direction = oldAllowed && !ueaDecision.Allowed
+                        ? "LEGACY_ALLOW_CANONICAL_DENY"
+                        : "LEGACY_DENY_CANONICAL_ALLOW",
+                    failed_predicates = ueaDecision.AuthorityFrame?.FailedPredicates ?? Array.Empty<string>(),
+                    note = "Old path and UEA disagree on order submission decision"
+                };
+                if (oldAllowed && !ueaDecision.Allowed)
+                {
+                    _log?.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument?.Trim() ?? "", "AUTHORITY_FRAME_UNSAFE_LEGACY_ALLOW",
+                        disagreementPayload));
+                }
+                _log?.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument?.Trim() ?? "", "AUTHORITY_FRAME_DISAGREEMENT",
+                    disagreementPayload));
                 _log?.Write(RobotEvents.ExecutionBase(utcNow, intentId, instrument?.Trim() ?? "", "UEA_SHADOW_DISAGREEMENT",
-                    new
-                    {
-                        old_allowed = oldAllowed,
-                        old_deny_reason = oldDenyReason,
-                        authority_frame_id = ueaDecision.AuthorityFrame?.FrameId,
-                        uea_allowed = ueaDecision.Allowed,
-                        uea_deny_gate = ueaDecision.DenyGate,
-                        uea_deny_reason = ueaDecision.DenyReason,
-                        blocked_what = blockedWhat,
-                        note = "Old path and UEA disagree on order submission decision"
-                    }));
+                    disagreementPayload));
             }
         }
         catch (Exception ex)
@@ -809,7 +892,7 @@ public sealed partial class NinjaTraderSimAdapter
         ExecutionSafetyEvaluationRequest req;
         try
         {
-            req = BuildExecutionSafetyEvaluationRequest(inst, intentId, utcNow);
+            req = BuildExecutionSafetyEvaluationRequest(inst, intentId, utcNow, blockedWhat);
         }
         catch
         {
@@ -821,6 +904,46 @@ public sealed partial class NinjaTraderSimAdapter
         }
 
         EmitPositionAuthorityEvaluated(req, utcNow);
+
+        var flattenAuthority = UnifiedExecutionAuthority.EvaluateAction(new ExecutionAuthorityActionEvaluationRequest
+        {
+            Action = ExecutionAuthorityAction.Flatten,
+            Source = "NinjaTraderSimAdapter.FlattenGuard",
+            Instrument = inst,
+            IntentId = intentId ?? "",
+            UtcNow = utcNow,
+            SnapshotSufficient = req.AccountSnapshot != null,
+            BrokerAbsQty = Math.Abs(req.AuthorityFrame?.BrokerPositionQty ?? 0),
+            BrokerWorkingOrderCount = req.AuthorityFrame?.BrokerWorkingOrdersCount ?? 0,
+            JournalOpenQty = req.AuthorityFrame?.JournalOpenQty ?? 0,
+            OwnershipOpenQty = req.AuthorityFrame?.OwnershipOpenQty ?? 0,
+            OwnershipActiveSlotCount = req.AuthorityFrame?.OwnershipActiveSlots ?? 0,
+            OwnershipOrphanSlotCount = req.AuthorityFrame?.OwnershipOrphanSlots ?? 0,
+            RealOpenQty = req.AuthorityFrame?.RealOpenQty ?? 0,
+            RecoveryOpenQty = req.AuthorityFrame?.RecoveryOpenQty ?? 0,
+            AuthorityFrame = req.AuthorityFrame
+        });
+        if (!flattenAuthority.Allowed)
+        {
+            snap = new ExecutionSafetySnapshot
+            {
+                Instrument = inst,
+                Reason = flattenAuthority.DenyReason,
+                Detail = flattenAuthority.Detail,
+                AuthorityFrameId = req.AuthorityFrame?.FrameId ?? ""
+            };
+            EmitExecutionBlockedUnsafeState(blockedWhat, intentId, snap, utcNow);
+            _log.Write(RobotEvents.ExecutionBase(utcNow, intentId ?? "", inst, "FLATTEN_BLOCKED_UNSAFE_STATE",
+                new
+                {
+                    authority_frame_id = req.AuthorityFrame?.FrameId,
+                    instrument = inst,
+                    reason = flattenAuthority.DenyReason,
+                    detail = flattenAuthority.Detail,
+                    correlation_id = correlationId
+                }));
+            return false;
+        }
 
         if (!ExecutionStructuralLayer.TryEvaluateFlattenStructure(req, out snap, out var flatReason))
         {

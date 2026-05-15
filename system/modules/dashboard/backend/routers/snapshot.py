@@ -1,12 +1,14 @@
 """
 Dashboard snapshot endpoints - Save dashboard state as git commit
 """
+import inspect
 import json
 import logging
 import subprocess
 from pathlib import Path
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from typing import Dict, Any, Optional
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
@@ -35,7 +37,9 @@ async def get_scheduler_status() -> Dict[str, Any]:
         from routers.schedule import get_scheduler_status as _get_scheduler_status
     
     try:
-        return await _get_scheduler_status()
+        if inspect.iscoroutinefunction(_get_scheduler_status):
+            return await _get_scheduler_status()
+        return await run_in_threadpool(_get_scheduler_status)
     except Exception as e:
         logger.warning(f"Failed to get scheduler status: {e}")
         return {}

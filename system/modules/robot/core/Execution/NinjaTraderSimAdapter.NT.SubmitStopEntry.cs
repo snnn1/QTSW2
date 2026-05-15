@@ -93,6 +93,9 @@ public sealed partial class NinjaTraderSimAdapter
             return OrderSubmissionResult.FailureResult(error, utcNow);
         }
 
+        if (TryBlockDuplicateEntrySubmit(intentId, instrument, "ENTRY_STOP", quantity, utcNow, out var duplicateEntryFailure))
+            return duplicateEntryFailure!;
+
         try
         {
             var orderAction = direction == "Long" ? OrderAction.Buy : OrderAction.SellShort;

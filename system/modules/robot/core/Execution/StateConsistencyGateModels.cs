@@ -128,6 +128,15 @@ public sealed class StateConsistencyReleaseReadinessResult
     public List<string> Contradictions { get; set; } = new();
     public string Summary { get; set; } = "";
 
+    /// <summary>
+    /// True only when UnifiedExecutionAuthority explicitly allowed MISMATCH_RELEASE for the same readiness frame.
+    /// The mismatch coordinator must not clear block state from ReleaseReady alone.
+    /// </summary>
+    public bool CanonicalReleaseAuthorityAllowed { get; set; }
+    public string CanonicalReleaseAuthorityGate { get; set; } = "";
+    public string CanonicalReleaseAuthorityDenyReason { get; set; } = "";
+    public string CanonicalReleaseAuthorityFrameId { get; set; } = "";
+
     /// <summary>False when evaluation returned before full inputs (e.g. snapshot missing).</summary>
     public bool SnapshotSufficient { get; set; }
 
@@ -290,6 +299,12 @@ public static class StateConsistencyReleaseEvaluator
         }
         else
             r.LocalStateCoherent = true;
+
+        if (i.PendingExecutionWorkload > 0)
+        {
+            r.LocalStateCoherent = false;
+            r.Contradictions.Add($"pending_execution_workload_{i.PendingExecutionWorkload}");
+        }
 
         if (HasActiveOwnershipGross(i) && i.BrokerPositionQty == 0)
         {

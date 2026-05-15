@@ -39,7 +39,8 @@ public sealed partial class NinjaTraderSimAdapter
 
         // Get tag/name (try Tag first, fallback to Name)
         var encodedTag = GetOrderTag(order);
-        var intentId = RobotOrderIds.DecodeIntentId(encodedTag);
+        var parsedTag = RobotOrderIds.ParseTag(encodedTag);
+        var intentId = parsedTag.IntentId ?? RobotOrderIds.DecodeIntentId(encodedTag);
         var utcNow = DateTimeOffset.UtcNow;
         var orderState = order.OrderState;
         var instrumentTrace = order.Instrument?.MasterInstrument?.Name ?? "";
@@ -80,7 +81,14 @@ public sealed partial class NinjaTraderSimAdapter
             }));
         }
 
-        if (!_orderMap.TryGetValue(intentId, out var orderInfo))
+        var legKey = parsedTag.Leg == "STOP" || parsedTag.Leg == "TARGET" ? parsedTag.Leg : null;
+        OrderInfo? orderInfo;
+        var foundOrderInfo = legKey != null
+            ? _orderMap.TryGetValue($"{intentId}:{legKey}", out orderInfo)
+            : _orderMap.TryGetValue(intentId, out orderInfo);
+        if (!foundOrderInfo && legKey == null)
+            foundOrderInfo = _orderMap.TryGetValue(intentId, out orderInfo);
+        if (!foundOrderInfo || orderInfo == null)
         {
             // CRITICAL FIX: Handle execution updates for untracked orders gracefully
             // This can happen if:

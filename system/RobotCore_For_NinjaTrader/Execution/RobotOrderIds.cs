@@ -52,6 +52,16 @@ public static class RobotOrderIds
     public static bool IsAggregatedTag(string? tag) =>
         !string.IsNullOrEmpty(tag) && tag.StartsWith(AggregatedPrefix, StringComparison.OrdinalIgnoreCase);
 
+    public static string? DecodeFlattenRequestId(string? tag)
+    {
+        const string flattenPrefix = Prefix + "FLATTEN:";
+        if (string.IsNullOrEmpty(tag) || !tag.StartsWith(flattenPrefix, StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        var requestId = tag.Substring(flattenPrefix.Length).Trim();
+        return string.IsNullOrEmpty(requestId) ? null : requestId;
+    }
+
     /// <summary>
     /// Decode aggregated intent IDs from tag. Returns null if not an aggregated tag.
     /// </summary>

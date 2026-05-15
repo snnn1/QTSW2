@@ -46,11 +46,13 @@ if (argsList.Contains("--help") || argsList.Contains("-h"))
 
 // --test DST: run session close fallback timezone tests (DST boundary weeks)
 // --test TERMINAL_INTENT: run terminal intent hardening tests (IsIntentCompleted, BE exclusion)
+// --test ENTRY_SUBMIT_IDEMPOTENCY: same-intent active entry submit blocker state contract
 // --test IEA_FLATTEN: run IEA flatten authority tests (exposure-reduction invariant)
 // --test IEA_ADOPTION_GATE: single-flight adoption scan gate state machine (CPU fix helper)
 // --test IEA_ADOPTION_NO_PROGRESS: recovery adoption no-progress skip evaluator (fingerprint + cooldown)
 // --test PHASE5_HARDENING: run Phase 5 hardening tests (kill switch, RiskGate, hysteresis)
 // --test SESSION_IDENTITY_GATE: session trading date vs engine latch (no retry / CRITICAL once)
+// --test IDENTITY_REPLAY: intent identity replay and restart hydration reconstruction
 // --test SCENARIO_HARNESS_SIX: run first six execution replay scenarios (happy path + early stress; distinct from CHAOS)
 // --test EXECUTION_SAFETY_PROTECTIVE_INTEGRATION: SUBMIT_PROTECTIVE_STOP through adapter safety gate (EPA+structural+overlay) with pending-alignment lag
 // --test STRUCTURAL_LAG_BYPASS: pending ledger + parity mismatch + repair latch → structural allow (flag); recovery still denies
@@ -98,6 +100,12 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
         Console.WriteLine(pass ? "PASS: Terminal intent hardening tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
+    else if (testName.Equals("ENTRY_SUBMIT_IDEMPOTENCY", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = EntrySubmitIdempotencyTests.RunEntrySubmitIdempotencyTests();
+        Console.WriteLine(pass ? "PASS: Entry submit idempotency tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
     else if (testName.Equals("FORCED_FLATTEN_POLICY", StringComparison.OrdinalIgnoreCase))
     {
         var (pass, err) = ForcedFlattenPolicyTests.RunForcedFlattenPolicyTests();
@@ -108,6 +116,12 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
     {
         var (pass, err) = SessionCloseInstrumentOwnerRoutingTests.RunSessionCloseInstrumentOwnerRoutingTests();
         Console.WriteLine(pass ? "PASS: Session-close instrument owner routing tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("IDENTITY_REPLAY", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = IdentityReplayScenarioRunner.RunAllIdentityValidationScenarios();
+        Console.WriteLine(pass ? "PASS: Identity replay and restart hydration scenarios" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
     else if (testName.Equals("IEA_FLATTEN", StringComparison.OrdinalIgnoreCase))
@@ -517,6 +531,12 @@ if (testIndex >= 0 && testIndex + 1 < argsList.Count)
     {
         var (pass, err) = AuthorityContradictionTests.RunAll();
         Console.WriteLine(pass ? "PASS: Authority contradiction tests" : $"FAIL: {err}");
+        Environment.Exit(pass ? 0 : 1);
+    }
+    else if (testName.Equals("AUTHORITY_FRAME", StringComparison.OrdinalIgnoreCase))
+    {
+        var (pass, err) = AuthorityFrameTests.RunAll();
+        Console.WriteLine(pass ? "PASS: Authority frame tests" : $"FAIL: {err}");
         Environment.Exit(pass ? 0 : 1);
     }
     else if (testName.Equals("RUN_SUMMARY", StringComparison.OrdinalIgnoreCase))

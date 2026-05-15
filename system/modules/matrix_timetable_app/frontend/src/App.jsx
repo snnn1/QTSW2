@@ -188,7 +188,7 @@ function AppContent() {
   const [currentTradingDay, setCurrentTradingDay] = useState(null)
 
   const [showBlockedTimetableRows, setShowBlockedTimetableRows] = useState(() => {
-    return readStoredBoolean('matrix_show_blocked_timetable', true)
+    return readStoredBoolean('matrix_show_blocked_timetable_v2', false)
   })
   const hasValidHistoricalDate = /^\d{4}-\d{2}-\d{2}$/.test(timetableGenerateDate.trim())
   const hasValidPlaybackScenarioRange =
@@ -306,6 +306,9 @@ function AppContent() {
         const st = res.status === 'published' ? 'Published' : 'Unchanged'
         const h = res.hash ? `${String(res.hash).slice(0, 16)}...` : '-'
         bannerText = `${st} replay timetable for ${d}. Playback file: timetable_replay_current.json. Content hash prefix: ${h}`
+        if (res?.playback_scenario_pointer?.removed) {
+          bannerText += `. Multi-day Playback pointer archived; restart NinjaTrader before normal playback/SIM.`
+        }
       } else {
         const cur = await matrixApi.getCurrentTimetable()
         const tdRaw =
@@ -331,6 +334,9 @@ function AppContent() {
         const st = res.status === 'published' ? 'Published' : 'Unchanged'
         const h = res.hash ? `${String(res.hash).slice(0, 16)}...` : '-'
         bannerText = `${st} (live mode). Content hash prefix: ${h}`
+        if (res?.playback_scenario_pointer?.removed) {
+          bannerText += `. Multi-day Playback pointer archived; restart NinjaTrader before SIM/live.`
+        }
       }
       if (!appliedDoc || typeof appliedDoc !== 'object') {
         throw new Error('Timetable API returned no document to display.')
@@ -389,9 +395,23 @@ function AppContent() {
       BlockReason:
         s.block_reason != null && String(s.block_reason).trim() !== ''
           ? String(s.block_reason)
-          : null,
+        : null,
     }))
   }, [workerExecutionTimetable])
+  const selectedTimetableStreams = useMemo(() => {
+    const selected = streamFilters?.master?.include_streams
+    if (!Array.isArray(selected)) return []
+    return selected.map((stream) => String(stream).trim().toUpperCase()).filter(Boolean)
+  }, [streamFilters])
+  const liveTimetableStreamsOutsideSelection = useMemo(() => {
+    if (timetableMode !== 'live' || selectedTimetableStreams.length === 0) return []
+    const selected = new Set(selectedTimetableStreams)
+    const outside = timetableRowsForDisplay
+      .filter((row) => row.Enabled !== false)
+      .map((row) => String(row.Stream || '').trim().toUpperCase())
+      .filter((stream) => stream && !selected.has(stream))
+    return Array.from(new Set(outside)).sort()
+  }, [selectedTimetableStreams, timetableMode, timetableRowsForDisplay])
   const displayedTradingDay = useMemo(() => {
     if (
       timetableMode === 'playback_multi' &&
@@ -433,7 +453,7 @@ function AppContent() {
 
   // Save showBlockedTimetableRows to localStorage when it changes
   useEffect(() => {
-    localStorage.setItem('matrix_show_blocked_timetable', String(showBlockedTimetableRows))
+    localStorage.setItem('matrix_show_blocked_timetable_v2', String(showBlockedTimetableRows))
   }, [showBlockedTimetableRows])
 
   useEffect(() => {
@@ -560,13 +580,16 @@ function AppContent() {
     let timeoutId = null
     let isCancelled = false
     let isReady = false // Track ready state with local variable
+    let probeInFlight = false
     
     const pollBackend = async () => {
-      if (isCancelled || isReady) return false
+      if (isCancelled || isReady || probeInFlight) return false
+      probeInFlight = true
+      let requestTimeout = null
       
       try {
         const controller = new AbortController()
-        const requestTimeout = setTimeout(() => controller.abort(), 2000) // 2s timeout per request
+        requestTimeout = setTimeout(() => controller.abort(), 2000) // 2s timeout per request
         
         // Must hit FastAPI via /api/... (Vite proxies /api → :8000). Do not use /health on the dev server root.
         const response = await fetch(getBackendProbeUrl(), {
@@ -601,6 +624,11 @@ function AppContent() {
         if (error.name !== 'AbortError') {
           console.debug('Backend not ready yet, continuing to poll...', error.message)
         }
+      } finally {
+        if (requestTimeout) {
+          clearTimeout(requestTimeout)
+        }
+        probeInFlight = false
       }
       return false
     }
@@ -610,7 +638,7 @@ function AppContent() {
       if (!ready && !isCancelled && !isReady) {
         pollInterval = setInterval(() => {
           pollBackend()
-        }, 500)
+        }, 1500)
       }
     })
     
@@ -3668,6 +3696,20 @@ function AppContent() {
                   }`}
                 >
                   {timetableManualPublishBanner.text}
+                </div>
+              ) : null}
+              {liveTimetableStreamsOutsideSelection.length > 0 ? (
+                <div className="mb-4 px-4 py-3 rounded border border-amber-700 bg-amber-950/50 text-sm text-amber-100">
+                  <div className="font-semibold text-amber-300">Live timetable is not using the selected stream filter yet</div>
+                  <div className="mt-1">
+                    Selected streams: <span className="font-mono">{selectedTimetableStreams.join(', ')}</span>
+                  </div>
+                  <div className="mt-1">
+                    Current live file still enables: <span className="font-mono">{liveTimetableStreamsOutsideSelection.join(', ')}</span>
+                  </div>
+                  <div className="mt-1 text-amber-200/90">
+                    Click <span className="font-semibold">Publish timetable</span> to rewrite live execution authority with the selected filter.
+                  </div>
                 </div>
               ) : null}
               {playbackScenarioResult?.manifest_path ? (

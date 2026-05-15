@@ -27,8 +27,7 @@ public sealed partial class RobotEngine
     {
         if (_intentExposureCoordinator == null || _executionAdapter is not NinjaTraderSimAdapter)
             return;
-        if (string.IsNullOrEmpty(TradingDateString) ||
-            !string.Equals(tradingDate, TradingDateString, StringComparison.Ordinal))
+        if (!ShouldRehydrateDurableJournalIntent(tradingDate, stream, intentId))
             return;
         if (string.Equals(stream, ExecutionJournal.UntrackedFillRecoveryStream, StringComparison.OrdinalIgnoreCase))
             return;
@@ -50,6 +49,39 @@ public sealed partial class RobotEngine
             exitFilledQty,
             utcNow,
             source);
+    }
+
+    private bool ShouldRehydrateDurableJournalIntent(string tradingDate, string stream, string intentId)
+    {
+        if (string.IsNullOrEmpty(TradingDateString))
+            return false;
+        if (string.Equals(tradingDate, TradingDateString, StringComparison.Ordinal))
+            return true;
+        if (string.Equals(stream, ExecutionJournal.UntrackedFillRecoveryStream, StringComparison.OrdinalIgnoreCase))
+            return false;
+        if (string.IsNullOrWhiteSpace(tradingDate) ||
+            string.IsNullOrWhiteSpace(stream) ||
+            string.IsNullOrWhiteSpace(intentId))
+            return false;
+
+        var journal = _journals.TryLoad(tradingDate, stream);
+        if (journal == null || journal.Committed || journal.SlotStatus != SlotStatus.ACTIVE)
+            return false;
+
+        var matchesOriginal = string.Equals(journal.OriginalIntentId, intentId, StringComparison.OrdinalIgnoreCase);
+        var matchesReentry = string.Equals(journal.ReentryIntentId, intentId, StringComparison.OrdinalIgnoreCase);
+        if (!matchesOriginal && !matchesReentry)
+            return false;
+
+        if (matchesReentry &&
+            (journal.ReentrySubmitPending || journal.ReentrySubmitted || journal.ReentryFilled ||
+             journal.ProtectionSubmitted || journal.ProtectionAccepted))
+            return true;
+
+        return matchesOriginal &&
+               (journal.ExecutionInterruptedByClose ||
+                journal.ForcedFlattenTimestamp.HasValue ||
+                string.IsNullOrWhiteSpace(journal.ReentryIntentId));
     }
 
     private void RehydrateOpenIntentExposuresFromJournal(DateTimeOffset utcNow)

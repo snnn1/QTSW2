@@ -116,7 +116,8 @@ public sealed partial class RobotEngine
                     out var suppressionReason))
             {
                 LogReleaseSuppressionDecisionIfDiag(inst, skipped: true, suppressionReason, in suppressionProbe, gen);
-                return cached!;
+                return ApplyMismatchReleaseAuthority(inst, snapshot, utcNow, null, cached!,
+                    "RobotEngine.MismatchRelease.Cached");
             }
 
             LogReleaseSuppressionDecisionIfDiag(inst, skipped: false, suppressionReason, in suppressionProbe, gen);
@@ -125,6 +126,8 @@ public sealed partial class RobotEngine
         var genAtStart = _releaseReconRedundancy.ExecutionActivityGeneration;
         var input = BuildStateConsistencyReleaseEvaluationInput(inst, snapshot, utcNow);
         var result = StateConsistencyReleaseEvaluator.Evaluate(input);
+        result = ApplyMismatchReleaseAuthority(inst, snapshot, utcNow, input, result,
+            "RobotEngine.MismatchRelease");
 
         if (snapshot != null && input.SnapshotSufficient && _journalIntegrityEnsuredForInstrument.ContainsKey(inst))
         {
@@ -176,6 +179,7 @@ public sealed partial class RobotEngine
                         ownership_active_slot_count = input.OwnershipActiveSlotCount,
                         ownership_orphan_slot_count = input.OwnershipOrphanSlotCount,
                         iea_trusted_working_count = input.IeaOwnedPlusAdoptedWorking,
+                        pending_execution_workload = input.PendingExecutionWorkload,
                         pending_candidate_count = input.PendingAdoptionCandidateCount,
                         release_ready = result.ReleaseReady,
                         contradictions = string.Join(";", result.Contradictions ?? new List<string>())
@@ -188,6 +192,146 @@ public sealed partial class RobotEngine
             _releaseReconRedundancy.RecordReleaseFullEvaluation(inst, input, result, utcNow, genAtStart);
 
         return result;
+    }
+
+    private StateConsistencyReleaseReadinessResult ApplyMismatchReleaseAuthority(
+        string inst,
+        AccountSnapshot? snapshot,
+        DateTimeOffset utcNow,
+        StateConsistencyReleaseEvaluationInput? input,
+        StateConsistencyReleaseReadinessResult result,
+        string source)
+    {
+        var authorized = ReleaseReconciliationRedundancySuppression.CloneReadiness(result);
+        var snapshotSufficient = input?.SnapshotSufficient ?? authorized.SnapshotSufficient;
+        var brokerPositionQty = input?.BrokerPositionQty ?? authorized.DiagnosticBrokerPositionQty;
+        var brokerWorkingCount = input?.BrokerWorkingCount ?? authorized.DiagnosticBrokerWorkingCount;
+        var journalOpenQty = input?.JournalOpenQty ?? authorized.DiagnosticJournalOpenQty;
+        var ownershipGrossOpenQty = input?.OwnershipGrossOpenQty ?? authorized.DiagnosticOwnershipGrossOpenQty;
+        var ownershipSignedNetQty = input?.OwnershipSignedNetQty ?? authorized.DiagnosticOwnershipSignedNetQty;
+        var ownershipActiveSlotCount = input?.OwnershipActiveSlotCount ?? authorized.DiagnosticOwnershipActiveSlotCount;
+        var ownershipOrphanSlotCount = input?.OwnershipOrphanSlotCount ?? authorized.DiagnosticOwnershipOrphanSlotCount;
+        var ieaOwnedPlusAdoptedWorking = input?.IeaOwnedPlusAdoptedWorking ?? authorized.DiagnosticIeaOwnedPlusAdoptedWorking;
+        var useIea = input?.UseInstrumentExecutionAuthority ?? ieaOwnedPlusAdoptedWorking >= 0;
+        var pendingExecutionWorkload = input?.PendingExecutionWorkload ?? authorized.DiagnosticPendingExecutionWorkload;
+
+        var releaseFrame = ExecutionAuthorityFrameBuilder.Build(new ExecutionAuthorityFrameBuilderInput
+        {
+            Source = source,
+            Account = _accountName ?? "",
+            Instrument = inst,
+            CanonicalInstrument = GetCanonicalInstrument(inst) ?? inst,
+            TradingDate = TradingDateString,
+            SubmitPath = "MISMATCH_RELEASE",
+            DecisionUtc = utcNow,
+            FrameCreatedUtc = utcNow,
+            BrokerSnapshotCapturedUtc = snapshot?.CapturedAtUtc,
+            SnapshotError = !snapshotSufficient || snapshot == null ? "snapshot_unavailable" : null,
+            BrokerPositionQty = brokerPositionQty,
+            BrokerWorkingOrdersCount = brokerWorkingCount,
+            JournalOpenQty = journalOpenQty,
+            OwnershipOpenQty = ownershipGrossOpenQty,
+            OwnershipSignedQty = ownershipSignedNetQty,
+            OwnershipActiveSlots = ownershipActiveSlotCount,
+            OwnershipOrphanSlots = ownershipOrphanSlotCount,
+            IeaMismatchTrustedWorkingCount = ieaOwnedPlusAdoptedWorking,
+            UseInstrumentExecutionAuthority = useIea,
+            MismatchBlockActive = _mismatchCoordinator?.IsInstrumentBlockedByMismatch(inst) == true,
+            MismatchBlockReason = authorized.ReleaseReady ? "" : string.Join(";", authorized.Contradictions ?? new List<string>()),
+            AuthorityState = "MISMATCH_RELEASE"
+        });
+        var releaseAuthority = UnifiedExecutionAuthority.EvaluateAction(new ExecutionAuthorityActionEvaluationRequest
+        {
+            Action = ExecutionAuthorityAction.MismatchRelease,
+            Source = source,
+            Instrument = inst,
+            UtcNow = utcNow,
+            SnapshotSufficient = snapshotSufficient,
+            ReleaseValidatorReady = authorized.ReleaseReady,
+            PendingExecutionWorkload = pendingExecutionWorkload,
+            BrokerAbsQty = Math.Abs(brokerPositionQty),
+            BrokerWorkingOrderCount = brokerWorkingCount,
+            JournalOpenQty = journalOpenQty,
+            OwnershipOpenQty = ownershipGrossOpenQty,
+            OwnershipActiveSlotCount = ownershipActiveSlotCount,
+            OwnershipOrphanSlotCount = ownershipOrphanSlotCount,
+            AuthorityFrame = releaseFrame
+        });
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString, eventType: "AUTHORITY_FRAME_SNAPSHOT", state: "ENGINE",
+            ExecutionAuthorityFrameBuilder.ToLogPayload(
+                releaseFrame,
+                action: "MISMATCH_RELEASE",
+                decision: releaseAuthority.Allowed ? "ALLOW" : "DENY",
+                denyReason: releaseAuthority.DenyReason)));
+
+        authorized.CanonicalReleaseAuthorityAllowed =
+            releaseAuthority.Allowed &&
+            string.Equals(releaseAuthority.GateName, "AuthorityMismatchRelease", StringComparison.Ordinal);
+        authorized.CanonicalReleaseAuthorityGate = releaseAuthority.GateName ?? "";
+        authorized.CanonicalReleaseAuthorityDenyReason = releaseAuthority.DenyReason ?? "";
+        authorized.CanonicalReleaseAuthorityFrameId = releaseAuthority.AuthorityFrame?.FrameId ?? releaseFrame.FrameId;
+
+        if (releaseAuthority.Allowed)
+            return authorized;
+
+        if (authorized.ReleaseReady)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+                eventType: "AUTHORITY_FRAME_UNSAFE_LEGACY_ALLOW", state: "ENGINE",
+                new
+                {
+                    action = "MISMATCH_RELEASE",
+                    instrument = inst,
+                    authority_gate = releaseAuthority.GateName,
+                    authority_deny_reason = releaseAuthority.DenyReason ?? "UNKNOWN",
+                    authority_detail = releaseAuthority.Detail ?? "",
+                    note = "State-consistency validator was release-ready, but canonical authority denied mismatch release."
+                }));
+        }
+
+        authorized.ReleaseReady = false;
+        var denyReason = releaseAuthority.DenyReason ?? "UNKNOWN";
+        authorized.Contradictions ??= new List<string>();
+        authorized.Contradictions.Add($"authority_mismatch_release_denied:{denyReason}");
+        authorized.Summary = $"authority_mismatch_release_denied:{denyReason}";
+        return authorized;
+    }
+
+    private void LogBrokerFlatJournalRepairDeferredToAuthority(
+        string source,
+        string instrument,
+        string executionInstrumentKey,
+        string canonicalInstrument,
+        int brokerPositionQty,
+        int brokerWorkingCount,
+        int journalOpenQty,
+        int pendingExecutionWorkload,
+        bool pendingFlattenLifecycle,
+        bool brokerJournalAlignmentActive,
+        bool ownershipGrossOpen,
+        DateTimeOffset utcNow)
+    {
+        if (journalOpenQty <= 0)
+            return;
+
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: TradingDateString,
+            eventType: "BROKER_FLAT_JOURNAL_REPAIR_DEFERRED_TO_AUTHORITY", state: "ENGINE",
+            new
+            {
+                source,
+                instrument,
+                execution_instrument_key = executionInstrumentKey,
+                canonical_instrument = canonicalInstrument,
+                broker_position_qty = brokerPositionQty,
+                broker_working_count = brokerWorkingCount,
+                journal_open_qty = journalOpenQty,
+                pending_execution_workload = pendingExecutionWorkload,
+                pending_flatten_lifecycle = pendingFlattenLifecycle,
+                broker_journal_alignment_active = brokerJournalAlignmentActive,
+                ownership_gross_open = ownershipGrossOpen,
+                required_authority_action = "JOURNAL_COMPLETE_BROKER_FLAT",
+                note = "Release readiness is read-only for broker-flat journal repair; journal completion must be routed through canonical authority."
+            }));
     }
 
     private StateConsistencyReleaseEvaluationInput BuildStateConsistencyReleaseEvaluationInput(string inst, AccountSnapshot snap, DateTimeOffset utcNow)
@@ -235,56 +379,45 @@ public sealed partial class RobotEngine
         var staleAdoptionJournalClosedCount = integrityResult.Reconstruction?.StaleAdoptionRowsClosed ?? 0;
         var journalAlignmentWriteCount = integrityResult.Reconstruction?.JournalWritesFromAlignment ?? 0;
         var recoveredIntentWrites = integrityResult.RecoveredIntentWrites;
-        var brokerFlatJournalClosedCount = 0;
-        var residualBrokerFlatJournalClosedCount = 0;
         var brokerJournalAlignmentActive = QuantExecutionControlStore.IsAnyBrokerJournalAlignmentWindowActive(inst, utcNow);
+        var pendingFlattenLifecycle = HasPendingFlattenLifecycle(inst);
+        var ownershipGrossOpen = HasReleaseOwnershipGrossOpen(input);
         var suppressBrokerFlatJournalClose =
-            HasPendingFlattenLifecycle(inst) ||
+            pendingFlattenLifecycle ||
             pendingIeAWorkload != 0 ||
             brokerJournalAlignmentActive ||
-            HasReleaseOwnershipGrossOpen(input);
+            ownershipGrossOpen;
 
         if (input.BrokerPositionQty == 0 && input.BrokerWorkingCount == 0)
         {
-            brokerFlatJournalClosedCount = _executionJournal.ReconcileBrokerFlatJournalRowsForRelease(
+            LogBrokerFlatJournalRepairDeferredToAuthority(
+                "ReleaseReadinessBrokerFlat",
+                inst,
                 releaseOwnershipKey,
                 canonical,
                 input.BrokerPositionQty,
                 input.BrokerWorkingCount,
-                robotIntentIds,
-                registryIntentIds,
-                utcNow,
-                "ReleaseReadinessBrokerFlat",
-                suppressBrokerFlatJournalClose,
-                onReconciled: (td, streamId, intentId, remaining) => RecordOwnershipBrokerFlatJournalClose(
-                    td,
-                    streamId,
-                    intentId,
-                    releaseOwnershipKey,
-                    remaining,
-                    utcNow,
-                    "Release-readiness broker-flat journal reconciliation mirrored into ownership ledger"));
+                journalOpenQtyBeforePreSum,
+                pendingIeAWorkload,
+                pendingFlattenLifecycle,
+                brokerJournalAlignmentActive,
+                ownershipGrossOpen,
+                utcNow);
             if (!suppressBrokerFlatJournalClose && pendingIeAWorkload == 0)
             {
-                residualBrokerFlatJournalClosedCount = _executionJournal.ReconcileBrokerFlatJournalRowsForRelease(
+                LogBrokerFlatJournalRepairDeferredToAuthority(
+                    "ResidualBrokerFlatCleanupPulse",
+                    inst,
                     releaseOwnershipKey,
                     canonical,
                     input.BrokerPositionQty,
                     input.BrokerWorkingCount,
-                    robotIntentIds,
-                    registryIntentIds,
-                    utcNow,
-                    "ResidualBrokerFlatCleanupPulse",
-                    suppressWhileFlattenPending: false,
-                    allowTaggedResidualRetirement: true,
-                    onReconciled: (td, streamId, intentId, remaining) => RecordOwnershipBrokerFlatJournalClose(
-                        td,
-                        streamId,
-                        intentId,
-                        releaseOwnershipKey,
-                        remaining,
-                        utcNow,
-                        "Residual broker-flat cleanup journal reconciliation mirrored into ownership ledger"));
+                    journalOpenQtyBeforePreSum,
+                    pendingIeAWorkload,
+                    pendingFlattenLifecycle,
+                    brokerJournalAlignmentActive,
+                    ownershipGrossOpen,
+                    utcNow);
             }
         }
 
@@ -297,8 +430,6 @@ public sealed partial class RobotEngine
             journalOpenQtyBeforePreSum != journalOpenQty ||
             staleAdoptionJournalClosedCount != 0 ||
             journalAlignmentWriteCount != 0 ||
-            brokerFlatJournalClosedCount != 0 ||
-            residualBrokerFlatJournalClosedCount != 0 ||
             recoveredIntentWrites != 0)
         {
             LogEvent(RobotEvents.EngineBase(utcNow, "", "RELEASE_READINESS_JOURNAL_PRE_SUM_CHAIN", "ENGINE",
@@ -311,8 +442,11 @@ public sealed partial class RobotEngine
                     journal_open_qty_before_pre_sum_chain = journalOpenQtyBeforePreSum,
                     stale_adoption_journal_closed_count = staleAdoptionJournalClosedCount,
                     journal_alignment_write_count = journalAlignmentWriteCount,
-                    broker_flat_journal_closed_count = brokerFlatJournalClosedCount,
-                    residual_broker_flat_journal_closed_count = residualBrokerFlatJournalClosedCount,
+                    broker_flat_journal_closed_count = 0,
+                    residual_broker_flat_journal_closed_count = 0,
+                    broker_flat_journal_repair_deferred_to_authority = input.BrokerPositionQty == 0 &&
+                                                                       input.BrokerWorkingCount == 0 &&
+                                                                       journalOpenQtyBeforePreSum > 0,
                     ownership_snapshot_available = input.OwnershipSnapshotAvailable,
                     ownership_gross_open_qty = input.OwnershipGrossOpenQty,
                     ownership_signed_net_qty = input.OwnershipSignedNetQty,
@@ -321,7 +455,7 @@ public sealed partial class RobotEngine
                     recovered_intent_writes = recoveredIntentWrites,
                     journal_open_qty_after_pre_sum_chain = journalOpenQty,
                     note =
-                        "Journal scan before ReconcileStaleAdoptionJournalCandidatesForRelease vs structural sum after ReconcileJournalOpenQuantityWithBroker; use with RELEASE_READINESS_INPUT_AUDIT to detect pre-audit zeroing"
+                        "Journal scan before stale-adoption reconciliation vs structural sum after integrity alignment; broker-flat journal repair is deferred to canonical authority"
                 }));
         }
         if (input.BrokerPositionQty != 0)
@@ -415,6 +549,7 @@ public sealed partial class RobotEngine
 
         var useIea = _executionPolicy?.UseInstrumentExecutionAuthority ?? false;
         var account = _accountName ?? "";
+        var pendingExecutionWorkload = GetPendingIeAWorkloadForBrokerInstrument(inst);
         InstrumentExecutionAuthority? ieaResolved = null;
         HashSet<string>? registryIntentIds = null;
         var ieaTrusted = 0;
@@ -456,6 +591,7 @@ public sealed partial class RobotEngine
             BrokerPositionQty = bp,
             BrokerWorkingCount = bw,
             JournalOpenQty = journalQty,
+            PendingExecutionWorkload = pendingExecutionWorkload,
             PendingCandidateCount = pending,
             IeaTrustedWorkingCount = ieaTrusted,
             UseIea = useIea,
@@ -707,24 +843,22 @@ public sealed partial class RobotEngine
 
         if (result.BrokerWorkingCountAfter == 0 && !gateOwnershipGrossOpen)
         {
-            _executionJournal.ReconcileBrokerFlatJournalRowsForRelease(
-                ieaAfterProbe?.ExecutionInstrumentKey ?? inst,
+            var gateExecutionKey = ieaAfterProbe?.ExecutionInstrumentKey ?? inst;
+            var (gateJournalOpenQty, _) =
+                _executionJournal.GetOpenJournalStructuralStateForInstrument(gateExecutionKey, canonicalInst);
+            LogBrokerFlatJournalRepairDeferredToAuthority(
+                "GateRecoveryBrokerFlat",
+                inst,
+                gateExecutionKey,
                 canonicalInst,
                 posAfter,
                 result.BrokerWorkingCountAfter,
-                CollectRobotTaggedIntentIdsForInstrument(snapAfter, inst),
-                ieaAfterProbe?.GetMismatchTrustedWorkingIntentIds(),
-                utcNow,
-                "GateRecoveryBrokerFlat",
-                HasPendingFlattenLifecycle(inst),
-                onReconciled: (td, streamId, intentId, remaining) => RecordOwnershipBrokerFlatJournalClose(
-                    td,
-                    streamId,
-                    intentId,
-                    ieaAfterProbe?.ExecutionInstrumentKey ?? inst,
-                    remaining,
-                    utcNow,
-                    "Gate-recovery broker-flat journal reconciliation mirrored into ownership ledger"));
+                gateJournalOpenQty,
+                pendingExecutionWorkload: 0,
+                pendingFlattenLifecycle: HasPendingFlattenLifecycle(inst),
+                brokerJournalAlignmentActive: QuantExecutionControlStore.IsAnyBrokerJournalAlignmentWindowActive(inst, utcNow),
+                ownershipGrossOpen: gateOwnershipGrossOpen,
+                utcNow);
         }
         else if (result.BrokerWorkingCountAfter == 0 && gateOwnershipGrossOpen)
         {

@@ -52,9 +52,13 @@ public static class IdentityReplayScenarioDefinitions
     public static string DeterministicCanonicalIntentId => BuildDeterministicIntent("IDENTITY_REPLAY").ComputeIntentId();
 
     /// <summary>Stream/instrument pair aligned with <c>DeriveCanonicalFromStream</c> (e.g. <c>ES_S1</c> → <c>ES</c>), not <c>MES_S1</c> → <c>ME</c>.</summary>
-    public const string HydrationTradeStream = "ES_S1";
+    public const string HydrationTradeStream = "ES2";
 
-    public const string HydrationExecutionInstrument = "ES";
+    public const string HydrationCanonicalInstrument = "ES";
+
+    public const string HydrationExecutionInstrument = "MES";
+
+    public const string HydrationSlotTimeChicago = "11:00";
 
     /// <summary>BE trigger matching <see cref="NinjaTraderSimAdapter"/> hydration reconstruction.</summary>
     public static decimal HydrationComputeBeTrigger(decimal entryPrice, decimal targetPrice, string direction)
@@ -77,10 +81,10 @@ public static class IdentityReplayScenarioDefinitions
         return new Intent(
             DeterministicTradingDate,
             HydrationTradeStream,
+            HydrationCanonicalInstrument,
             HydrationExecutionInstrument,
-            HydrationExecutionInstrument,
-            "S1",
-            "09:00",
+            "S2",
+            HydrationSlotTimeChicago,
             "Long",
             ep,
             sp,

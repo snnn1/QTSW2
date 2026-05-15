@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using QTSW2.Robot.Core.Execution;
 using QTSW2.Robot.Core.SessionAuthority;
@@ -221,8 +222,31 @@ public sealed partial class RobotEngine
         var brokerAbsQty = SumBrokerPositionQty(snap, inst);
         var brokerSignedQty = SumBrokerPositionSignedQty(snap, inst);
         var robotWorkingCount = CountRobotTaggedBrokerWorkingForInstrument(snap, inst);
+        var brokerOrderIds = CollectRobotTaggedBrokerOrderIdsForInstrument(snap, inst);
+        var brokerOrderTags = CollectRobotTaggedBrokerOrderTagsForInstrument(snap, inst);
+        var brokerEntryOrderIds = CollectRobotTaggedBrokerOrderIdsForInstrument(snap, inst, "ENTRY");
+        var brokerStopOrderIds = CollectRobotTaggedBrokerOrderIdsForInstrument(snap, inst, "STOP");
+        var brokerTargetOrderIds = CollectRobotTaggedBrokerOrderIdsForInstrument(snap, inst, "TARGET");
+        var brokerFlattenOrderIds = CollectRobotTaggedBrokerOrderIdsForInstrument(snap, inst, "FLATTEN");
         if (brokerAbsQty <= 0 && robotWorkingCount <= 0)
             return;
+        if (!IsSessionCloseGlobalSweepInstrumentInEngineScope(inst, sessionClass, tradingDateStr))
+        {
+            TryLogSessionCloseGlobalSweepSkipped(tradingDateStr, sessionClass, inst, "OUTSIDE_ENGINE_SCOPE", utcNow,
+                new
+                {
+                    instrument = inst,
+                    canonical_instrument = canonical,
+                    session_class = sessionClass,
+                    broker_abs_qty = brokerAbsQty,
+                    broker_signed_qty = brokerSignedQty,
+                    robot_working_count = robotWorkingCount,
+                    engine_execution_instrument = _executionInstrument ?? "",
+                    engine_master_instrument = _masterInstrumentName ?? "",
+                    note = "This strategy instance observed shared account exposure for another engine scope; global sweep is scoped to the owning engine."
+                });
+            return;
+        }
         if (HasLocalActiveSessionCloseStreamForInstrument(inst, sessionClass))
             return;
 
@@ -235,7 +259,116 @@ public sealed partial class RobotEngine
         foreach (var intentId in CollectRobotTaggedIntentIdsForInstrument(snap, inst))
             intentIds.Add(intentId);
 
-        if (journalOpenQty <= 0 && intentIds.Count == 0)
+        var hasActiveTrackedReentry = TryGetActiveTrackedReentrySweepBlocker(
+            tradingDateStr,
+            inst,
+            intentIds,
+            out var trackedStreams,
+            out var trackedSessions,
+            out var trackedReentryIntentIds);
+        var hasRobotEvidence = journalOpenQty > 0 || intentIds.Count > 0;
+        var activeReentryState = hasActiveTrackedReentry
+            ? "TRACKED_ACTIVE_REENTRY"
+            : "";
+        var hasActiveLifecycleEvidence =
+            hasActiveTrackedReentry ||
+            HasDurableSessionCloseLifecycleEvidence(rows, inst);
+        var sessionCloseSweepAnchorUtc = ResolveSessionCloseSweepAnchorUtc(rows);
+        var sessionCloseSweepWindowFresh = IsSessionCloseGlobalSweepWindowFresh(
+            utcNow,
+            sessionCloseSweepAnchorUtc,
+            out var sessionCloseSweepWindowAgeMs);
+        var sweepAuthorityFrame = ExecutionAuthorityFrameBuilder.Build(new ExecutionAuthorityFrameBuilderInput
+        {
+            FrameId = $"session_close_global_sweep:{tradingDateStr}:{sessionClass}:{inst}:{utcNow:O}",
+            Source = "RobotEngine.SessionCloseGlobalSweep",
+            Account = _accountName ?? "",
+            Instrument = inst,
+            CanonicalInstrument = canonical,
+            ExecutionInstrumentKey = _executionInstrument ?? "",
+            TradingDate = tradingDateStr,
+            IntentId = intentIds.FirstOrDefault() ?? "",
+            SubmitPath = "SESSION_CLOSE_GLOBAL_SWEEP",
+            ExecutionMode = _executionMode.ToString(),
+            DecisionUtc = utcNow,
+            FrameCreatedUtc = utcNow,
+            BrokerSnapshotCapturedUtc = utcNow,
+            BrokerPositionQty = brokerSignedQty,
+            BrokerWorkingOrdersCount = robotWorkingCount,
+            BrokerOrderIds = brokerOrderIds,
+            BrokerOrderTags = brokerOrderTags,
+            BrokerEntryOrderIds = brokerEntryOrderIds,
+            BrokerStopOrderIds = brokerStopOrderIds,
+            BrokerTargetOrderIds = brokerTargetOrderIds,
+            BrokerFlattenOrderIds = brokerFlattenOrderIds,
+            JournalOpenQty = journalOpenQty,
+            ActiveIntentsCount = intentIds.Count,
+            ActiveIntentIds = intentIds.ToArray(),
+            ActiveReentryState = activeReentryState,
+            SessionCloseState = sessionClass,
+            SessionCloseSweepAnchorUtc = sessionCloseSweepAnchorUtc,
+            SessionCloseSweepWindowAgeMs = sessionCloseSweepWindowAgeMs,
+            SessionCloseSweepWindowFresh = sessionCloseSweepWindowFresh,
+            AuthorityState = "SESSION_CLOSE_GLOBAL_SWEEP",
+            IsPlayback = _isolatedPlaybackPersistence || _playbackAccountDetected,
+            IsMultiDayScenario = _playbackScenarioActive && (_playbackScenario?.dates?.Count ?? 0) > 1,
+            PlaybackScenarioId = _playbackScenario?.scenario_id ?? ""
+        });
+        var sweepAuthority = UnifiedExecutionAuthority.EvaluateAction(new ExecutionAuthorityActionEvaluationRequest
+        {
+            Action = ExecutionAuthorityAction.SessionCloseGlobalSweep,
+            Source = "RobotEngine.SessionCloseGlobalSweep",
+            Instrument = inst,
+            IntentId = sweepAuthorityFrame.IntentId,
+            UtcNow = utcNow,
+            HasActiveTrackedReentry = hasActiveTrackedReentry,
+            HasActiveLifecycleEvidence = hasActiveLifecycleEvidence,
+            HasRobotEvidence = hasRobotEvidence,
+            SessionCloseSweepAnchorUtc = sessionCloseSweepAnchorUtc,
+            SessionCloseSweepWindowAgeMs = sessionCloseSweepWindowAgeMs,
+            SessionCloseSweepWindowFresh = sessionCloseSweepWindowFresh,
+            BrokerAbsQty = brokerAbsQty,
+            BrokerWorkingOrderCount = robotWorkingCount,
+            JournalOpenQty = journalOpenQty,
+            AuthorityFrame = sweepAuthorityFrame
+        });
+        LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "AUTHORITY_FRAME_SNAPSHOT", state: "ENGINE",
+            ExecutionAuthorityFrameBuilder.ToLogPayload(
+                sweepAuthorityFrame,
+                action: "SESSION_CLOSE_GLOBAL_SWEEP",
+                decision: sweepAuthority.Allowed ? "ALLOW" : "DENY",
+                denyReason: sweepAuthority.DenyReason)));
+
+        if (!sweepAuthority.Allowed &&
+            string.Equals(sweepAuthority.DenyReason, "TRACKED_ACTIVE_REENTRY", StringComparison.OrdinalIgnoreCase))
+        {
+            var staleRequestKey = (tradingDateStr, inst);
+            ClearSessionCloseGlobalSweepClaim(tradingDateStr, inst, staleRequestKey);
+            TryLogSessionCloseGlobalSweepSkipped(tradingDateStr, sessionClass, inst, "TRACKED_ACTIVE_REENTRY", utcNow,
+                new
+                {
+                    instrument = inst,
+                    canonical_instrument = canonical,
+                    session_class = sessionClass,
+                    broker_abs_qty = brokerAbsQty,
+                    broker_signed_qty = brokerSignedQty,
+                    robot_working_count = robotWorkingCount,
+                    journal_open_qty = journalOpenQty,
+                    intent_ids = intentIds.ToArray(),
+                    tracked_streams = trackedStreams,
+                    tracked_sessions = trackedSessions,
+                    tracked_reentry_intent_ids = trackedReentryIntentIds,
+                    stale_global_sweep_claim_cleared = true,
+                    authority_gate = sweepAuthority.GateName,
+                    authority_deny_reason = sweepAuthority.DenyReason ?? "",
+                    authority_detail = sweepAuthority.Detail ?? "",
+                    note = "Broker exposure/working orders are explained by an active tracked reentry lifecycle; refusing session-close global sweep so a prior close event cannot flatten the resumed trade."
+                });
+            return;
+        }
+
+        if (!sweepAuthority.Allowed &&
+            string.Equals(sweepAuthority.DenyReason, "NO_ROBOT_EVIDENCE", StringComparison.OrdinalIgnoreCase))
         {
             TryLogSessionCloseGlobalSweepSkipped(tradingDateStr, sessionClass, inst, "NO_ROBOT_EVIDENCE", utcNow,
                 new
@@ -245,7 +378,59 @@ public sealed partial class RobotEngine
                     broker_abs_qty = brokerAbsQty,
                     broker_signed_qty = brokerSignedQty,
                     robot_working_count = robotWorkingCount,
+                    authority_gate = sweepAuthority.GateName,
+                    authority_deny_reason = sweepAuthority.DenyReason ?? "",
+                    authority_detail = sweepAuthority.Detail ?? "",
                     note = "Broker exposure/working orders were visible, but no open journal row or QTSW2 intent tag tied them to this session."
+                });
+            return;
+        }
+
+        if (!sweepAuthority.Allowed &&
+            (string.Equals(sweepAuthority.DenyReason, "SESSION_CLOSE_SWEEP_WINDOW_STALE", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(sweepAuthority.DenyReason, "JOURNAL_OPEN_WITHOUT_ACTIVE_LIFECYCLE", StringComparison.OrdinalIgnoreCase)))
+        {
+            var staleRequestKey = (tradingDateStr, inst);
+            ClearSessionCloseGlobalSweepClaim(tradingDateStr, inst, staleRequestKey);
+            TryLogSessionCloseGlobalSweepSkipped(tradingDateStr, sessionClass, inst, sweepAuthority.DenyReason ?? "AUTHORITY_DENIED", utcNow,
+                new
+                {
+                    instrument = inst,
+                    canonical_instrument = canonical,
+                    broker_abs_qty = brokerAbsQty,
+                    broker_signed_qty = brokerSignedQty,
+                    journal_open_qty = journalOpenQty,
+                    robot_working_count = robotWorkingCount,
+                    intent_ids = intentIds.ToArray(),
+                    session_close_sweep_anchor_utc = sessionCloseSweepAnchorUtc?.ToString("o") ?? "",
+                    session_close_sweep_window_age_ms = sessionCloseSweepWindowAgeMs,
+                    session_close_sweep_window_seconds = SESSION_CLOSE_GLOBAL_SWEEP_STALE_WINDOW_SECONDS,
+                    has_active_lifecycle_evidence = hasActiveLifecycleEvidence,
+                    has_active_tracked_reentry = hasActiveTrackedReentry,
+                    stale_global_sweep_claim_cleared = true,
+                    authority_gate = sweepAuthority.GateName,
+                    authority_deny_reason = sweepAuthority.DenyReason ?? "",
+                    authority_detail = sweepAuthority.Detail ?? "",
+                    note = "Central authority refused a session-close global sweep because the close-window/lifecycle evidence was not fresh enough to justify flattening journal-backed exposure."
+                });
+            return;
+        }
+
+        if (!sweepAuthority.Allowed)
+        {
+            TryLogSessionCloseGlobalSweepSkipped(tradingDateStr, sessionClass, inst, sweepAuthority.DenyReason ?? "AUTHORITY_DENIED", utcNow,
+                new
+                {
+                    instrument = inst,
+                    canonical_instrument = canonical,
+                    broker_abs_qty = brokerAbsQty,
+                    broker_signed_qty = brokerSignedQty,
+                    journal_open_qty = journalOpenQty,
+                    robot_working_count = robotWorkingCount,
+                    authority_gate = sweepAuthority.GateName,
+                    authority_deny_reason = sweepAuthority.DenyReason ?? "",
+                    authority_detail = sweepAuthority.Detail ?? "",
+                    note = "Central execution authority denied session-close global sweep."
                 });
             return;
         }
@@ -271,14 +456,51 @@ public sealed partial class RobotEngine
         }
 
         var requestKey = (tradingDateStr, inst);
+        var retryingGlobalSweep = false;
+        var claimSource = "new_claim";
         lock (_sessionCloseGlobalSweepLock)
         {
             if (!_sessionCloseGlobalSweepRequested.Add(requestKey))
-                return;
+            {
+                if (!TryAllowSessionCloseGlobalSweepRetryLocked(requestKey, brokerAbsQty, utcNow))
+                    return;
+                retryingGlobalSweep = true;
+                claimSource = "in_memory_marker_retry";
+            }
+            else
+            {
+                _sessionCloseGlobalSweepLastRequestUtc[requestKey] = utcNow;
+            }
         }
 
-        if (!_journals.TryMarkSessionCloseGlobalSweepRequested(tradingDateStr, inst))
-            return;
+        if (!retryingGlobalSweep && !_journals.TryMarkSessionCloseGlobalSweepRequested(tradingDateStr, inst))
+        {
+            lock (_sessionCloseGlobalSweepLock)
+            {
+                if (!TryAllowSessionCloseGlobalSweepRetryLocked(requestKey, brokerAbsQty, utcNow))
+                    return;
+                retryingGlobalSweep = true;
+                claimSource = "durable_marker_retry";
+            }
+        }
+
+        if (retryingGlobalSweep)
+        {
+            LogEvent(RobotEvents.EngineBase(utcNow, tradingDate: tradingDateStr, eventType: "SESSION_CLOSE_GLOBAL_SWEEP_RETRY", state: "ENGINE",
+                new
+                {
+                    session_class = sessionClass,
+                    instrument = inst,
+                    canonical_instrument = canonical,
+                    broker_abs_qty = brokerAbsQty,
+                    broker_signed_qty = brokerSignedQty,
+                    journal_open_qty = journalOpenQty,
+                    robot_working_count = robotWorkingCount,
+                    claim_source = claimSource,
+                    retry_interval_seconds = SESSION_CLOSE_GLOBAL_SWEEP_RETRY_SECONDS,
+                    note = "Broker exposure remained after a prior session-close global sweep claim; enqueueing a bounded retry."
+                }));
+        }
 
         var path = "";
         var extraCancelCount = 0;
@@ -327,6 +549,7 @@ public sealed partial class RobotEngine
                     extra_cancel_intents_requested = extraCancelCount,
                     stream_journals_marked = marked,
                     streams_marked = markedStreams,
+                    authority_gate = sweepAuthority.GateName,
                     path,
                     note = "Broker-level session-close sweep requested because local stream flatten coverage was not sufficient."
                 }));
@@ -352,8 +575,28 @@ public sealed partial class RobotEngine
         lock (_sessionCloseGlobalSweepLock)
         {
             _sessionCloseGlobalSweepRequested.Remove(requestKey);
+            _sessionCloseGlobalSweepLastRequestUtc.Remove(requestKey);
         }
         _journals.ClearSessionCloseGlobalSweepRequested(tradingDateStr, inst);
+    }
+
+    private bool TryAllowSessionCloseGlobalSweepRetryLocked(
+        (string tradingDay, string instrument) requestKey,
+        int brokerAbsQty,
+        DateTimeOffset utcNow)
+    {
+        if (brokerAbsQty <= 0)
+            return false;
+        if (!_sessionCloseGlobalSweepLastRequestUtc.TryGetValue(requestKey, out var lastRequestUtc))
+        {
+            _sessionCloseGlobalSweepLastRequestUtc[requestKey] = utcNow;
+            return false;
+        }
+        if ((utcNow - lastRequestUtc).TotalSeconds < SESSION_CLOSE_GLOBAL_SWEEP_RETRY_SECONDS)
+            return false;
+
+        _sessionCloseGlobalSweepLastRequestUtc[requestKey] = utcNow;
+        return true;
     }
 
     private static List<(string TradingDate, string Stream, string IntentId, ExecutionJournalEntry Entry, int Remaining)>
@@ -402,6 +645,295 @@ public sealed partial class RobotEngine
                 string.Equals(s.Session, sessionClass, StringComparison.OrdinalIgnoreCase) &&
                 ExecutionInstrumentResolver.IsSameInstrument(s.ExecutionInstrument, instrument));
         }
+    }
+
+    private bool HasDurableSessionCloseLifecycleEvidence(
+        List<(string TradingDate, string Stream, string IntentId, ExecutionJournalEntry Entry, int Remaining)> rows,
+        string instrument)
+    {
+        var inst = instrument?.Trim() ?? "";
+        foreach (var row in rows)
+        {
+            if (string.IsNullOrWhiteSpace(row.TradingDate) || string.IsNullOrWhiteSpace(row.Stream))
+                continue;
+
+            var journal = _journals.TryLoad(row.TradingDate, row.Stream);
+            if (journal == null || journal.Committed)
+                continue;
+            if (!string.IsNullOrWhiteSpace(inst) && !ExecutionInstrumentResolver.IsSameInstrument(row.Entry.Instrument, inst))
+                continue;
+
+            if (journal.SlotStatus == SlotStatus.ACTIVE ||
+                journal.ExecutionInterruptedByClose ||
+                journal.ForcedFlattenTimestamp.HasValue ||
+                HasTrackedReentryJournalEvidence(journal))
+                return true;
+        }
+
+        return false;
+    }
+
+    private DateTimeOffset? ResolveSessionCloseSweepAnchorUtc(
+        List<(string TradingDate, string Stream, string IntentId, ExecutionJournalEntry Entry, int Remaining)> rows)
+    {
+        DateTimeOffset? latest = null;
+        foreach (var row in rows)
+        {
+            if (string.IsNullOrWhiteSpace(row.TradingDate) || string.IsNullOrWhiteSpace(row.Stream))
+                continue;
+
+            var journal = _journals.TryLoad(row.TradingDate, row.Stream);
+            var ts = journal?.ForcedFlattenTimestamp;
+            if (!ts.HasValue)
+                continue;
+
+            if (!latest.HasValue || ts.Value > latest.Value)
+                latest = ts.Value;
+        }
+
+        return latest;
+    }
+
+    private static bool IsSessionCloseGlobalSweepWindowFresh(
+        DateTimeOffset utcNow,
+        DateTimeOffset? sessionCloseSweepAnchorUtc,
+        out long? ageMs)
+    {
+        ageMs = null;
+        if (!sessionCloseSweepAnchorUtc.HasValue)
+            return true;
+
+        ageMs = Math.Max(0L, (long)(utcNow - sessionCloseSweepAnchorUtc.Value).TotalMilliseconds);
+        return ageMs.Value <= (long)(SESSION_CLOSE_GLOBAL_SWEEP_STALE_WINDOW_SECONDS * 1000.0);
+    }
+
+    private string[] CollectRobotTaggedBrokerOrderIdsForInstrument(
+        AccountSnapshot snap,
+        string instrument,
+        string? role = null)
+    {
+        if (snap.WorkingOrders == null || string.IsNullOrWhiteSpace(instrument))
+            return Array.Empty<string>();
+
+        var ids = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var order in snap.WorkingOrders)
+        {
+            if (order == null || string.IsNullOrWhiteSpace(order.OrderId))
+                continue;
+            if (!ExecutionInstrumentResolver.IsSameInstrument(order.Instrument, instrument))
+                continue;
+            if (!IsRobotOwnedOrder(order))
+                continue;
+            if (!string.IsNullOrWhiteSpace(role) &&
+                !string.Equals(ClassifyBrokerOrderRole(order), role, StringComparison.OrdinalIgnoreCase))
+                continue;
+            ids.Add(order.OrderId.Trim());
+        }
+
+        return ids.ToArray();
+    }
+
+    private string[] CollectRobotTaggedBrokerOrderTagsForInstrument(AccountSnapshot snap, string instrument)
+    {
+        if (snap.WorkingOrders == null || string.IsNullOrWhiteSpace(instrument))
+            return Array.Empty<string>();
+
+        var tags = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var order in snap.WorkingOrders)
+        {
+            if (order == null)
+                continue;
+            if (!ExecutionInstrumentResolver.IsSameInstrument(order.Instrument, instrument))
+                continue;
+            if (!IsRobotOwnedOrder(order))
+                continue;
+
+            if (!string.IsNullOrWhiteSpace(order.Tag))
+                tags.Add(order.Tag.Trim());
+            if (!string.IsNullOrWhiteSpace(order.OcoGroup))
+                tags.Add(order.OcoGroup.Trim());
+        }
+
+        return tags.ToArray();
+    }
+
+    private static string ClassifyBrokerOrderRole(WorkingOrderSnapshot order)
+    {
+        var parsed = RobotOrderIds.ParseTag(order.Tag);
+        if (!string.IsNullOrWhiteSpace(parsed.Leg))
+            return parsed.Leg!.Trim().ToUpperInvariant();
+
+        var tag = (order.Tag ?? "") + " " + (order.OcoGroup ?? "");
+        if (tag.IndexOf("FLATTEN", StringComparison.OrdinalIgnoreCase) >= 0)
+            return "FLATTEN";
+        if (tag.IndexOf(":STOP", StringComparison.OrdinalIgnoreCase) >= 0)
+            return "STOP";
+        if (tag.IndexOf(":TARGET", StringComparison.OrdinalIgnoreCase) >= 0)
+            return "TARGET";
+        if (tag.IndexOf(":ENTRY", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            tag.IndexOf("OCO_ENTRY", StringComparison.OrdinalIgnoreCase) >= 0)
+            return "ENTRY";
+
+        var orderType = order.OrderType ?? "";
+        if (orderType.IndexOf("target", StringComparison.OrdinalIgnoreCase) >= 0 ||
+            orderType.IndexOf("limit", StringComparison.OrdinalIgnoreCase) >= 0)
+            return "TARGET";
+        if (orderType.IndexOf("stop", StringComparison.OrdinalIgnoreCase) >= 0)
+            return "STOP";
+
+        return "UNKNOWN";
+    }
+
+    private bool TryGetActiveTrackedReentrySweepBlocker(
+        string tradingDateStr,
+        string instrument,
+        IEnumerable<string> intentIds,
+        out string[] trackedStreams,
+        out string[] trackedSessions,
+        out string[] trackedReentryIntentIds)
+    {
+        var inst = instrument?.Trim() ?? "";
+        var intentSet = new HashSet<string>(
+            intentIds?.Where(id => !string.IsNullOrWhiteSpace(id)).Select(id => id.Trim()) ?? Array.Empty<string>(),
+            StringComparer.OrdinalIgnoreCase);
+        var streams = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        var sessions = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+        var reentryIds = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        lock (_engineLock)
+        {
+            foreach (var stream in _streams.Values)
+            {
+                if (!stream.HasActiveReentryLifecycleEvidence)
+                    continue;
+                if (!ExecutionInstrumentResolver.IsSameInstrument(stream.ExecutionInstrument, inst))
+                    continue;
+
+                var reentryIntentId = stream.ReentryIntentId?.Trim() ?? "";
+                var originalIntentId = stream.OriginalIntentId?.Trim() ?? "";
+                var intentMatched = intentSet.Count == 0 ||
+                                    (!string.IsNullOrWhiteSpace(reentryIntentId) && intentSet.Contains(reentryIntentId)) ||
+                                    (!string.IsNullOrWhiteSpace(originalIntentId) && intentSet.Contains(originalIntentId));
+                if (!intentMatched)
+                    continue;
+
+                streams.Add(stream.Stream);
+                sessions.Add(stream.Session);
+                if (!string.IsNullOrWhiteSpace(reentryIntentId))
+                    reentryIds.Add(reentryIntentId);
+            }
+        }
+
+        foreach (var journal in EnumerateStreamJournalsForTradingDate(tradingDateStr))
+        {
+            var reentryIntentId = journal.ReentryIntentId?.Trim() ?? "";
+            var originalIntentId = journal.OriginalIntentId?.Trim() ?? "";
+            if (string.IsNullOrWhiteSpace(reentryIntentId))
+                continue;
+            if (!HasTrackedReentryJournalEvidence(journal))
+                continue;
+
+            var intentMatched = intentSet.Count == 0 ||
+                                intentSet.Contains(reentryIntentId) ||
+                                (!string.IsNullOrWhiteSpace(originalIntentId) && intentSet.Contains(originalIntentId));
+            if (!intentMatched)
+                continue;
+
+            var entry = _executionJournal.GetEntry(reentryIntentId, journal.TradingDate, journal.Stream);
+            if (entry == null || entry.TradeCompleted || ExecutionJournal.GetEntryRemainingOpenQuantity(entry) <= 0)
+                continue;
+            if (!ExecutionInstrumentResolver.IsSameInstrument(entry.Instrument, inst))
+                continue;
+
+            streams.Add(journal.Stream);
+            sessions.Add(TimetableStream.DeriveSessionFromStreamId(journal.Stream));
+            reentryIds.Add(reentryIntentId);
+        }
+
+        trackedStreams = streams.ToArray();
+        trackedSessions = sessions.ToArray();
+        trackedReentryIntentIds = reentryIds.ToArray();
+        return trackedStreams.Length > 0;
+    }
+
+    private IEnumerable<StreamJournal> EnumerateStreamJournalsForTradingDate(string tradingDateStr)
+    {
+        if (string.IsNullOrWhiteSpace(tradingDateStr))
+            yield break;
+
+        string[] paths;
+        try
+        {
+            var journalDir = RobotRunArtifactPaths.StateStreamJournals(_persistenceBase);
+            if (!Directory.Exists(journalDir))
+                yield break;
+            paths = Directory.GetFiles(journalDir, $"{tradingDateStr}_*.json");
+        }
+        catch
+        {
+            yield break;
+        }
+
+        foreach (var path in paths)
+        {
+            StreamJournal? journal = null;
+            try
+            {
+                journal = JsonUtil.Deserialize<StreamJournal>(File.ReadAllText(path));
+            }
+            catch
+            {
+                // Ignore unreadable stream journals here; reconciliation owns corruption escalation.
+            }
+
+            if (journal != null)
+                yield return journal;
+        }
+    }
+
+    private static bool HasTrackedReentryJournalEvidence(StreamJournal journal)
+        => !string.IsNullOrWhiteSpace(journal.ReentryIntentId) &&
+           (journal.ReentrySubmitPending ||
+            journal.ReentrySubmitted ||
+            journal.ReentryFilled ||
+            journal.ProtectionSubmitted ||
+            journal.ProtectionAccepted);
+
+    private bool IsSessionCloseGlobalSweepInstrumentInEngineScope(string instrument, string sessionClass, string tradingDateStr)
+    {
+        var inst = instrument?.Trim() ?? "";
+        if (string.IsNullOrWhiteSpace(inst))
+            return false;
+
+        lock (_engineLock)
+        {
+            var hasExplicitScope =
+                !string.IsNullOrWhiteSpace(_executionInstrument) ||
+                !string.IsNullOrWhiteSpace(_masterInstrumentName) ||
+                _streams.Count > 0;
+
+            if (!hasExplicitScope)
+                return true;
+
+            if (!string.IsNullOrWhiteSpace(_executionInstrument) &&
+                ExecutionInstrumentResolver.IsSameInstrument(_executionInstrument, inst))
+                return true;
+
+            if (!string.IsNullOrWhiteSpace(_masterInstrumentName) &&
+                ExecutionInstrumentResolver.IsSameInstrument(_masterInstrumentName, inst))
+                return true;
+
+            return _streams.Values.Any(s =>
+                string.Equals(s.Session, sessionClass, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(s.TradingDate, tradingDateStr, StringComparison.Ordinal) &&
+                ExecutionInstrumentResolver.IsSameInstrument(s.ExecutionInstrument, inst));
+        }
+    }
+
+    internal void RunSessionCloseGlobalExposureSweepForTest(IExecutionAdapter adapter, string tradingDateStr, string sessionClass, DateTimeOffset utcNow)
+    {
+        _executionAdapter = adapter ?? throw new ArgumentNullException(nameof(adapter));
+        RunSessionCloseGlobalExposureSweep(tradingDateStr, sessionClass, utcNow);
     }
 
     private int MarkSessionCloseInterruptedJournals(

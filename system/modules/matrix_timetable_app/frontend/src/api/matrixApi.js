@@ -7,10 +7,13 @@
 
 import { devLog } from '../utils/logger'
 
-// Default: same-origin `/api` so Vite dev proxy can forward to FastAPI. Override with VITE_API_BASE (e.g. absolute URL ending in /api) for production split-host.
+// The launcher serves the built frontend with python http.server on :5174, which cannot proxy same-origin /api.
+// Default to the dashboard API on IPv4 localhost. The static launcher binds the
+// servers to 127.0.0.1, and some Windows setups resolve localhost to ::1 first.
+export const DEFAULT_API_BASE = 'http://127.0.0.1:8000/api'
 export const API_PORT = import.meta.env.VITE_API_PORT || '8000'
 export const API_BASE =
-  (import.meta.env.VITE_API_BASE && String(import.meta.env.VITE_API_BASE).trim()) || '/api'
+  (import.meta.env.VITE_API_BASE && String(import.meta.env.VITE_API_BASE).trim()) || DEFAULT_API_BASE
 
 /**
  * Parse JSON after reading body as text so empty responses (wrong proxy/port) fail with a clear message
@@ -22,7 +25,7 @@ async function readResponseJson(response) {
     throw new Error(
       `Empty HTTP response (${response.status} ${response.statusText || ''}). ` +
         'The FastAPI process may have crashed during the request (check the backend terminal), or something other than the dashboard is bound to the API port. ' +
-        'Confirm Vite proxies /api to the dashboard (vite.config.js; default backend :8000) and that only one backend listens on that port.'
+        'Confirm the frontend API base points at the dashboard API (default http://127.0.0.1:8000/api) and that only one backend listens on that port.'
     )
   }
   try {
@@ -47,8 +50,9 @@ function errorMessageFromPayload(data) {
 }
 
 /**
- * URL that must reach FastAPI (under /api), not the Vite dev root.
- * Dev: `/api/matrix/test` is proxied (vite.config.js → :8000). Absolute: `http://host:port/api/matrix/test`.
+ * URL that must reach FastAPI (under /api), not the static frontend server.
+ * Static launcher default: `http://127.0.0.1:8000/api/matrix/test`.
+ * Dev/proxy overrides can set VITE_API_BASE=/api when running Vite directly.
  */
 export function getBackendProbeUrl() {
   return `${String(API_BASE).replace(/\/$/, '')}/matrix/test`
@@ -79,7 +83,7 @@ export async function checkBackendHealth(timeoutMs = 3000) {
     if (error.name === 'AbortError') {
       return {
         success: false,
-        error: `Backend connection timeout (${getBackendProbeUrl()}). Is the dashboard API on http://localhost:${API_PORT}?`,
+        error: `Backend connection timeout (${getBackendProbeUrl()}). Is the dashboard API on http://127.0.0.1:${API_PORT}?`,
       }
     }
     return {
@@ -93,17 +97,7 @@ export async function checkBackendHealth(timeoutMs = 3000) {
  * Build master matrix
  */
 export async function buildMatrix({ streamFilters = {}, visibleYears = [], rebuildStream = null, warmupMonths = 1 }) {
-  const streamFiltersApi = {}
-  Object.keys(streamFilters).forEach(streamId => {
-    const filters = streamFilters[streamId]
-    if (filters) {
-      streamFiltersApi[streamId] = {
-        exclude_days_of_week: filters.exclude_days_of_week || [],
-        exclude_days_of_month: filters.exclude_days_of_month || [],
-        exclude_times: filters.exclude_times || []
-      }
-    }
-  })
+  const streamFiltersApi = streamFiltersForMatrixApi(streamFilters)
 
   const buildBody = {
     stream_filters: Object.keys(streamFiltersApi).length > 0 ? streamFiltersApi : null,
@@ -362,21 +356,66 @@ export async function computeTimetableContentHash({ session_trading_date, stream
 }
 
 /**
- * Strip UI-only keys; match POST /api/matrix/resequence stream_filters shape for execution publish merge.
+ * Strip UI-only keys while preserving execution-relevant filters.
  */
 export function streamFiltersForExecutionApi(streamFilters = {}) {
+  return streamFiltersForMatrixApi(streamFilters)
+}
+
+/**
+ * Shape stream filters for matrix/resequence APIs.
+ * `master.include_streams` is not a row-level matrix filter, but it is required
+ * by the downstream timetable auto-publish after resequence/build.
+ */
+export function streamFiltersForMatrixApi(streamFilters = {}) {
   const out = {}
   Object.keys(streamFilters).forEach(streamId => {
     const filters = streamFilters[streamId]
     if (filters && typeof filters === 'object') {
-      out[streamId] = {
+      const shaped = {
         exclude_days_of_week: filters.exclude_days_of_week || [],
         exclude_days_of_month: filters.exclude_days_of_month || [],
         exclude_times: filters.exclude_times || []
       }
+      if (streamId === 'master' && Array.isArray(filters.include_streams)) {
+        shaped.include_streams = filters.include_streams
+      }
+      out[streamId] = shaped
     }
   })
   return out
+}
+
+/**
+ * Load durable Matrix stream filters from the backend config file.
+ */
+export async function getStreamFiltersConfig() {
+  const response = await fetch(`${API_BASE}/matrix/filters`, {
+    method: 'GET',
+  })
+  const payload = await readResponseJson(response)
+  if (!response.ok) {
+    throw new Error(errorMessageFromPayload(payload) || 'Failed to load stream filters config')
+  }
+  return payload
+}
+
+/**
+ * Persist execution-relevant Matrix filters server-side.
+ * UI-only filters such as include_years intentionally stay browser-local.
+ */
+export async function saveStreamFiltersConfig(streamFilters = {}) {
+  const apiFilters = streamFiltersForMatrixApi(streamFilters)
+  const response = await fetch(`${API_BASE}/matrix/filters`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ stream_filters: apiFilters })
+  })
+  const payload = await readResponseJson(response)
+  if (!response.ok) {
+    throw new Error(errorMessageFromPayload(payload) || 'Failed to save stream filters config')
+  }
+  return payload
 }
 
 /**
@@ -583,17 +622,7 @@ export async function clearPlaybackScenario() {
  * @param {number} options.resequenceDays - Number of trading days to resequence (default 40)
  */
 export async function resequenceMatrix({ streamFilters = {}, resequenceDays = 40 }) {
-  const streamFiltersApi = {}
-  Object.keys(streamFilters).forEach(streamId => {
-    const filters = streamFilters[streamId]
-    if (filters) {
-      streamFiltersApi[streamId] = {
-        exclude_days_of_week: filters.exclude_days_of_week || [],
-        exclude_days_of_month: filters.exclude_days_of_month || [],
-        exclude_times: filters.exclude_times || []
-      }
-    }
-  })
+  const streamFiltersApi = streamFiltersForMatrixApi(streamFilters)
 
   const resequenceBody = {
     resequence_days: resequenceDays,
